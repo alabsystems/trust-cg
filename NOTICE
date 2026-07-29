@@ -1,0 +1,23 @@
+trust-cg
+Copyright 2026 Andrew Yates
+
+trust-cg is licensed under the ALab Academic Use License 1.0; the terms are in LICENSE.
+
+trust-cg's binaries include third-party components. Each remains under its own
+license, and nothing in the ALab Academic Use License limits the rights that license
+gives you.
+
+trust-cg's binaries include code from the following projects. Each part keeps
+its upstream license; the license texts named are in licenses/.
+
+- MicroSAT, by Marijn Heule (https://github.com/marijnheule/microsat,
+  revision 26985d9b6b9aa5375d345051bd98afd63213043d), MIT.
+- drat-trim, by Marijn Heule (https://github.com/marijnheule/drat-trim,
+  revision 2e3b2dc0ecf938addbd779d42877b6ed69d9a985), MIT.
+- xxHash, by Yann Collet (https://github.com/Cyan4973/xxHash, v0.8.2),
+  BSD-2-Clause: the XXH3 algorithm, constants and default secret.
+- The Rust standard library (https://github.com/rust-lang/rust, 1.97.1),
+  The Rust Project Contributors, MIT OR Apache-2.0, used under MIT: a
+  SipHasher13-derived transcription.
+
+Rust crate dependencies keep the terms their packages declare.
