@@ -1,0 +1,15 @@
+{
+  "status": "unknown",
+  "artifact_id": "trust-cg-gamma-v1-blake3-256:c8c2a6fa61e6150fc15aa41a1a4f9f638d1c2d239f758dbdbd8cd0f8f3ff7d89",
+  "timing_ns": {
+    "parse": 1000,
+    "compatibility": 2000,
+    "verify": 3000,
+    "total": 6000
+  },
+  "certificate": null,
+  "checker": {
+    "checker_id": "gamma-crown-checker-v1",
+    "checker_abi": "gamma-checker-abi-v1"
+  }
+}

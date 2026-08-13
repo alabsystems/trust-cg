@@ -1,0 +1,51 @@
+# trust-cg-sat-host - Host bindings to the vendored MicroSAT CDCL solver
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache-2.0
+
+[package]
+name = "trust-cg-sat-host"
+description = "Raw FFI bindings to the vendored MicroSAT CDCL solver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+
+[dependencies]
+trust-cg-jit-matrix = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+
+[build-dependencies]
+cc = "1"
+bindgen = "0.71"
+
+[dev-dependencies]
+tempfile = "3"
+serde = { workspace = true }
+serde_json = { workspace = true }
+trust-cg-drat-trim = { workspace = true }
+criterion = "0.5"
+libc = "0.2"
+
+[[bench]]
+name = "satlib_jit_shadow_bench"
+harness = false
+
+[[bench]]
+name = "microsat_c_o3_baseline_bench"
+harness = false
+
+[[bin]]
+name = "satlib_bench_table"
+path = "src/bin/satlib_bench_table.rs"
+
+[[bin]]
+name = "trust_cg_sat"
+path = "src/bin/trust_cg_sat.rs"
+
+[lints]
+workspace = true

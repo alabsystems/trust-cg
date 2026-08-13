@@ -1,0 +1,88 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# Rust
+target/
+# Cargo.lock is committed: trust-cg's dependency revs (notably trust-ir) are
+# pinned for cross-repo reproducibility with ty/trust-mc (shared-core alignment).
+**/*.rs.bk
+
+# SAT-Comp 2026 starexec_build artefact directory (binary is rebuilt
+# from source by `./starexec_build`; never committed).
+/bin/
+
+# C++
+*.o
+*.out
+*.exe
+build/
+
+# Benchmark outputs
+benchmarks/**/results/
+benchmarks/**/logs/
+benchmarks/**/data/
+
+# Emacs
+*~
+\#*\#
+.#*
+
+# Credentials and secrets
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.pfx
+credentials.json
+secrets.json
+*_secret*
+*.secret
+.secrets/
+
+# Mutation testing artifacts
+mutants/
+.mutmut-cache/
+kani_status.json
+
+# Local agent/editor configuration
+.claude/
+.mcp.json
+
+# Explicit development-only Cargo source redirects. The tracked example records
+# the expected sibling layout; the active config must never become repository
+# dependency authority.
+/.cargo/local-siblings.toml
+
+# Trust compiler Internal Compiler Error dumps (transient; never commit)
+rustc-ice-*.txt
+trustc-ice-*.txt
+
+# external CARGO_TARGET_DIR used for the bridge dylib differential gate.
+# The canonical build convention is
+#   cd crates/rustc-codegen-trust-cg && CARGO_TARGET_DIR=target-bridge cargo build --release
+# so the dir appears BOTH at the repo root (older worktree-based recipe) and
+# under the bridge crate. Anchoring only the root left the canonical one
+# untracked-but-not-ignored, polluting `git status` and risking an accidental
+# commit of a multi-hundred-MB build tree.
+/target-bridge/
+target-bridge/
+
+# Lean build artifacts (formal/ forward-sim development)
+/formal/lean/.lake/
+/formal/lean/build/
+*.olean
+
+# publish.sh work area (export tree, guard reports, staging clone)
+publish/.out/
+
+# Session scratch work area (untracked temp files; never commit)
+# Fuzzer repro directories are source-controlled regression fixtures.
+/scratchpad/

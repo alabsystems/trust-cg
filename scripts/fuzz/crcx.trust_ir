@@ -1,0 +1,25 @@
+; trust_ir text format v1
+module "crcx"
+functy.0 = (ptr, i32, ptr) -> (i64)
+fn @crc_x(functy.0) {
+bb0(%0: ptr, %1: i32, %2: ptr):
+    %3 = const i64 0
+    %4 = const i32 0
+    %5 = const i32 1
+    br bb1(%4, %3)
+bb1(%6: i32, %7: i64):
+    %8 = icmp slt i32 %6, %1
+    condbr %8, bb2(%6, %7), bb3(%7)
+bb2(%9: i32, %10: i64):
+    %11 = sext i32 %9 to i64
+    %12 = gep i8, ptr %0, %11
+    %13 = load i8, ptr %12
+    %14 = zext i8 %13 to i64
+    %15 = gep i64, ptr %2, %14
+    %16 = load i64, ptr %15
+    %17 = xor i64 %10, %16
+    %18 = add i32 %9, %5
+    br bb1(%18, %17)
+bb3(%19: i64):
+    ret %19
+}

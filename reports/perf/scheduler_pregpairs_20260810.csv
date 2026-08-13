@@ -1,0 +1,4 @@
+n_stmts,llvm_ms,tcg_before_all_ms,tcg_after_all_ms,ratio_before,ratio_after
+400,30.0,105.8,78.0,3.527,2.600
+1600,54.6,702.8,273.0,12.872,5.000
+3200,96.4,2414.1,677.8,25.043,7.031

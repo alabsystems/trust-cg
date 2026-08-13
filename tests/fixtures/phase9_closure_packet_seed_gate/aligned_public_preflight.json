@@ -1,0 +1,30 @@
+{
+  "local_required_fixes_present": {
+    "3b69945172c75ea424f9501c078468b69433f72b": true,
+    "4574b115e5103d4ba20331b51912f86b8c9a50f4": true
+  },
+  "missing_artifacts": [],
+  "ok": true,
+  "public_trust_cg_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "public_trust_cg_trust_ir_build_dependency": {
+    "git": "https://github.com/alabsystems/trust-ir",
+    "path": null,
+    "rev": null
+  },
+  "public_trust_cg_trust_ir_dependency": {
+    "git": "https://github.com/alabsystems/trust-ir",
+    "path": null,
+    "rev": null
+  },
+  "public_required_fixes_present": {
+    "3b69945172c75ea424f9501c078468b69433f72b": true,
+    "4574b115e5103d4ba20331b51912f86b8c9a50f4": true
+  },
+  "public_trust_ir_head": "02b4f872948b67fe61632765c31542da7166dfe4",
+  "reasons": [],
+  "ay_trust_cg_dependency": {
+    "git": "https://github.com/alabsystems/trust-cg.git",
+    "path": null,
+    "rev": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  }
+}

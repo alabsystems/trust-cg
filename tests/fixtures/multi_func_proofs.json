@@ -1,0 +1,340 @@
+{
+  "name": "multi_func_proofs",
+  "functions": [
+    {
+      "id": 0,
+      "name": "pure_add",
+      "ty": {
+        "params": [
+          {
+            "Primitive": {
+              "Int": {
+                "width": "I32",
+                "signed": true
+              }
+            }
+          },
+          {
+            "Primitive": {
+              "Int": {
+                "width": "I32",
+                "signed": true
+              }
+            }
+          }
+        ],
+        "returns": [
+          {
+            "Primitive": {
+              "Int": {
+                "width": "I32",
+                "signed": true
+              }
+            }
+          }
+        ]
+      },
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              {
+                "Primitive": {
+                  "Int": {
+                    "width": "I32",
+                    "signed": true
+                  }
+                }
+              }
+            ],
+            [
+              1,
+              {
+                "Primitive": {
+                  "Int": {
+                    "width": "I32",
+                    "signed": true
+                  }
+                }
+              }
+            ]
+          ],
+          "body": [
+            {
+              "instr": {
+                "BinOp": {
+                  "op": "Add",
+                  "ty": {
+                    "Primitive": {
+                      "Int": {
+                        "width": "I32",
+                        "signed": true
+                      }
+                    }
+                  },
+                  "lhs": {
+                    "Value": 0
+                  },
+                  "rhs": {
+                    "Value": 1
+                  }
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [
+                {
+                  "NoOverflow": {
+                    "signed": true
+                  }
+                },
+                "Commutative",
+                "Associative"
+              ]
+            },
+            {
+              "instr": {
+                "Return": {
+                  "values": [
+                    {
+                      "Value": 2
+                    }
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": []
+            }
+          ]
+        }
+      ],
+      "proofs": [
+        "Pure"
+      ]
+    },
+    {
+      "id": 1,
+      "name": "negate_f64",
+      "ty": {
+        "params": [
+          {
+            "Primitive": {
+              "Float": "F64"
+            }
+          }
+        ],
+        "returns": [
+          {
+            "Primitive": {
+              "Float": "F64"
+            }
+          }
+        ]
+      },
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              {
+                "Primitive": {
+                  "Float": "F64"
+                }
+              }
+            ]
+          ],
+          "body": [
+            {
+              "instr": {
+                "UnOp": {
+                  "op": "FNeg",
+                  "ty": {
+                    "Primitive": {
+                      "Float": "F64"
+                    }
+                  },
+                  "operand": {
+                    "Value": 0
+                  }
+                }
+              },
+              "results": [
+                1
+              ],
+              "proofs": []
+            },
+            {
+              "instr": {
+                "Return": {
+                  "values": [
+                    {
+                      "Value": 1
+                    }
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": []
+            }
+          ]
+        }
+      ],
+      "proofs": [
+        "Pure"
+      ]
+    },
+    {
+      "id": 2,
+      "name": "load_and_store",
+      "ty": {
+        "params": [
+          {
+            "Ref": {
+              "kind": {
+                "Raw": "Immutable"
+              },
+              "pointee": {
+                "Primitive": {
+                  "Int": {
+                    "width": "I64",
+                    "signed": true
+                  }
+                }
+              }
+            }
+          },
+          {
+            "Ref": {
+              "kind": {
+                "Raw": "Immutable"
+              },
+              "pointee": {
+                "Primitive": {
+                  "Int": {
+                    "width": "I64",
+                    "signed": true
+                  }
+                }
+              }
+            }
+          }
+        ],
+        "returns": []
+      },
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              {
+                "Ref": {
+                  "kind": {
+                    "Raw": "Immutable"
+                  },
+                  "pointee": {
+                    "Primitive": {
+                      "Int": {
+                        "width": "I64",
+                        "signed": true
+                      }
+                    }
+                  }
+                }
+              }
+            ],
+            [
+              1,
+              {
+                "Ref": {
+                  "kind": {
+                    "Raw": "Immutable"
+                  },
+                  "pointee": {
+                    "Primitive": {
+                      "Int": {
+                        "width": "I64",
+                        "signed": true
+                      }
+                    }
+                  }
+                }
+              }
+            ]
+          ],
+          "body": [
+            {
+              "instr": {
+                "Load": {
+                  "ty": {
+                    "Primitive": {
+                      "Int": {
+                        "width": "I64",
+                        "signed": true
+                      }
+                    }
+                  },
+                  "ptr": 0
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [
+                {
+                  "NotNull": {
+                    "ptr": 0
+                  }
+                }
+              ]
+            },
+            {
+              "instr": {
+                "Store": {
+                  "ty": {
+                    "Primitive": {
+                      "Int": {
+                        "width": "I64",
+                        "signed": true
+                      }
+                    }
+                  },
+                  "ptr": 1,
+                  "value": {
+                    "Value": 2
+                  }
+                }
+              },
+              "results": [],
+              "proofs": [
+                {
+                  "NotNull": {
+                    "ptr": 1
+                  }
+                }
+              ]
+            },
+            {
+              "instr": {
+                "Return": {
+                  "values": []
+                }
+              },
+              "results": [],
+              "proofs": []
+            }
+          ]
+        }
+      ],
+      "proofs": []
+    }
+  ],
+  "structs": []
+}

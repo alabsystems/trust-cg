@@ -1,0 +1,33 @@
+{
+  "name": "conv_relu_maxpool",
+  "inputs": [
+    { "name": "input", "shape": [1, 3, 32, 32], "dtype": "f32", "layout": "nchw" }
+  ],
+  "outputs": ["pool_out"],
+  "tensors": [
+    { "name": "conv_out", "shape": [1, 8, 32, 32], "dtype": "f32", "layout": "nchw" },
+    { "name": "relu_out", "shape": [1, 8, 32, 32], "dtype": "f32", "layout": "nchw" },
+    { "name": "pool_out", "shape": [1, 8, 16, 16], "dtype": "f32", "layout": "nchw" }
+  ],
+  "initializers": [
+    { "name": "conv.weight", "shape": [8, 3, 3, 3], "dtype": "f32", "layout": "oihw", "values": [0.1] },
+    { "name": "conv.bias", "shape": [8], "dtype": "f32", "layout": "vector", "values": [0.0] }
+  ],
+  "nodes": [
+    {
+      "name": "Conv_0",
+      "op_type": "Conv",
+      "inputs": ["input", "conv.weight", "conv.bias"],
+      "outputs": ["conv_out"],
+      "attributes": { "kernel_shape": [3, 3], "strides": [1, 1], "pads": [1, 1, 1, 1] }
+    },
+    { "name": "Relu_1", "op_type": "Relu", "inputs": ["conv_out"], "outputs": ["relu_out"] },
+    {
+      "name": "MaxPool_2",
+      "op_type": "MaxPool",
+      "inputs": ["relu_out"],
+      "outputs": ["pool_out"],
+      "attributes": { "kernel_shape": [2, 2], "strides": [2, 2], "pads": [0, 0, 0, 0] }
+    }
+  ]
+}

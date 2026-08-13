@@ -1,0 +1,124 @@
+# trust-cg
+# Proof-oriented compiler backend — trust-ir to machine code
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache-2.0
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/trust-cg-ir",
+    "crates/trust-cg-dialect",
+    "crates/trust-cg-lower",
+    "crates/trust-cg-opt",
+    "crates/trust-cg-verify",
+    "crates/trust-cg-codegen",
+    "crates/trust-cg-lift",
+    "crates/trust-cg-regalloc",
+    "crates/trust-cg-gpu",
+    "crates/trust-cg-cli",
+    "crates/trust-cg-fuzz",
+    "crates/trust-cg-llvm-import",
+    "crates/trust-cg-onnx-import",
+    "crates/trust-cg-jit-matrix",
+    "crates/trust-cg-sat-host",
+    "crates/trust-cg-drat-trim",
+    "crates/trust-cg-test",
+    "crates/trust-cg-process-env",
+    "crates/trust-types-compat",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["Andrew Yates <andrewyates.name@gmail.com>"]
+publish = false
+repository = "https://github.com/alabsystems/trust-cg"
+homepage = "https://github.com/alabsystems/trust-cg"
+readme = "README.md"
+
+[workspace.dependencies]
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rmp-serde = "1.3"
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Input IR (trust-ir). Cargo auto-derives the Rust
+# identifier `trust_ir` from the kebab package name, so `use trust_ir::...`
+# in source code keeps compiling.
+# trust-ir is consumed as a git dependency so trust-cg builds standalone from
+# any location. Development checkouts may use configured Git credentials;
+# publication maps the exact pin to anonymous public HTTPS.
+# When built inside the `alabsystems/trust` superproject, that superproject's
+# `.cargo/config.toml` redirects this git dep to its `first-party/trust-ir`.
+trust-ir = { git = "https://github.com/alabsystems/trust-ir.git", rev = "f497428646b05c2f20ff0017f6b01d4924935d12", features = ["serde", "parser", "binary", "dialect-verif-example", "clean-expr"] }
+trust-ir-build = { git = "https://github.com/alabsystems/trust-ir.git", rev = "f497428646b05c2f20ff0017f6b01d4924935d12" }
+
+# Internal crates
+trust-cg-ir = { path = "crates/trust-cg-ir" }
+trust-cg-dialect = { path = "crates/trust-cg-dialect" }
+trust-cg-lower = { path = "crates/trust-cg-lower" }
+trust-cg-opt = { path = "crates/trust-cg-opt" }
+trust-cg-verify = { path = "crates/trust-cg-verify", default-features = false }
+trust-cg-codegen = { path = "crates/trust-cg-codegen" }
+trust-cg-lift = { path = "crates/trust-cg-lift" }
+trust-cg-regalloc = { path = "crates/trust-cg-regalloc" }
+trust-cg-gpu = { path = "crates/trust-cg-gpu" }
+trust-cg-llvm-import = { path = "crates/trust-cg-llvm-import" }
+trust-cg-onnx-import = { path = "crates/trust-cg-onnx-import" }
+trust-cg-jit-matrix = { path = "crates/trust-cg-jit-matrix" }
+trust-cg-process-env = { path = "crates/trust-cg-process-env" }
+trust-cg-sat-host = { path = "crates/trust-cg-sat-host" }
+trust-cg-drat-trim = { path = "crates/trust-cg-drat-trim" }
+trust-types = { path = "crates/trust-types-compat" }
+
+# Workspace-wide lint configuration.
+#
+# deny(warnings) is the zero-warnings ratchet enforced by
+# `scripts/check_warnings_ratchet.sh`. Production and test code must
+# compile without warnings. If a new warning is unavoidable (e.g., an
+# inherited dependency quirk), prefer a narrowly-scoped `#[allow(...)]`
+# with a comment explaining why, rather than loosening this lint.
+#
+# Per-crate opt-in: every member crate should include
+#   [lints]
+#   workspace = true
+# so this policy applies.
+[workspace.lints.rust]
+warnings = "deny"
+
+[workspace.metadata.trust_cg.panic_clippy]
+# Baseline-aware panic-family lint gate. The command-line check uses these
+# exact lints as deny-level clippy diagnostics, then compares findings against
+# the generated panic audit baseline so accepted ledger entries keep compiling
+# while newly introduced production sites fail.
+command = "scripts/check_panic_clippy.sh"
+scope = "crates/*/src/** production code; tests and trust-cg-verify are excluded"
+lints = [
+    "clippy::unwrap_used",
+    "clippy::expect_used",
+    "clippy::panic",
+    "clippy::unreachable",
+    "clippy::todo",
+]
+
+[workspace.metadata.trust_cg.fmt]
+# rustfmt conformance gate. rustfmt.toml pins edition/style_edition 2024 and the
+# root rust-toolchain.toml pins the toolchain *with the rustfmt component*, so
+# the formatting is reproducible for every checkout rather than a function of
+# whichever rustfmt happens to be on PATH. The gate reports and exits; it never
+# rewrites, so a landing diff cannot pick up unreviewed reformatting.
+command = "scripts/check_fmt.sh"
+scope = "every workspace member, via `cargo fmt --all -- --check`"
+fix = "cargo fmt --all"
+
+[workspace.metadata.atpkg]
+# The one user-facing command for `trust-cg`. The rest of the workspace bins are internal
+# tooling (drivers, benches, matrices, JIT probes, the competition solver trust_cg_sat which,
+# if shipped, belongs as its own atpkg package).
+expose = ["trust-cg"]

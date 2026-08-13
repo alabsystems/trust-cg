@@ -1,0 +1,64 @@
+---
+source: crates/trust-cg-test/tests/cli.rs
+expression: "help_of(&[\"ratchet\", \"lint-linux\"])"
+---
+Cross-compile check for Linux-only `trust-cg-codegen` paths.
+
+Runs `cargo check --target <linux-triple> -p trust-cg-codegen` through the shared `trust-cg-test`
+shell boundary. Missing Rust targets are reported as `skipped`, so the command is safe on macOS-only
+developer boxes.
+
+Equivalent to top-level `trust-cg-test lint-linux`; kept under `ratchet` so CI can sweep every
+invariant through one dispatcher.
+
+# Examples
+
+  trust-cg-test ratchet lint-linux
+  trust-cg-test ratchet lint-linux --target x86_64-unknown-linux-gnu
+  trust-cg-test ratchet lint-linux --format json
+
+Usage: trust-cg-test ratchet lint-linux [OPTIONS]
+
+Options:
+  -f, --format <FORMAT>
+          Output format (human, json, junit)
+
+          Possible values:
+          - human: Pretty table + narrative, targeted at humans
+          - json:  Machine-readable JSON
+          - junit: JUnit XML for CI consumers
+
+          [default: human]
+
+      --target <TRIPLE>
+          Override the target triple(s) to check. Defaults to the two Linux triples we care about.
+          Repeatable
+
+  -o, --out <PATH>
+          Override the command-specific output file or directory.
+
+          See the selected subcommand's help for its output type and default.
+
+      --package <PACKAGE>
+          Package(s) to check. Defaults to `trust-cg-codegen`. Repeatable
+
+      --timeout <SECS>
+          Per-unit timeout in seconds. Subcommands may apply per-unit defaults when this is unset
+
+      --parallel <N>
+          Worker count (honors cargo-serialization lock). Default: auto
+
+  -q, --quiet
+          Suppress progress bars; errors still go to stderr
+
+  -v, --verbose...
+          Show debug-level events. Repeat for more: -vv, -vvv
+
+      --no-cache
+          Ignore proof / corpus caches
+
+      --dry-run
+          Print what would run without executing external tools
+
+  -h, --help
+          Print help (see a summary with '-h')

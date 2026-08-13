@@ -1,0 +1,41 @@
+# trust-cg-gpu - GPU passes (Metal first)
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache-2.0
+
+[package]
+name = "trust-cg-gpu"
+description = "GPU passes for Trust Codegen (KernelExtract, AddressSpaceInfer, MemoryPartition, DivergenceFlatten, HeteroPartition, LaunchSynth)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+
+[features]
+# No compile-time features. The six passes are opt-in at RUN time through
+# `GpuPipelineConfig` toggles.
+#
+# A `gpu-passes` feature was declared here and documented as "the pipeline
+# hookup ... only wired into the main optimization pipeline when this feature is
+# on". No `cfg` ever read it and no crate depends on trust-cg-gpu, so it gated
+# nothing while reading as though it gated the whole crate. `cargo check
+# --all-features` in scripts/run_public_release_checks.sh made it look exercised.
+# If the hookup is ever built, reintroduce the feature together with the `cfg`
+# that consumes it.
+default = []
+
+[dependencies]
+trust-cg-ir = { workspace = true }
+trust-cg-lower = { workspace = true }
+trust-cg-codegen = { workspace = true }
+trust-ir = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

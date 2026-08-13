@@ -1,0 +1,5 @@
+Vendored from: alabsystems/trust-ir
+Source commit: e2cc0db8208a7ee04e4219bbbad05a8fd91871cc
+Introduced at: 32428b78c982a10eb319d0e1b003e0bde486852e
+Source path: crates/trust_ir-conformance/tests/fixtures/inst_vector_dialect.trust_ir
+Vendored payload: inst_vector_dialect.trust_ir

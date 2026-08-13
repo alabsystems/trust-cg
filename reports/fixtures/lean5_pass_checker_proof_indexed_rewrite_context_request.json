@@ -1,0 +1,164 @@
+{
+  "format_version": "trust-cg.lean5_pass_check.request.v1",
+  "certificate": {
+    "format_version": "trust-cg.certified_pass.v1",
+    "pass": {
+      "name": "proof-indexed-rewrite-context",
+      "version": "1",
+      "implementation_commit": "workspace-local",
+      "instance_id": "proof-indexed-rewrite-context:v1",
+      "pipeline_ordinal": 1,
+      "target_profile": {
+        "triple": "synthetic-proof-indexed",
+        "cpu": "unspecified",
+        "features": []
+      },
+      "options_hash": "sha256:69ccf59b416bc5b36e3bce0b5bb9a8b04c4d5434ef56a18dce4d5aecd9c5ac9f"
+    },
+    "provenance": {
+      "source": {
+        "program_id": "trust-cg://proof-indexed-demo/proof_indexed_demo/before/proof-indexed-rewrite-context:v1",
+        "node_ids": [],
+        "expression_digest": "trust-cg-pass-obligation-v1:sha256:3b5d5c9d4fde57025deff4e37005a672b8c7dafdc2a2ef8831fdc00b6033e4cc"
+      },
+      "rewrite": {
+        "program_id": "trust-cg://proof-indexed-demo/proof_indexed_demo/after/proof-indexed-rewrite-context:v1",
+        "node_ids": [],
+        "expression_digest": "trust-cg-pass-obligation-v1:sha256:3b5d5c9d4fde57025deff4e37005a672b8c7dafdc2a2ef8831fdc00b6033e4cc"
+      }
+    },
+    "contract": {
+      "mode": "local_pass_certificate_summary",
+      "semantic_policy": {
+        "source": "trust-cg-opt certified wrapper",
+        "fail_closed": true
+      }
+    },
+    "domain": {
+      "kind": "machine-ir",
+      "certified_pass_run": {
+        "format_version": "trust-cg.opt.certified_pass_run.v1",
+        "pass_name": "proof-indexed-rewrite-context",
+        "pass_version": 1,
+        "pass_instance_id": "proof-indexed-rewrite-context:v1",
+        "function_name": "proof_indexed_demo",
+        "changed": false,
+        "status": "verified",
+        "certificate_count": 0,
+        "failure_count": 0,
+        "obligation_hash": "trust-cg-pass-obligation-v1:sha256:3b5d5c9d4fde57025deff4e37005a672b8c7dafdc2a2ef8831fdc00b6033e4cc",
+        "local_checker": {
+          "kind": "trust-cg-opt-local",
+          "name": "proof-indexed-rewrite-context checker",
+          "version": "1",
+          "status": "verified"
+        },
+        "summary": {
+          "changed": false,
+          "certificates": [],
+          "failures": []
+        }
+      }
+    },
+    "obligation_hash": "trust-cg-pass-obligation-v1:sha256:3b5d5c9d4fde57025deff4e37005a672b8c7dafdc2a2ef8831fdc00b6033e4cc",
+    "checker": {
+      "kind": "lean5",
+      "name": "trust-cg-cert-check",
+      "version": "0.1.0",
+      "proof_family": "trust-cg-opt-local-certified-pass-run-v1",
+      "invocation": {
+        "mode": "in_process",
+        "command": [
+          "trust-cg-codegen",
+          "production-certified-pass-chain"
+        ],
+        "working_directory_policy": "process"
+      },
+      "limits": {
+        "timeout_ms": 1000
+      },
+      "replay_inputs": [
+        {
+          "kind": "canonical_obligation",
+          "uri": "trust-cg-opt://certified-pass-run/e0b389c0202fa85ae1648f2cf68a29c94fa97d7d2971c3ad645821a7d0a00046.json",
+          "digest": "sha256:e0b389c0202fa85ae1648f2cf68a29c94fa97d7d2971c3ad645821a7d0a00046",
+          "media_type": "application/json",
+          "placeholder_transport": null
+        },
+        {
+          "kind": "lean_module",
+          "uri": "reports/fixtures/ProofIndexedRewriteContext.lean",
+          "digest": "sha256:46685390451b9ce05e4e56fa5cb43b36d18f22fd166961f16cf7dc73fb5ba215",
+          "media_type": "text/plain",
+          "placeholder_transport": null
+        }
+      ],
+      "trust_base": [
+        "lean5-kernel",
+        "trust-cg-opt-local-certified-pass-run",
+        "proof-indexed-fixture"
+      ]
+    },
+    "result": {
+      "status": "verified",
+      "checked_at_unix": 0,
+      "duration_ms": 0,
+      "local_checker": {
+        "kind": "trust-cg-opt-local",
+        "name": "proof-indexed-rewrite-context checker",
+        "version": "1",
+        "status": "verified"
+      },
+      "certificate_count": 0,
+      "failure_count": 0
+    },
+    "artifacts": {
+      "refs": [
+        {
+          "kind": "canonical_obligation",
+          "uri": "trust-cg-opt://certified-pass-run/e0b389c0202fa85ae1648f2cf68a29c94fa97d7d2971c3ad645821a7d0a00046.json",
+          "digest": "sha256:e0b389c0202fa85ae1648f2cf68a29c94fa97d7d2971c3ad645821a7d0a00046",
+          "media_type": "application/json",
+          "placeholder_transport": null
+        },
+        {
+          "kind": "lean_module",
+          "uri": "reports/fixtures/ProofIndexedRewriteContext.lean",
+          "digest": "sha256:46685390451b9ce05e4e56fa5cb43b36d18f22fd166961f16cf7dc73fb5ba215",
+          "media_type": "text/plain",
+          "placeholder_transport": null
+        }
+      ]
+    },
+    "chain": {
+      "compilation_unit": "proof-indexed-demo",
+      "certificate_index": 0,
+      "must_be_verified": true
+    }
+  },
+  "obligation_hash": "trust-cg-pass-obligation-v1:sha256:3b5d5c9d4fde57025deff4e37005a672b8c7dafdc2a2ef8831fdc00b6033e4cc",
+  "policy": {
+    "checker": "lean5",
+    "mode": "semantic",
+    "timeout_ms": 1000,
+    "fail_closed": true,
+    "expected_lean_version": null,
+    "lean5_binary": null
+  },
+  "artifacts": [
+    {
+      "kind": "canonical_obligation",
+      "uri": "trust-cg-opt://certified-pass-run/e0b389c0202fa85ae1648f2cf68a29c94fa97d7d2971c3ad645821a7d0a00046.json",
+      "digest": "sha256:e0b389c0202fa85ae1648f2cf68a29c94fa97d7d2971c3ad645821a7d0a00046",
+      "media_type": "application/json",
+      "placeholder_transport": null
+    },
+    {
+      "kind": "lean_module",
+      "uri": "reports/fixtures/ProofIndexedRewriteContext.lean",
+      "digest": "sha256:46685390451b9ce05e4e56fa5cb43b36d18f22fd166961f16cf7dc73fb5ba215",
+      "media_type": "text/plain",
+      "placeholder_transport": null
+    }
+  ]
+}

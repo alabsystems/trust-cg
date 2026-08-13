@@ -1,0 +1,24 @@
+; trust_ir text format v1
+module "tribkern"
+
+functy.0 = (i32) -> (i32)
+
+fn @trib_kernel(functy.0) {
+bb0(%0: i32):
+    %1 = const i32 1
+    %2 = const i32 0
+    %3 = const i32 0
+    %4 = const i32 1
+    %5 = const i32 0
+    br bb1(%5, %2, %3, %4)
+bb1(%6: i32, %7: i32, %8: i32, %9: i32):
+    %10 = icmp slt i32 %6, %0
+    condbr %10, bb2(%6, %7, %8, %9), bb3(%9)
+bb2(%11: i32, %12: i32, %13: i32, %14: i32):
+    %15 = add i32 %12, %13
+    %16 = add i32 %15, %14
+    %17 = add i32 %11, %1
+    br bb1(%17, %13, %14, %16)
+bb3(%18: i32):
+    ret %18
+}

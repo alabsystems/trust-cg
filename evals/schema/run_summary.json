@@ -1,0 +1,226 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "RunSummary_for_EmptyRecord",
+  "description": "The canonical top-level result document written to disk by every result-emitting subcommand. `T` is the per-unit record type and must implement `Serialize + DeserializeOwned + JsonSchema`.",
+  "type": "object",
+  "required": [
+    "command",
+    "config_digest",
+    "duration_ms",
+    "environment",
+    "exit",
+    "host",
+    "started_at",
+    "totals",
+    "units",
+    "version"
+  ],
+  "properties": {
+    "command": {
+      "description": "Command name, e.g. `\"matrix\"`, `\"fuzz.csmith\"`.",
+      "type": "string"
+    },
+    "config_digest": {
+      "description": "`blake3` digest of the resolved config + argv — used for cache invalidation and repro validation.",
+      "type": "string"
+    },
+    "duration_ms": {
+      "description": "Duration in milliseconds.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "environment": {
+      "description": "Observed tool versions.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Environment"
+        }
+      ]
+    },
+    "exit": {
+      "description": "Terminal status.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/ResultStatus"
+        }
+      ]
+    },
+    "host": {
+      "description": "Host metadata.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/HostInfo"
+        }
+      ]
+    },
+    "started_at": {
+      "description": "Start time, UTC.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "totals": {
+      "description": "Aggregate counts.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Totals"
+        }
+      ]
+    },
+    "units": {
+      "description": "Per-unit records.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/EmptyRecord"
+      }
+    },
+    "version": {
+      "description": "Repo version — `git rev-parse HEAD` at run time.",
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "EmptyRecord": {
+      "description": "Empty record — used by `doctor` and other subcommands that don't enumerate per-unit results but still emit a summary.",
+      "type": "object"
+    },
+    "Environment": {
+      "description": "Tool version info discovered at run start.",
+      "type": "object",
+      "required": [
+        "tools"
+      ],
+      "properties": {
+        "tools": {
+          "description": "`tool_name -> version_string` as reported by `--version`.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "HostInfo": {
+      "description": "Host metadata captured at run start — useful for reproducibility.",
+      "type": "object",
+      "required": [
+        "arch",
+        "cores",
+        "os"
+      ],
+      "properties": {
+        "arch": {
+          "description": "Target arch (e.g. `aarch64`, `x86_64`).",
+          "type": "string"
+        },
+        "cores": {
+          "description": "Logical CPU count.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "cpu": {
+          "description": "Optional CPU brand string if detectable.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hostname": {
+          "description": "Hostname reported by the OS.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "os": {
+          "description": "Target os string (e.g. `macos`).",
+          "type": "string"
+        }
+      }
+    },
+    "ResultStatus": {
+      "description": "Terminal status for a run. Mapped to process exit code in `main`.\n\nThe numeric exit codes follow `sysexits.h` where applicable: * 0   — all units passed * 1   — at least one unit failed (user-level failure) * 2   — environment broken / tool missing * 64  — argv / usage error * 70  — internal bug (panic or unexpected error)",
+      "oneOf": [
+        {
+          "description": "Every unit passed.",
+          "type": "string",
+          "enum": [
+            "ok"
+          ]
+        },
+        {
+          "description": "At least one unit failed; the run completed cleanly.",
+          "type": "string",
+          "enum": [
+            "failed"
+          ]
+        },
+        {
+          "description": "A required external tool was missing or the environment is broken.",
+          "type": "string",
+          "enum": [
+            "env_broken"
+          ]
+        },
+        {
+          "description": "User provided invalid arguments.",
+          "type": "string",
+          "enum": [
+            "usage_error"
+          ]
+        },
+        {
+          "description": "Internal bug — panic caught at `main`, or unexpected error.",
+          "type": "string",
+          "enum": [
+            "errored"
+          ]
+        },
+        {
+          "description": "Subcommand is not yet implemented. Tracked per the design doc.",
+          "type": "string",
+          "enum": [
+            "not_implemented"
+          ]
+        }
+      ]
+    },
+    "Totals": {
+      "description": "Aggregate counts for a run.",
+      "type": "object",
+      "required": [
+        "errored",
+        "failed",
+        "passed",
+        "skipped"
+      ],
+      "properties": {
+        "errored": {
+          "description": "Number of units that errored before reaching the oracle.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "failed": {
+          "description": "Number of units that failed the oracle check.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "passed": {
+          "description": "Number of units that passed.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "skipped": {
+          "description": "Number of units intentionally skipped. Should be 0 in CI (rule #341).",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    }
+  }
+}

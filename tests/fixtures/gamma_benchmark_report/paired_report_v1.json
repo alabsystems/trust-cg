@@ -1,0 +1,55 @@
+{
+  "schema": "trust-cg.gamma_crown.specialized_benchmark_report.v1",
+  "fixture_only": true,
+  "benchmark_rows_path": "tests/fixtures/gamma_benchmark_report/paired_rows_v1.csv",
+  "comparison_key": "vnncomp2025::unit-fixture::row=1::conv_relu.onnx::p1.vnnlib",
+  "subject": {
+    "subject_kind": "vnncomp_instance",
+    "category": "unit-fixture",
+    "model_path": "benchmarks/vnncomp/unit/conv_relu.onnx",
+    "property_path": "benchmarks/vnncomp/unit/p1.vnnlib",
+    "preset_path": "configs/vnncomp25/unit-fast.yaml",
+    "timeout_seconds": 60,
+    "method": "alpha-crown"
+  },
+  "provenance": {
+    "compare_run_id": "gamma-specialized-contract-fixture-1",
+    "host_id": "darwin-arm64-ci-fixture",
+    "gamma_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "trust_cg_commit": "dddddddddddddddddddddddddddddddddddddddd",
+    "query_set_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "artifact_id": "trust-cg-gamma-v1-blake3-256:c8c2a6fa61e6150fc15aa41a1a4f9f638d1c2d239f758dbdbd8cd0f8f3ff7d89",
+    "artifact_manifest_path": "tests/fixtures/gamma_verifier_abi/manifest_v1.json"
+  },
+  "timing": {
+    "cold_compile_install_seconds": 3.25,
+    "warm_query_count": 12,
+    "generic_warm_wall_seconds": 2.4,
+    "specialized_warm_wall_seconds": 0.9
+  },
+  "correctness_gate": {
+    "status": "passed",
+    "generic": {
+      "answer_status": "verified",
+      "checker_id": "gamma-crown-checker-v1",
+      "certificate_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    },
+    "specialized": {
+      "answer_status": "verified",
+      "checker_id": "gamma-crown-checker-v1",
+      "certificate_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    }
+  },
+  "derived_comparison": {
+    "generic_queries_per_second": 5.0,
+    "specialized_queries_per_second": 13.3333333333,
+    "warm_throughput_speedup": 2.6666666667
+  },
+  "verdict": {
+    "state": "contract_fixture_only",
+    "first_supported_model_result": false,
+    "score_bearing": false,
+    "dependency_blockers": [],
+    "notes": "Synthetic fixture for schema and report gating only; not a measured first-model result."
+  }
+}

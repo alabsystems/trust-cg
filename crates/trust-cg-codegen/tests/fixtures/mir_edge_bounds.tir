@@ -1,0 +1,457 @@
+; TrustIr text format v1
+module "mir::closure::edge_bounds_entry"
+
+functy.0 = (u32, u32, i64, u64, u32) -> (u64)
+
+functy.1 = (ptr, u32) -> ()
+
+functy.2 = (ptr, u8, ptr, bool) -> ()
+
+functy.3 = (u128, u128) -> (u128)
+
+functy.4 = (ptr, u8, ptr) -> ()
+
+fn @edge_bounds_entry(functy.0) {
+bb0(%0: u32, %1: u32, %2: i64, %3: u64, %4: u32):
+    %21 = alloca (i128, i128), align 16
+    %22 = alloca i8, align 1
+    %23 = alloca (i128, i128), align 16
+    %24 = alloca (i128, i128), align 16
+    %25 = const u32 0
+    %26 = icmp ne u32 %1, %25
+    condbr %26, bb1(%0, %2, %3, %4), bb3(%0, %4)
+bb1(%5: u32, %6: i64, %7: u64, %8: u32):
+    %27 = sext i64 %6 to i128
+    %28 = const i32 64
+    %29 = bitcast i32 %28 to u32
+    %30 = const u32 128
+    %31 = icmp ult u32 %29, %30
+    condbr %31, bb2(%5, %7, %8, %27), bb19
+bb2(%9: u32, %10: u64, %11: u32, %12: i128):
+    %32 = const i32 64
+    %33 = zext i32 %32 to i128
+    %34 = shl i128 %12, %33
+    %35 = zext u64 %10 to i128
+    %36 = or i128 %34, %35
+    %37 = const i64 16
+    %38 = gep i8, ptr %21, %37
+    store i128 %36, ptr %38
+    %39 = const i128 1
+    store i128 %39, ptr %21
+    br bb4(%9, %11)
+bb3(%13: u32, %14: u32):
+    %40 = const i128 0
+    store i128 %40, ptr %21
+    br bb4(%13, %14)
+bb4(%15: u32, %16: u32):
+    call @func.1(%22, %15)
+    br bb5(%16)
+bb5(%17: u32):
+    %41 = const u32 3
+    %42 = icmp ult u32 %17, %41
+    %43 = load i128, ptr %21
+    store i128 %43, ptr %24
+    %44 = const i64 16
+    %45 = gep i8, ptr %21, %44
+    %46 = const i64 16
+    %47 = gep i8, ptr %24, %46
+    %48 = load i128, ptr %45
+    store i128 %48, ptr %47
+    %49 = load u8, ptr %22
+    call @func.2(%23, %49, %24, %42)
+    br bb6(%17)
+bb6(%18: u32):
+    switch %18 [ 0: bb9 3: bb9 1: bb8 4: bb8 default: bb7 ]
+bb7:
+    %50 = load i128, ptr %23
+    %51 = trunc i128 %50 to i64
+    switch %51 [ 0: bb15 1: bb16 default: bb10 ]
+bb8:
+    %52 = load i128, ptr %23
+    %53 = trunc i128 %52 to i64
+    switch %53 [ 0: bb13 1: bb14 default: bb10 ]
+bb9:
+    %54 = load i128, ptr %23
+    %55 = trunc i128 %54 to i64
+    switch %55 [ 0: bb11 1: bb12 default: bb10 ]
+bb10:
+    unreachable
+bb11:
+    %56 = const u64 0
+    br bb18(%56)
+bb12:
+    %57 = const u64 1
+    br bb18(%57)
+bb13:
+    %58 = const u64 0
+    br bb18(%58)
+bb14:
+    %59 = const i64 16
+    %60 = gep i8, ptr %23, %59
+    %61 = load u128, ptr %60
+    %62 = trunc u128 %61 to u64
+    br bb18(%62)
+bb15:
+    %63 = const u64 0
+    br bb18(%63)
+bb16:
+    %64 = const i64 16
+    %65 = gep i8, ptr %23, %64
+    %66 = load u128, ptr %65
+    %67 = const i32 64
+    %68 = bitcast i32 %67 to u32
+    %69 = const u32 128
+    %70 = icmp ult u32 %68, %69
+    condbr %70, bb17(%66), bb19
+bb17(%19: u128):
+    %71 = const i32 64
+    %72 = zext i32 %71 to u128
+    %73 = lshr u128 %19, %72
+    %74 = trunc u128 %73 to u64
+    br bb18(%74)
+bb18(%20: u64):
+    ret %20
+bb19:
+    unreachable
+}
+
+fn @op_for_tag(functy.1) {
+bb0(%0: ptr, %1: u32):
+    switch %1 [ 0: bb10 1: bb9 2: bb8 3: bb7 4: bb6 5: bb5 6: bb4 7: bb3 8: bb2 default: bb1 ]
+bb1:
+    %2 = const i8 9
+    store i8 %2, ptr %0
+    br bb11
+bb2:
+    %3 = const i8 8
+    store i8 %3, ptr %0
+    br bb11
+bb3:
+    %4 = const i8 7
+    store i8 %4, ptr %0
+    br bb11
+bb4:
+    %5 = const i8 6
+    store i8 %5, ptr %0
+    br bb11
+bb5:
+    %6 = const i8 5
+    store i8 %6, ptr %0
+    br bb11
+bb6:
+    %7 = const i8 4
+    store i8 %7, ptr %0
+    br bb11
+bb7:
+    %8 = const i8 3
+    store i8 %8, ptr %0
+    br bb11
+bb8:
+    %9 = const i8 2
+    store i8 %9, ptr %0
+    br bb11
+bb9:
+    %10 = const i8 1
+    store i8 %10, ptr %0
+    br bb11
+bb10:
+    %11 = const i8 0
+    store i8 %11, ptr %0
+    br bb11
+bb11:
+    ret
+}
+
+fn @edge_bound_pick(functy.2) {
+bb0(%0: ptr, %1: u8, %2: ptr, %3: bool):
+    %5 = alloca i8, align 1
+    %6 = alloca (i128, i128, i128, i128), align 16
+    store u8 %1, ptr %5
+    %7 = load u8, ptr %5
+    call @func.4(%6, %7, %2)
+    br bb1(%3)
+bb1(%4: bool):
+    condbr %4, bb2, bb3
+bb2:
+    %8 = load i128, ptr %6
+    store i128 %8, ptr %0
+    %9 = const i64 16
+    %10 = gep i8, ptr %6, %9
+    %11 = const i64 16
+    %12 = gep i8, ptr %0, %11
+    %13 = load i128, ptr %10
+    store i128 %13, ptr %12
+    br bb4
+bb3:
+    %14 = const i64 32
+    %15 = gep i8, ptr %6, %14
+    %16 = load i128, ptr %15
+    store i128 %16, ptr %0
+    %17 = const i64 16
+    %18 = gep i8, ptr %15, %17
+    %19 = const i64 16
+    %20 = gep i8, ptr %0, %19
+    %21 = load i128, ptr %18
+    store i128 %21, ptr %20
+    br bb4
+bb4:
+    ret
+}
+
+fn @_RNvMs8_NtCs2EYQwhfuABO_4core3numo14saturating_sub(functy.3) {
+}
+
+fn @edge_bounds(functy.4) {
+bb0(%0: ptr, %1: u8, %2: ptr):
+    %12 = alloca i8, align 1
+    %13 = alloca (i128, i128), align 16
+    %14 = alloca (i128, i128), align 16
+    %15 = alloca (i128, i128), align 16
+    %16 = alloca (i128, i128), align 16
+    %17 = alloca (i128, i128), align 16
+    %18 = alloca (i128, i128), align 16
+    %19 = alloca (i128, i128), align 16
+    %20 = alloca (i128, i128), align 16
+    %21 = alloca (i128, i128), align 16
+    %22 = alloca (i128, i128), align 16
+    %23 = alloca (i128, i128), align 16
+    %24 = alloca (i128, i128), align 16
+    %25 = alloca (i128, i128), align 16
+    %26 = alloca (i128, i128), align 16
+    %27 = alloca (i128, i128), align 16
+    %28 = alloca (i128, i128), align 16
+    store u8 %1, ptr %12
+    %29 = load i128, ptr %2
+    %30 = trunc i128 %29 to i64
+    switch %30 [ 1: bb2 0: bb1 default: bb6 ]
+bb1:
+    %31 = const i128 0
+    store i128 %31, ptr %13
+    %32 = const i128 0
+    store i128 %32, ptr %14
+    %33 = load i128, ptr %13
+    store i128 %33, ptr %0
+    %34 = const i64 16
+    %35 = gep i8, ptr %13, %34
+    %36 = const i64 16
+    %37 = gep i8, ptr %0, %36
+    %38 = load i128, ptr %35
+    store i128 %38, ptr %37
+    %39 = const i64 32
+    %40 = gep i8, ptr %0, %39
+    %41 = load i128, ptr %14
+    store i128 %41, ptr %40
+    %42 = const i64 16
+    %43 = gep i8, ptr %14, %42
+    %44 = const i64 16
+    %45 = gep i8, ptr %40, %44
+    %46 = load i128, ptr %43
+    store i128 %46, ptr %45
+    br bb13
+bb2:
+    %47 = const i64 16
+    %48 = gep i8, ptr %2, %47
+    %49 = load i128, ptr %48
+    %50 = const i128 0
+    %51 = icmp slt i128 %49, %50
+    condbr %51, bb3, bb4(%49)
+bb3:
+    %52 = const i128 0
+    store i128 %52, ptr %15
+    %53 = const i128 0
+    store i128 %53, ptr %16
+    %54 = load i128, ptr %15
+    store i128 %54, ptr %0
+    %55 = const i64 16
+    %56 = gep i8, ptr %15, %55
+    %57 = const i64 16
+    %58 = gep i8, ptr %0, %57
+    %59 = load i128, ptr %56
+    store i128 %59, ptr %58
+    %60 = const i64 32
+    %61 = gep i8, ptr %0, %60
+    %62 = load i128, ptr %16
+    store i128 %62, ptr %61
+    %63 = const i64 16
+    %64 = gep i8, ptr %16, %63
+    %65 = const i64 16
+    %66 = gep i8, ptr %61, %65
+    %67 = load i128, ptr %64
+    store i128 %67, ptr %66
+    br bb13
+bb4(%3: i128):
+    %68 = bitcast i128 %3 to u128
+    %69 = const u128 1
+    %70 = call @func.3(%68, %69)
+    br bb5(%68, %70)
+bb5(%4: u128, %5: u128):
+    %71 = load i8, ptr %12
+    %72 = sext i8 %71 to i64
+    switch %72 [ 0: bb8(%4) 1: bb7(%4) 2: bb12(%5) 3: bb11(%4) 4: bb10(%4) 5: bb9(%5) 6: bb12(%5) 7: bb11(%4) 8: bb10(%4) 9: bb9(%5) default: bb6 ]
+bb6:
+    unreachable
+bb7(%6: u128):
+    %73 = const i128 0
+    store i128 %73, ptr %27
+    %74 = const i64 16
+    %75 = gep i8, ptr %28, %74
+    store u128 %6, ptr %75
+    %76 = const i128 1
+    store i128 %76, ptr %28
+    %77 = load i128, ptr %27
+    store i128 %77, ptr %0
+    %78 = const i64 16
+    %79 = gep i8, ptr %27, %78
+    %80 = const i64 16
+    %81 = gep i8, ptr %0, %80
+    %82 = load i128, ptr %79
+    store i128 %82, ptr %81
+    %83 = const i64 32
+    %84 = gep i8, ptr %0, %83
+    %85 = load i128, ptr %28
+    store i128 %85, ptr %84
+    %86 = const i64 16
+    %87 = gep i8, ptr %28, %86
+    %88 = const i64 16
+    %89 = gep i8, ptr %84, %88
+    %90 = load i128, ptr %87
+    store i128 %90, ptr %89
+    br bb13
+bb8(%7: u128):
+    %91 = const i64 16
+    %92 = gep i8, ptr %25, %91
+    store u128 %7, ptr %92
+    %93 = const i128 1
+    store i128 %93, ptr %25
+    %94 = const i128 0
+    store i128 %94, ptr %26
+    %95 = load i128, ptr %25
+    store i128 %95, ptr %0
+    %96 = const i64 16
+    %97 = gep i8, ptr %25, %96
+    %98 = const i64 16
+    %99 = gep i8, ptr %0, %98
+    %100 = load i128, ptr %97
+    store i128 %100, ptr %99
+    %101 = const i64 32
+    %102 = gep i8, ptr %0, %101
+    %103 = load i128, ptr %26
+    store i128 %103, ptr %102
+    %104 = const i64 16
+    %105 = gep i8, ptr %26, %104
+    %106 = const i64 16
+    %107 = gep i8, ptr %102, %106
+    %108 = load i128, ptr %105
+    store i128 %108, ptr %107
+    br bb13
+bb9(%8: u128):
+    %109 = const i128 0
+    store i128 %109, ptr %23
+    %110 = const i64 16
+    %111 = gep i8, ptr %24, %110
+    store u128 %8, ptr %111
+    %112 = const i128 1
+    store i128 %112, ptr %24
+    %113 = load i128, ptr %23
+    store i128 %113, ptr %0
+    %114 = const i64 16
+    %115 = gep i8, ptr %23, %114
+    %116 = const i64 16
+    %117 = gep i8, ptr %0, %116
+    %118 = load i128, ptr %115
+    store i128 %118, ptr %117
+    %119 = const i64 32
+    %120 = gep i8, ptr %0, %119
+    %121 = load i128, ptr %24
+    store i128 %121, ptr %120
+    %122 = const i64 16
+    %123 = gep i8, ptr %24, %122
+    %124 = const i64 16
+    %125 = gep i8, ptr %120, %124
+    %126 = load i128, ptr %123
+    store i128 %126, ptr %125
+    br bb13
+bb10(%9: u128):
+    %127 = const i128 0
+    store i128 %127, ptr %21
+    %128 = const i64 16
+    %129 = gep i8, ptr %22, %128
+    store u128 %9, ptr %129
+    %130 = const i128 1
+    store i128 %130, ptr %22
+    %131 = load i128, ptr %21
+    store i128 %131, ptr %0
+    %132 = const i64 16
+    %133 = gep i8, ptr %21, %132
+    %134 = const i64 16
+    %135 = gep i8, ptr %0, %134
+    %136 = load i128, ptr %133
+    store i128 %136, ptr %135
+    %137 = const i64 32
+    %138 = gep i8, ptr %0, %137
+    %139 = load i128, ptr %22
+    store i128 %139, ptr %138
+    %140 = const i64 16
+    %141 = gep i8, ptr %22, %140
+    %142 = const i64 16
+    %143 = gep i8, ptr %138, %142
+    %144 = load i128, ptr %141
+    store i128 %144, ptr %143
+    br bb13
+bb11(%10: u128):
+    %145 = const i64 16
+    %146 = gep i8, ptr %19, %145
+    store u128 %10, ptr %146
+    %147 = const i128 1
+    store i128 %147, ptr %19
+    %148 = const i128 0
+    store i128 %148, ptr %20
+    %149 = load i128, ptr %19
+    store i128 %149, ptr %0
+    %150 = const i64 16
+    %151 = gep i8, ptr %19, %150
+    %152 = const i64 16
+    %153 = gep i8, ptr %0, %152
+    %154 = load i128, ptr %151
+    store i128 %154, ptr %153
+    %155 = const i64 32
+    %156 = gep i8, ptr %0, %155
+    %157 = load i128, ptr %20
+    store i128 %157, ptr %156
+    %158 = const i64 16
+    %159 = gep i8, ptr %20, %158
+    %160 = const i64 16
+    %161 = gep i8, ptr %156, %160
+    %162 = load i128, ptr %159
+    store i128 %162, ptr %161
+    br bb13
+bb12(%11: u128):
+    %163 = const i64 16
+    %164 = gep i8, ptr %17, %163
+    store u128 %11, ptr %164
+    %165 = const i128 1
+    store i128 %165, ptr %17
+    %166 = const i128 0
+    store i128 %166, ptr %18
+    %167 = load i128, ptr %17
+    store i128 %167, ptr %0
+    %168 = const i64 16
+    %169 = gep i8, ptr %17, %168
+    %170 = const i64 16
+    %171 = gep i8, ptr %0, %170
+    %172 = load i128, ptr %169
+    store i128 %172, ptr %171
+    %173 = const i64 32
+    %174 = gep i8, ptr %0, %173
+    %175 = load i128, ptr %18
+    store i128 %175, ptr %174
+    %176 = const i64 16
+    %177 = gep i8, ptr %18, %176
+    %178 = const i64 16
+    %179 = gep i8, ptr %174, %178
+    %180 = load i128, ptr %177
+    store i128 %180, ptr %179
+    br bb13
+bb13:
+    ret
+}

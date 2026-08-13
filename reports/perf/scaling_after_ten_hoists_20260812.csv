@@ -1,0 +1,10 @@
+# core=19 reps=3 opt=3 emit=obj rustc=/home/ayates/.rustup/toolchains/nightly-2026-04-20-aarch64-unknown-linux-gnu/bin/rustc
+shape,n,llvm_us,tcg_us,ratio,status
+branchy,200,58666,163390,2.785,ok
+branchy,400,111755,410688,3.675,ok
+many_fns,200,99523,332769,3.344,ok
+many_fns,400,153342,855408,5.578,ok
+mul_chain,200,28133,59451,2.113,ok
+mul_chain,400,35610,85060,2.389,ok
+ilp_add,200,42858,62650,1.462,ok
+ilp_add,400,43657,62251,1.426,ok

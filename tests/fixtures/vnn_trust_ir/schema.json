@@ -1,0 +1,192 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://trust-cg.local/schemas/vnn-trust_ir.schema.json",
+  "title": "VNN tensor trust_ir fixture schema",
+  "type": "object",
+  "required": ["version", "dialect", "entry", "tensors", "ops"],
+  "additionalProperties": false,
+  "properties": {
+    "version": { "const": 1 },
+    "dialect": { "const": "trust_ir.vnn" },
+    "entry": { "type": "string", "minLength": 1 },
+    "tensors": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": { "$ref": "#/$defs/tensor" }
+    },
+    "initializers": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/initializer" }
+    },
+    "ops": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/op" }
+    },
+    "edges": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/edge" }
+    }
+  },
+  "$defs": {
+    "shape": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "integer", "minimum": 1 }
+    },
+    "dtype": {
+      "enum": ["f32", "f16", "i32", "i64"]
+    },
+    "layout": {
+      "enum": ["nchw", "nhwc", "nc", "nld", "oihw", "oi", "vector", "scalar", "strided"]
+    },
+    "tensor": {
+      "type": "object",
+      "required": ["shape", "dtype", "layout", "role"],
+      "additionalProperties": false,
+      "properties": {
+        "shape": { "$ref": "#/$defs/shape" },
+        "dtype": { "$ref": "#/$defs/dtype" },
+        "layout": { "$ref": "#/$defs/layout" },
+        "role": { "enum": ["input", "activation", "output", "initializer"] }
+      }
+    },
+    "initializer": {
+      "type": "object",
+      "required": ["shape", "dtype", "layout", "storage", "sha256"],
+      "additionalProperties": false,
+      "properties": {
+        "shape": { "$ref": "#/$defs/shape" },
+        "dtype": { "$ref": "#/$defs/dtype" },
+        "layout": { "$ref": "#/$defs/layout" },
+        "storage": {
+          "type": "object",
+          "required": ["kind"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "enum": ["external", "inline"] },
+            "name": { "type": "string", "minLength": 1 },
+            "values": { "type": "array", "items": { "type": "number" } }
+          }
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "op": {
+      "type": "object",
+      "required": ["id", "op", "inputs", "outputs", "attrs", "provenance"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "pattern": "^vnn\\.[0-9]+$" },
+        "op": {
+          "enum": [
+            "trust_ir.vnn.conv2d",
+            "trust_ir.vnn.batch_norm",
+            "trust_ir.vnn.relu",
+            "trust_ir.vnn.add",
+            "trust_ir.vnn.avg_pool2d",
+            "trust_ir.vnn.max_pool2d",
+            "trust_ir.vnn.linear",
+            "trust_ir.vnn.matmul",
+            "trust_ir.vnn.softmax",
+            "trust_ir.vnn.layer_norm",
+            "trust_ir.vnn.flatten",
+            "trust_ir.vnn.reshape",
+            "trust_ir.vnn.transpose"
+          ]
+        },
+        "inputs": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "outputs": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "weights": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "attrs": {
+          "type": "object",
+          "additionalProperties": {
+            "anyOf": [
+              { "type": "boolean" },
+              { "type": "integer" },
+              { "type": "number" },
+              { "type": "string" },
+              { "type": "array", "items": { "type": ["boolean", "integer", "number", "string"] } }
+            ]
+          }
+        },
+        "provenance": { "$ref": "#/$defs/provenance" }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "required": ["gamma_layer_id", "gamma_layer_type", "onnx_node_name", "onnx_op_type", "onnx_outputs"],
+      "additionalProperties": false,
+      "properties": {
+        "gamma_layer_id": { "type": "string", "pattern": "^layer\\.[0-9]+$" },
+        "gamma_layer_type": {
+          "enum": [
+            "Conv2d",
+            "BatchNorm",
+            "ReLU",
+            "Add",
+            "AveragePool",
+            "MaxPool",
+            "Linear",
+            "MatMul",
+            "Softmax",
+            "LayerNorm",
+            "Flatten",
+            "Reshape",
+            "Transpose"
+          ]
+        },
+        "onnx_node_name": { "type": "string", "minLength": 1 },
+        "onnx_op_type": {
+          "enum": [
+            "Conv",
+            "BatchNormalization",
+            "Relu",
+            "Add",
+            "AveragePool",
+            "GlobalAveragePool",
+            "MaxPool",
+            "Gemm",
+            "MatMul",
+            "Softmax",
+            "LayerNormalization",
+            "Flatten",
+            "Reshape",
+            "Transpose"
+          ]
+        },
+        "onnx_outputs": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "edge": {
+      "type": "object",
+      "required": ["from", "to", "from_layer", "to_layer", "onnx_tensor"],
+      "additionalProperties": false,
+      "properties": {
+        "from": { "type": "string", "minLength": 1 },
+        "to": { "type": "string", "pattern": "^vnn\\.[0-9]+$" },
+        "from_layer": { "type": "string", "pattern": "^layer\\.[0-9]+$" },
+        "to_layer": { "type": "string", "pattern": "^layer\\.[0-9]+$" },
+        "onnx_tensor": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

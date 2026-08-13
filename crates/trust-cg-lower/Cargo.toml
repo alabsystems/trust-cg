@@ -1,0 +1,50 @@
+# trust-cg-lower - trust-ir to LIR lowering
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache-2.0
+
+[package]
+name = "trust-cg-lower"
+description = "trust-ir to Low-level IR lowering for Trust Codegen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+
+[features]
+default = []
+# WP-2 — turn the decidable-lattice guard-replay capability
+# (`lattice_guard::LatticeBoundsCapability`) into actual elimination authority.
+#
+# OFF by default: without this feature the capability is still minted and
+# inspectable (so its soundness tests run on every build) but
+# `lattice_guard::lattice_guard_replay_authority_available()` is `false` and every
+# consumer refuses to turn it into behavior — a default build emits byte-identical
+# code to the pre-lattice compiler. A Cargo feature, not an environment variable,
+# so no runtime input can flip the policy.
+lattice-guard-elision = []
+
+[dependencies]
+# Shared machine IR model (canonical type definitions)
+trust-cg-ir = { workspace = true }
+
+# trust-ir (input IR) — real crate from trust-ir repo
+trust-ir = { workspace = true }
+trust-ir-build = { workspace = true }
+
+# Utilities
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+# Property-based testing for the panic-fuzz harness on `translate_function`
+# (#387 / #372 Phase 2). proptest is dev-only; it MUST NOT leak into the
+# production graph.
+proptest = "1.7"

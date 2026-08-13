@@ -1,0 +1,74 @@
+{
+  "format_version": "trust-cg.gamma.vnncomp_certified_demo.v1",
+  "model": {
+    "name": "vnncomp-small-cnn-conv-bn-relu",
+    "benchmark_family": "VNN-COMP representative CNN",
+    "source_fixture": "tests/fixtures/vnn_trust_ir/valid_conv_bn_relu.json",
+    "source_sha256": "17d670c5a815f946d37dd22e52919acd8a875435f9ababc58022c42df8084e01",
+    "entry": "model",
+    "input_bounds": {
+      "tensor": "%input",
+      "kind": "box",
+      "lower": 0.0,
+      "upper": 1.0
+    },
+    "provenance": {
+      "onnx_nodes": ["Conv_0", "BatchNormalization_1", "Relu_2"],
+      "gamma_layers": ["layer.0", "layer.1", "layer.2"],
+      "trust_ir_ops": ["vnn.0", "vnn.1", "vnn.2"]
+    }
+  },
+  "compile_result": {
+    "status": "certified_demo_compile",
+    "full_vnncomp_compile": true,
+    "full_certified_compile": true,
+    "production_certificate_chain_boundary": "three_pass_real_bn_relu",
+    "required_operational_certified_passes": 3,
+    "verified_operational_certified_passes": 3,
+    "reason": "The production demo compile path attaches checker-verified const-fold and DCE entries and consumes a real certified BN+ReLU run record from emit_vnn_batch_norm_relu_msl(certified=true)."
+  },
+  "checker_identity": {
+    "kind": "lean5",
+    "name": "trust-cg-cert-check",
+    "version": "0.1.0",
+    "mode": "placeholder_transport",
+    "semantic_replay": "placeholder_transport"
+  },
+  "certificate_chain": [
+    {
+      "ordinal": 1,
+      "pass": "const-fold-bv64",
+      "request": "reports/fixtures/gamma_vnncomp_demo_const_fold_request.json",
+      "obligation_hash": "trust-cg-pass-obligation-v1:sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "checker_result": "verified",
+      "status": "available_pass_local_certificate"
+    },
+    {
+      "ordinal": 2,
+      "pass": "dce-pure-unused",
+      "request": "reports/fixtures/gamma_vnncomp_demo_dce_request.json",
+      "obligation_hash": "trust-cg-pass-obligation-v1:sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "checker_result": "verified",
+      "status": "available_pass_local_certificate"
+    },
+    {
+      "ordinal": 3,
+      "pass": "bn-relu-relaxation-fusion",
+      "request": "reports/fixtures/gamma_vnncomp_demo_bn_relu_request.json",
+      "obligation_hash": "trust-cg-pass-obligation-v1:sha256:0ef2d8d57b3347ab6bf947452406c54fd4b482112d9bbffb69e7ff94c4e9524f",
+      "checker_result": "verified",
+      "status": "available_production_certified_pass",
+      "run_record_source": "crates/trust-cg-codegen/src/metal_emitter.rs:emit_vnn_batch_norm_relu_msl(certified=true)",
+      "source_ops": ["vnn.1", "vnn.2"],
+      "rewrite_op": "trust_ir.vnn.batch_norm_relu"
+    }
+  ],
+  "summary": {
+    "entries": 3,
+    "verified": 3,
+    "failed": 0,
+    "timeout": 0,
+    "skipped": 0,
+    "must_reject_as_full_certified_compile": false
+  }
+}

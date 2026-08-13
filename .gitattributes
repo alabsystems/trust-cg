@@ -1,0 +1,6 @@
+# Length-framed proof/verdict data files are byte-exact: `entry <byte-len>`
+# rows and the schema header are LF-anchored, and the file is embedded verbatim
+# via `include_str!`. Git's autocrlf must NOT rewrite these to CRLF, or the
+# embedded tier-0 verdict DB fails to parse on Windows (schema-line mismatch +
+# corrupted length framing), silently disabling the proof cache.
+*.vdb binary

@@ -1,0 +1,1492 @@
+// clean_decl_universe_slice — T1 UNIVERSE INTEGRATION.
+//
+// The universal decl gate (`Environment::check_decl_readonly`, env/decl_add.rs:229)
+// + the inference/reduction/equality pillars it composes, lifted onto the FULL
+// production `Level` {Zero, Succ, Max, IMax, Param} with the ALREADY-VERIFIED
+// `Level::is_def_eq` / `normalize` universe-unification machinery (level/mod.rs)
+// wired in as the def_eq pillar's `level_eq` — exactly as the real kernel does
+// (cert/expr_eq.rs:34 `level_eq(l1,l2) = Level::is_def_eq(l1,l2)`).
+//
+// This CLOSES the decl-gate universe deferral: the previously-verified
+// `clean_decl_check_slice` ran over a simplified {Zero,Succ,Param} Level model
+// with structural-congruence level equality and a modeled `imax`; here the gate,
+// `infer_sort`, `infer_type`'s Sort/Pi rules, and `def_eq`'s Sort arm all execute
+// over genuinely universe-POLYMORPHIC types (Max/IMax normalization: flatten /
+// insertion-sort / dedup-same-base / subsume / Succ-offset distribution).
+//
+// SOURCES (verbatim transcription targets in $HOME/clean/crates/clean-kernel/src):
+//   level/mod.rs        — Level enum (:81), PartialEq (cfg(kani) iterative, :142),
+//                         Hash (cfg(not(kani)) production impl), zero/succ/max/imax
+//                         (:259-359), is_zero/is_nonzero (:367-389), get_offset (:399),
+//                         add_offset (:416), normalize (:433), kind_ord (:441),
+//                         is_norm_lt (:459 kani-iterative), push_max_args (:530),
+//                         mk_max_from_args (:558), is_explicit (:577), normalize_impl
+//                         (:593), normalize_max (:644), subsume_max_args (:727),
+//                         dedup_max_args (:775), is_geq (:840), is_geq_core (:871
+//                         kani-iterative worklist), is_geq_leaf (:920), is_def_eq
+//                         (:1026), has_params_impl (:1245).
+//   expr/meta.rs        — ExprMeta bit-packing + compute_meta (mix_hash, KaniHasher).
+//   cert/reduction.rs   — whnf_impl (BETA/DELTA/ZETA/proj-iota; iota/quot leaves cut).
+//   cert/expr_eq.rs     — def_eq_impl (level_eq = Level::is_def_eq, THE integration).
+//   tc/infer.rs         — infer_type_fast_inner typing rules (:735 infer_sort,
+//                         :765 infer_sort_inner, :670 check_type).
+//   env/decl_add.rs     — find_undef_level_param_in_level (:64),
+//                         find_undef_level_param (:88), check_decl_readonly (:229).
+//   env/types.rs        — Declaration (:338, all 4 variants incl. level_params),
+//                         EnvError (:388, the 6 reachable variants in source order).
+//
+// The Level section is byte-for-byte the ALREADY-VERIFIED
+// prev/clean_level_isdefeq_slice.rs (same cfg(kani)-body selections, same
+// sort_by -> stable-insertion-sort rewrite, documented there and re-documented
+// inline below). The Expr/whnf/def_eq/infer section is the ALREADY-VERIFIED
+// prev/clean_expr_infer_slice.rs with the Level model REPLACED by the full Level.
+//
+// MODELED BOUNDARIES (each documented at its site; summary):
+//   B1. env/cache: the environment is a slice-scan over &[(Name, Option<Expr>)]
+//       (unfolding value per const); a const's TYPE is the inferred type of its
+//       value; no hashbrown, no tc caches. Same boundary as every prior pillar rung.
+//   B2. Name = Name(u32) newtype (real: interned component list w/ cached hash);
+//       PartialEq/Ord/Hash on the id — faithful for equality + the is_norm_lt
+//       total order (deterministic distinct-param order).
+//   B3. binder opening: the slice threads a de-Bruijn Vec<Expr> local context
+//       (push/index/pop) where the real tc opens binders with FVars (ctx_push/
+//       open_bvar). Same boundary as the verified infer_type rung.
+//   B4. stack_safe / heartbeats / tc caches / profiler / options plumbing:
+//       pass-throughs or resource-limit config, elided (same as prior rungs).
+//       infer_only flag: cert-path slice has no infer_only distinction.
+//   B5. ExprKind is the 11-variant production core (BVar/FVar/Sort/Const/App/Lam/
+//       Pi/Let/Lit/Proj/MData); SProp/Squash/Cubical*/ZFC* arms of the real
+//       find_undef_level_param / infer_sort do not exist here (their absence is
+//       structural: no input can construct them). infer_sort's SProp=>0 arm elided
+//       with them.
+//   B6. Declaration carries Arc<Expr> for type_/value (real: Expr by value) —
+//       same modeled boundary as the prior verified decl rung.
+//   B7. Level Hash: the production manual impl (discriminant + recursive child
+//       hash) transcribed verbatim; monomorphized at KaniHasher (clean's own
+//       cfg-verification hasher, the prior rungs' precedent). <Arc<Level> as Hash>
+//       is an extern leaf (shim forwards to native), so child recursion completes
+//       natively — same class as the prior rungs' Box<Level> hash leaf.
+//   B8. whnf iota/quot reduction leaves cut to None (same as the verified
+//       infer/decl rungs; recursor/native-arith/quot iota are separately verified).
+//   B9. REWRITES (semantics-preserving, lowering-driven, all documented inline):
+//       sort_by -> stable insertion sort w/ identical is_norm_lt order (proven in
+//       the level rung); slice::contains / iter().enumerate() -> index loops with
+//       identical predicates; map_err(..)? -> match (identical control flow);
+//       for _ in 0..n -> counter while.
+//   B10. delta-unfold ignores Const levels (no substitute_params on unfold): env
+//       values here are universe-monomorphic; the gate's polymorphic surface is
+//       Sort levels, which are fully exercised. (Const-level instantiation was
+//       verified separately in the infer_ext rung.)
+//
+// REGEN:
+//   S=$HOME/trust/build/aarch64-apple-darwin/stage1
+//   cd $HOME/trust-ir/frontend
+//   env -u RUSTUP_TOOLCHAIN RUSTC=$S/bin/rustc \
+//     DYLD_LIBRARY_PATH=$S/lib/rustlib/aarch64-apple-darwin/lib \
+//     $S/bin/cargo run --bin trust_ir_mir -- \
+//     <this file> --crate-type=lib --mir-emit-closure check_decl_readonly <out.tir>
+//
+// Crate name is load-bearing (appears in the mangled extern-leaf symbols the JIT
+// binds): clean_decl_universe_slice.
+
+#![allow(dead_code)]
+#![allow(clippy::all)]
+
+use std::sync::Arc;
+
+// ── Name leaf model (B2): Name(u32); PartialEq + Ord + Hash on the id. ──
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Name(pub u32);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FVarId(pub u64);
+
+pub type LevelArc = Arc<Level>;
+
+#[inline(always)]
+fn level_arc(l: Level) -> LevelArc {
+    Arc::new(l)
+}
+
+// The real Level enum (level/mod.rs:81). Variant ORDER is VERBATIM so
+// discriminants match the JIT (Zero=0, Succ=1, Max=2, IMax=3, Param=4).
+#[derive(Clone, Debug)]
+pub enum Level {
+    Zero,
+    Succ(LevelArc),
+    Max(LevelArc, LevelArc),
+    IMax(LevelArc, LevelArc),
+    Param(Name),
+}
+
+// VERBATIM the cfg(kani) iterative explicit-stack PartialEq (mod.rs:142-168) —
+// the body clean's own soundness_harness checks against the derived production
+// eq. Same selection as the verified level rung.
+impl PartialEq for Level {
+    fn eq(&self, other: &Self) -> bool {
+        let mut stack: Vec<(&Level, &Level)> = vec![(self, other)];
+        while let Some((a, b)) = stack.pop() {
+            match (a, b) {
+                (Level::Zero, Level::Zero) => {}
+                (Level::Succ(la), Level::Succ(lb)) => {
+                    stack.push((la, lb));
+                }
+                (Level::Max(la1, la2), Level::Max(lb1, lb2))
+                | (Level::IMax(la1, la2), Level::IMax(lb1, lb2)) => {
+                    stack.push((la1, lb1));
+                    stack.push((la2, lb2));
+                }
+                (Level::Param(na), Level::Param(nb)) => {
+                    if na != nb {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+        }
+        true
+    }
+}
+
+impl Eq for Level {}
+
+// VERBATIM the production cfg(not(kani)) Hash (mod.rs, "matches derived
+// behavior": discriminant + recursive field hashing). B7: monomorphized at
+// KaniHasher; <Arc<Level> as Hash> is the extern leaf.
+impl std::hash::Hash for Level {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Level::Zero => {}
+            Level::Succ(l) => l.hash(state),
+            Level::Max(l, r) | Level::IMax(l, r) => {
+                l.hash(state);
+                r.hash(state);
+            }
+            Level::Param(n) => n.hash(state),
+        }
+    }
+}
+
+impl Level {
+    // ── smart constructors (mod.rs:259-359) ──
+
+    pub fn zero() -> Self {
+        Level::Zero
+    }
+
+    pub fn succ(l: Level) -> Self {
+        Level::Succ(level_arc(l))
+    }
+
+    // VERBATIM the cfg(kani) `max` path (mod.rs:295-308): the is_geq subsumption
+    // shortcut is gated out (breaks the max->is_geq->normalize->imax->max cycle);
+    // normalize performs subsumption during canonicalization, so only intermediate
+    // Max nodes are less-simplified — correctness preserved. Same selection as the
+    // verified level rung.
+    pub fn max(l1: Level, l2: Level) -> Self {
+        if l1 == l2 {
+            return l1;
+        }
+        if l1.is_zero() {
+            return l2;
+        }
+        if l2.is_zero() {
+            return l1;
+        }
+        Level::Max(level_arc(l1), level_arc(l2))
+    }
+
+    // VERBATIM `imax` (mod.rs:324-349).
+    pub fn imax(l1: Level, l2: Level) -> Self {
+        if l2.is_zero() {
+            return Level::Zero;
+        }
+        if l2.is_nonzero() {
+            return Level::max(l1, l2);
+        }
+        if l1.is_zero() {
+            return l2;
+        }
+        if l1 == Level::succ(Level::zero()) {
+            return l2;
+        }
+        if l1 == l2 {
+            return l1;
+        }
+        Level::IMax(level_arc(l1), level_arc(l2))
+    }
+
+    pub fn param(name: Name) -> Self {
+        Level::Param(name)
+    }
+
+    // VERBATIM `is_zero` (mod.rs:367-374).
+    pub fn is_zero(&self) -> bool {
+        match self {
+            Level::Zero => true,
+            Level::Succ(_) | Level::Param(_) => false,
+            Level::Max(l1, l2) => l1.is_zero() && l2.is_zero(),
+            Level::IMax(_, l2) => l2.is_zero(),
+        }
+    }
+
+    // VERBATIM `is_nonzero` (mod.rs:382-389).
+    fn is_nonzero(&self) -> bool {
+        match self {
+            Level::Zero | Level::Param(_) => false,
+            Level::Succ(_) => true,
+            Level::Max(l1, l2) => l1.is_nonzero() || l2.is_nonzero(),
+            Level::IMax(_, l2) => l2.is_nonzero(),
+        }
+    }
+
+    // VERBATIM `has_params_impl` (mod.rs:1245-1254); stack_safe pass-through (B4).
+    pub fn has_params(&self) -> bool {
+        match self {
+            Level::Zero => false,
+            Level::Succ(l) => l.has_params(),
+            Level::Max(l1, l2) | Level::IMax(l1, l2) => l1.has_params() || l2.has_params(),
+            Level::Param(_) => true,
+        }
+    }
+
+    // VERBATIM `get_offset` (mod.rs:399-408). Iterative Succ-strip.
+    fn get_offset(&self) -> (&Level, u32) {
+        let mut current = self;
+        let mut offset = 0u32;
+        while let Level::Succ(inner) = current {
+            offset = offset.saturating_add(1);
+            current = inner;
+        }
+        (current, offset)
+    }
+
+    // VERBATIM `add_offset` (mod.rs:416-423); `for _ in 0..n` -> counter while (B9).
+    fn add_offset(&self, n: u32) -> Level {
+        let mut result = self.clone();
+        let mut c = 0u32;
+        while c < n {
+            result = Level::succ(result);
+            c += 1;
+        }
+        result
+    }
+
+    // `normalize` (mod.rs:433-435); stack_safe pass-through (B4).
+    pub fn normalize(&self) -> Level {
+        self.normalize_impl()
+    }
+
+    // VERBATIM `kind_ord` (mod.rs:441-449).
+    fn kind_ord(&self) -> u8 {
+        match self {
+            Level::Zero => 0,
+            Level::Succ(_) => 1,
+            Level::Max(_, _) => 2,
+            Level::IMax(_, _) => 3,
+            Level::Param(_) => 4,
+        }
+    }
+
+    // VERBATIM the cfg(kani) iterative `is_norm_lt` (mod.rs:459-493).
+    fn is_norm_lt(a: &Level, b: &Level) -> bool {
+        let mut a = a;
+        let mut b = b;
+        loop {
+            if a == b {
+                return false;
+            }
+            let (base1, off1) = a.get_offset();
+            let (base2, off2) = b.get_offset();
+            if base1 != base2 {
+                if base1.kind_ord() != base2.kind_ord() {
+                    return base1.kind_ord() < base2.kind_ord();
+                }
+                match (base1, base2) {
+                    (Level::Param(n1), Level::Param(n2)) => return n1 < n2,
+                    (Level::Max(a1, b1), Level::Max(a2, b2))
+                    | (Level::IMax(a1, b1), Level::IMax(a2, b2)) => {
+                        if a1 != a2 {
+                            a = a1;
+                            b = a2;
+                            continue;
+                        } else {
+                            a = b1;
+                            b = b2;
+                            continue;
+                        }
+                    }
+                    _ => return false,
+                }
+            } else {
+                return off1 < off2;
+            }
+        }
+    }
+
+    // VERBATIM the cfg(kani) iterative `push_max_args` (mod.rs:530-542).
+    fn push_max_args(l: &Level, buf: &mut Vec<Level>) {
+        let mut stack: Vec<&Level> = vec![l];
+        while let Some(current) = stack.pop() {
+            match current {
+                Level::Max(a, b) => {
+                    stack.push(b);
+                    stack.push(a);
+                }
+                _ => buf.push(current.clone()),
+            }
+        }
+    }
+
+    // VERBATIM `mk_max_from_args` (mod.rs:558-571). Right-associated rebuild.
+    fn mk_max_from_args(args: &[Level]) -> Level {
+        if args.len() == 1 {
+            return args[0].clone();
+        }
+        let mut r = Level::Max(
+            level_arc(args[args.len() - 2].clone()),
+            level_arc(args[args.len() - 1].clone()),
+        );
+        let mut i = args.len() - 2;
+        while i > 0 {
+            i -= 1;
+            r = Level::Max(level_arc(args[i].clone()), level_arc(r));
+        }
+        r
+    }
+
+    // VERBATIM `is_explicit` (mod.rs:577-579).
+    fn is_explicit(&self) -> bool {
+        matches!(self.get_offset().0, Level::Zero)
+    }
+
+    // `normalize_impl` (mod.rs:593-639). VERBATIM control flow; Zero/Param arm is
+    // the cfg(kani) iterative re-wrap; dead unreachable!() arms replaced with
+    // benign in-domain values (non-lowerable &str panic constants) — identical on
+    // the reachable domain. Same selections as the verified level rung.
+    fn normalize_impl(&self) -> Level {
+        let (base, outer_offset) = self.get_offset();
+
+        match base {
+            Level::Zero | Level::Param(_) => {
+                let mut result = match base {
+                    Level::Zero => Level::Zero,
+                    Level::Param(n) => Level::Param(*n),
+                    _ => Level::Zero,
+                };
+                let mut c = 0u32;
+                while c < outer_offset {
+                    result = Level::succ(result);
+                    c += 1;
+                }
+                result
+            }
+            // DEAD: get_offset strips every Succ layer.
+            Level::Succ(_) => base.clone(),
+
+            Level::IMax(l1, l2) => {
+                let l1_norm = l1.normalize_impl();
+                let l2_norm = l2.normalize_impl();
+                let result = Level::imax(l1_norm, l2_norm);
+                if matches!(result, Level::Max(_, _)) {
+                    result.add_offset(outer_offset).normalize_impl()
+                } else {
+                    result.add_offset(outer_offset)
+                }
+            }
+
+            Level::Max(_, _) => Self::normalize_max(base, outer_offset),
+        }
+    }
+
+    // `normalize_max` (mod.rs:644-690). VERBATIM EXCEPT Step 3: `args.sort_by`
+    // (generic core::slice::sort, not lowerable) rewritten as a STABLE INSERTION
+    // SORT with the IDENTICAL `is_norm_lt` strict-weak order (B9; proven
+    // byte-identical canonical forms in the verified level rung).
+    fn normalize_max(base: &Level, outer_offset: u32) -> Level {
+        // Step 1: flatten.
+        let mut todo = Vec::new();
+        Self::push_max_args(base, &mut todo);
+
+        // Step 2: normalize each arg, re-flatten.
+        let mut args = Vec::new();
+        let mut ti = 0;
+        while ti < todo.len() {
+            let normed = todo[ti].normalize_impl();
+            Self::push_max_args(&normed, &mut args);
+            ti += 1;
+        }
+
+        // Step 3: sort with is_norm_lt — stable insertion sort (see above).
+        let mut i = 1;
+        while i < args.len() {
+            let mut j = i;
+            while j > 0 && Self::is_norm_lt(&args[j], &args[j - 1]) {
+                args.swap(j, j - 1);
+                j -= 1;
+            }
+            i += 1;
+        }
+
+        // Step 4: dedup same-base (keep largest offset) + explicit subsumption.
+        let deduped = Self::dedup_max_args(&args);
+
+        // Step 5: semantic subsumption.
+        let mut rargs = Self::subsume_max_args(&deduped);
+
+        // Step 6: reapply outer offset.
+        if outer_offset > 0 {
+            let mut k = 0;
+            while k < rargs.len() {
+                rargs[k] = rargs[k].add_offset(outer_offset);
+                k += 1;
+            }
+        }
+
+        if rargs.is_empty() {
+            Level::Zero
+        } else {
+            Self::mk_max_from_args(&rargs)
+        }
+    }
+
+    // `subsume_max_args` (mod.rs:727-770). VERBATIM; iter().filter()/any()
+    // closures rewritten as index loops with IDENTICAL predicates (B9).
+    fn subsume_max_args(args: &[Level]) -> Vec<Level> {
+        if args.len() <= 1 {
+            return args.to_vec();
+        }
+        let mut any_composite = false;
+        {
+            let mut c = 0;
+            while c < args.len() {
+                if matches!(args[c].get_offset().0, Level::Max(_, _) | Level::IMax(_, _)) {
+                    any_composite = true;
+                    break;
+                }
+                c += 1;
+            }
+        }
+        if !any_composite {
+            return args.to_vec();
+        }
+
+        let mut kept: Vec<Level> = Vec::new();
+        let mut i = 0;
+        while i < args.len() {
+            let x = &args[i];
+            let x_composite =
+                matches!(x.get_offset().0, Level::Max(_, _) | Level::IMax(_, _));
+
+            let mut dominated_by_kept = false;
+            {
+                let mut ky = 0;
+                while ky < kept.len() {
+                    let y = &kept[ky];
+                    let y_composite =
+                        matches!(y.get_offset().0, Level::Max(_, _) | Level::IMax(_, _));
+                    if (x_composite || y_composite) && Self::is_geq_core(y, x) {
+                        dominated_by_kept = true;
+                        break;
+                    }
+                    ky += 1;
+                }
+            }
+            if dominated_by_kept {
+                i += 1;
+                continue;
+            }
+
+            let mut dominated_by_later_strict = false;
+            {
+                let mut ly = i + 1;
+                while ly < args.len() {
+                    let y = &args[ly];
+                    let y_composite =
+                        matches!(y.get_offset().0, Level::Max(_, _) | Level::IMax(_, _));
+                    if (x_composite || y_composite)
+                        && Self::is_geq_core(y, x)
+                        && !Self::is_geq_core(x, y)
+                    {
+                        dominated_by_later_strict = true;
+                        break;
+                    }
+                    ly += 1;
+                }
+            }
+            if dominated_by_later_strict {
+                i += 1;
+                continue;
+            }
+
+            kept.push(x.clone());
+            i += 1;
+        }
+        kept
+    }
+
+    // VERBATIM `dedup_max_args` (mod.rs:775-824).
+    fn dedup_max_args(args: &[Level]) -> Vec<Level> {
+        let mut rargs: Vec<Level> = Vec::new();
+        let mut i = 0;
+
+        if args[i].is_explicit() {
+            while i + 1 < args.len() && args[i + 1].is_explicit() {
+                i += 1;
+            }
+            let k = args[i].get_offset().1;
+            let mut j = i + 1;
+            while j < args.len() {
+                if args[j].get_offset().1 >= k {
+                    break;
+                }
+                j += 1;
+            }
+            if j < args.len() {
+                i += 1;
+            }
+        }
+
+        if i < args.len() {
+            rargs.push(args[i].clone());
+            let mut prev_offset = args[i].get_offset();
+            i += 1;
+            while i < args.len() {
+                let curr_offset = args[i].get_offset();
+                if prev_offset.0 == curr_offset.0 {
+                    if prev_offset.1 < curr_offset.1 {
+                        prev_offset = curr_offset;
+                        rargs.pop();
+                        rargs.push(args[i].clone());
+                    }
+                } else {
+                    prev_offset = curr_offset;
+                    rargs.push(args[i].clone());
+                }
+                i += 1;
+            }
+        }
+
+        rargs
+    }
+
+    // `is_geq` (mod.rs:840-844).
+    fn is_geq(l1: &Level, l2: &Level) -> bool {
+        let n1 = l1.normalize();
+        let n2 = l2.normalize();
+        Self::is_geq_core(&n1, &n2)
+    }
+
+    // VERBATIM the cfg(kani) `is_geq_core` = is_geq_core_iter (mod.rs:871-915):
+    // conjunction worklist, NO hashbrown memoization.
+    fn is_geq_core(l1: &Level, l2: &Level) -> bool {
+        let mut worklist: Vec<(&Level, &Level)> = vec![(l1, l2)];
+        while let Some((l1, l2)) = worklist.pop() {
+            if l1 == l2 || l2.is_zero() {
+                continue;
+            }
+            let (base1, offset1) = l1.get_offset();
+            if offset1 > 0 && *base1 == *l2 {
+                continue;
+            }
+            if let Level::Max(a, b) = l2 {
+                worklist.push((l1, a));
+                worklist.push((l1, b));
+                continue;
+            }
+            if let Level::Max(a, b) = l1 {
+                if Self::is_geq_leaf(a, l2) || Self::is_geq_leaf(b, l2) {
+                    continue;
+                }
+                return false;
+            }
+            if let Level::IMax(a, b) = l2 {
+                worklist.push((l1, a));
+                worklist.push((l1, b));
+                continue;
+            }
+            if let Level::IMax(_, b) = l1 {
+                worklist.push((b, l2));
+                continue;
+            }
+            let (base2, offset2) = l2.get_offset();
+            if base1 == base2 || base2.is_zero() {
+                if offset1 >= offset2 {
+                    continue;
+                }
+                return false;
+            }
+            if offset1 == offset2 && offset1 > 0 {
+                worklist.push((base1, base2));
+                continue;
+            }
+            return false;
+        }
+        true
+    }
+
+    // VERBATIM the cfg(kani) `is_geq_leaf` (mod.rs:920-930).
+    fn is_geq_leaf(l1: &Level, l2: &Level) -> bool {
+        if l1 == l2 || l2.is_zero() {
+            return true;
+        }
+        let (base1, offset1) = l1.get_offset();
+        if offset1 > 0 && *base1 == *l2 {
+            return true;
+        }
+        let (base2, offset2) = l2.get_offset();
+        (base1 == base2 || base2.is_zero()) && offset1 >= offset2
+    }
+
+    // ── THE VERIFIED UNIVERSE PILLAR: `is_def_eq` (mod.rs:1026-1033) — VERBATIM. ──
+    pub fn is_def_eq(l1: &Level, l2: &Level) -> bool {
+        if l1 == l2 {
+            return true;
+        }
+        l1.normalize() == l2.normalize()
+    }
+}
+
+pub type LevelVec = Vec<Level>;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Literal { Nat(u64), Str(u32) }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BinderData { pub info: u8, pub mult: u8 }
+
+// ── expr/meta.rs — VERBATIM (identical to the verified construction/infer rungs). ──
+
+#[inline]
+fn mix_hash(h: u64, k: u64) -> u64 {
+    const M: u64 = 0xc6a4_a793_5bd1_e995;
+    const R: u32 = 47;
+    let mut k = k.wrapping_mul(M);
+    k ^= k >> R;
+    k ^= M;
+    let mut h = h ^ k;
+    h = h.wrapping_mul(M);
+    h
+}
+
+pub struct KaniHasher { state: u64 }
+impl KaniHasher { fn new() -> Self { KaniHasher { state: 0 } } }
+impl std::hash::Hasher for KaniHasher {
+    fn finish(&self) -> u64 { self.state }
+    fn write(&mut self, bytes: &[u8]) { for &b in bytes { self.state = self.state.wrapping_mul(31).wrapping_add(b as u64); } }
+    fn write_u8(&mut self, i: u8) { self.state ^= i as u64; self.state = self.state.wrapping_mul(0x517cc1b727220a95); }
+    fn write_u16(&mut self, i: u16) { self.state ^= i as u64; self.state = self.state.wrapping_mul(0x517cc1b727220a95); }
+    fn write_u32(&mut self, i: u32) { self.state ^= i as u64; self.state = self.state.wrapping_mul(0x517cc1b727220a95); }
+    fn write_u64(&mut self, i: u64) { self.state ^= i; self.state = self.state.wrapping_mul(0x517cc1b727220a95); }
+    fn write_u128(&mut self, i: u128) { self.write_u64(i as u64); self.write_u64((i >> 64) as u64); }
+    fn write_usize(&mut self, i: usize) { self.write_u64(i as u64); }
+}
+
+// Monomorphic per-type hashers (NOT a generic hash_to_u64<T>): a generic helper
+// monomorphizes to several same-friendly-named bodies which collide as duplicate
+// JIT symbols. Same as the prior verified rungs.
+#[inline]
+fn hash_name(value: &Name) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = KaniHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+#[inline]
+fn hash_level(value: &Level) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = KaniHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+#[inline]
+fn hash_lit(value: &Literal) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = KaniHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+// clean's Level has NO MVar variant (mod.rs:81-92); constant false, as in the
+// verified rungs.
+#[inline]
+fn level_has_mvar(_l: &Level) -> bool { false }
+
+#[derive(Clone, Copy, Debug)]
+pub struct ExprMeta(u64);
+
+impl ExprMeta {
+    const HASH_MASK: u64 = 0xFFFF_FFFF;
+    const DEPTH_SHIFT: u32 = 32;
+    const DEPTH_MASK: u64 = 0xFF;
+    const HAS_FVAR_BIT: u32 = 40;
+    const HAS_EXPR_MVAR_BIT: u32 = 41;
+    const HAS_LEVEL_MVAR_BIT: u32 = 42;
+    const HAS_LEVEL_PARAM_BIT: u32 = 43;
+    const BVAR_RANGE_SHIFT: u32 = 44;
+    const MAX_DEPTH: u32 = 255;
+    const MAX_BVAR_RANGE: u32 = 1_048_575;
+
+    fn pack(hash: u32, loose_bvar_range: u32, approx_depth: u32, has_fvar: bool, has_expr_mvar: bool, has_level_mvar: bool, has_level_param: bool) -> Self {
+        let depth = approx_depth.min(Self::MAX_DEPTH);
+        let range = loose_bvar_range;
+        let bits = (hash as u64)
+            | ((depth as u64) << Self::DEPTH_SHIFT)
+            | ((has_fvar as u64) << Self::HAS_FVAR_BIT)
+            | ((has_expr_mvar as u64) << Self::HAS_EXPR_MVAR_BIT)
+            | ((has_level_mvar as u64) << Self::HAS_LEVEL_MVAR_BIT)
+            | ((has_level_param as u64) << Self::HAS_LEVEL_PARAM_BIT)
+            | ((range as u64) << Self::BVAR_RANGE_SHIFT);
+        ExprMeta(bits)
+    }
+    fn raw(self) -> u64 { self.0 }
+    fn hash(self) -> u32 { (self.0 & Self::HASH_MASK) as u32 }
+    fn approx_depth(self) -> u8 { ((self.0 >> Self::DEPTH_SHIFT) & Self::DEPTH_MASK) as u8 }
+    fn has_fvar(self) -> bool { (self.0 >> Self::HAS_FVAR_BIT) & 1 == 1 }
+    fn has_expr_mvar(self) -> bool { (self.0 >> Self::HAS_EXPR_MVAR_BIT) & 1 == 1 }
+    fn has_level_mvar(self) -> bool { (self.0 >> Self::HAS_LEVEL_MVAR_BIT) & 1 == 1 }
+    fn has_level_param(self) -> bool { (self.0 >> Self::HAS_LEVEL_PARAM_BIT) & 1 == 1 }
+    fn loose_bvar_range(self) -> u32 { (self.0 >> Self::BVAR_RANGE_SHIFT) as u32 }
+
+    fn mk_app_meta(f: ExprMeta, a: ExprMeta) -> ExprMeta {
+        let depth = (f.approx_depth().max(a.approx_depth()) as u32 + 1).min(Self::MAX_DEPTH);
+        let range = f.loose_bvar_range().max(a.loose_bvar_range());
+        let h = mix_hash(f.0, a.0) as u32;
+        let flags = (f.0 | a.0) & (0xF_u64 << Self::HAS_FVAR_BIT);
+        let bits = (h as u64) | ((depth as u64) << Self::DEPTH_SHIFT) | flags | ((range as u64) << Self::BVAR_RANGE_SHIFT);
+        ExprMeta(bits)
+    }
+    fn mk_binder_meta(ty: ExprMeta, body: ExprMeta, extra_hash: u64) -> ExprMeta {
+        let depth = (ty.approx_depth().max(body.approx_depth()) as u32 + 1).min(Self::MAX_DEPTH);
+        let body_range = body.loose_bvar_range().saturating_sub(1);
+        let range = ty.loose_bvar_range().max(body_range);
+        let h = mix_hash(depth as u64, mix_hash(ty.hash() as u64, mix_hash(body.hash() as u64, extra_hash))) as u32;
+        ExprMeta::pack(h, range, depth, ty.has_fvar() || body.has_fvar(), ty.has_expr_mvar() || body.has_expr_mvar(), ty.has_level_mvar() || body.has_level_mvar(), ty.has_level_param() || body.has_level_param())
+    }
+    fn mk_let_meta(ty: ExprMeta, val: ExprMeta, body: ExprMeta) -> ExprMeta {
+        let depth = (ty.approx_depth().max(val.approx_depth()).max(body.approx_depth()) as u32 + 1).min(Self::MAX_DEPTH);
+        let body_range = body.loose_bvar_range().saturating_sub(1);
+        let range = ty.loose_bvar_range().max(val.loose_bvar_range()).max(body_range);
+        let h = mix_hash(depth as u64, mix_hash(ty.hash() as u64, mix_hash(val.hash() as u64, body.hash() as u64))) as u32;
+        ExprMeta::pack(h, range, depth, ty.has_fvar() || val.has_fvar() || body.has_fvar(), ty.has_expr_mvar() || val.has_expr_mvar() || body.has_expr_mvar(), ty.has_level_mvar() || val.has_level_mvar() || body.has_level_mvar(), ty.has_level_param() || val.has_level_param() || body.has_level_param())
+    }
+    fn mk_wrapper_meta(inner: ExprMeta, extra_hash: u64) -> ExprMeta {
+        let depth = (inner.approx_depth() as u32 + 1).min(Self::MAX_DEPTH);
+        let h = mix_hash(depth as u64, mix_hash(inner.hash() as u64, extra_hash)) as u32;
+        ExprMeta::pack(h, inner.loose_bvar_range(), depth, inner.has_fvar(), inner.has_expr_mvar(), inner.has_level_mvar(), inner.has_level_param())
+    }
+}
+
+// The production ExprKind core (B5: the 11-variant subset the prior rungs verify).
+#[derive(Clone, Debug)]
+pub enum ExprKind {
+    BVar(u32),
+    FVar(FVarId),
+    Sort(Level),
+    Const(Name, LevelVec),
+    App(Arc<Expr>, Arc<Expr>),
+    Lam(BinderData, Arc<Expr>, Arc<Expr>),
+    Pi(BinderData, Arc<Expr>, Arc<Expr>),
+    Let(Name, Arc<Expr>, Arc<Expr>, Arc<Expr>, bool),
+    Lit(Literal),
+    Proj(Name, u32, Arc<Expr>),
+    MData(u32, Arc<Expr>),
+}
+
+impl ExprKind {
+    fn compute_meta(&self) -> ExprMeta {
+        match self {
+            ExprKind::BVar(idx) => ExprMeta::pack(mix_hash(7, *idx as u64) as u32, idx.saturating_add(1), 0, false, false, false, false),
+            ExprKind::App(f, a) => ExprMeta::mk_app_meta(f.meta(), a.meta()),
+            ExprKind::Lam(_bi, ty, body) => ExprMeta::mk_binder_meta(ty.meta(), body.meta(), 0),
+            ExprKind::Pi(_bi, ty, body) => ExprMeta::mk_binder_meta(ty.meta(), body.meta(), 1),
+            ExprKind::FVar(id) => ExprMeta::pack(mix_hash(13, id.0) as u32, 0, 0, true, false, false, false),
+            ExprKind::Sort(lvl) => ExprMeta::pack(mix_hash(11, hash_level(lvl)) as u32, 0, 0, false, false, level_has_mvar(lvl), lvl.has_params()),
+            ExprKind::Const(name, _levels) => {
+                let name_hash = hash_name(name);
+                ExprMeta::pack(mix_hash(5, name_hash) as u32, 0, 0, false, false, false, false)
+            }
+            ExprKind::Let(_, ty, val, body, _) => ExprMeta::mk_let_meta(ty.meta(), val.meta(), body.meta()),
+            ExprKind::Lit(lit) => ExprMeta::pack(mix_hash(3, hash_lit(lit)) as u32, 0, 0, false, false, false, false),
+            ExprKind::Proj(name, idx, expr) => {
+                let inner = expr.meta();
+                let depth = (inner.approx_depth() as u32 + 1).min(255);
+                let h = mix_hash(depth as u64, mix_hash(hash_name(name), mix_hash(*idx as u64, inner.hash() as u64))) as u32;
+                ExprMeta::pack(h, inner.loose_bvar_range(), depth, inner.has_fvar(), inner.has_expr_mvar(), inner.has_level_mvar(), inner.has_level_param())
+            }
+            ExprKind::MData(_, expr) => ExprMeta::mk_wrapper_meta(expr.meta(), 0),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Expr { kind: ExprKind, meta: ExprMeta }
+
+impl Expr {
+    fn from_kind(kind: ExprKind) -> Self { let meta = kind.compute_meta(); Expr { kind, meta } }
+    fn meta(&self) -> ExprMeta { self.meta }
+    fn kind(&self) -> &ExprKind { &self.kind }
+    fn loose_bvar_range(&self) -> u32 { self.meta.loose_bvar_range() }
+    // The O(1) metadata quick checks (expr/mod.rs:289-303) — VERBATIM.
+    fn has_fvar_quick(&self) -> bool { self.meta.has_fvar() }
+    fn has_expr_mvar_quick(&self) -> bool { self.meta.has_expr_mvar() }
+    fn has_level_mvar_quick(&self) -> bool { self.meta.has_level_mvar() }
+    fn bvar(idx: u32) -> Self { Expr::from_kind(ExprKind::BVar(idx)) }
+    fn cnst(name: Name) -> Self { Expr::from_kind(ExprKind::Const(name, vec![])) }
+    fn sort0() -> Self { Expr::from_kind(ExprKind::Sort(Level::Zero)) }
+    fn sort(l: Level) -> Self { Expr::from_kind(ExprKind::Sort(l)) }
+    fn nat(n: u64) -> Self { Expr::from_kind(ExprKind::Lit(Literal::Nat(n))) }
+    fn app(func: Expr, arg: Expr) -> Self { Expr::from_kind(ExprKind::App(Arc::new(func), Arc::new(arg))) }
+    fn lam(bd: BinderData, ty: Expr, body: Expr) -> Self { Expr::from_kind(ExprKind::Lam(bd, Arc::new(ty), Arc::new(body))) }
+    fn pi(bd: BinderData, ty: Expr, body: Expr) -> Self { Expr::from_kind(ExprKind::Pi(bd, Arc::new(ty), Arc::new(body))) }
+    fn lett(name: Name, ty: Expr, val: Expr, body: Expr, nondep: bool) -> Self { Expr::from_kind(ExprKind::Let(name, Arc::new(ty), Arc::new(val), Arc::new(body), nondep)) }
+    fn proj(name: Name, idx: u32, e: Expr) -> Self { Expr::from_kind(ExprKind::Proj(name, idx, Arc::new(e))) }
+    fn mdata(tag: u32, e: Expr) -> Self { Expr::from_kind(ExprKind::MData(tag, Arc::new(e))) }
+
+    // VERBATIM lift_at (verified substitution core).
+    fn lift_at(&self, start: u32, amount: u32) -> Expr {
+        if amount == 0 { return self.clone(); }
+        if start >= self.loose_bvar_range() { return self.clone(); }
+        match &self.kind {
+            ExprKind::BVar(idx) => { if *idx >= start { Expr::bvar(idx.saturating_add(amount)) } else { self.clone() } }
+            ExprKind::App(f, a) => Expr::app(f.lift_at(start, amount), a.lift_at(start, amount)),
+            ExprKind::Lam(bd, ty, body) => Expr::lam(*bd, ty.lift_at(start, amount), body.lift_at(start.saturating_add(1), amount)),
+            ExprKind::Pi(bd, ty, body) => Expr::pi(*bd, ty.lift_at(start, amount), body.lift_at(start.saturating_add(1), amount)),
+            _ => self.clone(),
+        }
+    }
+    fn lift_from(&self, start: u32, amount: u32) -> Expr { self.lift_at(start, amount) }
+    // VERBATIM instantiate / instantiate_at (the beta primitive).
+    fn instantiate(&self, val: &Expr) -> Expr { self.instantiate_at(val, 0) }
+    fn instantiate_at(&self, val: &Expr, depth: u32) -> Expr {
+        if depth >= self.loose_bvar_range() { return self.clone(); }
+        match &self.kind {
+            ExprKind::BVar(idx) => {
+                if *idx == depth { val.lift_at(0, depth) }
+                else if *idx > depth { Expr::bvar(idx.saturating_sub(1)) }
+                else { self.clone() }
+            }
+            ExprKind::App(f, a) => Expr::app(f.instantiate_at(val, depth), a.instantiate_at(val, depth)),
+            ExprKind::Lam(bd, ty, body) => Expr::lam(*bd, ty.instantiate_at(val, depth), body.instantiate_at(val, depth.saturating_add(1))),
+            ExprKind::Pi(bd, ty, body) => Expr::pi(*bd, ty.instantiate_at(val, depth), body.instantiate_at(val, depth.saturating_add(1))),
+            ExprKind::Let(name, ty, val_e, body, nondep) => Expr::lett(*name, ty.instantiate_at(val, depth), val_e.instantiate_at(val, depth), body.instantiate_at(val, depth.saturating_add(1)), *nondep),
+            ExprKind::Proj(name, idx, e) => Expr::proj(*name, *idx, e.instantiate_at(val, depth)),
+            _ => self.clone(),
+        }
+    }
+    // VERBATIM get_app_fn (clone-returning).
+    fn get_app_fn(&self) -> Expr {
+        let mut current = self.clone();
+        loop {
+            let next = match &current.kind { ExprKind::App(f, _) => f.as_ref().clone(), _ => return current };
+            current = next;
+        }
+    }
+    // VERBATIM get_app_args (collect innermost-first, reverse to source order).
+    fn get_app_args(&self) -> Vec<Expr> {
+        let mut args: Vec<Expr> = Vec::new();
+        let mut current = self.clone();
+        while let ExprKind::App(f, a) = &current.kind {
+            args.push(a.as_ref().clone());
+            let next = f.as_ref().clone();
+            current = next;
+        }
+        args.reverse();
+        args
+    }
+}
+
+// ── Modeled environment (B1): slice-scan. Layout identical to the verified
+// whnf/def_eq/infer/decl rungs (2 fat-pointer fields, 4 words). ──
+pub struct Verifier<'env> {
+    env: &'env [(Name, Option<Expr>)],
+    ctors: &'env [(Name, u32)],
+}
+
+// ── The slice TypeError (tc/infer.rs TypeError, reachable subset in source
+// shape; carries the offending Expr/Name directly — no format!/String). ──
+#[derive(Clone, Debug)]
+pub enum TypeError {
+    UnboundVariable(u32),
+    UnknownConst(Name),
+    TypeMismatch { expected: Arc<Expr>, inferred: Arc<Expr> },
+    NotAPi { ty: Arc<Expr> },
+    ExpectedSort { ty: Arc<Expr> },
+    SortDepthExceeded { depth: u32 },
+    Unsupported,
+}
+
+impl<'env> Verifier<'env> {
+    fn unfold_const(&self, name: &Name) -> Option<Expr> {
+        let mut i: usize = 0;
+        let n = self.env.len();
+        while i < n {
+            let entry = &self.env[i];
+            if entry.0 == *name { return entry.1.clone(); }
+            i += 1;
+        }
+        None
+    }
+    fn get_constructor_num_params(&self, name: &Name) -> Option<u32> {
+        let mut i: usize = 0;
+        let n = self.ctors.len();
+        while i < n {
+            let entry = &self.ctors[i];
+            if entry.0 == *name { return Some(entry.1); }
+            i += 1;
+        }
+        None
+    }
+    // Modeled env type lookup (B1): a const's TYPE is the inferred type of its
+    // unfolding value (faithful for non-recursive defs). B10: no level-param
+    // instantiation on the modeled env (env values universe-monomorphic here).
+    fn const_type(&self, name: &Name) -> Option<Expr> {
+        match self.unfold_const(name) {
+            Some(val) => match self.infer_type(&val) {
+                Ok(ty) => Some(ty),
+                Err(_) => None,
+            },
+            None => None,
+        }
+    }
+    fn try_iota_reduction(&self, _e: &Expr) -> Option<Expr> { None } // B8
+    fn try_quot_reduction(&self, _e: &Expr) -> Option<Expr> { None } // B8
+
+    // ── WHNF pillar (cert/reduction.rs whnf_impl) — VERBATIM, as verified. ──
+    fn whnf_impl(&self, e: &Expr) -> Expr { self.whnf_inner(e) }
+    fn whnf_inner(&self, e: &Expr) -> Expr {
+        match &e.kind {
+            ExprKind::App(f, a) => {
+                let f_whnf = self.whnf_impl(f);
+                match &f_whnf.kind {
+                    ExprKind::Lam(_, _, body) => { let reduced = body.instantiate(a); self.whnf_impl(&reduced) }
+                    _ => {
+                        let app = Expr::from_kind(ExprKind::App(Arc::new(f_whnf), a.clone()));
+                        if let Some(reduced) = self.try_iota_reduction(&app) { return self.whnf_impl(&reduced); }
+                        if let Some(reduced) = self.try_quot_reduction(&app) { return self.whnf_impl(&reduced); }
+                        app
+                    }
+                }
+            }
+            ExprKind::Let(_, _, val, body, _) => { let reduced = body.instantiate(val); self.whnf_impl(&reduced) }
+            ExprKind::Const(name, _levels) => match self.unfold_const(name) {
+                Some(val) => self.whnf_impl(&val),
+                None => e.clone(),
+            },
+            ExprKind::Proj(struct_name, idx, expr) => self.reduce_proj(struct_name, *idx, expr),
+            ExprKind::MData(_, inner) => self.whnf_impl(inner),
+            _ => e.clone(),
+        }
+    }
+    fn reduce_proj(&self, struct_name: &Name, idx: u32, expr: &Expr) -> Expr {
+        let expr_whnf = self.whnf_impl(expr);
+        let head = expr_whnf.get_app_fn();
+        if let ExprKind::Const(ctor_name, _) = &head.kind {
+            if let Some(num_params) = self.get_constructor_num_params(ctor_name) {
+                let args = expr_whnf.get_app_args();
+                let field_idx = num_params as usize + idx as usize;
+                if field_idx < args.len() { return self.whnf_impl(&args[field_idx]); }
+            }
+        }
+        Expr::from_kind(ExprKind::Proj(*struct_name, idx, Arc::new(expr_whnf)))
+    }
+
+    // ── DEF-EQ pillar (cert/expr_eq.rs) — VERBATIM; THE UNIVERSE INTEGRATION:
+    // `level_eq` is the REAL `Level::is_def_eq` (cert/expr_eq.rs:34-36), i.e. the
+    // full Max/IMax normalization machinery — no longer the structural model. ──
+    fn level_eq(&self, l1: &Level, l2: &Level) -> bool { Level::is_def_eq(l1, l2) }
+    fn level_vec_eq(&self, ls1: &[Level], ls2: &[Level]) -> bool {
+        if ls1.len() != ls2.len() { return false; }
+        let mut i: usize = 0;
+        let n = ls1.len();
+        while i < n {
+            if !self.level_eq(&ls1[i], &ls2[i]) { return false; }
+            i += 1;
+        }
+        true
+    }
+    fn structural_eq(&self, a: &Expr, b: &Expr) -> bool {
+        match (&a.kind, &b.kind) {
+            (ExprKind::BVar(i), ExprKind::BVar(j)) => i == j,
+            (ExprKind::FVar(i), ExprKind::FVar(j)) => i == j,
+            (ExprKind::Sort(l1), ExprKind::Sort(l2)) => self.level_eq(l1, l2),
+            (ExprKind::Const(n1, ls1), ExprKind::Const(n2, ls2)) => n1 == n2 && self.level_vec_eq(ls1, ls2),
+            (ExprKind::App(f1, a1), ExprKind::App(f2, a2)) => self.structural_eq(f1, f2) && self.structural_eq(a1, a2),
+            (ExprKind::Lam(_b1, ty1, b1), ExprKind::Lam(_b2, ty2, b2))
+            | (ExprKind::Pi(_b1, ty1, b1), ExprKind::Pi(_b2, ty2, b2)) => self.structural_eq(ty1, ty2) && self.structural_eq(b1, b2),
+            (ExprKind::Let(_, ty1, v1, b1, _), ExprKind::Let(_, ty2, v2, b2, _)) => self.structural_eq(ty1, ty2) && self.structural_eq(v1, v2) && self.structural_eq(b1, b2),
+            (ExprKind::Lit(l1), ExprKind::Lit(l2)) => l1 == l2,
+            (ExprKind::Proj(n1, i1, e1), ExprKind::Proj(n2, i2, e2)) => n1 == n2 && i1 == i2 && self.structural_eq(e1, e2),
+            (ExprKind::MData(_, in1), ExprKind::MData(_, in2)) => self.structural_eq(in1, in2),
+            _ => false,
+        }
+    }
+    fn is_def_eq(&self, a: &Expr, b: &Expr) -> bool { self.def_eq_inner(a, b) }
+    fn def_eq_impl(&self, a: &Expr, b: &Expr) -> bool { self.def_eq_inner(a, b) }
+    fn def_eq_inner(&self, a: &Expr, b: &Expr) -> bool {
+        let a_whnf = self.whnf_impl(a);
+        let b_whnf = self.whnf_impl(b);
+        if a_whnf.meta.raw() == b_whnf.meta.raw() && self.structural_eq(&a_whnf, &b_whnf) {
+            return true;
+        }
+        let matched = match (&a_whnf.kind, &b_whnf.kind) {
+            (ExprKind::BVar(i), ExprKind::BVar(j)) => i == j,
+            (ExprKind::FVar(i), ExprKind::FVar(j)) => i == j,
+            (ExprKind::Sort(l1), ExprKind::Sort(l2)) => self.level_eq(l1, l2),
+            (ExprKind::Const(n1, ls1), ExprKind::Const(n2, ls2)) => n1 == n2 && self.level_vec_eq(ls1, ls2),
+            (ExprKind::App(f1, a1), ExprKind::App(f2, a2)) => self.def_eq_impl(f1, f2) && self.def_eq_impl(a1, a2),
+            (ExprKind::Lam(_b1, ty1, b1), ExprKind::Lam(_b2, ty2, b2))
+            | (ExprKind::Pi(_b1, ty1, b1), ExprKind::Pi(_b2, ty2, b2)) => self.def_eq_impl(ty1, ty2) && self.def_eq_impl(b1, b2),
+            (ExprKind::Let(_, ty1, v1, b1, _), ExprKind::Let(_, ty2, v2, b2, _)) => self.def_eq_impl(ty1, ty2) && self.def_eq_impl(v1, v2) && self.def_eq_impl(b1, b2),
+            (ExprKind::Lit(l1), ExprKind::Lit(l2)) => l1 == l2,
+            (ExprKind::Proj(n1, i1, e1), ExprKind::Proj(n2, i2, e2)) => n1 == n2 && i1 == i2 && self.def_eq_impl(e1, e2),
+            (ExprKind::MData(_, in1), ExprKind::MData(_, in2)) => self.def_eq_impl(in1, in2),
+            _ => false,
+        };
+        if matched { return true; }
+        self.try_eta_expansion(&a_whnf, &b_whnf)
+    }
+    fn try_eta_expansion(&self, a: &Expr, b: &Expr) -> bool {
+        match (&a.kind, &b.kind) {
+            (ExprKind::Lam(_, _ty, body), _) => {
+                let other_lifted = b.lift_from(0, 1);
+                let other_applied = Expr::app(other_lifted, Expr::bvar(0));
+                self.def_eq_impl(body, &other_applied)
+            }
+            (_, ExprKind::Lam(_, _ty, body)) => {
+                let other_lifted = a.lift_from(0, 1);
+                let other_applied = Expr::app(other_lifted, Expr::bvar(0));
+                self.def_eq_impl(body, &other_applied)
+            }
+            _ => false,
+        }
+    }
+
+    // ── INFER-TYPE pillar (tc/infer.rs infer_type_fast_inner) — VERBATIM as
+    // verified; the Sort/Pi rules now construct FULL Levels (succ / imax). B3:
+    // de-Bruijn Vec<Expr> local context. ──
+    fn infer_type(&self, e: &Expr) -> Result<Expr, TypeError> {
+        let mut ctx: Vec<Expr> = Vec::new();
+        self.infer_type_core(e, &mut ctx)
+    }
+
+    fn infer_type_core(&self, e: &Expr, ctx: &mut Vec<Expr>) -> Result<Expr, TypeError> {
+        match &e.kind {
+            // Sort(l) : Sort(succ l) — the FULL Level succ.
+            ExprKind::Sort(l) => Ok(Expr::sort(Level::succ(l.clone()))),
+
+            ExprKind::BVar(idx) => {
+                let depth = ctx.len();
+                if (*idx as usize) >= depth {
+                    return Err(TypeError::UnboundVariable(*idx));
+                }
+                let pos = depth - 1 - (*idx as usize);
+                let raw = ctx[pos].clone();
+                Ok(raw.lift_at(0, idx.saturating_add(1)))
+            }
+
+            ExprKind::Const(name, _levels) => match self.const_type(name) {
+                Some(ty) => Ok(ty),
+                None => Err(TypeError::UnknownConst(*name)),
+            },
+
+            ExprKind::App(f, a) => {
+                let f_type = self.infer_type_core(f, ctx)?;
+                let f_type_whnf = self.whnf_impl(&f_type);
+                match &f_type_whnf.kind {
+                    ExprKind::Pi(_, expected_arg_type, result_type) => {
+                        let arg_type = self.infer_type_core(a, ctx)?;
+                        if !self.is_def_eq(&arg_type, expected_arg_type) {
+                            return Err(TypeError::TypeMismatch {
+                                expected: Arc::new(expected_arg_type.as_ref().clone()),
+                                inferred: Arc::new(arg_type),
+                            });
+                        }
+                        Ok(result_type.instantiate(a))
+                    }
+                    _ => Err(TypeError::NotAPi { ty: Arc::new(f_type) }),
+                }
+            }
+
+            ExprKind::Lam(bi, arg_type, body) => {
+                let arg_sort = self.infer_type_core(arg_type, ctx)?;
+                let arg_sort_whnf = self.whnf_impl(&arg_sort);
+                match &arg_sort_whnf.kind {
+                    ExprKind::Sort(_) => {}
+                    _ => return Err(TypeError::ExpectedSort { ty: Arc::new(arg_sort) }),
+                }
+                ctx.push(arg_type.as_ref().clone());
+                let body_type = self.infer_type_core(body, ctx);
+                ctx.pop();
+                let body_type = body_type?;
+                Ok(Expr::pi(*bi, arg_type.as_ref().clone(), body_type))
+            }
+
+            // Pi(A, B) : Sort(imax u v) — the FULL Level imax (Max/IMax smart
+            // constructor, incl. the imax(_,0)=0 and imax(_,Succ..)=max collapses).
+            ExprKind::Pi(_bi, arg_type, body) => {
+                let arg_sort = self.infer_type_core(arg_type, ctx)?;
+                let arg_sort_whnf = self.whnf_impl(&arg_sort);
+                let l1 = match &arg_sort_whnf.kind {
+                    ExprKind::Sort(l) => l.clone(),
+                    _ => return Err(TypeError::ExpectedSort { ty: Arc::new(arg_sort) }),
+                };
+                ctx.push(arg_type.as_ref().clone());
+                let body_sort = self.infer_type_core(body, ctx);
+                ctx.pop();
+                let body_sort = body_sort?;
+                let body_sort_whnf = self.whnf_impl(&body_sort);
+                let l2 = match &body_sort_whnf.kind {
+                    ExprKind::Sort(l) => l.clone(),
+                    _ => return Err(TypeError::ExpectedSort { ty: Arc::new(body_sort) }),
+                };
+                Ok(Expr::sort(Level::imax(l1, l2)))
+            }
+
+            ExprKind::Let(_name, ty, val, body, _nondep) => {
+                let ty_sort = self.infer_type_core(ty, ctx)?;
+                let ty_sort_whnf = self.whnf_impl(&ty_sort);
+                match &ty_sort_whnf.kind {
+                    ExprKind::Sort(_) => {}
+                    _ => return Err(TypeError::ExpectedSort { ty: Arc::new(ty_sort) }),
+                }
+                let val_type = self.infer_type_core(val, ctx)?;
+                if !self.is_def_eq(&val_type, ty) {
+                    return Err(TypeError::TypeMismatch {
+                        expected: Arc::new(ty.as_ref().clone()),
+                        inferred: Arc::new(val_type),
+                    });
+                }
+                ctx.push(ty.as_ref().clone());
+                let body_type = self.infer_type_core(body, ctx);
+                ctx.pop();
+                let body_type = body_type?;
+                Ok(body_type.instantiate(val))
+            }
+
+            ExprKind::Lit(lit) => Ok(match lit {
+                Literal::Nat(_) => Expr::cnst(Name(0xFFFF_0001)),
+                Literal::Str(_) => Expr::cnst(Name(0xFFFF_0002)),
+            }),
+
+            ExprKind::MData(_, inner) => self.infer_type_core(inner, ctx),
+
+            // Proj/FVar inference deferred here (verified separately in the
+            // infer_ext rung) — the decl gate cases never reach them.
+            _ => Err(TypeError::Unsupported),
+        }
+    }
+
+    // ── §5: infer_sort (tc/infer.rs:735 / :765 infer_sort_inner) — VERBATIM
+    // control flow. B3 ctx; B4 stack_safe/infer_only/heartbeat pass-through; B5:
+    // no SProp arm (variant not in the slice core). The Pi arm's Ok is the FULL
+    // Level::imax. ──
+    const INFER_SORT_MAX_DEPTH: u32 = 64;
+
+    fn infer_sort(&self, e: &Expr) -> Result<Level, TypeError> {
+        let mut ctx: Vec<Expr> = Vec::new();
+        self.infer_sort_inner(e, 0, &mut ctx)
+    }
+
+    fn infer_sort_inner(&self, e: &Expr, depth: u32, ctx: &mut Vec<Expr>) -> Result<Level, TypeError> {
+        let ty = self.infer_type_core(e, ctx)?;
+        let ty_whnf = self.whnf_impl(&ty);
+        match &ty_whnf.kind {
+            ExprKind::Sort(l) => Ok(l.clone()),
+            ExprKind::Pi(_bd, arg_type, body) => {
+                if depth >= Self::INFER_SORT_MAX_DEPTH {
+                    // SOUNDNESS (tc/infer.rs:784): under-reporting a deep universe
+                    // as Prop would defeat the theorem-is-Prop gate. Hard error.
+                    return Err(TypeError::SortDepthExceeded { depth });
+                }
+                let arg_level = self.infer_sort_inner(arg_type, depth + 1, ctx)?;
+                ctx.push(arg_type.as_ref().clone());
+                let body_level_result = self.infer_sort_inner(body, depth + 1, ctx);
+                ctx.pop();
+                let body_level = body_level_result?;
+                Ok(Level::imax(arg_level, body_level))
+            }
+            _ => Err(TypeError::ExpectedSort {
+                ty: Arc::new(ty),
+            }),
+        }
+    }
+
+    // ── §7: check_type (tc/infer.rs:670) — VERBATIM minus infer_only/heartbeat
+    // plumbing (B4). ──
+    fn check_type(&self, e: &Expr, expected: &Expr) -> Result<(), TypeError> {
+        let inferred = self.infer_type(e)?;
+        if self.is_def_eq(&inferred, expected) {
+            Ok(())
+        } else {
+            Err(TypeError::TypeMismatch {
+                expected: Arc::new(expected.clone()),
+                inferred: Arc::new(inferred),
+            })
+        }
+    }
+}
+
+// ── env/types.rs Declaration (:338) — all 4 variants, VERBATIM field shape
+// except type_/value are Arc<Expr> (B6). Variant order VERBATIM
+// (Definition=0, Axiom=1, Theorem=2, Opaque=3). ──
+#[derive(Clone, Debug)]
+pub enum Declaration {
+    Definition {
+        name: Name,
+        level_params: Vec<Name>,
+        type_: Arc<Expr>,
+        value: Arc<Expr>,
+        is_reducible: bool,
+    },
+    Axiom {
+        name: Name,
+        level_params: Vec<Name>,
+        type_: Arc<Expr>,
+    },
+    Theorem {
+        name: Name,
+        level_params: Vec<Name>,
+        type_: Arc<Expr>,
+        value: Arc<Expr>,
+    },
+    Opaque {
+        name: Name,
+        level_params: Vec<Name>,
+        type_: Arc<Expr>,
+        value: Arc<Expr>,
+    },
+}
+
+// ── env/types.rs EnvError (:388) — the 6 variants check_decl_readonly can
+// reach, in the REAL enum's source order (subset discriminants 0..5). ──
+#[derive(Clone, Debug)]
+pub enum EnvError {
+    TypeCheckFailed { name: Name, source: TypeError },
+    DuplicateLevelParam { name: Name, param: Name },
+    TheoremTypeNotProp { name: Name, sort: Level },
+    ContainsFreeVar { name: Name },
+    ContainsMetavar { name: Name },
+    UndefinedLevelParam { name: Name, param: Name },
+}
+
+// ── env/decl_add.rs:64 find_undef_level_param_in_level — VERBATIM; the generic
+// `allowed.contains(n)` (core slice body) rewritten as an index loop with the
+// IDENTICAL Name equality (B9). The Max/IMax push arms are the
+// universe-polymorphic surface this rung adds. ──
+fn find_undef_level_param_in_level(l: &Level, allowed: &[Name]) -> Option<Name> {
+    let mut level_stack: Vec<&Level> = vec![l];
+    while let Some(curr) = level_stack.pop() {
+        match curr {
+            Level::Zero => {}
+            Level::Param(n) => {
+                let mut found = false;
+                let mut k: usize = 0;
+                while k < allowed.len() {
+                    if allowed[k] == *n {
+                        found = true;
+                        break;
+                    }
+                    k += 1;
+                }
+                if !found {
+                    return Some(*n);
+                }
+            }
+            Level::Succ(inner) => level_stack.push(inner),
+            Level::Max(a, b) | Level::IMax(a, b) => {
+                level_stack.push(b);
+                level_stack.push(a);
+            }
+        }
+    }
+    None
+}
+
+// ── env/decl_add.rs:88 find_undef_level_param — VERBATIM over the slice's
+// 11-variant ExprKind core (B5: SProp/Squash/Cubical*/ZFC* arms structurally
+// absent); the Const-levels `for` loop rewritten as an index loop (B9). ──
+fn find_undef_level_param(e: &Expr, allowed: &[Name]) -> Option<Name> {
+    let mut expr_stack: Vec<&Expr> = vec![e];
+    while let Some(curr) = expr_stack.pop() {
+        match curr.kind() {
+            ExprKind::Sort(l) => {
+                if let Some(undef) = find_undef_level_param_in_level(l, allowed) {
+                    return Some(undef);
+                }
+            }
+            ExprKind::Const(_, levels) => {
+                let mut li: usize = 0;
+                while li < levels.len() {
+                    if let Some(undef) = find_undef_level_param_in_level(&levels[li], allowed) {
+                        return Some(undef);
+                    }
+                    li += 1;
+                }
+            }
+            ExprKind::BVar(_) | ExprKind::FVar(_) | ExprKind::Lit(_) => {}
+            ExprKind::App(f, a) => {
+                expr_stack.push(a);
+                expr_stack.push(f);
+            }
+            ExprKind::Lam(_, ty, body) | ExprKind::Pi(_, ty, body) => {
+                expr_stack.push(body);
+                expr_stack.push(ty);
+            }
+            ExprKind::Let(_, ty, val, body, _) => {
+                expr_stack.push(body);
+                expr_stack.push(val);
+                expr_stack.push(ty);
+            }
+            ExprKind::Proj(_, _, inner) | ExprKind::MData(_, inner) => {
+                expr_stack.push(inner);
+            }
+        }
+    }
+    None
+}
+
+impl<'env> Verifier<'env> {
+    // ── THE UNIVERSAL DECL GATE: env/decl_add.rs:229 check_decl_readonly —
+    // VERBATIM steps §2(dup level params), §3(no mvar/fvar), §4(level-param
+    // closure), §5(infer_sort), §6(theorem-is-Prop), §7(check_type). Elided (B4):
+    // the TypeChecker construction / heartbeat / cache-limit / profiler / loc
+    // plumbing (resource+diagnostics config, not gate logic). REWRITES (B9): the
+    // §2 `iter().enumerate()` + prefix `contains` -> index loops with identical
+    // first-hit semantics; `map_err(..)?` -> match with identical control flow. ──
+    pub fn check_decl_readonly(&self, decl: &Declaration) -> Result<(), EnvError> {
+        // Phase-1 field extraction — exactly as add_decl's.
+        let (name, level_params, type_, opt_value, is_theorem): (
+            &Name,
+            &Vec<Name>,
+            &Arc<Expr>,
+            Option<&Arc<Expr>>,
+            bool,
+        ) = match decl {
+            Declaration::Definition {
+                name,
+                level_params,
+                type_,
+                value,
+                ..
+            } => (name, level_params, type_, Some(value), false),
+            Declaration::Axiom {
+                name,
+                level_params,
+                type_,
+            } => (name, level_params, type_, None, false),
+            Declaration::Theorem {
+                name,
+                level_params,
+                type_,
+                value,
+            } => (name, level_params, type_, Some(value), true),
+            Declaration::Opaque {
+                name,
+                level_params,
+                type_,
+                value,
+            } => (name, level_params, type_, Some(value), false),
+        };
+
+        // (2) Duplicate universe level parameters.
+        {
+            let n = level_params.len();
+            let mut i: usize = 0;
+            while i < n {
+                let mut j: usize = 0;
+                while j < i {
+                    if level_params[j] == level_params[i] {
+                        return Err(EnvError::DuplicateLevelParam {
+                            name: *name,
+                            param: level_params[i],
+                        });
+                    }
+                    j += 1;
+                }
+                i += 1;
+            }
+        }
+
+        // (3) Reject metavariables and free variables in type and value.
+        if type_.has_expr_mvar_quick() || type_.has_level_mvar_quick() {
+            return Err(EnvError::ContainsMetavar { name: *name });
+        }
+        if type_.has_fvar_quick() {
+            return Err(EnvError::ContainsFreeVar { name: *name });
+        }
+        if let Some(value) = opt_value {
+            if value.has_expr_mvar_quick() || value.has_level_mvar_quick() {
+                return Err(EnvError::ContainsMetavar { name: *name });
+            }
+            if value.has_fvar_quick() {
+                return Err(EnvError::ContainsFreeVar { name: *name });
+            }
+        }
+
+        // (4) All Level::Param references must be in the declared level_params.
+        if let Some(undef) = find_undef_level_param(type_, level_params) {
+            return Err(EnvError::UndefinedLevelParam {
+                name: *name,
+                param: undef,
+            });
+        }
+        if let Some(value) = opt_value {
+            if let Some(undef) = find_undef_level_param(value, level_params) {
+                return Err(EnvError::UndefinedLevelParam {
+                    name: *name,
+                    param: undef,
+                });
+            }
+        }
+
+        // (5) The type must be well-formed: infer_sort yields a Sort.
+        let sort = match self.infer_sort(type_) {
+            Ok(s) => s,
+            Err(e) => {
+                return Err(EnvError::TypeCheckFailed {
+                    name: *name,
+                    source: e,
+                })
+            }
+        };
+
+        // (6) For theorems: type must live in Prop (Sort 0) — over the FULL
+        // Level, is_zero recurses Max/IMax children.
+        if is_theorem && !sort.is_zero() {
+            return Err(EnvError::TheoremTypeNotProp {
+                name: *name,
+                sort,
+            });
+        }
+
+        // (7) For value-bearing decls: value must have the declared type.
+        if let Some(value) = opt_value {
+            match self.check_type(value, type_) {
+                Ok(()) => {}
+                Err(e) => {
+                    return Err(EnvError::TypeCheckFailed {
+                        name: *name,
+                        source: e,
+                    })
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+// Concrete monomorphization roots (lib codegen only seeds reachable items from
+// exported symbols; the lifetime-generic Verifier methods need a concrete caller
+// to be instantiated). NOT part of the verified bodies — emission scaffolding.
+#[no_mangle]
+pub extern "C" fn __root_decl_check(v: &Verifier, d: &Declaration) -> bool {
+    v.check_decl_readonly(d).is_ok()
+}
+
+#[no_mangle]
+pub extern "C" fn __root_level_is_def_eq(l1: &Level, l2: &Level) -> bool {
+    Level::is_def_eq(l1, l2)
+}

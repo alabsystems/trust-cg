@@ -1,0 +1,22 @@
+# trust-cg-lift - Binary lifting support for Trust Codegen
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache-2.0
+
+[package]
+name = "trust-cg-lift"
+description = "Binary lifting support for Trust Codegen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

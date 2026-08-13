@@ -1,0 +1,69 @@
+---
+source: crates/trust-cg-test/tests/cli.rs
+expression: "help_of(&[\"doctor\"])"
+---
+Check the local environment for tools and reference corpora used by `trust-cg-test`. Prints a table
+for `--format human`, a structured JSON report for `--format json`. Exits 0 when every *required*
+tool for the given `--for` target is present, 2 otherwise.
+
+# Examples
+
+  trust-cg-test doctor
+  trust-cg-test doctor --for fuzz --format json
+  trust-cg-test doctor --for matrix
+
+Usage: trust-cg-test doctor [OPTIONS]
+
+Options:
+  -f, --format <FORMAT>
+          Output format (human, json, junit)
+
+          Possible values:
+          - human: Pretty table + narrative, targeted at humans
+          - json:  Machine-readable JSON
+          - junit: JUnit XML for CI consumers
+
+          [default: human]
+
+      --for <FOR_CMD>
+          Restrict checks to tools needed by one subcommand
+
+          Possible values:
+          - all:       Everything across every subcommand
+          - matrix:    Just the tools `matrix` needs
+          - suite:     Just the tools `suite` needs
+          - fuzz:      Just the tools `fuzz` needs
+          - rustc:     Just the tools `rustc` needs
+          - bootstrap: Just the tools `bootstrap` needs
+          - ecosystem: Just the tools `ecosystem` needs
+          - prove:     Just the tools `prove` needs
+          - pipeline:  Just the tools `pipeline` needs
+          - report:    Just the tools `report` needs
+
+          [default: all]
+
+  -o, --out <PATH>
+          Override the command-specific output file or directory.
+
+          See the selected subcommand's help for its output type and default.
+
+      --timeout <SECS>
+          Per-unit timeout in seconds. Subcommands may apply per-unit defaults when this is unset
+
+      --parallel <N>
+          Worker count (honors cargo-serialization lock). Default: auto
+
+  -q, --quiet
+          Suppress progress bars; errors still go to stderr
+
+  -v, --verbose...
+          Show debug-level events. Repeat for more: -vv, -vvv
+
+      --no-cache
+          Ignore proof / corpus caches
+
+      --dry-run
+          Print what would run without executing external tools
+
+  -h, --help
+          Print help (see a summary with '-h')

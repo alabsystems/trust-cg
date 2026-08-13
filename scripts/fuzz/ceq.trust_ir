@@ -1,0 +1,23 @@
+; TrustIr text format v1
+module "m"
+target "aarch64-apple-darwin" 8 little abi="aapcs64"
+functy.0 = (ptr, i32, i32) -> (i32)
+fn @counteq(functy.0){
+bb0(%0: ptr,%1: i32,%2: i32):
+ %3=const i32 0
+ %4=const i32 1
+ br bb1(%3,%3)
+bb1(%10: i32,%11: i32):
+ %12=icmp slt i32 %10,%1
+ condbr %12,bb3(%10,%11),bb2(%11)
+bb3(%20: i32,%21: i32):
+ %22=gep i32,ptr %0,%20
+ %23=load i32,ptr %22
+ %24=icmp eq i32 %23,%2
+ %25=select i32 %24,%4,%3
+ %26=add i32 %21,%25
+ %27=add i32 %20,%4
+ br bb1(%27,%26)
+bb2(%40: i32):
+ ret %40
+}

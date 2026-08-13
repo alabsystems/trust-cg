@@ -1,0 +1,33 @@
+# COMPLETE-5 ratchet floor — intent-to-treat compile-and-match coverage % over
+# the real-program corpus rows (program x {O0, O3}, both lanes) measured by
+# tests/real_program_corpus_x86.rs.
+#
+# RULES (soundness doctrine):
+#   * RAISE this floor when a completeness fix lands and the measured coverage
+#     is stable across quiet-machine runs.
+#   * NEVER lower it to make the gate pass — a drop below the floor means a
+#     previously-compiling real-program shape regressed to fail-closed.
+#   * MISMATCH rows are never tolerated at any floor (hard fail in the test).
+#
+# Seeded at the initially measured value (see the test's report output for the
+# per-row verdicts and the ranked gap table at measurement time).
+#
+# MEASURED BASELINE (2026-07-02, x86_64-apple-darwin, quiet run, 0 NONDET):
+#   26 rows (13 programs x {O0,O3}) | MATCH 14 | INCOMPLETE 12 | MISMATCH 0
+#   compile-and-match coverage = 53.8%
+#   ranked gap table: 10x TCG-MIR-UNSUPPORTED, 2x fail-closed (p12 sse2-ABI).
+#
+# COMPLETE-6 (std breadth) UPDATE (2026-07-02, same host, quiet run, 0 NONDET):
+#   26 rows | MATCH 16 | INCOMPLETE 10 | MISMATCH 0
+#   compile-and-match coverage = 61.5%  (+2 rows over baseline)
+#   New MATCH rows unlocked by the COMPLETE-6 bridge lowering fixes:
+#     * p10_struct_logic (O3): multi-latch loop back-edge faithfulness
+#       false-positive fix (per-back-edge mutation dominance).
+#     * p11_vec_stack   (O0): `Vec::is_empty` + `Vec::pop` general lowering.
+#   (These require the corresponding crates/rustc-codegen-trust-cg/src/lib.rs
+#    fixes to be committed; the floor below assumes they are in tree.)
+# The floor is raised to 57.6 (measured 61.5 minus a ~one-row 3.85pt margin) so a
+# single load-induced NONDET fail-closed cannot red the gate below the honestly
+# measured level; RAISE toward the roadmap G5/M6 target (>=80%) as completeness
+# fixes land and the higher number is stable across quiet runs.
+coverage_floor_percent = 57.6

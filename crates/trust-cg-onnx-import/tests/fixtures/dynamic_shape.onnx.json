@@ -1,0 +1,13 @@
+{
+  "name": "dynamic_shape",
+  "inputs": [
+    { "name": "input", "shape": [1, -1, 32, 32], "dtype": "f32", "layout": "nchw" }
+  ],
+  "outputs": ["relu_out"],
+  "tensors": [
+    { "name": "relu_out", "shape": [1, -1, 32, 32], "dtype": "f32", "layout": "nchw" }
+  ],
+  "nodes": [
+    { "name": "Relu_0", "op_type": "Relu", "inputs": ["input"], "outputs": ["relu_out"] }
+  ]
+}

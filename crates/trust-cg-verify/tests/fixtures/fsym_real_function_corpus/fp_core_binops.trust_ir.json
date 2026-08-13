@@ -1,0 +1,827 @@
+{
+  "name": "fsym_real_fp_core_binops",
+  "functions": [
+    {
+      "id": 0,
+      "name": "add_f",
+      "ty": 0,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "F32"
+            ],
+            [
+              1,
+              "F32"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Alloca": {
+                  "ty": "F32",
+                  "count": null,
+                  "align": null
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Alloca": {
+                  "ty": "F32",
+                  "count": null,
+                  "align": null
+                }
+              },
+              "results": [
+                3
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Store": {
+                  "ty": "F32",
+                  "ptr": 2,
+                  "value": 0,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Store": {
+                  "ty": "F32",
+                  "ptr": 3,
+                  "value": 1,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Load": {
+                  "ty": "F32",
+                  "ptr": 2,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [
+                4
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Load": {
+                  "ty": "F32",
+                  "ptr": 3,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [
+                5
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "FAdd",
+                  "ty": "F32",
+                  "lhs": 4,
+                  "rhs": 5
+                }
+              },
+              "results": [
+                6
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    6
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External"
+    },
+    {
+      "id": 1,
+      "name": "add_d",
+      "ty": 1,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "F64"
+            ],
+            [
+              1,
+              "F64"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Alloca": {
+                  "ty": "F64",
+                  "count": null,
+                  "align": null
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Alloca": {
+                  "ty": "F64",
+                  "count": null,
+                  "align": null
+                }
+              },
+              "results": [
+                3
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Store": {
+                  "ty": "F64",
+                  "ptr": 2,
+                  "value": 0,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Store": {
+                  "ty": "F64",
+                  "ptr": 3,
+                  "value": 1,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Load": {
+                  "ty": "F64",
+                  "ptr": 2,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [
+                4
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Load": {
+                  "ty": "F64",
+                  "ptr": 3,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [
+                5
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "FAdd",
+                  "ty": "F64",
+                  "lhs": 4,
+                  "rhs": 5
+                }
+              },
+              "results": [
+                6
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    6
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External"
+    },
+    {
+      "id": 2,
+      "name": "cmp_lt",
+      "ty": 2,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "F64"
+            ],
+            [
+              1,
+              "F64"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "FCmp": {
+                  "op": "OLt",
+                  "ty": "F64",
+                  "lhs": 0,
+                  "rhs": 1
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "CondBr": {
+                  "cond": 2,
+                  "then_target": 1,
+                  "then_args": [],
+                  "else_target": 2,
+                  "else_args": []
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        },
+        {
+          "id": 1,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": 1
+                  }
+                }
+              },
+              "results": [
+                3
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    3
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        },
+        {
+          "id": 2,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": 2
+                  }
+                }
+              },
+              "results": [
+                4
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    4
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External"
+    },
+    {
+      "id": 3,
+      "name": "roundtrip",
+      "ty": 3,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "I32"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Cast": {
+                  "op": "SIToFP",
+                  "src_ty": "I32",
+                  "dst_ty": "F64",
+                  "operand": 0
+                }
+              },
+              "results": [
+                1
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Cast": {
+                  "op": "FPToSI",
+                  "src_ty": "F64",
+                  "dst_ty": "I32",
+                  "operand": 1
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    2
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External"
+    },
+    {
+      "id": 4,
+      "name": "neg",
+      "ty": 4,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "F64"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "UnOp": {
+                  "op": "FNeg",
+                  "ty": "F64",
+                  "operand": 0
+                }
+              },
+              "results": [
+                1
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    1
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External"
+    },
+    {
+      "id": 5,
+      "name": "binop_fadd",
+      "ty": 5,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "F64"
+            ],
+            [
+              1,
+              "F64"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "FAdd",
+                  "ty": "F64",
+                  "lhs": 0,
+                  "rhs": 1
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    2
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External"
+    },
+    {
+      "id": 6,
+      "name": "binop_fsub",
+      "ty": 6,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "F64"
+            ],
+            [
+              1,
+              "F64"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "FSub",
+                  "ty": "F64",
+                  "lhs": 0,
+                  "rhs": 1
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    2
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External"
+    },
+    {
+      "id": 7,
+      "name": "binop_fmul",
+      "ty": 7,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "F64"
+            ],
+            [
+              1,
+              "F64"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "FMul",
+                  "ty": "F64",
+                  "lhs": 0,
+                  "rhs": 1
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    2
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External"
+    },
+    {
+      "id": 8,
+      "name": "binop_fdiv",
+      "ty": 8,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "F64"
+            ],
+            [
+              1,
+              "F64"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "FDiv",
+                  "ty": "F64",
+                  "lhs": 0,
+                  "rhs": 1
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    2
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External"
+    }
+  ],
+  "structs": [],
+  "enums": [],
+  "records": [],
+  "closure_types": [],
+  "globals": [],
+  "func_types": [
+    {
+      "params": [
+        "F32",
+        "F32"
+      ],
+      "returns": [
+        "F32"
+      ],
+      "is_vararg": false
+    },
+    {
+      "params": [
+        "F64",
+        "F64"
+      ],
+      "returns": [
+        "F64"
+      ],
+      "is_vararg": false
+    },
+    {
+      "params": [
+        "F64",
+        "F64"
+      ],
+      "returns": [
+        "I32"
+      ],
+      "is_vararg": false
+    },
+    {
+      "params": [
+        "I32"
+      ],
+      "returns": [
+        "I32"
+      ],
+      "is_vararg": false
+    },
+    {
+      "params": [
+        "F64"
+      ],
+      "returns": [
+        "F64"
+      ],
+      "is_vararg": false
+    },
+    {
+      "params": [
+        "F64",
+        "F64"
+      ],
+      "returns": [
+        "F64"
+      ],
+      "is_vararg": false
+    },
+    {
+      "params": [
+        "F64",
+        "F64"
+      ],
+      "returns": [
+        "F64"
+      ],
+      "is_vararg": false
+    },
+    {
+      "params": [
+        "F64",
+        "F64"
+      ],
+      "returns": [
+        "F64"
+      ],
+      "is_vararg": false
+    },
+    {
+      "params": [
+        "F64",
+        "F64"
+      ],
+      "returns": [
+        "F64"
+      ],
+      "is_vararg": false
+    }
+  ],
+  "types": [],
+  "proof_obligations": [],
+  "proof_certificates": [],
+  "target_info": null
+}

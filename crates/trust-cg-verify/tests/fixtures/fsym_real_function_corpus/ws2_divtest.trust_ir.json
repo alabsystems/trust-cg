@@ -1,0 +1,1090 @@
+{
+  "name": "fsym_real_ws2_divtest",
+  "functions": [
+    {
+      "id": 0,
+      "name": "testL",
+      "ty": 0,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "I64"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Alloca": {
+                  "ty": "I64",
+                  "count": null,
+                  "align": null
+                }
+              },
+              "results": [
+                1
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Store": {
+                  "ty": "I64",
+                  "ptr": 1,
+                  "value": 0,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Load": {
+                  "ty": "I64",
+                  "ptr": 1,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I64",
+                  "value": {
+                    "Int": 16
+                  }
+                }
+              },
+              "results": [
+                3
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "SDiv",
+                  "ty": "I64",
+                  "lhs": 2,
+                  "rhs": 3
+                }
+              },
+              "results": [
+                4
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Cast": {
+                  "op": "Trunc",
+                  "src_ty": "I64",
+                  "dst_ty": "I32",
+                  "operand": 4
+                }
+              },
+              "results": [
+                5
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "Ptr",
+                  "value": {
+                    "Int": 18076885954311749632
+                  }
+                }
+              },
+              "results": [
+                6
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Call": {
+                  "callee": 1,
+                  "args": [
+                    6,
+                    5
+                  ]
+                }
+              },
+              "results": [
+                7
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Load": {
+                  "ty": "I64",
+                  "ptr": 1,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [
+                8
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I64",
+                  "value": {
+                    "Int": 70368744177664
+                  }
+                }
+              },
+              "results": [
+                9
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "SDiv",
+                  "ty": "I64",
+                  "lhs": 8,
+                  "rhs": 9
+                }
+              },
+              "results": [
+                10
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Cast": {
+                  "op": "Trunc",
+                  "src_ty": "I64",
+                  "dst_ty": "I32",
+                  "operand": 10
+                }
+              },
+              "results": [
+                11
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "Ptr",
+                  "value": {
+                    "Int": 18076885954311749632
+                  }
+                }
+              },
+              "results": [
+                12
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Call": {
+                  "callee": 1,
+                  "args": [
+                    12,
+                    11
+                  ]
+                }
+              },
+              "results": [
+                13
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": []
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External"
+    },
+    {
+      "id": 1,
+      "name": "printf",
+      "ty": 1,
+      "entry": 0,
+      "blocks": [],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External"
+    },
+    {
+      "id": 2,
+      "name": "test",
+      "ty": 2,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "I32"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Alloca": {
+                  "ty": "I32",
+                  "count": null,
+                  "align": null
+                }
+              },
+              "results": [
+                1
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Store": {
+                  "ty": "I32",
+                  "ptr": 1,
+                  "value": 0,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Load": {
+                  "ty": "I32",
+                  "ptr": 1,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": 1
+                  }
+                }
+              },
+              "results": [
+                3
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "SDiv",
+                  "ty": "I32",
+                  "lhs": 2,
+                  "rhs": 3
+                }
+              },
+              "results": [
+                4
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "Ptr",
+                  "value": {
+                    "Int": 18076885954311749632
+                  }
+                }
+              },
+              "results": [
+                5
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Call": {
+                  "callee": 1,
+                  "args": [
+                    5,
+                    4
+                  ]
+                }
+              },
+              "results": [
+                6
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Load": {
+                  "ty": "I32",
+                  "ptr": 1,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [
+                7
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": 16
+                  }
+                }
+              },
+              "results": [
+                8
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "SDiv",
+                  "ty": "I32",
+                  "lhs": 7,
+                  "rhs": 8
+                }
+              },
+              "results": [
+                9
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "Ptr",
+                  "value": {
+                    "Int": 18076885954311749632
+                  }
+                }
+              },
+              "results": [
+                10
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Call": {
+                  "callee": 1,
+                  "args": [
+                    10,
+                    9
+                  ]
+                }
+              },
+              "results": [
+                11
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Load": {
+                  "ty": "I32",
+                  "ptr": 1,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [
+                12
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": 262144
+                  }
+                }
+              },
+              "results": [
+                13
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "SDiv",
+                  "ty": "I32",
+                  "lhs": 12,
+                  "rhs": 13
+                }
+              },
+              "results": [
+                14
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "Ptr",
+                  "value": {
+                    "Int": 18076885954311749632
+                  }
+                }
+              },
+              "results": [
+                15
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Call": {
+                  "callee": 1,
+                  "args": [
+                    15,
+                    14
+                  ]
+                }
+              },
+              "results": [
+                16
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Load": {
+                  "ty": "I32",
+                  "ptr": 1,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [
+                17
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": 1073741824
+                  }
+                }
+              },
+              "results": [
+                18
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "SDiv",
+                  "ty": "I32",
+                  "lhs": 17,
+                  "rhs": 18
+                }
+              },
+              "results": [
+                19
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "Ptr",
+                  "value": {
+                    "Int": 18076885954311749632
+                  }
+                }
+              },
+              "results": [
+                20
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Call": {
+                  "callee": 1,
+                  "args": [
+                    20,
+                    19
+                  ]
+                }
+              },
+              "results": [
+                21
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": []
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External"
+    },
+    {
+      "id": 3,
+      "name": "main",
+      "ty": 3,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Alloca": {
+                  "ty": "I32",
+                  "count": null,
+                  "align": null
+                }
+              },
+              "results": [
+                0
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Alloca": {
+                  "ty": "I32",
+                  "count": null,
+                  "align": null
+                }
+              },
+              "results": [
+                1
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Alloca": {
+                  "ty": "I64",
+                  "count": null,
+                  "align": null
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": 0
+                  }
+                }
+              },
+              "results": [
+                3
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Store": {
+                  "ty": "I32",
+                  "ptr": 0,
+                  "value": 3,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": -1048576
+                  }
+                }
+              },
+              "results": [
+                4
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Store": {
+                  "ty": "I32",
+                  "ptr": 1,
+                  "value": 4,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I64",
+                  "value": {
+                    "Int": -9007199254740992
+                  }
+                }
+              },
+              "results": [
+                5
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Store": {
+                  "ty": "I64",
+                  "ptr": 2,
+                  "value": 5,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Load": {
+                  "ty": "I32",
+                  "ptr": 1,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [
+                6
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": 32
+                  }
+                }
+              },
+              "results": [
+                7
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "Add",
+                  "ty": "I32",
+                  "lhs": 6,
+                  "rhs": 7
+                }
+              },
+              "results": [
+                8
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Call": {
+                  "callee": 2,
+                  "args": [
+                    8
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Load": {
+                  "ty": "I32",
+                  "ptr": 1,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [
+                9
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": 33
+                  }
+                }
+              },
+              "results": [
+                10
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "Add",
+                  "ty": "I32",
+                  "lhs": 9,
+                  "rhs": 10
+                }
+              },
+              "results": [
+                11
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Call": {
+                  "callee": 2,
+                  "args": [
+                    11
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Load": {
+                  "ty": "I64",
+                  "ptr": 2,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [
+                12
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I64",
+                  "value": {
+                    "Int": 64
+                  }
+                }
+              },
+              "results": [
+                13
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "Add",
+                  "ty": "I64",
+                  "lhs": 12,
+                  "rhs": 13
+                }
+              },
+              "results": [
+                14
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Call": {
+                  "callee": 0,
+                  "args": [
+                    14
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Load": {
+                  "ty": "I64",
+                  "ptr": 2,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [
+                15
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I64",
+                  "value": {
+                    "Int": 65
+                  }
+                }
+              },
+              "results": [
+                16
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "Add",
+                  "ty": "I64",
+                  "lhs": 15,
+                  "rhs": 16
+                }
+              },
+              "results": [
+                17
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Call": {
+                  "callee": 0,
+                  "args": [
+                    17
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": 0
+                  }
+                }
+              },
+              "results": [
+                18
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    18
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External"
+    }
+  ],
+  "structs": [],
+  "enums": [],
+  "records": [],
+  "closure_types": [],
+  "globals": [
+    {
+      "name": ".str",
+      "ty": "Ptr",
+      "mutable": false,
+      "initializer": {
+        "Aggregate": [
+          {
+            "Int": 37
+          },
+          {
+            "Int": 100
+          },
+          {
+            "Int": 10
+          },
+          {
+            "Int": 0
+          }
+        ]
+      },
+      "linkage": "Private"
+    }
+  ],
+  "func_types": [
+    {
+      "params": [
+        "I64"
+      ],
+      "returns": [],
+      "is_vararg": false
+    },
+    {
+      "params": [
+        "Ptr"
+      ],
+      "returns": [
+        "I32"
+      ],
+      "is_vararg": true
+    },
+    {
+      "params": [
+        "I32"
+      ],
+      "returns": [],
+      "is_vararg": false
+    },
+    {
+      "params": [],
+      "returns": [
+        "I32"
+      ],
+      "is_vararg": false
+    }
+  ],
+  "types": [],
+  "proof_obligations": [],
+  "proof_certificates": [],
+  "target_info": null
+}

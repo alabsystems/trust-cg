@@ -1,0 +1,15 @@
+tcg-verdict-db-exemptions-v1
+solver-sha256: 6d6a8b6c7531420e8e3277f22fcdf0c9b5e656731b201b5e6e413df714aaf842
+solver-version: build.version=0.11.0
+provenance: PROOF-4 (registry) + PROOF-5 (parametric reconstruction) regen, ay 0.11.0
+count: 6
+# Registry obligations the real solver did NOT discharge Verified offline at the pinned
+# 30s budget. NOT credited via tier-0 — each keeps the (sound, weaker) statistical-sweep
+# discharge on the compile path until solver work / lane-wise decomposition closes it.
+# Format per row: <reason>\t<category>\t<name>
+Timeout	Memory	CoroSuspend: state store preserves the yielded value (disjoint slot)
+Timeout	Peephole	Peephole: SDIV Xd, Xn, #-1 ≡ NEG Xd, Xn
+Timeout	x86-64 Lowering	x86_64: Sdiv_I32 -> branchless-guarded IDIV r32 (total, INT_MIN/-1)
+Timeout	x86-64 Lowering	x86_64: Sdiv_I64 -> branchless-guarded IDIV r64 (total, INT_MIN/-1)
+Timeout	x86-64 Lowering	x86_64: Srem_I32 -> branchless-guarded IDIV r32 (total, INT_MIN/-1)
+Timeout	x86-64 Lowering	x86_64: Srem_I64 -> branchless-guarded IDIV r64 (total, INT_MIN/-1)

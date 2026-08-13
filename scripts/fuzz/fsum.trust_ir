@@ -1,0 +1,22 @@
+; TrustIr text format v1
+module "m"
+target "aarch64-apple-darwin" 8 little abi="aapcs64"
+functy.0 = (ptr, i32) -> (f32)
+fn @fsum(functy.0){
+bb0(%0: ptr,%1: i32):
+ %2=const i32 0
+ %3=const i32 1
+ %4=const f32 0.0
+ br bb1(%2,%4)
+bb1(%10: i32,%11: f32):
+ %12=icmp slt i32 %10,%1
+ condbr %12,bb3(%10,%11),bb2(%11)
+bb3(%20: i32,%21: f32):
+ %22=gep f32,ptr %0,%20
+ %23=load f32,ptr %22
+ %24=fadd f32 %21,%23
+ %25=add i32 %20,%3
+ br bb1(%25,%24)
+bb2(%40: f32):
+ ret %40
+}

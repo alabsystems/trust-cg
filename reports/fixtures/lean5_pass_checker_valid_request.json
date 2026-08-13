@@ -1,0 +1,173 @@
+{
+  "format_version": "trust-cg.lean5_pass_check.request.v1",
+  "certificate": {
+    "format_version": "trust-cg.certified_pass.v1",
+    "pass": {
+      "name": "placeholder-transport-demo",
+      "version": "1",
+      "implementation_commit": "workspace-local",
+      "instance_id": "placeholder:v1",
+      "pipeline_ordinal": 1,
+      "target_profile": {
+        "triple": "synthetic-proof-indexed",
+        "cpu": "unspecified",
+        "features": []
+      },
+      "options_hash": "sha256:69ccf59b416bc5b36e3bce0b5bb9a8b04c4d5434ef56a18dce4d5aecd9c5ac9f"
+    },
+    "provenance": {
+      "source": {
+        "program_id": "trust-cg://proof-indexed-demo/proof_indexed_demo/before/placeholder:v1",
+        "node_ids": [],
+        "expression_digest": "trust-cg-pass-obligation-v1:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "rewrite": {
+        "program_id": "trust-cg://proof-indexed-demo/proof_indexed_demo/after/placeholder:v1",
+        "node_ids": [],
+        "expression_digest": "trust-cg-pass-obligation-v1:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    },
+    "contract": {
+      "mode": "local_pass_certificate_summary",
+      "semantic_policy": {
+        "source": "trust-cg-opt certified wrapper",
+        "fail_closed": true
+      }
+    },
+    "domain": {
+      "kind": "machine-ir",
+      "certified_pass_run": {
+        "format_version": "trust-cg.opt.certified_pass_run.v1",
+        "pass_name": "placeholder-transport-demo",
+        "pass_version": 1,
+        "pass_instance_id": "placeholder:v1",
+        "function_name": "proof_indexed_demo",
+        "changed": false,
+        "status": "verified",
+        "certificate_count": 0,
+        "failure_count": 0,
+        "obligation_hash": "trust-cg-pass-obligation-v1:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "local_checker": {
+          "kind": "trust-cg-opt-local",
+          "name": "placeholder-transport-demo checker",
+          "version": "1",
+          "status": "verified"
+        },
+        "summary": {
+          "changed": false,
+          "certificates": [],
+          "failures": []
+        }
+      }
+    },
+    "obligation_hash": "trust-cg-pass-obligation-v1:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "checker": {
+      "kind": "lean5",
+      "name": "trust-cg-cert-check",
+      "version": "0.1.0",
+      "proof_family": "trust-cg-opt-local-certified-pass-run-v1",
+      "invocation": {
+        "mode": "in_process",
+        "command": [
+          "trust-cg-codegen",
+          "production-certified-pass-chain"
+        ],
+        "working_directory_policy": "process"
+      },
+      "limits": {
+        "timeout_ms": 1000
+      },
+      "replay_inputs": [
+        {
+          "kind": "canonical_obligation",
+          "uri": "trust-cg-opt://certified-pass-run/99be948742cedc12a3cc7e7e896e123d599a23ff80ccbc5072c59a0247b37ced.json",
+          "digest": "sha256:99be948742cedc12a3cc7e7e896e123d599a23ff80ccbc5072c59a0247b37ced",
+          "media_type": "application/json",
+          "placeholder_transport": null
+        },
+        {
+          "kind": "lean_module",
+          "uri": "builtin://trust-cg-opt/certified-pass-run/placeholder/placeholder-lean5",
+          "digest": "sha256:9e5f026e536796e2353c77fe1f349bb087e263e295b7bb39067b4557666844cf",
+          "media_type": "text/plain",
+          "placeholder_transport": {
+            "accepted": true,
+            "note": "Transport check for an trust-cg-opt local certified pass run; semantic Lean replay is not part of this bounded slice."
+          }
+        }
+      ],
+      "trust_base": [
+        "lean5-kernel",
+        "trust-cg-opt-local-certified-pass-run",
+        "proof-indexed-fixture"
+      ]
+    },
+    "result": {
+      "status": "verified",
+      "checked_at_unix": 0,
+      "duration_ms": 0,
+      "local_checker": {
+        "kind": "trust-cg-opt-local",
+        "name": "placeholder-transport-demo checker",
+        "version": "1",
+        "status": "verified"
+      },
+      "certificate_count": 0,
+      "failure_count": 0
+    },
+    "artifacts": {
+      "refs": [
+        {
+          "kind": "canonical_obligation",
+          "uri": "trust-cg-opt://certified-pass-run/99be948742cedc12a3cc7e7e896e123d599a23ff80ccbc5072c59a0247b37ced.json",
+          "digest": "sha256:99be948742cedc12a3cc7e7e896e123d599a23ff80ccbc5072c59a0247b37ced",
+          "media_type": "application/json",
+          "placeholder_transport": null
+        },
+        {
+          "kind": "lean_module",
+          "uri": "builtin://trust-cg-opt/certified-pass-run/placeholder/placeholder-lean5",
+          "digest": "sha256:9e5f026e536796e2353c77fe1f349bb087e263e295b7bb39067b4557666844cf",
+          "media_type": "text/plain",
+          "placeholder_transport": {
+            "accepted": true,
+            "note": "Transport check for an trust-cg-opt local certified pass run; semantic Lean replay is not part of this bounded slice."
+          }
+        }
+      ]
+    },
+    "chain": {
+      "compilation_unit": "proof-indexed-demo",
+      "certificate_index": 0,
+      "must_be_verified": true
+    }
+  },
+  "obligation_hash": "trust-cg-pass-obligation-v1:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "policy": {
+    "checker": "lean5",
+    "mode": "placeholder_transport",
+    "timeout_ms": 1000,
+    "fail_closed": true,
+    "expected_lean_version": "Lean 5.0.0-placeholder",
+    "lean5_binary": null
+  },
+  "artifacts": [
+    {
+      "kind": "canonical_obligation",
+      "uri": "trust-cg-opt://certified-pass-run/99be948742cedc12a3cc7e7e896e123d599a23ff80ccbc5072c59a0247b37ced.json",
+      "digest": "sha256:99be948742cedc12a3cc7e7e896e123d599a23ff80ccbc5072c59a0247b37ced",
+      "media_type": "application/json",
+      "placeholder_transport": null
+    },
+    {
+      "kind": "lean_module",
+      "uri": "builtin://trust-cg-opt/certified-pass-run/placeholder/placeholder-lean5",
+      "digest": "sha256:9e5f026e536796e2353c77fe1f349bb087e263e295b7bb39067b4557666844cf",
+      "media_type": "text/plain",
+      "placeholder_transport": {
+        "accepted": true,
+        "note": "Transport check for an trust-cg-opt local certified pass run; semantic Lean replay is not part of this bounded slice."
+      }
+    }
+  ]
+}

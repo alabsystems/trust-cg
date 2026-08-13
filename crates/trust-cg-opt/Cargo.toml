@@ -1,0 +1,33 @@
+# trust-cg-opt - Optimization passes with verification hooks
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache-2.0
+
+[package]
+name = "trust-cg-opt"
+description = "Optimization passes with verification hooks for Trust Codegen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+
+[features]
+default = []
+# WP-2 — forward the decidable-lattice guard-elision authority (see
+# `trust-cg-lower/src/lattice_guard.rs`). DEFAULT OFF.
+lattice-guard-elision = ["trust-cg-lower/lattice-guard-elision"]
+
+[dependencies]
+trust-cg-ir = { workspace = true }
+trust-cg-lower = { workspace = true }
+trust-cg-process-env = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

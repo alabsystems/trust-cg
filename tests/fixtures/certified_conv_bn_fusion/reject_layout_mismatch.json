@@ -1,0 +1,145 @@
+{
+  "format_version": "trust-cg.conv_bn_fusion_obligation.v1",
+  "pass": {
+    "name": "conv-bn-fusion",
+    "version": "0.1.0",
+    "mode": "certified"
+  },
+  "contract": {
+    "mode": "epsilon_equivalence",
+    "metric": "absolute_per_element",
+    "epsilon": 0.000001
+  },
+  "semantic_policy": {
+    "dtype": "f32",
+    "rounding": "rne",
+    "nan": "disallowed",
+    "signed_zero": "preserved",
+    "denormals": "ieee"
+  },
+  "source": {
+    "op": {
+      "id": "vnn.0",
+      "kind": "trust_ir.vnn.conv2d",
+      "input": {
+        "id": "%input",
+        "shape": [1, 2, 2, 1],
+        "dtype": "f32",
+        "layout": "nc"
+      },
+      "output": {
+        "id": "%conv",
+        "shape": [1, 2, 2, 1],
+        "dtype": "f32",
+        "layout": "nc"
+      },
+      "weight": {
+        "id": "conv.weight",
+        "shape": [1, 1, 1, 1],
+        "dtype": "f32",
+        "layout": "oihw",
+        "values": [1.0]
+      },
+      "attrs": {
+        "strides": [1, 1],
+        "pads": [0, 0, 0, 0],
+        "dilations": [1, 1],
+        "groups": 1
+      }
+    },
+    "bn": {
+      "id": "vnn.1",
+      "input": {
+        "id": "%conv",
+        "shape": [1, 2, 2, 1],
+        "dtype": "f32",
+        "layout": "nc"
+      },
+      "output": {
+        "id": "%bn",
+        "shape": [1, 2, 2, 1],
+        "dtype": "f32",
+        "layout": "nc"
+      },
+      "inference_mode": true,
+      "statistics": "static",
+      "epsilon": 0.00001,
+      "scale": {
+        "id": "bn.scale",
+        "shape": [1],
+        "dtype": "f32",
+        "layout": "vector",
+        "values": [1.0]
+      },
+      "bias": {
+        "id": "bn.bias",
+        "shape": [1],
+        "dtype": "f32",
+        "layout": "vector",
+        "values": [0.0]
+      },
+      "mean": {
+        "id": "bn.mean",
+        "shape": [1],
+        "dtype": "f32",
+        "layout": "vector",
+        "values": [0.0]
+      },
+      "variance": {
+        "id": "bn.var",
+        "shape": [1],
+        "dtype": "f32",
+        "layout": "vector",
+        "values": [1.0]
+      }
+    },
+    "provenance": {
+      "source_gamma_layer_ids": ["layer.0", "layer.1"],
+      "source_onnx_nodes": ["Conv_0", "BatchNormalization_1"]
+    }
+  },
+  "rewrite": {
+    "op": {
+      "id": "vnn.0.fused",
+      "kind": "trust_ir.vnn.conv2d",
+      "input": {
+        "id": "%input",
+        "shape": [1, 2, 2, 1],
+        "dtype": "f32",
+        "layout": "nc"
+      },
+      "output": {
+        "id": "%bn",
+        "shape": [1, 2, 2, 1],
+        "dtype": "f32",
+        "layout": "nc"
+      },
+      "attrs": {
+        "fused_from": ["vnn.0", "vnn.1"]
+      }
+    },
+    "fused_weight": {
+      "id": "conv_bn_fused.weight",
+      "shape": [1, 1, 1, 1],
+      "dtype": "f32",
+      "layout": "oihw",
+      "values": [1.0]
+    },
+    "fused_bias": {
+      "id": "conv_bn_fused.bias",
+      "shape": [1],
+      "dtype": "f32",
+      "layout": "vector",
+      "values": [0.0]
+    },
+    "provenance": {
+      "fused_gamma_layer_ids": ["layer.0", "layer.1"],
+      "source_obligation": "tests/fixtures/certified_conv_bn_fusion/reject_layout_mismatch.json"
+    }
+  },
+  "obligation_hash": "trust-cg-pass-obligation-v1:sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "expected": {
+    "eligible": false,
+    "reason": "unsupported_layout"
+  }
+}

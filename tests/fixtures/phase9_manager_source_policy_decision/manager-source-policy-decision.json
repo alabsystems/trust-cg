@@ -1,0 +1,38 @@
+{
+  "approver_role": "manager",
+  "claims": {
+    "final_promotion_ready": false,
+    "product_promotion": false,
+    "public_publication": false,
+    "release_replay_ready": false,
+    "ay_repin_closure": false
+  },
+  "decision": "authorize_private_source_policy",
+  "decision_issue": "#954",
+  "evidence_issue_refs": {
+    "closure_packet": "#730",
+    "final_promotion": "#667",
+    "public_source_blocker": "#719",
+    "public_source_repin": "#779",
+    "release_replay": "#664"
+  },
+  "issue_refs": {
+    "closure_packet": "#730",
+    "final_promotion": "#667",
+    "public_source_blocker": "#719",
+    "public_source_repin": "#779",
+    "release_replay": "#664"
+  },
+  "manager_approved": true,
+  "parent_issue": "#730",
+  "schema": "trust-cg.phase9.manager_source_policy_decision.v1",
+  "scope": "phase9_final_closure_packet",
+  "source_lock_policy": "approved_private_source",
+  "source_locks": {
+    "trust_cg_revision": "fixture-current-trust-cg-private",
+    "tla2_revision": "fixture-current-tla2-private",
+    "trust_ir_revision": "fixture-current-trust_ir-private",
+    "ay_revision": "fixture-current-ay-private"
+  },
+  "stale_if_source_locks_change": true
+}

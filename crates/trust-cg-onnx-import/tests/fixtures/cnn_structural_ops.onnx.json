@@ -1,0 +1,57 @@
+{
+  "name": "cnn_structural_ops",
+  "inputs": [
+    { "name": "input", "shape": [1, 3, 32, 32], "dtype": "f32", "layout": "nchw" }
+  ],
+  "outputs": ["reshaped"],
+  "tensors": [
+    { "name": "bn_out", "shape": [1, 3, 32, 32], "dtype": "f32", "layout": "nchw" },
+    { "name": "avg_out", "shape": [1, 3, 16, 16], "dtype": "f32", "layout": "nchw" },
+    { "name": "gap_out", "shape": [1, 3, 1, 1], "dtype": "f32", "layout": "nchw" },
+    { "name": "transposed", "shape": [1, 1, 1, 3], "dtype": "f32", "layout": "strided" },
+    { "name": "reshaped", "shape": [1, 3], "dtype": "f32", "layout": "nc" }
+  ],
+  "initializers": [
+    { "name": "bn.scale", "shape": [3], "dtype": "f32", "layout": "vector", "values": [1.0, 1.0, 1.0] },
+    { "name": "bn.bias", "shape": [3], "dtype": "f32", "layout": "vector", "values": [0.0, 0.0, 0.0] },
+    { "name": "bn.mean", "shape": [3], "dtype": "f32", "layout": "vector", "values": [0.0, 0.0, 0.0] },
+    { "name": "bn.var", "shape": [3], "dtype": "f32", "layout": "vector", "values": [1.0, 1.0, 1.0] },
+    { "name": "shape", "shape": [2], "dtype": "i64", "layout": "vector", "values": [1, 3] }
+  ],
+  "nodes": [
+    {
+      "name": "BatchNormalization_0",
+      "op_type": "BatchNormalization",
+      "inputs": ["input", "bn.scale", "bn.bias", "bn.mean", "bn.var"],
+      "outputs": ["bn_out"],
+      "attributes": { "epsilon": 0.00001, "momentum": 0.9 }
+    },
+    {
+      "name": "AveragePool_1",
+      "op_type": "AveragePool",
+      "inputs": ["bn_out"],
+      "outputs": ["avg_out"],
+      "attributes": { "kernel_shape": [2, 2], "strides": [2, 2], "pads": [0, 0, 0, 0] }
+    },
+    {
+      "name": "GlobalAveragePool_2",
+      "op_type": "GlobalAveragePool",
+      "inputs": ["avg_out"],
+      "outputs": ["gap_out"]
+    },
+    {
+      "name": "Transpose_3",
+      "op_type": "Transpose",
+      "inputs": ["gap_out"],
+      "outputs": ["transposed"],
+      "attributes": { "perm": [0, 2, 3, 1] }
+    },
+    {
+      "name": "Reshape_4",
+      "op_type": "Reshape",
+      "inputs": ["transposed", "shape"],
+      "outputs": ["reshaped"],
+      "attributes": { "target_shape": [1, 3] }
+    }
+  ]
+}

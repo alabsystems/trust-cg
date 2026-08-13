@@ -1,0 +1,48 @@
+# trust-cg-llvm-import
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache-2.0
+#
+# Minimal textual LLVM IR (.ll) -> trust-ir importer. Used by Workstream 2
+# (issue #439) as the bridge between the llvm/llvm-test-suite SingleSource
+# correctness corpus and the Trust Codegen pipeline. The shipped root
+# LIMITATIONS.md and this crate's executable tests define the supported subset.
+
+[package]
+name = "trust-cg-llvm-import"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+authors = { workspace = true }
+publish = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+readme = { workspace = true }
+description = "Minimal LLVM IR (.ll) to trust-ir importer for external correctness corpora"
+
+[features]
+default = []
+driver = ["dep:trust-cg-codegen", "dep:trust-cg-opt"]
+
+[dependencies]
+trust-cg-ir = { workspace = true }
+trust-cg-lower = { workspace = true }
+trust-cg-codegen = { path = "../trust-cg-codegen", optional = true, default-features = false }
+# PGO profile plumbing for the 2-pass GEN/USE driver mode (CounterMap,
+# ProfData, CacheKey). Driver-only, like trust-cg-codegen.
+trust-cg-opt = { workspace = true, optional = true }
+serde_json = { workspace = true }
+trust-ir = { workspace = true }
+thiserror = { workspace = true }
+
+# Binary helper used by scripts/run_llvm_test_suite.sh. Takes a .ll on
+# disk and writes a .o (Mach-O) through the codegen pipeline, exiting
+# with `unsupported:` on stderr if the importer hits an Error::Unsupported.
+
+[[bin]]
+name = "trust-cg-ws2-import"
+path = "src/bin/trust-cg-ws2-import.rs"
+required-features = ["driver"]
+
+[lints]
+workspace = true

@@ -1,0 +1,98 @@
+# rustc_codegen_trust_cg — experimental nightly rustc backend.
+#
+# This crate is a nightly rustc codegen backend. It is NOT part of the
+# Trust Codegen workspace (different toolchain, uses `rustc_private`). Build with
+# the nightly pinned by this crate's `rust-toolchain.toml`.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates
+# License: Apache-2.0
+[package]
+name = "rustc_codegen_trust_cg"
+version = "0.1.0"
+edition = "2021"
+authors = ["Andrew Yates <andrewyates.name@gmail.com>"]
+license = "Apache-2.0"
+description = "Experimental Trust Codegen backend for nightly rustc"
+publish = false
+repository = "https://github.com/alabsystems/trust-cg"
+homepage = "https://github.com/alabsystems/trust-cg"
+
+[lib]
+# rustc loads the codegen backend as a dylib through
+# `-Zcodegen-backend=<path>`. On macOS that resolves to `.dylib`, on
+# Linux `.so`. This matches rustc_codegen_cranelift's crate-type.
+crate-type = ["dylib"]
+
+[features]
+default = []
+# ay-regalloc: forward the AY-PBO optimal register allocator (STAGE 3) down the
+# codegen dep chain (trust-cg-codegen -> trust-cg-regalloc). DEFAULT OFF, so the
+# shipped bridge is byte-identical to origin. Even when compiled in, the AY path
+# is entered only when the `TCG_AY_REGALLOC` env var is set (an opt-in behind a
+# high -O tier). A wrong AY allocation can never miscompile: it passes the same
+# always-on translation validator + per-instruction certs + TV-4 recheck greedy
+# does, and any rejection/timeout/oversize falls back to the greedy allocation.
+ay-regalloc = ["trust-cg-codegen/ay-regalloc"]
+
+[dependencies]
+# `verify` (a default feature, restated explicitly here) compiles in the
+# per-function proof-certificate surface (`cfg(feature = "verify")` paths in
+# `compiler.rs`: `generate_x86_64_proof_certificates`, the AArch64 cert path,
+# relocation-inventory certs). Without it, `emit_proofs = true` fail-closes
+# every x86-64 compile with `ProofsUnsupportedForTarget` (#465). The feature
+# adds NO new dependencies: trust-cg-verify is already a non-optional dep of
+# trust-cg-codegen (`default-features = false`, no solver toolchain) and the
+# verifier discharges obligations by pure exhaustive/statistical evaluation.
+trust-cg-codegen = { path = "../trust-cg-codegen", default-features = false, features = ["verify"] }
+trust-cg-lower = { path = "../trust-cg-lower" }
+# P1.3: the structural SSA / loop-completeness fail-closed gate
+# (`ssa_loop_complete::check_function_fail_closed`) lives in trust-cg-verify.
+# `default-features = false` keeps the SMT/ay subprocess toolchain out of the
+# bridge's dependency graph — the checker imports only `trust_ir` + `std`, so
+# this pulls in trust-cg-opt + rayon + sha2 + rmp-serde but no solver binary.
+trust-cg-verify = { path = "../trust-cg-verify", default-features = false }
+# Direct dependency (not `workspace = true`): this crate is its own workspace (see the
+# empty `[workspace]` below), so it cannot inherit `trust-ir` from the main
+# Trust Codegen workspace. The git source + features mirror the root workspace's
+# `workspace.dependencies.trust-ir` so feature unification with the
+# trust-cg-codegen/trust-cg-lower path deps stays consistent.
+trust-ir = { git = "https://github.com/alabsystems/trust-ir.git", rev = "f497428646b05c2f20ff0017f6b01d4924935d12", features = ["serde", "parser", "binary", "dialect-verif-example", "clean-expr"] }
+
+[package.metadata.rust-analyzer]
+# Tell rust-analyzer to enable `rustc_private` so it indexes our
+# extern crate rustc_* statements correctly.
+rustc_private = true
+
+# Keep this crate OUT of the Trust Codegen cargo workspace on purpose. It needs
+# a pinned nightly toolchain and links against rustc internals; those
+# concerns must not leak into the rest of the workspace.
+[workspace]
+
+# The backend ships as a ~89MB dylib that rustc dlopen()s on EVERY invocation,
+# so its load cost is paid once per compile and shows up as fixed overhead in
+# every compile-time comparison.
+#
+# WHAT THE DYNAMIC LINKER ACTUALLY TOUCHES (measured, aarch64 Cortex-X925):
+# a dlopen faults in only ~150 pages of this 89MB file. Every relocation
+# targets .data.rel.ro/.got/.data/.tbss -- ZERO target .text, .rodata,
+# .eh_frame or .gcc_except_table. So load cost is driven by the loader
+# METADATA (.dynsym/.dynstr/.gnu.hash/.rela.*) and the symbol/relocation
+# COUNT, not by how big the code is. Consequences, all measured:
+#   * Stripping does not help: .symtab/.strtab are never read at load.
+#   * Shrinking .eh_frame (2.6MB) / .gcc_except_table (4.8MB) cannot help
+#     either -- they are only paged in while unwinding, never at load.
+#   * opt-level="s" cut .text 57.8MB -> 35.4MB and still made load *slower*
+#     (dlopen 0.19 -> 0.30ms), because it raised the relocation count.
+# The lever that works is cutting exported symbols -- see
+# `emit_hidden_rlib_symbols` in build.rs (`--exclude-libs,ALL`), worth
+# ~1.4ms/invocation.
+#
+# lto="thin" + codegen-units=1 trades bridge BUILD time for per-compile load
+# time -- the right direction for something invoked far more often than it is
+# built. lto="fat" was measured and is NOT worth it: 4m20s vs 24s to relink for
+# a 2.8KB smaller dylib and no load-time difference (median paired diff
+# -0.12ms, faster in 23/41 rounds = noise).
+[profile.release]
+lto = "thin"
+codegen-units = 1

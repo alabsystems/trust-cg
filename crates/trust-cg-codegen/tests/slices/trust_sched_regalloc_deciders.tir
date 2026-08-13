@@ -1,0 +1,602 @@
+; TrustIr text format v1
+module "mir::closure::deciders_root"
+target "aarch64-apple-darwin" 8 little
+file 0 "trust_sched_regalloc_deciders_slice.rs"
+
+functy.0 = (i64, i64, i64, i64, u32, u32, u32, ptr) -> ()
+
+functy.1 = (i64, i64, i64, i64) -> (bool)
+
+functy.2 = (ptr, ptr) -> (bool)
+
+functy.3 = (ptr, u32) -> (bool)
+
+functy.4 = (ptr, u32) -> ()
+
+functy.5 = (ptr, u8, u8) -> ()
+
+functy.6 = (u8) -> (u32)
+
+functy.7 = (u8) -> (u32)
+
+functy.8 = (u8) -> (u32)
+
+functy.9 = (u8) -> (u32)
+
+functy.10 = (ptr, u32) -> ()
+
+functy.11 = (u8) -> (u32)
+
+functy.12 = (ptr, ptr) -> (bool)
+
+fn @deciders_root(functy.0) {
+bb0(%0: i64, %1: i64, %2: i64, %3: i64, %4: u32, %5: u32, %6: u32, %7: ptr):
+    %52 = alloca (i32, i32), align 4
+    %53 = alloca (i32, i32), align 4
+    %54 = alloca (i32, i32), align 4
+    %55 = alloca i8, align 1
+    %56 = alloca i8, align 1
+    %57 = alloca i8, align 1
+    %58 = alloca i8, align 1
+    %59 = call @func.1(%0, %1, %2, %3)
+    br bb1(%0, %1, %2, %3, %4, %5, %6, %7, %59)
+bb1(%8: i64, %9: i64, %10: i64, %11: i64, %12: u32, %13: u32, %14: u32, %15: ptr, %16: bool):
+    %60 = const u32 1
+    %61 = const u32 0
+    %62 = select u32 %16, %60, %61
+    store u32 %62, ptr %15
+    %63 = trunc i64 %8 to u32
+    %64 = trunc i64 %9 to u32
+    %65 = trunc i64 %10 to u32
+    %66 = trunc i64 %11 to u32
+    store u32 %63, ptr %52
+    %67 = const i64 4
+    %68 = gep i8, ptr %52, %67
+    store u32 %64, ptr %68
+    store u32 %65, ptr %53
+    %69 = const i64 4
+    %70 = gep i8, ptr %53, %69
+    store u32 %66, ptr %70
+    %71 = call @func.2(%52, %53)
+    br bb2(%12, %13, %14, %15, %63, %64, %65, %71)
+bb2(%17: u32, %18: u32, %19: u32, %20: ptr, %21: u32, %22: u32, %23: u32, %24: bool):
+    %72 = const u32 1
+    %73 = const u32 0
+    %74 = select u32 %24, %72, %73
+    %75 = const i64 4
+    %76 = gep i8, ptr %20, %75
+    store u32 %74, ptr %76
+    store u32 %21, ptr %54
+    %77 = const i64 4
+    %78 = gep i8, ptr %54, %77
+    store u32 %22, ptr %78
+    %79 = call @func.3(%54, %23)
+    br bb3(%17, %18, %19, %20, %79)
+bb3(%25: u32, %26: u32, %27: u32, %28: ptr, %29: bool):
+    %80 = const u32 1
+    %81 = const u32 0
+    %82 = select u32 %29, %80, %81
+    %83 = const i64 8
+    %84 = gep i8, ptr %28, %83
+    store u32 %82, ptr %84
+    call @func.4(%55, %25)
+    br bb4(%26, %27, %28)
+bb4(%30: u32, %31: u32, %32: ptr):
+    call @func.4(%56, %30)
+    br bb5(%31, %32)
+bb5(%33: u32, %34: ptr):
+    %85 = load u8, ptr %55
+    %86 = load u8, ptr %56
+    call @func.5(%57, %85, %86)
+    br bb6(%33, %34)
+bb6(%35: u32, %36: ptr):
+    %87 = load u8, ptr %57
+    %88 = call @func.6(%87)
+    br bb7(%35, %36, %88)
+bb7(%37: u32, %38: ptr, %39: u32):
+    %89 = const i64 12
+    %90 = gep i8, ptr %38, %89
+    store u32 %39, ptr %90
+    %91 = load u8, ptr %55
+    %92 = call @func.7(%91)
+    br bb8(%37, %38, %92)
+bb8(%40: u32, %41: ptr, %42: u32):
+    %93 = const i64 16
+    %94 = gep i8, ptr %41, %93
+    store u32 %42, ptr %94
+    %95 = load u8, ptr %55
+    %96 = call @func.8(%95)
+    br bb9(%40, %41, %96)
+bb9(%43: u32, %44: ptr, %45: u32):
+    %97 = const i64 20
+    %98 = gep i8, ptr %44, %97
+    store u32 %45, ptr %98
+    %99 = load u8, ptr %55
+    %100 = call @func.9(%99)
+    br bb10(%43, %44, %100)
+bb10(%46: u32, %47: ptr, %48: u32):
+    %101 = const i64 24
+    %102 = gep i8, ptr %47, %101
+    store u32 %48, ptr %102
+    call @func.10(%58, %46)
+    br bb11(%47)
+bb11(%49: ptr):
+    %103 = load u8, ptr %58
+    %104 = call @func.11(%103)
+    br bb12(%49, %104)
+bb12(%50: ptr, %51: u32):
+    %105 = const i64 28
+    %106 = gep i8, ptr %50, %105
+    store u32 %51, ptr %106
+    ret
+}
+
+fn @byte_ranges_overlap(functy.1) {
+bb0(%0: i64, %1: i64, %2: i64, %3: i64):
+    %23 = const i64 0
+    %24 = icmp sle i64 %1, %23
+    condbr %24, bb2, bb1(%0, %1, %2, %3)
+bb1(%4: i64, %5: i64, %6: i64, %7: i64):
+    %25 = const i64 0
+    %26 = icmp sle i64 %7, %25
+    condbr %26, bb2, bb3(%4, %5, %6, %7)
+bb2:
+    %27 = const bool true
+    br bb10(%27)
+bb3(%8: i64, %9: i64, %10: i64, %11: i64):
+    %28 = const i64 9223372036854775807
+    %29 = sub i64 %28, %9
+    %30 = icmp sgt i64 %8, %29
+    condbr %30, bb4, bb5(%8, %9, %10, %11)
+bb4:
+    %31 = const bool true
+    br bb10(%31)
+bb5(%12: i64, %13: i64, %14: i64, %15: i64):
+    %32 = const i64 9223372036854775807
+    %33 = sub i64 %32, %15
+    %34 = icmp sgt i64 %14, %33
+    condbr %34, bb6, bb7(%12, %13, %14, %15)
+bb6:
+    %35 = const bool true
+    br bb10(%35)
+bb7(%16: i64, %17: i64, %18: i64, %19: i64):
+    %36 = add i64 %16, %17
+    %37 = add i64 %18, %19
+    %38 = icmp slt i64 %16, %37
+    condbr %38, bb8(%18, %36), bb9
+bb8(%20: i64, %21: i64):
+    %39 = icmp slt i64 %20, %21
+    br bb10(%39)
+bb9:
+    %40 = const bool false
+    br bb10(%40)
+bb10(%22: bool):
+    ret %22
+}
+
+fn @LiveRange__overlaps(functy.2) {
+bb0(%0: ptr, %1: ptr):
+    %5 = load u32, ptr %0
+    %6 = const i64 4
+    %7 = gep i8, ptr %1, %6
+    %8 = load u32, ptr %7
+    %9 = icmp ult u32 %5, %8
+    condbr %9, bb1(%0, %1), bb2
+bb1(%2: ptr, %3: ptr):
+    %10 = load u32, ptr %3
+    %11 = const i64 4
+    %12 = gep i8, ptr %2, %11
+    %13 = load u32, ptr %12
+    %14 = icmp ult u32 %10, %13
+    br bb3(%14)
+bb2:
+    %15 = const bool false
+    br bb3(%15)
+bb3(%4: bool):
+    ret %4
+}
+
+fn @LiveRange__contains(functy.3) {
+bb0(%0: ptr, %1: u32):
+    %5 = load u32, ptr %0
+    %6 = icmp ule u32 %5, %1
+    condbr %6, bb1(%0, %1), bb2
+bb1(%2: ptr, %3: u32):
+    %7 = const i64 4
+    %8 = gep i8, ptr %2, %7
+    %9 = load u32, ptr %8
+    %10 = icmp ult u32 %3, %9
+    br bb3(%10)
+bb2:
+    %11 = const bool false
+    br bb3(%11)
+bb3(%4: bool):
+    ret %4
+}
+
+fn @reg_class_from_tag(functy.4) {
+bb0(%0: ptr, %1: u32):
+    switch %1 [ 0: bb8 1: bb7 2: bb6 3: bb5 4: bb4 5: bb3 6: bb2 default: bb1 ]
+bb1:
+    %2 = const i8 7
+    store i8 %2, ptr %0
+    br bb9
+bb2:
+    %3 = const i8 6
+    store i8 %3, ptr %0
+    br bb9
+bb3:
+    %4 = const i8 5
+    store i8 %4, ptr %0
+    br bb9
+bb4:
+    %5 = const i8 4
+    store i8 %5, ptr %0
+    br bb9
+bb5:
+    %6 = const i8 3
+    store i8 %6, ptr %0
+    br bb9
+bb6:
+    %7 = const i8 2
+    store i8 %7, ptr %0
+    br bb9
+bb7:
+    %8 = const i8 1
+    store i8 %8, ptr %0
+    br bb9
+bb8:
+    %9 = const i8 0
+    store i8 %9, ptr %0
+    br bb9
+bb9:
+    ret
+}
+
+fn @merge_vreg_class(functy.5) {
+bb0(%0: ptr, %1: u8, %2: u8):
+    %4 = alloca i8, align 1
+    %5 = alloca i8, align 1
+    %6 = alloca (i8, i8), align 1
+    store u8 %1, ptr %4
+    store u8 %2, ptr %5
+    %7 = call @func.12(%4, %5)
+    br bb1(%7)
+bb1(%3: bool):
+    condbr %3, bb2, bb3
+bb2:
+    %8 = load i8, ptr %4
+    store i8 %8, ptr %0
+    br bb30
+bb3:
+    %9 = load i8, ptr %4
+    store i8 %9, ptr %6
+    %10 = const i64 1
+    %11 = gep i8, ptr %6, %10
+    %12 = load i8, ptr %5
+    store i8 %12, ptr %11
+    %13 = load i8, ptr %6
+    %14 = sext i8 %13 to i64
+    switch %14 [ 0: bb5 default: bb4 ]
+bb4:
+    %15 = const i64 1
+    %16 = gep i8, ptr %6, %15
+    %17 = load i8, ptr %16
+    %18 = sext i8 %17 to i64
+    switch %18 [ 0: bb7 1: bb9 7: bb8 default: bb6 ]
+bb5:
+    %19 = const i64 1
+    %20 = gep i8, ptr %6, %19
+    %21 = load i8, ptr %20
+    %22 = sext i8 %21 to i64
+    switch %22 [ 1: bb29 7: bb29 default: bb4 ]
+bb6:
+    %23 = load i8, ptr %6
+    %24 = sext i8 %23 to i64
+    switch %24 [ 2: bb11 default: bb10 ]
+bb7:
+    %25 = load i8, ptr %6
+    %26 = sext i8 %25 to i64
+    switch %26 [ 1: bb29 7: bb29 default: bb6 ]
+bb8:
+    %27 = load i8, ptr %6
+    %28 = sext i8 %27 to i64
+    switch %28 [ 1: bb28 default: bb6 ]
+bb9:
+    %29 = load i8, ptr %6
+    %30 = sext i8 %29 to i64
+    switch %30 [ 7: bb28 default: bb6 ]
+bb10:
+    %31 = const i64 1
+    %32 = gep i8, ptr %6, %31
+    %33 = load i8, ptr %32
+    %34 = sext i8 %33 to i64
+    switch %34 [ 2: bb13 default: bb12 ]
+bb11:
+    %35 = const i64 1
+    %36 = gep i8, ptr %6, %35
+    %37 = load i8, ptr %36
+    %38 = sext i8 %37 to i64
+    switch %38 [ 3: bb27 4: bb27 5: bb27 6: bb27 default: bb10 ]
+bb12:
+    %39 = load i8, ptr %6
+    %40 = sext i8 %39 to i64
+    switch %40 [ 3: bb15 default: bb14 ]
+bb13:
+    %41 = load i8, ptr %6
+    %42 = sext i8 %41 to i64
+    switch %42 [ 3: bb27 4: bb27 5: bb27 6: bb27 default: bb12 ]
+bb14:
+    %43 = const i64 1
+    %44 = gep i8, ptr %6, %43
+    %45 = load i8, ptr %44
+    %46 = sext i8 %45 to i64
+    switch %46 [ 3: bb17 default: bb16 ]
+bb15:
+    %47 = const i64 1
+    %48 = gep i8, ptr %6, %47
+    %49 = load i8, ptr %48
+    %50 = sext i8 %49 to i64
+    switch %50 [ 4: bb26 5: bb26 6: bb26 default: bb14 ]
+bb16:
+    %51 = load i8, ptr %6
+    %52 = sext i8 %51 to i64
+    switch %52 [ 4: bb19 default: bb18 ]
+bb17:
+    %53 = load i8, ptr %6
+    %54 = sext i8 %53 to i64
+    switch %54 [ 4: bb26 5: bb26 6: bb26 default: bb16 ]
+bb18:
+    %55 = const i64 1
+    %56 = gep i8, ptr %6, %55
+    %57 = load i8, ptr %56
+    %58 = sext i8 %57 to i64
+    switch %58 [ 4: bb21 5: bb23 6: bb22 default: bb20 ]
+bb19:
+    %59 = const i64 1
+    %60 = gep i8, ptr %6, %59
+    %61 = load i8, ptr %60
+    %62 = sext i8 %61 to i64
+    switch %62 [ 5: bb25 6: bb25 default: bb18 ]
+bb20:
+    %63 = load i8, ptr %4
+    store i8 %63, ptr %0
+    br bb30
+bb21:
+    %64 = load i8, ptr %6
+    %65 = sext i8 %64 to i64
+    switch %65 [ 5: bb25 6: bb25 default: bb20 ]
+bb22:
+    %66 = load i8, ptr %6
+    %67 = sext i8 %66 to i64
+    switch %67 [ 5: bb24 default: bb20 ]
+bb23:
+    %68 = load i8, ptr %6
+    %69 = sext i8 %68 to i64
+    switch %69 [ 6: bb24 default: bb20 ]
+bb24:
+    %70 = const i8 5
+    store i8 %70, ptr %0
+    br bb30
+bb25:
+    %71 = const i8 4
+    store i8 %71, ptr %0
+    br bb30
+bb26:
+    %72 = const i8 3
+    store i8 %72, ptr %0
+    br bb30
+bb27:
+    %73 = const i8 2
+    store i8 %73, ptr %0
+    br bb30
+bb28:
+    %74 = const i8 1
+    store i8 %74, ptr %0
+    br bb30
+bb29:
+    %75 = const i8 0
+    store i8 %75, ptr %0
+    br bb30
+bb30:
+    ret
+}
+
+fn @reg_class_tag(functy.6) {
+bb0(%0: u8):
+    %2 = alloca i8, align 1
+    store u8 %0, ptr %2
+    %3 = load i8, ptr %2
+    %4 = sext i8 %3 to i64
+    switch %4 [ 0: bb9 1: bb8 2: bb7 3: bb6 4: bb5 5: bb4 6: bb3 7: bb2 default: bb1 ]
+bb1:
+    unreachable
+bb2:
+    %5 = const u32 7
+    br bb10(%5)
+bb3:
+    %6 = const u32 6
+    br bb10(%6)
+bb4:
+    %7 = const u32 5
+    br bb10(%7)
+bb5:
+    %8 = const u32 4
+    br bb10(%8)
+bb6:
+    %9 = const u32 3
+    br bb10(%9)
+bb7:
+    %10 = const u32 2
+    br bb10(%10)
+bb8:
+    %11 = const u32 1
+    br bb10(%11)
+bb9:
+    %12 = const u32 0
+    br bb10(%12)
+bb10(%1: u32):
+    ret %1
+}
+
+fn @reg_class_size(functy.7) {
+bb0(%0: u8):
+    %2 = alloca i8, align 1
+    store u8 %0, ptr %2
+    %3 = load i8, ptr %2
+    %4 = sext i8 %3 to i64
+    switch %4 [ 0: bb6 1: bb7 2: bb5 3: bb6 4: bb7 5: bb4 6: bb3 7: bb2 default: bb1 ]
+bb1:
+    unreachable
+bb2:
+    %5 = const u32 4
+    br bb8(%5)
+bb3:
+    %6 = const u32 1
+    br bb8(%6)
+bb4:
+    %7 = const u32 2
+    br bb8(%7)
+bb5:
+    %8 = const u32 16
+    br bb8(%8)
+bb6:
+    %9 = const u32 8
+    br bb8(%9)
+bb7:
+    %10 = const u32 4
+    br bb8(%10)
+bb8(%1: u32):
+    ret %1
+}
+
+fn @RegClass__size_bits(functy.8) {
+bb0(%0: u8):
+    %2 = alloca i8, align 1
+    store u8 %0, ptr %2
+    %3 = load i8, ptr %2
+    %4 = sext i8 %3 to i64
+    switch %4 [ 0: bb9 1: bb8 2: bb7 3: bb6 4: bb5 5: bb4 6: bb3 7: bb2 default: bb1 ]
+bb1:
+    unreachable
+bb2:
+    %5 = const u32 32
+    br bb10(%5)
+bb3:
+    %6 = const u32 8
+    br bb10(%6)
+bb4:
+    %7 = const u32 16
+    br bb10(%7)
+bb5:
+    %8 = const u32 32
+    br bb10(%8)
+bb6:
+    %9 = const u32 64
+    br bb10(%9)
+bb7:
+    %10 = const u32 128
+    br bb10(%10)
+bb8:
+    %11 = const u32 32
+    br bb10(%11)
+bb9:
+    %12 = const u32 64
+    br bb10(%12)
+bb10(%1: u32):
+    ret %1
+}
+
+fn @RegClass__size_bytes(functy.9) {
+bb0(%0: u8):
+    %3 = alloca i8, align 1
+    store u8 %0, ptr %3
+    %4 = load u8, ptr %3
+    %5 = call @func.8(%4)
+    br bb1(%5)
+bb1(%1: u32):
+    %6 = const u32 8
+    %7 = const u32 0
+    %8 = icmp eq u32 %6, %7
+    %9 = const bool false
+    %10 = icmp eq bool %8, %9
+    condbr %10, bb2(%1), bb3
+bb2(%2: u32):
+    %11 = const u32 8
+    %12 = udiv u32 %2, %11
+    ret %12
+bb3:
+    unreachable
+}
+
+fn @port_from_tag(functy.10) {
+bb0(%0: ptr, %1: u32):
+    switch %1 [ 0: bb6 1: bb5 2: bb4 3: bb3 4: bb2 default: bb1 ]
+bb1:
+    %2 = const i8 5
+    store i8 %2, ptr %0
+    br bb7
+bb2:
+    %3 = const i8 4
+    store i8 %3, ptr %0
+    br bb7
+bb3:
+    %4 = const i8 3
+    store i8 %4, ptr %0
+    br bb7
+bb4:
+    %5 = const i8 2
+    store i8 %5, ptr %0
+    br bb7
+bb5:
+    %6 = const i8 1
+    store i8 %6, ptr %0
+    br bb7
+bb6:
+    %7 = const i8 0
+    store i8 %7, ptr %0
+    br bb7
+bb7:
+    ret
+}
+
+fn @port_capacity(functy.11) {
+bb0(%0: u8):
+    %2 = alloca i8, align 1
+    store u8 %0, ptr %2
+    %3 = load i8, ptr %2
+    %4 = sext i8 %3 to i64
+    switch %4 [ 0: bb7 1: bb6 2: bb5 3: bb4 4: bb3 5: bb2 default: bb1 ]
+bb1:
+    unreachable
+bb2:
+    %5 = const u32 4
+    br bb8(%5)
+bb3:
+    %6 = const u32 1
+    br bb8(%6)
+bb4:
+    %7 = const u32 2
+    br bb8(%7)
+bb5:
+    %8 = const u32 1
+    br bb8(%8)
+bb6:
+    %9 = const u32 2
+    br bb8(%9)
+bb7:
+    %10 = const u32 6
+    br bb8(%10)
+bb8(%1: u32):
+    ret %1
+}
+
+fn @_RegClass_as_std__cmp__PartialEq___eq(functy.12) {
+bb0(%0: ptr, %1: ptr):
+    %2 = load i8, ptr %0
+    %3 = sext i8 %2 to i64
+    %4 = load i8, ptr %1
+    %5 = sext i8 %4 to i64
+    %6 = icmp eq i64 %3, %5
+    ret %6
+}

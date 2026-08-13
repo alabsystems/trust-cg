@@ -1,0 +1,42 @@
+satprov1
+rule Neg_I8 -> NEG (8-bit)
+width 8
+vars 42
+input a 1 2 3 4 5 6 7 8
+gate ir xor2 9 -2 -1
+gate ir and2 10 -2 -1
+gate ir xor2 11 -3 10
+gate ir and2 12 -3 10
+gate ir xor2 13 -4 12
+gate ir and2 14 -4 12
+gate ir xor2 15 -5 14
+gate ir and2 16 -5 14
+gate ir xor2 17 -6 16
+gate ir and2 18 -6 16
+gate ir xor2 19 -7 18
+gate ir and2 20 -7 18
+gate ir xor2 21 -8 20
+gate mc xor2 22 -2 -1
+gate mc and2 23 -2 -1
+gate mc xor2 24 -3 23
+gate mc and2 25 -3 23
+gate mc xor2 26 -4 25
+gate mc and2 27 -4 25
+gate mc xor2 28 -5 27
+gate mc and2 29 -5 27
+gate mc xor2 30 -6 29
+gate mc and2 31 -6 29
+gate mc xor2 32 -7 31
+gate mc and2 33 -7 31
+gate mc xor2 34 -8 33
+gate diff xor2 35 1 1
+gate diff xor2 36 9 22
+gate diff xor2 37 11 24
+gate diff xor2 38 13 26
+gate diff xor2 39 15 28
+gate diff xor2 40 17 30
+gate diff xor2 41 19 32
+gate diff xor2 42 21 34
+irout 1 9 11 13 15 17 19 21
+mcout 1 22 24 26 28 30 32 34
+diff 35 36 37 38 39 40 41 42

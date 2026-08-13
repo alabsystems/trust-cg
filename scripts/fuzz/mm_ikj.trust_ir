@@ -1,0 +1,52 @@
+; TrustIr text format v1
+module "mm"
+target "aarch64-apple-darwin" 8 little abi="aapcs64"
+functy.0 = (ptr, ptr, ptr, i32) -> ()
+fn @matmul(functy.0) {
+; #param_attrs 0: noalias
+; #param_attrs 1: noalias
+; #param_attrs 2: noalias
+bb0(%0: ptr, %1: ptr, %2: ptr, %3: i32):
+    %4 = const i32 0
+    %5 = const i32 1
+    br bb1(%4)
+bb1(%10: i32):
+    %50 = icmp slt i32 %10, %3
+    condbr %50, bb2, bb9
+bb2:
+    %11 = mul i32 %10, %3
+    %12 = gep i32, ptr %0, %11
+    %13 = mul i32 %10, %3
+    %14 = gep i32, ptr %1, %13
+    br bb3(%4)
+bb3(%20: i32):
+    %51 = icmp slt i32 %20, %3
+    condbr %51, bb4, bb8
+bb4:
+    %21 = gep i32, ptr %14, %20
+    %22 = load i32, ptr %21
+    %23 = mul i32 %20, %3
+    %24 = gep i32, ptr %2, %23
+    br bb5(%4)
+bb5(%30: i32):
+    %52 = icmp slt i32 %30, %3
+    condbr %52, bb6, bb7
+bb6:
+    %31 = gep i32, ptr %12, %30
+    %32 = load i32, ptr %31
+    %33 = gep i32, ptr %24, %30
+    %34 = load i32, ptr %33
+    %35 = mul i32 %22, %34
+    %36 = add i32 %32, %35
+    store i32 %36, ptr %31
+    %37 = add i32 %30, %5
+    br bb5(%37)
+bb7:
+    %40 = add i32 %20, %5
+    br bb3(%40)
+bb8:
+    %41 = add i32 %10, %5
+    br bb1(%41)
+bb9:
+    ret
+}

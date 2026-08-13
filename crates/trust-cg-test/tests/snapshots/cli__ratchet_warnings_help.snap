@@ -1,0 +1,52 @@
+---
+source: crates/trust-cg-test/tests/cli.rs
+expression: "help_of(&[\"ratchet\", \"warnings\"])"
+---
+Warnings-zero ratchet for the Trust Codegen workspace.
+
+Builds the workspace and tests through the centralized cargo wrapper, counts Rust diagnostics, and
+fails when the total warning count exceeds `ratchet/warnings_baseline.json`.
+
+# Examples
+
+  trust-cg-test ratchet warnings
+  trust-cg-test ratchet warnings --format json
+
+Usage: trust-cg-test ratchet warnings [OPTIONS]
+
+Options:
+  -f, --format <FORMAT>
+          Output format (human, json, junit)
+
+          Possible values:
+          - human: Pretty table + narrative, targeted at humans
+          - json:  Machine-readable JSON
+          - junit: JUnit XML for CI consumers
+
+          [default: human]
+
+  -o, --out <PATH>
+          Override the command-specific output file or directory.
+
+          See the selected subcommand's help for its output type and default.
+
+      --timeout <SECS>
+          Per-unit timeout in seconds. Subcommands may apply per-unit defaults when this is unset
+
+      --parallel <N>
+          Worker count (honors cargo-serialization lock). Default: auto
+
+  -q, --quiet
+          Suppress progress bars; errors still go to stderr
+
+  -v, --verbose...
+          Show debug-level events. Repeat for more: -vv, -vvv
+
+      --no-cache
+          Ignore proof / corpus caches
+
+      --dry-run
+          Print what would run without executing external tools
+
+  -h, --help
+          Print help (see a summary with '-h')

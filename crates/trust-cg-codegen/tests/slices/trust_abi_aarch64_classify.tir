@@ -1,0 +1,599 @@
+; TrustIr text format v1
+module "mir::closure::abi_aa_root"
+target "aarch64-apple-darwin" 8 little
+file 0 "trust_abi_aarch64_classify_slice.rs"
+
+functy.0 = (u32, u32, u32, i64, i64, ptr) -> ()
+
+functy.1 = (ptr, u32) -> ()
+
+functy.2 = (ptr) -> (u32)
+
+functy.3 = (ptr) -> (u32)
+
+functy.4 = (ptr, ptr, u64) -> ()
+
+functy.5 = (ptr, u32) -> ()
+
+functy.6 = (i64, i64) -> (i64)
+
+fn @abi_aa_root(functy.0) {
+bb0(%0: u32, %1: u32, %2: u32, %3: i64, %4: i64, %5: ptr):
+    %60 = alloca i8, align 1
+    %61 = alloca (i64, i64, i64), align 8
+    %62 = alloca (i64, i64), align 8
+    %63 = alloca (i32, i32), align 4
+    call @func.1(%60, %0)
+    br bb1(%1, %2, %3, %4, %5)
+bb1(%6: u32, %7: u32, %8: i64, %9: i64, %10: ptr):
+    %64 = call @func.2(%60)
+    br bb2(%6, %7, %8, %9, %10, %64)
+bb2(%11: u32, %12: u32, %13: i64, %14: i64, %15: ptr, %16: u32):
+    store u32 %16, ptr %15
+    %65 = call @func.3(%60)
+    br bb3(%11, %12, %13, %14, %15, %65)
+bb3(%17: u32, %18: u32, %19: i64, %20: i64, %21: ptr, %22: u32):
+    %66 = const i64 4
+    %67 = gep i8, ptr %21, %66
+    store u32 %22, ptr %67
+    %68 = zext u32 %17 to u64
+    call @func.4(%61, %60, %68)
+    br bb4(%18, %19, %20, %21)
+bb4(%23: u32, %24: i64, %25: i64, %26: ptr):
+    %69 = load i16, ptr %61
+    %70 = const i16 4
+    %71 = icmp eq i16 %69, %70
+    %72 = const i64 0
+    %73 = const i64 1
+    %74 = select i64 %71, %72, %73
+    switch %74 [ 0: bb7(%23, %24, %25, %26) 1: bb6(%23, %24, %25, %26) default: bb5 ]
+bb5:
+    unreachable
+bb6(%27: u32, %28: i64, %29: i64, %30: ptr):
+    %75 = load i64, ptr %61
+    store i64 %75, ptr %62
+    %76 = const i64 8
+    %77 = gep i8, ptr %61, %76
+    %78 = const i64 8
+    %79 = gep i8, ptr %62, %78
+    %80 = load i64, ptr %77
+    store i64 %80, ptr %79
+    %81 = const i64 16
+    %82 = gep i8, ptr %61, %81
+    %83 = load u64, ptr %82
+    %84 = const u32 1
+    %85 = const i64 8
+    %86 = gep i8, ptr %30, %85
+    store u32 %84, ptr %86
+    %87 = load i16, ptr %62
+    %88 = sext i16 %87 to i64
+    switch %88 [ 0: bb9(%27, %28, %29, %30, %83) default: bb8(%27, %28, %29, %30, %83) ]
+bb7(%31: u32, %32: i64, %33: i64, %34: ptr):
+    %89 = const u32 0
+    %90 = const i64 8
+    %91 = gep i8, ptr %34, %90
+    store u32 %89, ptr %91
+    %92 = const u32 9999
+    %93 = const i64 12
+    %94 = gep i8, ptr %34, %93
+    store u32 %92, ptr %94
+    %95 = const u32 9999
+    %96 = const i64 16
+    %97 = gep i8, ptr %34, %96
+    store u32 %95, ptr %97
+    br bb11(%31, %32, %33, %34)
+bb8(%35: u32, %36: i64, %37: i64, %38: ptr, %39: u64):
+    %98 = const u32 8888
+    br bb10(%35, %36, %37, %38, %39, %98)
+bb9(%40: u32, %41: i64, %42: i64, %43: ptr, %44: u64):
+    %99 = const i64 2
+    %100 = gep i8, ptr %62, %99
+    %101 = load u16, ptr %100
+    %102 = zext u16 %101 to u32
+    br bb10(%40, %41, %42, %43, %44, %102)
+bb10(%45: u32, %46: i64, %47: i64, %48: ptr, %49: u64, %50: u32):
+    %103 = const i64 12
+    %104 = gep i8, ptr %48, %103
+    store u32 %50, ptr %104
+    %105 = trunc u64 %49 to u32
+    %106 = const i64 16
+    %107 = gep i8, ptr %48, %106
+    store u32 %105, ptr %107
+    br bb11(%45, %46, %47, %48)
+bb11(%51: u32, %52: i64, %53: i64, %54: ptr):
+    call @func.5(%63, %51)
+    br bb12(%52, %53, %54)
+bb12(%55: i64, %56: i64, %57: ptr):
+    %108 = load u32, ptr %63
+    %109 = const i64 4
+    %110 = gep i8, ptr %63, %109
+    %111 = load u32, ptr %110
+    %112 = const i64 20
+    %113 = gep i8, ptr %57, %112
+    store u32 %108, ptr %113
+    %114 = const i64 24
+    %115 = gep i8, ptr %57, %114
+    store u32 %111, ptr %115
+    %116 = call @func.6(%55, %56)
+    br bb13(%57, %116)
+bb13(%58: ptr, %59: i64):
+    %117 = const i64 32
+    %118 = gep i8, ptr %58, %117
+    store i64 %59, ptr %118
+    ret
+}
+
+fn @build_type(functy.1) {
+bb0(%0: ptr, %1: u32):
+    switch %1 [ 0: bb10 1: bb9 2: bb8 3: bb7 4: bb6 5: bb5 6: bb4 7: bb3 8: bb2 default: bb1 ]
+bb1:
+    %2 = const i8 9
+    store i8 %2, ptr %0
+    br bb11
+bb2:
+    %3 = const i8 8
+    store i8 %3, ptr %0
+    br bb11
+bb3:
+    %4 = const i8 7
+    store i8 %4, ptr %0
+    br bb11
+bb4:
+    %5 = const i8 6
+    store i8 %5, ptr %0
+    br bb11
+bb5:
+    %6 = const i8 5
+    store i8 %6, ptr %0
+    br bb11
+bb6:
+    %7 = const i8 4
+    store i8 %7, ptr %0
+    br bb11
+bb7:
+    %8 = const i8 3
+    store i8 %8, ptr %0
+    br bb11
+bb8:
+    %9 = const i8 2
+    store i8 %9, ptr %0
+    br bb11
+bb9:
+    %10 = const i8 1
+    store i8 %10, ptr %0
+    br bb11
+bb10:
+    %11 = const i8 0
+    store i8 %11, ptr %0
+    br bb11
+bb11:
+    ret
+}
+
+fn @Type__bytes(functy.2) {
+bb0(%0: ptr):
+    %2 = load i8, ptr %0
+    %3 = sext i8 %2 to i64
+    switch %3 [ 0: bb6 1: bb5 2: bb4 3: bb3 4: bb2 5: bb5 6: bb4 7: bb3 8: bb6 9: bb2 default: bb1 ]
+bb1:
+    unreachable
+bb2:
+    %4 = const u32 16
+    br bb7(%4)
+bb3:
+    %5 = const u32 8
+    br bb7(%5)
+bb4:
+    %6 = const u32 4
+    br bb7(%6)
+bb5:
+    %7 = const u32 2
+    br bb7(%7)
+bb6:
+    %8 = const u32 1
+    br bb7(%8)
+bb7(%1: u32):
+    ret %1
+}
+
+fn @Type__align(functy.3) {
+bb0(%0: ptr):
+    %5 = load i8, ptr %0
+    %6 = sext i8 %5 to i64
+    switch %6 [ 4: bb2 9: bb2 default: bb1(%0) ]
+bb1(%1: ptr):
+    %7 = call @func.2(%1)
+    br bb3(%7)
+bb2:
+    %8 = const u32 16
+    br bb6(%8)
+bb3(%2: u32):
+    %9 = const u32 8
+    %10 = icmp ult u32 %2, %9
+    condbr %10, bb4(%2), bb5
+bb4(%3: u32):
+    br bb6(%3)
+bb5:
+    %11 = const u32 8
+    br bb6(%11)
+bb6(%4: u32):
+    ret %4
+}
+
+fn @classify_fp_arg(functy.4) {
+bb0(%0: ptr, %1: ptr, %2: u64):
+    %17 = alloca (i64, i64, i64), align 8
+    %18 = alloca (i64, i64), align 8
+    %19 = alloca (i16, i16), align 2
+    %20 = alloca (i64, i64), align 8
+    %21 = alloca (i64, i64, i64), align 8
+    %22 = alloca (i64, i64), align 8
+    %23 = alloca (i16, i16), align 2
+    %24 = alloca (i64, i64), align 8
+    %25 = alloca (i64, i64, i64), align 8
+    %26 = alloca (i64, i64), align 8
+    %27 = alloca (i16, i16), align 2
+    %28 = alloca (i64, i64), align 8
+    %29 = alloca (i64, i64, i64), align 8
+    %30 = alloca (i64, i64), align 8
+    %31 = alloca (i16, i16), align 2
+    %32 = alloca (i64, i64), align 8
+    %33 = const u64 8
+    %34 = icmp uge u64 %2, %33
+    condbr %34, bb1, bb2(%1, %2)
+bb1:
+    %35 = const i16 4
+    store i16 %35, ptr %0
+    br bb16
+bb2(%3: ptr, %4: u64):
+    %36 = trunc u64 %4 to u16
+    %37 = load i8, ptr %3
+    %38 = sext i8 %37 to i64
+    switch %38 [ 5: bb7(%4, %36) 6: bb6(%4, %36) 7: bb5(%4, %36) 9: bb4(%4, %36) default: bb3 ]
+bb3:
+    %39 = const i16 4
+    store i16 %39, ptr %0
+    br bb16
+bb4(%5: u64, %6: u16):
+    %40 = const u16 64
+    %41, %42 = add.overflow u16 %40, %6
+    store u16 %41, ptr %31
+    %43 = const i64 2
+    %44 = gep i8, ptr %31, %43
+    store bool %42, ptr %44
+    %45 = const i64 2
+    %46 = gep i8, ptr %31, %45
+    %47 = load bool, ptr %46
+    %48 = const bool false
+    %49 = icmp eq bool %47, %48
+    condbr %49, bb14(%5), bb17
+bb5(%7: u64, %8: u16):
+    %50 = const u16 96
+    %51, %52 = add.overflow u16 %50, %8
+    store u16 %51, ptr %27
+    %53 = const i64 2
+    %54 = gep i8, ptr %27, %53
+    store bool %52, ptr %54
+    %55 = const i64 2
+    %56 = gep i8, ptr %27, %55
+    %57 = load bool, ptr %56
+    %58 = const bool false
+    %59 = icmp eq bool %57, %58
+    condbr %59, bb12(%7), bb17
+bb6(%9: u64, %10: u16):
+    %60 = const u16 128
+    %61, %62 = add.overflow u16 %60, %10
+    store u16 %61, ptr %23
+    %63 = const i64 2
+    %64 = gep i8, ptr %23, %63
+    store bool %62, ptr %64
+    %65 = const i64 2
+    %66 = gep i8, ptr %23, %65
+    %67 = load bool, ptr %66
+    %68 = const bool false
+    %69 = icmp eq bool %67, %68
+    condbr %69, bb10(%9), bb17
+bb7(%11: u64, %12: u16):
+    %70 = const u16 165
+    %71, %72 = add.overflow u16 %70, %12
+    store u16 %71, ptr %19
+    %73 = const i64 2
+    %74 = gep i8, ptr %19, %73
+    store bool %72, ptr %74
+    %75 = const i64 2
+    %76 = gep i8, ptr %19, %75
+    %77 = load bool, ptr %76
+    %78 = const bool false
+    %79 = icmp eq bool %77, %78
+    condbr %79, bb8(%11), bb17
+bb8(%13: u64):
+    %80 = load u16, ptr %19
+    %81 = const i64 2
+    %82 = gep i8, ptr %18, %81
+    store u16 %80, ptr %82
+    %83 = const i16 0
+    store i16 %83, ptr %18
+    %84 = const u64 1
+    %85, %86 = add.overflow u64 %13, %84
+    store u64 %85, ptr %20
+    %87 = const i64 8
+    %88 = gep i8, ptr %20, %87
+    store bool %86, ptr %88
+    %89 = const i64 8
+    %90 = gep i8, ptr %20, %89
+    %91 = load bool, ptr %90
+    %92 = const bool false
+    %93 = icmp eq bool %91, %92
+    condbr %93, bb9, bb17
+bb9:
+    %94 = load u64, ptr %20
+    %95 = load i64, ptr %18
+    store i64 %95, ptr %17
+    %96 = const i64 8
+    %97 = gep i8, ptr %18, %96
+    %98 = const i64 8
+    %99 = gep i8, ptr %17, %98
+    %100 = load i64, ptr %97
+    store i64 %100, ptr %99
+    %101 = const i64 16
+    %102 = gep i8, ptr %17, %101
+    store u64 %94, ptr %102
+    %103 = load i64, ptr %17
+    store i64 %103, ptr %0
+    %104 = const i64 8
+    %105 = gep i8, ptr %17, %104
+    %106 = const i64 8
+    %107 = gep i8, ptr %0, %106
+    %108 = load i64, ptr %105
+    store i64 %108, ptr %107
+    %109 = const i64 16
+    %110 = gep i8, ptr %17, %109
+    %111 = const i64 16
+    %112 = gep i8, ptr %0, %111
+    %113 = load i64, ptr %110
+    store i64 %113, ptr %112
+    br bb16
+bb10(%14: u64):
+    %114 = load u16, ptr %23
+    %115 = const i64 2
+    %116 = gep i8, ptr %22, %115
+    store u16 %114, ptr %116
+    %117 = const i16 0
+    store i16 %117, ptr %22
+    %118 = const u64 1
+    %119, %120 = add.overflow u64 %14, %118
+    store u64 %119, ptr %24
+    %121 = const i64 8
+    %122 = gep i8, ptr %24, %121
+    store bool %120, ptr %122
+    %123 = const i64 8
+    %124 = gep i8, ptr %24, %123
+    %125 = load bool, ptr %124
+    %126 = const bool false
+    %127 = icmp eq bool %125, %126
+    condbr %127, bb11, bb17
+bb11:
+    %128 = load u64, ptr %24
+    %129 = load i64, ptr %22
+    store i64 %129, ptr %21
+    %130 = const i64 8
+    %131 = gep i8, ptr %22, %130
+    %132 = const i64 8
+    %133 = gep i8, ptr %21, %132
+    %134 = load i64, ptr %131
+    store i64 %134, ptr %133
+    %135 = const i64 16
+    %136 = gep i8, ptr %21, %135
+    store u64 %128, ptr %136
+    %137 = load i64, ptr %21
+    store i64 %137, ptr %0
+    %138 = const i64 8
+    %139 = gep i8, ptr %21, %138
+    %140 = const i64 8
+    %141 = gep i8, ptr %0, %140
+    %142 = load i64, ptr %139
+    store i64 %142, ptr %141
+    %143 = const i64 16
+    %144 = gep i8, ptr %21, %143
+    %145 = const i64 16
+    %146 = gep i8, ptr %0, %145
+    %147 = load i64, ptr %144
+    store i64 %147, ptr %146
+    br bb16
+bb12(%15: u64):
+    %148 = load u16, ptr %27
+    %149 = const i64 2
+    %150 = gep i8, ptr %26, %149
+    store u16 %148, ptr %150
+    %151 = const i16 0
+    store i16 %151, ptr %26
+    %152 = const u64 1
+    %153, %154 = add.overflow u64 %15, %152
+    store u64 %153, ptr %28
+    %155 = const i64 8
+    %156 = gep i8, ptr %28, %155
+    store bool %154, ptr %156
+    %157 = const i64 8
+    %158 = gep i8, ptr %28, %157
+    %159 = load bool, ptr %158
+    %160 = const bool false
+    %161 = icmp eq bool %159, %160
+    condbr %161, bb13, bb17
+bb13:
+    %162 = load u64, ptr %28
+    %163 = load i64, ptr %26
+    store i64 %163, ptr %25
+    %164 = const i64 8
+    %165 = gep i8, ptr %26, %164
+    %166 = const i64 8
+    %167 = gep i8, ptr %25, %166
+    %168 = load i64, ptr %165
+    store i64 %168, ptr %167
+    %169 = const i64 16
+    %170 = gep i8, ptr %25, %169
+    store u64 %162, ptr %170
+    %171 = load i64, ptr %25
+    store i64 %171, ptr %0
+    %172 = const i64 8
+    %173 = gep i8, ptr %25, %172
+    %174 = const i64 8
+    %175 = gep i8, ptr %0, %174
+    %176 = load i64, ptr %173
+    store i64 %176, ptr %175
+    %177 = const i64 16
+    %178 = gep i8, ptr %25, %177
+    %179 = const i64 16
+    %180 = gep i8, ptr %0, %179
+    %181 = load i64, ptr %178
+    store i64 %181, ptr %180
+    br bb16
+bb14(%16: u64):
+    %182 = load u16, ptr %31
+    %183 = const i64 2
+    %184 = gep i8, ptr %30, %183
+    store u16 %182, ptr %184
+    %185 = const i16 0
+    store i16 %185, ptr %30
+    %186 = const u64 1
+    %187, %188 = add.overflow u64 %16, %186
+    store u64 %187, ptr %32
+    %189 = const i64 8
+    %190 = gep i8, ptr %32, %189
+    store bool %188, ptr %190
+    %191 = const i64 8
+    %192 = gep i8, ptr %32, %191
+    %193 = load bool, ptr %192
+    %194 = const bool false
+    %195 = icmp eq bool %193, %194
+    condbr %195, bb15, bb17
+bb15:
+    %196 = load u64, ptr %32
+    %197 = load i64, ptr %30
+    store i64 %197, ptr %29
+    %198 = const i64 8
+    %199 = gep i8, ptr %30, %198
+    %200 = const i64 8
+    %201 = gep i8, ptr %29, %200
+    %202 = load i64, ptr %199
+    store i64 %202, ptr %201
+    %203 = const i64 16
+    %204 = gep i8, ptr %29, %203
+    store u64 %196, ptr %204
+    %205 = load i64, ptr %29
+    store i64 %205, ptr %0
+    %206 = const i64 8
+    %207 = gep i8, ptr %29, %206
+    %208 = const i64 8
+    %209 = gep i8, ptr %0, %208
+    %210 = load i64, ptr %207
+    store i64 %210, ptr %209
+    %211 = const i64 16
+    %212 = gep i8, ptr %29, %211
+    %213 = const i64 16
+    %214 = gep i8, ptr %0, %213
+    %215 = load i64, ptr %212
+    store i64 %215, ptr %214
+    br bb16
+bb16:
+    ret
+bb17:
+    unreachable
+}
+
+fn @classify_aggregate_by_size(functy.5) {
+bb0(%0: ptr, %1: u32):
+    %5 = const u32 0
+    %6 = icmp ule u32 %5, %1
+    condbr %6, bb6(%1), bb3(%1)
+bb1:
+    %7 = const u32 1
+    store u32 %7, ptr %0
+    %8 = const u32 0
+    %9 = const i64 4
+    %10 = gep i8, ptr %0, %9
+    store u32 %8, ptr %10
+    br bb7
+bb2:
+    %11 = const u32 0
+    store u32 %11, ptr %0
+    %12 = const u32 1
+    %13 = const i64 4
+    %14 = gep i8, ptr %0, %13
+    store u32 %12, ptr %14
+    br bb7
+bb3(%2: u32):
+    %15 = const u32 9
+    %16 = icmp ule u32 %15, %2
+    condbr %16, bb5(%2), bb1
+bb4:
+    %17 = const u32 0
+    store u32 %17, ptr %0
+    %18 = const u32 2
+    %19 = const i64 4
+    %20 = gep i8, ptr %0, %19
+    store u32 %18, ptr %20
+    br bb7
+bb5(%3: u32):
+    %21 = const u32 16
+    %22 = icmp ule u32 %3, %21
+    condbr %22, bb4, bb1
+bb6(%4: u32):
+    %23 = const u32 8
+    %24 = icmp ule u32 %4, %23
+    condbr %24, bb2, bb3(%4)
+bb7:
+    ret
+}
+
+fn @align_up(functy.6) {
+bb0(%0: i64, %1: i64):
+    %5 = alloca (i64, i64), align 8
+    %6 = alloca (i64, i64), align 8
+    %7 = alloca (i64, i64), align 8
+    %8, %9 = add.overflow i64 %0, %1
+    store i64 %8, ptr %5
+    %10 = const i64 8
+    %11 = gep i8, ptr %5, %10
+    store bool %9, ptr %11
+    %12 = const i64 8
+    %13 = gep i8, ptr %5, %12
+    %14 = load bool, ptr %13
+    %15 = const bool false
+    %16 = icmp eq bool %14, %15
+    condbr %16, bb1(%1), bb4
+bb1(%2: i64):
+    %17 = load i64, ptr %5
+    %18 = const i64 1
+    %19, %20 = sub.overflow i64 %17, %18
+    store i64 %19, ptr %6
+    %21 = const i64 8
+    %22 = gep i8, ptr %6, %21
+    store bool %20, ptr %22
+    %23 = const i64 8
+    %24 = gep i8, ptr %6, %23
+    %25 = load bool, ptr %24
+    %26 = const bool false
+    %27 = icmp eq bool %25, %26
+    condbr %27, bb2(%2), bb4
+bb2(%3: i64):
+    %28 = load i64, ptr %6
+    %29 = const i64 1
+    %30, %31 = sub.overflow i64 %3, %29
+    store i64 %30, ptr %7
+    %32 = const i64 8
+    %33 = gep i8, ptr %7, %32
+    store bool %31, ptr %33
+    %34 = const i64 8
+    %35 = gep i8, ptr %7, %34
+    %36 = load bool, ptr %35
+    %37 = const bool false
+    %38 = icmp eq bool %36, %37
+    condbr %38, bb3(%28), bb4
+bb3(%4: i64):
+    %39 = load i64, ptr %7
+    %40 = not i64 %39
+    %41 = and i64 %4, %40
+    ret %41
+bb4:
+    unreachable
+}

@@ -1,0 +1,53 @@
+{
+  "name": "ay_subsumption_scanner_cases",
+  "issue": 571,
+  "source_reference": "ay/crates/ay-jit/src/simd_inprocess.rs@origin/main",
+  "sentinel": 2147483647,
+  "literal_encoding": "var * 2 + polarity",
+  "clause_lengths": [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+  "clauses": [
+    {"id": 0, "length": 2, "padded_length": 4, "lits": [10, 12]},
+    {"id": 1, "length": 3, "padded_length": 4, "lits": [10, 12, 14]},
+    {"id": 2, "length": 4, "padded_length": 4, "lits": [20, 22, 24, 26]},
+    {"id": 3, "length": 5, "padded_length": 8, "lits": [20, 22, 24, 26, 28]},
+    {"id": 4, "length": 6, "padded_length": 8, "lits": [30, 32, 34, 36, 38, 40]},
+    {"id": 5, "length": 7, "padded_length": 8, "lits": [30, 32, 34, 36, 38, 40, 42]},
+    {"id": 6, "length": 8, "padded_length": 8, "lits": [50, 52, 54, 56, 58, 60, 62, 64]},
+    {"id": 7, "length": 9, "padded_length": 12, "lits": [50, 52, 54, 56, 58, 60, 62, 64, 66]},
+    {"id": 8, "length": 10, "padded_length": 12, "lits": [70, 72, 74, 76, 78, 80, 82, 84, 86, 88]},
+    {"id": 9, "length": 11, "padded_length": 12, "lits": [70, 72, 74, 76, 78, 80, 82, 84, 86, 88, 90]},
+    {"id": 10, "length": 12, "padded_length": 12, "lits": [100, 102, 104, 106, 108, 110, 112, 114, 116, 118, 120, 122]},
+    {"id": 11, "length": 13, "padded_length": 16, "lits": [100, 102, 104, 106, 108, 110, 112, 114, 116, 118, 120, 122, 124]},
+    {"id": 12, "length": 14, "padded_length": 16, "lits": [130, 132, 134, 136, 138, 140, 142, 144, 146, 148, 150, 152, 154, 156]},
+    {"id": 13, "length": 15, "padded_length": 16, "lits": [130, 132, 134, 136, 138, 140, 142, 144, 146, 148, 150, 152, 154, 156, 158]},
+    {"id": 14, "length": 16, "padded_length": 16, "lits": [170, 172, 174, 176, 178, 180, 182, 184, 186, 188, 190, 192, 194, 196, 198, 200]}
+  ],
+  "contains_queries": [
+    {"literal": 10, "expected_clause_ids": [0, 1], "covers": "first-lane match"},
+    {"literal": 14, "expected_clause_ids": [1], "covers": "last real lane before padding"},
+    {"literal": 28, "expected_clause_ids": [3], "covers": "first lane in second padded chunk"},
+    {"literal": 42, "expected_clause_ids": [5], "covers": "last real lane with padding"},
+    {"literal": 122, "expected_clause_ids": [10, 11], "covers": "last lane in full chunk"},
+    {"literal": 124, "expected_clause_ids": [11], "covers": "tail chunk with three padding lanes"},
+    {"literal": 2147483647, "expected_clause_ids": [], "covers": "sentinel padding must not match"},
+    {"literal": 999998, "expected_clause_ids": [], "covers": "absent literal"}
+  ],
+  "subsumption_pairs": [
+    {"a": 0, "b": 1, "expected": true, "covers": "short true subset"},
+    {"a": 1, "b": 0, "expected": false, "covers": "longer A cannot subsume shorter B"},
+    {"a": 2, "b": 3, "expected": true, "covers": "full first chunk subset"},
+    {"a": 3, "b": 2, "expected": false, "covers": "tail literal absent"},
+    {"a": 4, "b": 5, "expected": true, "covers": "mixed padding true subset"},
+    {"a": 5, "b": 4, "expected": false, "covers": "last real lane absent"},
+    {"a": 10, "b": 11, "expected": true, "covers": "12-to-13 length true subset"},
+    {"a": 11, "b": 10, "expected": false, "covers": "tail chunk false subset"},
+    {"a": 12, "b": 13, "expected": true, "covers": "14-to-15 length true subset"},
+    {"a": 13, "b": 14, "expected": false, "covers": "different literal family false subset"}
+  ],
+  "benchmark_matrix": {
+    "length_buckets": ["2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "mixed_2_16"],
+    "variants": ["ay_neon_reference", "trust_cg_o2_vectorized", "trust_cg_o3_vectorized", "trust_cg_o2_disable_vec", "trust_cg_o3_disable_vec"],
+    "warmup_iterations": 10,
+    "measurement_repetitions": 30
+  }
+}

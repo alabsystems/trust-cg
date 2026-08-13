@@ -1,0 +1,166 @@
+{
+  "name": "fsym_real_objectsize_intrinsic",
+  "functions": [
+    {
+      "id": 0,
+      "name": "llvm.objectsize.i64.p0",
+      "ty": 0,
+      "entry": 0,
+      "blocks": [],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External"
+    },
+    {
+      "id": 1,
+      "name": "main",
+      "ty": 1,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Alloca": {
+                  "ty": "I8",
+                  "count": null,
+                  "align": null
+                }
+              },
+              "results": [
+                0
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "Bool",
+                  "value": {
+                    "Bool": false
+                  }
+                }
+              },
+              "results": [
+                1
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "Bool",
+                  "value": {
+                    "Bool": true
+                  }
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "Bool",
+                  "value": {
+                    "Bool": false
+                  }
+                }
+              },
+              "results": [
+                3
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Call": {
+                  "callee": 0,
+                  "args": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
+                }
+              },
+              "results": [
+                4
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Cast": {
+                  "op": "Trunc",
+                  "src_ty": "I64",
+                  "dst_ty": "I32",
+                  "operand": 4
+                }
+              },
+              "results": [
+                5
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    5
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External"
+    }
+  ],
+  "structs": [],
+  "enums": [],
+  "records": [],
+  "closure_types": [],
+  "globals": [],
+  "func_types": [
+    {
+      "params": [
+        "Ptr",
+        "Bool",
+        "Bool",
+        "Bool"
+      ],
+      "returns": [
+        "I64"
+      ],
+      "is_vararg": false
+    },
+    {
+      "params": [],
+      "returns": [
+        "I32"
+      ],
+      "is_vararg": false
+    }
+  ],
+  "types": [],
+  "proof_obligations": [],
+  "proof_certificates": [],
+  "target_info": null
+}

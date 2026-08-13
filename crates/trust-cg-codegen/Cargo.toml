@@ -1,0 +1,98 @@
+# trust-cg-codegen - Proof-oriented machine code generation
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache-2.0
+
+[package]
+name = "trust-cg-codegen"
+description = "Proof-oriented machine code generation for Trust Codegen (x86-64, AArch64, RISC-V)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+
+[features]
+default = ["verify"]
+# ay-regalloc: forward the AY-PBO optimal register allocator (STAGE 3) down to
+# trust-cg-regalloc. DEFAULT OFF. Purely opt-in: compiling this feature in only
+# makes the allocator *available*; it is still entered only when the runtime
+# `TCG_AY_REGALLOC` env var is set (see trust-cg-regalloc). With the feature off,
+# or the env unset, codegen is byte-identical to origin. A wrong AY allocation
+# can never ship: it passes the same always-on translation validator greedy does
+# and falls back to greedy on any rejection/timeout/oversize.
+ay-regalloc = ["trust-cg-regalloc/ay-regalloc"]
+# WP-2 — forward the decidable-lattice guard-elision authority. DEFAULT OFF.
+# With the feature off, a refinement-carrying module compiles to byte-identical
+# code: the capability is minted and reported, but never becomes authority.
+lattice-guard-elision = [
+    "trust-cg-lower/lattice-guard-elision",
+    "trust-cg-opt/lattice-guard-elision",
+]
+# `verify` opts into the heavier SMT/ay-backed verification surface
+# (function verifier, proof-certificate emission, certified-pass-chain plumbing).
+# It NO LONGER toggles whether trust-cg-verify is linked: the crate is now a
+# non-optional dependency (below) so the pure-lattice fail-closed checkers
+# (`carrier_hygiene`, `pass_validators`) run on the DEFAULT build too. `verify`
+# only enables the extra, solver-flavoured code paths gated on `cfg(feature =
+# "verify")` throughout `compiler.rs`.
+verify = []
+
+[dependencies]
+trust-cg-ir = { workspace = true }
+trust-cg-dialect = { workspace = true }
+trust-cg-lower = { workspace = true }
+trust-cg-opt = { workspace = true }
+trust-cg-process-env = { workspace = true }
+trust-cg-regalloc = { workspace = true }
+# Non-optional, `default-features = false`: the carrier-hygiene and pass
+# validators are pure lattice / exhaustive-evaluation checkers needing only
+# trust-cg-lower types + std, so they MUST run on every build (including the
+# rustc bridge, which builds trust-cg-codegen with `default-features = false`).
+# `default-features = false` retains the always-present external-solver bridge
+# without adding optional verification features to the default graph.
+trust-cg-verify = { workspace = true, default-features = false }
+trust-ir = { workspace = true }
+trust-ir-build = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+rayon = "1.10"
+
+[dev-dependencies]
+# The AArch64 on-host correctness harness (`tests/common/a64_interp.rs`) decodes
+# the emitted AArch64 `__text` bytes with the real leaf disassembler and
+# interprets the integer/compare/branch/FP subset, so AArch64 codegen
+# correctness is asserted fail-CLOSED on this x86 host (only native AArch64
+# EXECUTION is hardware-blocked). trust-cg-lift is a leaf crate (no trust-cg
+# dependencies) so this introduces no cycle.
+trust-cg-lift = { workspace = true }
+# Property-based testing for the `.tmbc` round-trip harness (#415).
+# proptest is dev-only; it MUST NOT leak into the production graph.
+proptest = "1.7"
+# The FAITHFUL bignum backing the micro-checker native-arith IOTA roundtrip test
+# (`mir_native_arith_iota_roundtrip`): the `bu_*` leaf shims call the REAL
+# `num_bigint::BigUint` digit arithmetic (the same external trusted base the real
+# clean-kernel `MicroLiteral::Nat(BigUint)` uses). Dev-only; MUST NOT leak into
+# the production graph.
+num-bigint = "0.4"
+num-traits = "0.2"
+
+[[bench]]
+name = "compile_bench"
+harness = false
+
+[[bench]]
+name = "compare_clang"
+harness = false
+
+[[bench]]
+name = "compile_speed"
+harness = false
+
+[lints]
+workspace = true

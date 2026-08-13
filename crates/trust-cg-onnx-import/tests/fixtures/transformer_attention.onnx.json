@@ -1,0 +1,57 @@
+{
+  "name": "transformer_attention",
+  "inputs": [
+    { "name": "hidden", "shape": [1, 4, 8], "dtype": "f32", "layout": "nld" }
+  ],
+  "outputs": ["attn_norm"],
+  "tensors": [
+    { "name": "q", "shape": [1, 4, 8], "dtype": "f32", "layout": "nld" },
+    { "name": "k", "shape": [1, 4, 8], "dtype": "f32", "layout": "nld" },
+    { "name": "v", "shape": [1, 4, 8], "dtype": "f32", "layout": "nld" },
+    { "name": "kt", "shape": [1, 8, 4], "dtype": "f32", "layout": "strided" },
+    { "name": "scores", "shape": [1, 4, 4], "dtype": "f32", "layout": "nld" },
+    { "name": "scaled_scores", "shape": [1, 4, 4], "dtype": "f32", "layout": "nld" },
+    { "name": "prob", "shape": [1, 4, 4], "dtype": "f32", "layout": "nld" },
+    { "name": "ctx", "shape": [1, 4, 8], "dtype": "f32", "layout": "nld" },
+    { "name": "residual", "shape": [1, 4, 8], "dtype": "f32", "layout": "nld" },
+    { "name": "attn_norm", "shape": [1, 4, 8], "dtype": "f32", "layout": "nld" }
+  ],
+  "initializers": [
+    { "name": "q.weight", "shape": [8, 8], "dtype": "f32", "layout": "oi", "values": [0.1] },
+    { "name": "k.weight", "shape": [8, 8], "dtype": "f32", "layout": "oi", "values": [0.1] },
+    { "name": "v.weight", "shape": [8, 8], "dtype": "f32", "layout": "oi", "values": [0.1] },
+    { "name": "inv_sqrt_d", "shape": [], "dtype": "f32", "layout": "scalar", "values": [0.3535533905932738] },
+    { "name": "ln.weight", "shape": [8], "dtype": "f32", "layout": "vector", "values": [1.0] },
+    { "name": "ln.bias", "shape": [8], "dtype": "f32", "layout": "vector", "values": [0.0] }
+  ],
+  "nodes": [
+    { "name": "Q_0", "op_type": "MatMul", "inputs": ["hidden", "q.weight"], "outputs": ["q"] },
+    { "name": "K_1", "op_type": "MatMul", "inputs": ["hidden", "k.weight"], "outputs": ["k"] },
+    { "name": "V_2", "op_type": "MatMul", "inputs": ["hidden", "v.weight"], "outputs": ["v"] },
+    {
+      "name": "Transpose_3",
+      "op_type": "Transpose",
+      "inputs": ["k"],
+      "outputs": ["kt"],
+      "attributes": { "perm": [0, 2, 1] }
+    },
+    { "name": "Scores_4", "op_type": "MatMul", "inputs": ["q", "kt"], "outputs": ["scores"] },
+    { "name": "Scale_5", "op_type": "Mul", "inputs": ["scores", "inv_sqrt_d"], "outputs": ["scaled_scores"] },
+    {
+      "name": "Softmax_6",
+      "op_type": "Softmax",
+      "inputs": ["scaled_scores"],
+      "outputs": ["prob"],
+      "attributes": { "axis": -1 }
+    },
+    { "name": "Context_7", "op_type": "MatMul", "inputs": ["prob", "v"], "outputs": ["ctx"] },
+    { "name": "Residual_8", "op_type": "Add", "inputs": ["ctx", "hidden"], "outputs": ["residual"] },
+    {
+      "name": "LayerNormalization_9",
+      "op_type": "LayerNormalization",
+      "inputs": ["residual", "ln.weight", "ln.bias"],
+      "outputs": ["attn_norm"],
+      "attributes": { "axis": -1, "epsilon": 0.000001 }
+    }
+  ]
+}

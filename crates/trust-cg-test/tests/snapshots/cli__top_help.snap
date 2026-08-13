@@ -1,0 +1,74 @@
+---
+source: crates/trust-cg-test/tests/cli.rs
+expression: "help_of(&[])"
+---
+Repository test, fuzz, and proof workflows behind one CLI. Implemented commands delegate to
+maintained script-backed runners; planned commands return an explicit not-implemented status. Use
+each subcommand's `--help` for its current requirements and examples. Generic JSON building-block
+schemas are committed under `evals/schema/`; command-specific JSON shapes remain unstable in v0.1.0.
+
+# Examples
+
+  trust-cg-test matrix --format human
+  trust-cg-test doctor --for fuzz
+  trust-cg-test report --out reports/weekly/2026-04-19.md
+
+Usage: trust-cg-test [OPTIONS] <COMMAND>
+
+Commands:
+  matrix                    WS1 — Run the workspace unit/integration test matrix
+  suite                     Planned WS2 llvm-test-suite runner (not implemented in v0.1.0)
+  fuzz                      Planned WS3 differential-fuzzing dispatcher (not implemented in v0.1.0)
+  rustc                     WS4 — Drive `rustc_codegen_trust_cg` + rustc UI tests
+  bootstrap                 Planned WS5 rustc bootstrap driver (not implemented in v0.1.0)
+  ecosystem                 Planned WS6 crates.io smoke runner (not implemented in v0.1.0)
+  prove                     Planned WS7 AY proof dispatcher (not implemented in v0.1.0)
+  pipeline                  Planned WS8 non-ISel proof dispatcher (not implemented in v0.1.0)
+  report                    WS9 — Generate weekly report + dashboard
+  jit-diagnostic-dashboard  Generate Phase 3 JIT diagnostic dashboard exports from fixtures
+  ratchet                   Run ratchet checks (called by CI)
+  doctor                    Check environment for required tools
+  lint-linux                Cross-compile check for Linux `#[cfg(target_os = "linux")]` paths in
+                            `trust-cg-codegen` (issue #346). Safe on macOS-only boxes — targets not
+                            installed via `rustup target add` are reported as `skipped`
+  help                      Print this message or the help of the given subcommand(s)
+
+Options:
+  -f, --format <FORMAT>
+          Output format (human, json, junit)
+
+          Possible values:
+          - human: Pretty table + narrative, targeted at humans
+          - json:  Machine-readable JSON
+          - junit: JUnit XML for CI consumers
+
+          [default: human]
+
+  -o, --out <PATH>
+          Override the command-specific output file or directory.
+
+          See the selected subcommand's help for its output type and default.
+
+      --timeout <SECS>
+          Per-unit timeout in seconds. Subcommands may apply per-unit defaults when this is unset
+
+      --parallel <N>
+          Worker count (honors cargo-serialization lock). Default: auto
+
+  -q, --quiet
+          Suppress progress bars; errors still go to stderr
+
+  -v, --verbose...
+          Show debug-level events. Repeat for more: -vv, -vvv
+
+      --no-cache
+          Ignore proof / corpus caches
+
+      --dry-run
+          Print what would run without executing external tools
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version

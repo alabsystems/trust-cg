@@ -1,0 +1,127 @@
+{
+  "version": 1,
+  "description": "ORT parity harness fixture matrix for ONNX -> VNN trust_ir -> CPU execution.",
+  "deterministic_input_policy": "sha256(label:index) mapped to stable f32 host values",
+  "raw_initializer_policy": "raw ONNX TensorProto f32 initializer buffers are decoded and reused for Trust Codegen execution",
+  "f32_tolerance": {
+    "rtol": 0.00001,
+    "atol": 0.000001,
+    "rounding": "compare_as_host_f64_after_f32_backend_execution"
+  },
+  "cases": [
+    {
+      "case_id": "conv_bn_relu_f32_nchw",
+      "operator_family": "Conv+BN+ReLU",
+      "vnn_trust_ir": "../vnn_trust_ir/valid_conv_bn_relu.json",
+      "onnx_model": "models/conv_bn_relu.onnx",
+      "expected_status_without_ort": "skipped",
+      "expected_status_with_ort": "passed_or_mismatch"
+    },
+    {
+      "case_id": "linear_softmax_f32_nc",
+      "operator_family": "Gemm/Linear+Softmax",
+      "vnn_trust_ir": "../vnn_trust_ir/valid_linear_softmax.json",
+      "onnx_model": "models/linear_softmax.onnx",
+      "expected_status_without_ort": "skipped",
+      "expected_status_with_ort": "passed_or_mismatch"
+    },
+    {
+      "case_id": "add_pool_matmul_layer_norm_f32",
+      "operator_family": "Add residual, Pooling, MatMul, LayerNorm",
+      "vnn_trust_ir": "../vnn_trust_ir/valid_add_pool_matmul_layer_norm.json",
+      "onnx_model": "models/add_pool_matmul_layer_norm.onnx",
+      "expected_status_without_ort": "skipped",
+      "expected_status_with_ort": "passed_or_mismatch"
+    },
+    {
+      "case_id": "add_broadcast_unsupported",
+      "operator_family": "Add residual",
+      "vnn_trust_ir": "unsupported_add_residual.vnn_trust_ir.json",
+      "onnx_model": "models/add_residual_broadcast.onnx",
+      "expected_status": "unsupported",
+      "expected_diagnostic": "vnn.lower.unsupported_attr"
+    }
+  ],
+  "raw_onnx_cases": [
+    {
+      "case_id": "raw_simple_mlp_f32",
+      "operator_family": "Gemm/Linear+ReLU",
+      "onnx_model": "../../../crates/trust-cg-onnx-import/tests/fixtures/simple_mlp.onnx",
+      "import_path": "raw_onnx_model_proto",
+      "expected_vnn_ops": ["trust_ir.vnn.linear", "trust_ir.vnn.relu", "trust_ir.vnn.linear"],
+      "expected_output_map": { "%output": "output" },
+      "expected_status_with_ort": "passed"
+    },
+    {
+      "case_id": "raw_linear_softmax_f32",
+      "operator_family": "Gemm/Linear+Softmax",
+      "onnx_model": "../../../crates/trust-cg-onnx-import/tests/fixtures/linear_softmax.onnx",
+      "import_path": "raw_onnx_model_proto",
+      "expected_vnn_ops": ["trust_ir.vnn.linear", "trust_ir.vnn.softmax"],
+      "expected_output_map": { "%probabilities": "probabilities" },
+      "expected_status_with_ort": "passed"
+    },
+    {
+      "case_id": "raw_conv_relu_maxpool_f32",
+      "operator_family": "Conv+ReLU+Pooling",
+      "onnx_model": "../../../crates/trust-cg-onnx-import/tests/fixtures/conv_relu_maxpool.onnx",
+      "import_path": "raw_onnx_model_proto",
+      "expected_vnn_ops": ["trust_ir.vnn.conv2d", "trust_ir.vnn.relu", "trust_ir.vnn.max_pool2d"],
+      "expected_output_map": { "%output": "output" },
+      "expected_status_with_ort": "passed"
+    },
+    {
+      "case_id": "raw_add_residual_f32",
+      "operator_family": "Add residual",
+      "onnx_model": "../../../crates/trust-cg-onnx-import/tests/fixtures/add_residual.onnx",
+      "import_path": "raw_onnx_model_proto",
+      "expected_vnn_ops": ["trust_ir.vnn.add"],
+      "expected_output_map": { "%sum": "sum" },
+      "expected_status_with_ort": "passed"
+    },
+    {
+      "case_id": "raw_cnn_with_flatten_f32",
+      "operator_family": "Conv+ReLU+Pooling+Flatten+Gemm",
+      "onnx_model": "../../../crates/trust-cg-onnx-import/tests/fixtures/cnn_with_flatten.onnx",
+      "import_path": "raw_onnx_model_proto",
+      "expected_vnn_ops": [
+        "trust_ir.vnn.conv2d",
+        "trust_ir.vnn.relu",
+        "trust_ir.vnn.max_pool2d",
+        "trust_ir.vnn.flatten",
+        "trust_ir.vnn.linear"
+      ],
+      "expected_output_map": { "%output": "output" },
+      "expected_status_with_ort": "passed"
+    },
+    {
+      "case_id": "raw_cifar100_or_tinyimagenet_class_f32",
+      "operator_family": "cifar100/tinyimagenet-class",
+      "onnx_model": "../../../crates/trust-cg-onnx-import/tests/fixtures/cifar100_or_tinyimagenet_class.onnx",
+      "import_path": "raw_onnx_model_proto",
+      "model_class": "cifar100_or_tinyimagenet",
+      "acceptance_role": "class_model_fixture",
+      "fixture_available": true,
+      "input_shape": [1, 3, 8, 8],
+      "output_classes": 100,
+      "expected_vnn_ops": [
+        "trust_ir.vnn.conv2d",
+        "trust_ir.vnn.relu",
+        "trust_ir.vnn.max_pool2d",
+        "trust_ir.vnn.flatten",
+        "trust_ir.vnn.linear",
+        "trust_ir.vnn.softmax"
+      ],
+      "expected_output_map": { "%probabilities": "probabilities" },
+      "expected_status_with_ort": "passed"
+    }
+  ],
+  "class_model_fixture": {
+    "class": "cifar100_or_tinyimagenet",
+    "raw_onnx_case_id": "raw_cifar100_or_tinyimagenet_class_f32",
+    "onnx_model": "../../../crates/trust-cg-onnx-import/tests/fixtures/cifar100_or_tinyimagenet_class.onnx",
+    "status": "passed_with_ort",
+    "expected_output_map": { "%probabilities": "probabilities" },
+    "reason": "committed deterministic 100-class Conv/ReLU/MaxPool/Flatten/Gemm/Softmax ONNX fixture"
+  }
+}

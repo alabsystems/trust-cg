@@ -1,0 +1,606 @@
+{
+  "name": "fsym_real_switch_narrow_widths",
+  "functions": [
+    {
+      "id": 0,
+      "name": "switch_narrow_i1",
+      "ty": 0,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "Bool"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Switch": {
+                  "value": 0,
+                  "default": 1,
+                  "default_args": [],
+                  "cases": [
+                    {
+                      "value": {
+                        "Int": 1
+                      },
+                      "target": 2,
+                      "args": []
+                    }
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        },
+        {
+          "id": 1,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": "Bool",
+                  "value": {
+                    "Int": 0
+                  }
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    2
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        },
+        {
+          "id": 2,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": "Bool",
+                  "value": {
+                    "Int": 1
+                  }
+                }
+              },
+              "results": [
+                1
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    1
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External"
+    },
+    {
+      "id": 1,
+      "name": "switch_narrow_i8",
+      "ty": 1,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "I8"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Switch": {
+                  "value": 0,
+                  "default": 1,
+                  "default_args": [],
+                  "cases": [
+                    {
+                      "value": {
+                        "Int": 7
+                      },
+                      "target": 2,
+                      "args": []
+                    }
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        },
+        {
+          "id": 1,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I8",
+                  "value": {
+                    "Int": 0
+                  }
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    2
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        },
+        {
+          "id": 2,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I8",
+                  "value": {
+                    "Int": 1
+                  }
+                }
+              },
+              "results": [
+                1
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    1
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External"
+    },
+    {
+      "id": 2,
+      "name": "switch_narrow_i16",
+      "ty": 2,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "I16"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Switch": {
+                  "value": 0,
+                  "default": 1,
+                  "default_args": [],
+                  "cases": [
+                    {
+                      "value": {
+                        "Int": 300
+                      },
+                      "target": 2,
+                      "args": []
+                    }
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        },
+        {
+          "id": 1,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I16",
+                  "value": {
+                    "Int": 0
+                  }
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    2
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        },
+        {
+          "id": 2,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I16",
+                  "value": {
+                    "Int": 1
+                  }
+                }
+              },
+              "results": [
+                1
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    1
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External"
+    },
+    {
+      "id": 3,
+      "name": "switch_narrow_i32",
+      "ty": 3,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "I32"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Switch": {
+                  "value": 0,
+                  "default": 1,
+                  "default_args": [],
+                  "cases": [
+                    {
+                      "value": {
+                        "Int": 42
+                      },
+                      "target": 2,
+                      "args": []
+                    }
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        },
+        {
+          "id": 1,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": 0
+                  }
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    2
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        },
+        {
+          "id": 2,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": 1
+                  }
+                }
+              },
+              "results": [
+                1
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    1
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External"
+    },
+    {
+      "id": 4,
+      "name": "switch_narrow_i64",
+      "ty": 4,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "I64"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Switch": {
+                  "value": 0,
+                  "default": 1,
+                  "default_args": [],
+                  "cases": [
+                    {
+                      "value": {
+                        "Int": 9999999999
+                      },
+                      "target": 2,
+                      "args": []
+                    }
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        },
+        {
+          "id": 1,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I64",
+                  "value": {
+                    "Int": 0
+                  }
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    2
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        },
+        {
+          "id": 2,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I64",
+                  "value": {
+                    "Int": 1
+                  }
+                }
+              },
+              "results": [
+                1
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    1
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External"
+    }
+  ],
+  "structs": [],
+  "enums": [],
+  "records": [],
+  "closure_types": [],
+  "globals": [],
+  "func_types": [
+    {
+      "params": [
+        "Bool"
+      ],
+      "returns": [
+        "Bool"
+      ],
+      "is_vararg": false
+    },
+    {
+      "params": [
+        "I8"
+      ],
+      "returns": [
+        "I8"
+      ],
+      "is_vararg": false
+    },
+    {
+      "params": [
+        "I16"
+      ],
+      "returns": [
+        "I16"
+      ],
+      "is_vararg": false
+    },
+    {
+      "params": [
+        "I32"
+      ],
+      "returns": [
+        "I32"
+      ],
+      "is_vararg": false
+    },
+    {
+      "params": [
+        "I64"
+      ],
+      "returns": [
+        "I64"
+      ],
+      "is_vararg": false
+    }
+  ],
+  "types": [],
+  "proof_obligations": [],
+  "proof_certificates": [],
+  "target_info": null
+}

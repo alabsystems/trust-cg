@@ -1,0 +1,48 @@
+# trust-cg-test — the unified Trust Codegen test & verification CLI
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache-2.0
+#
+# The binary keeps repository validation workflows behind one CLI boundary.
+# Every workstream (WS1-WS9) writes into `src/cmd/<ws>.rs`. No loose scripts.
+
+[package]
+name = "trust-cg-test"
+description = "Unified test and verification CLI for the proof-oriented Trust Codegen backend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+
+[[bin]]
+name = "trust-cg-test"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "cargo", "env", "wrap_help"] }
+clap_mangen = "0.2"
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { version = "0.8", features = ["chrono"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+indicatif = "0.17"
+chrono = { version = "0.4", features = ["serde"] }
+blake3 = "1"
+# Pin blake3's transitive equality helper to the Rust-1.94-compatible line.
+constant_time_eq = "=0.4.2"
+
+[dev-dependencies]
+insta = { version = "1", features = ["filters"] }
+assert_cmd = "2"
+tempfile = "3"
+toml = "0.8"
+
+[lints]
+workspace = true

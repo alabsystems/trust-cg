@@ -1,0 +1,45 @@
+{
+  "schema": "trust-cg-gates-v1",
+  "source_of_truth": "metrics-contract.md (section 10) -- this file must never drift from it",
+  "results_schema": "trust-cg-bench-v1",
+  "notes": [
+    "Predicates are conjunctions in a jq-compatible subset: `.path op literal [and ...]`.",
+    "They evaluate identically via `jq '<predicate>' results.json` (when jq is installed) and via",
+    "the dependency-free checker: python3 benchmarks/beat-llvm/contract/check_gates.py <results.json>.",
+    "Every gate ALSO requires the eligibility predicate. `.headline_eligible` is computed by the",
+    "harness per contract section 8 (quiet AND clean tree AND no proof-weakening TCG_* env AND",
+    "contract-default N AND 0 MISMATCH) and stamped into every results JSON.",
+    "Geomeans are over MATCH rows and must be co-published with coverage_pct (intent-to-treat)."
+  ],
+  "eligibility": ".headline_eligible == true and .provenance.quiet == true and .provenance.git_dirty == false and .aggregates.mismatch_count == 0",
+  "gates": {
+    "G1a_scalar_runtime_M2": {
+      "description": "scalar-integer corpus runtime geomean <= 1.30x LLVM -O3 (scalar category only, per manifest.json — the corpus now spans categories, BENCH-3)",
+      "predicate": ".aggregates.scalar_runtime_geomean_vs_llvm_o3 != null and .aggregates.scalar_runtime_geomean_vs_llvm_o3 <= 1.30"
+    },
+    "G1b_vectorizable_M5": {
+      "description": "each vectorizable kernel <= 2.0x LLVM -O3 (worst over the vectorizable category)",
+      "predicate": ".aggregates.vectorizable_worst_runtime_vs_llvm_o3 != null and .aggregates.vectorizable_worst_runtime_vs_llvm_o3 <= 2.0"
+    },
+    "G1c_GATE_SB_M6": {
+      "description": "strictly better: full intent-to-treat geomean < 1.00x AND no benchmark > 1.50x, coverage >= 80%",
+      "predicate": ".aggregates.runtime_geomean_vs_llvm_o3 != null and .aggregates.runtime_geomean_vs_llvm_o3 < 1.00 and .aggregates.runtime_worst_vs_llvm_o3 <= 1.50 and .aggregates.coverage_pct >= 80"
+    },
+    "G2_M1_compile_warm_vs_O2": {
+      "description": "warm certs-on compile geomean <= 1.00x LLVM -O2 (warm cache mode stamped)",
+      "predicate": ".aggregates.compile_warm_geomean_vs_llvm_o2 != null and .aggregates.compile_warm_geomean_vs_llvm_o2 <= 1.00 and .provenance.cache.mode == \"warm\""
+    },
+    "G2_M1_compile_cold_vs_O2": {
+      "description": "cold compile geomean <= 2.00x LLVM -O2 (true cold, not cold_proxy)",
+      "predicate": ".aggregates.compile_cold_geomean_vs_llvm_o2 != null and .aggregates.compile_cold_geomean_vs_llvm_o2 <= 2.00"
+    },
+    "G2_endstate_compile_warm_vs_O3": {
+      "description": "end-state: warm certs-on compile geomean < 1.00x LLVM -O3",
+      "predicate": ".aggregates.compile_warm_geomean_vs_llvm_o3 != null and .aggregates.compile_warm_geomean_vs_llvm_o3 < 1.00"
+    },
+    "G5_coverage_M6": {
+      "description": "intent-to-treat coverage >= 80% compile-and-match",
+      "predicate": ".aggregates.coverage_pct >= 80"
+    }
+  }
+}

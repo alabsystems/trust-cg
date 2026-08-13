@@ -1,0 +1,70 @@
+{
+  "schema": "trust-cg.gamma_crown.compile_driver_request.v1",
+  "request_id": "gamma-driver-boundary-1",
+  "benchmark_subject": {
+    "category": "unit-fixture",
+    "instance_id": "conv_relu_static_f32_nchw",
+    "model_path": "benchmarks/vnncomp/unit/conv_relu.onnx",
+    "model_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "onnx_opset": 17,
+    "trust_ir_module_ref": "tests/fixtures/vnn_trust_ir/valid_conv_relu.json"
+  },
+  "gamma_crown": {
+    "commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "method": "alpha-crown",
+    "preset": "unit-fast",
+    "crown_relaxation_spec_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "proof_policy": "checked-cert-v1",
+    "layer_mapping_version": "gamma-layer-map-v1",
+    "runtime_abi": "gamma-runtime-abi-v1"
+  },
+  "target": {
+    "triple": "aarch64-apple-darwin",
+    "cpu": "apple-m2",
+    "features": ["+fp-armv8", "+neon"],
+    "artifact_kind": "executable_memory",
+    "accelerator_policy": "cpu-required-gpu-optional"
+  },
+  "compile": {
+    "profile": "FastAarch64Solver",
+    "fusion_profile": "conv2d_relu_cpu_v1",
+    "proof_cert_settings": "emit-pass-chain+runtime-checker",
+    "compile_service_artifact_abi": "trust-cg-artifact-abi-v1",
+    "generation": 7,
+    "stale_before": 0,
+    "install_intent": "Install"
+  },
+  "query_contract": {
+    "static_shapes": {
+      "input": [1, 3, 32, 32],
+      "output": [1, 16, 32, 32]
+    },
+    "layout": "nchw",
+    "dtype": "f32",
+    "accepted_vnnlib_query_family": "unit-conv-relu-property-v1",
+    "query_adapter_abi": "vnnlib-adapter-v1",
+    "output_abi": "gamma-answer-cert-v1",
+    "certificate_format": "gamma-cert-v1",
+    "runtime_abi": "trust-cg-specialized-verifier-runtime-v1"
+  },
+  "outputs": {
+    "install_root": "target/gamma-specialized",
+    "manifest_path": "target/gamma-specialized/conv_relu_static_f32_nchw.manifest.json",
+    "binary_name": "gamma-verify-specialized-conv-relu",
+    "report_artifact_path": "target/gamma-specialized/conv_relu_static_f32_nchw.report.json"
+  },
+  "dependency_gates": {
+    "onnx_importer_issue": 540,
+    "onnx_importer_available": false,
+    "vnn_trust_ir_schema_issue": 538,
+    "vnn_trust_ir_schema_available": true,
+    "vnn_trust_ir_lowering_issue": 541,
+    "vnn_trust_ir_lowering_available": false,
+    "compile_service_executable_issue": 545,
+    "compile_service_executable_available": false,
+    "artifact_manifest_issue": 543,
+    "artifact_manifest_available": true,
+    "verifier_abi_issue": 548,
+    "verifier_abi_available": true
+  }
+}

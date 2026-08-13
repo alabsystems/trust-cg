@@ -1,0 +1,22 @@
+{
+  "schema": "trust-cg.gamma_crown.specialized_artifact_manifest.v1",
+  "artifact_kind": "executable",
+  "artifact_id": "trust-cg-gamma-v1-blake3-256:c8c2a6fa61e6150fc15aa41a1a4f9f638d1c2d239f758dbdbd8cd0f8f3ff7d89",
+  "identity_inputs": {
+    "model": {
+      "path": "benchmarks/vnncomp/acasxu/model.onnx",
+      "model_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "onnx_opset": 17
+    },
+    "gamma_crown": {
+      "crown_relaxation_spec_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+    },
+    "contract": {
+      "accepted_vnnlib_query_family": "acasxu-linear-property-v1",
+      "query_adapter_abi": "vnnlib-adapter-v1",
+      "output_abi": "gamma-answer-cert-v1",
+      "certificate_format": "gamma-cert-v1",
+      "runtime_abi": "trust-cg-specialized-verifier-runtime-v1"
+    }
+  }
+}

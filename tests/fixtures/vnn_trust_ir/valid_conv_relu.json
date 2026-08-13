@@ -1,0 +1,87 @@
+{
+  "version": 1,
+  "dialect": "trust_ir.vnn",
+  "entry": "model",
+  "tensors": {
+    "%input": {
+      "shape": [1, 3, 32, 32],
+      "dtype": "f32",
+      "layout": "nchw",
+      "role": "input"
+    },
+    "%conv0": {
+      "shape": [1, 16, 32, 32],
+      "dtype": "f32",
+      "layout": "nchw",
+      "role": "activation"
+    },
+    "%relu0": {
+      "shape": [1, 16, 32, 32],
+      "dtype": "f32",
+      "layout": "nchw",
+      "role": "output"
+    }
+  },
+  "initializers": {
+    "conv0.weight": {
+      "shape": [16, 3, 3, 3],
+      "dtype": "f32",
+      "layout": "oihw",
+      "storage": { "kind": "external", "name": "conv0.weight" },
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "conv0.bias": {
+      "shape": [16],
+      "dtype": "f32",
+      "layout": "vector",
+      "storage": { "kind": "external", "name": "conv0.bias" },
+      "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+    }
+  },
+  "ops": [
+    {
+      "id": "vnn.0",
+      "op": "trust_ir.vnn.conv2d",
+      "inputs": ["%input"],
+      "outputs": ["%conv0"],
+      "weights": ["conv0.weight", "conv0.bias"],
+      "attrs": {
+        "kernel_shape": [3, 3],
+        "strides": [1, 1],
+        "pads": [1, 1, 1, 1],
+        "dilations": [1, 1],
+        "groups": 1
+      },
+      "provenance": {
+        "gamma_layer_id": "layer.0",
+        "gamma_layer_type": "Conv2d",
+        "onnx_node_name": "Conv_0",
+        "onnx_op_type": "Conv",
+        "onnx_outputs": ["conv0_out"]
+      }
+    },
+    {
+      "id": "vnn.1",
+      "op": "trust_ir.vnn.relu",
+      "inputs": ["%conv0"],
+      "outputs": ["%relu0"],
+      "attrs": {},
+      "provenance": {
+        "gamma_layer_id": "layer.1",
+        "gamma_layer_type": "ReLU",
+        "onnx_node_name": "Relu_1",
+        "onnx_op_type": "Relu",
+        "onnx_outputs": ["relu0_out"]
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from": "%conv0",
+      "to": "vnn.1",
+      "from_layer": "layer.0",
+      "to_layer": "layer.1",
+      "onnx_tensor": "conv0_out"
+    }
+  ]
+}

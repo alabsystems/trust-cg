@@ -1,0 +1,2149 @@
+; TrustIr text format v1
+module "mir::closure::opcode_root"
+target "aarch64-apple-darwin" 8 little
+file 0 "trust_opcode_sched_class_slice.rs"
+
+functy.0 = (u32, u32, ptr) -> ()
+
+functy.1 = (ptr, u32) -> ()
+
+functy.2 = (ptr, u16) -> ()
+
+functy.3 = (u8) -> (u32)
+
+functy.4 = (u16) -> (bool)
+
+functy.5 = (ptr, u16) -> ()
+
+functy.6 = (u16, u16) -> (bool)
+
+functy.7 = (u16, u16) -> (bool)
+
+functy.8 = (u16, u16) -> (bool)
+
+functy.9 = (ptr, u16, u16) -> ()
+
+functy.10 = (u16, u16) -> (bool)
+
+functy.11 = (ptr, u16, u16) -> ()
+
+functy.12 = (u16) -> (bool)
+
+functy.13 = (ptr, u16, u16) -> ()
+
+fn @opcode_root(functy.0) {
+bb0(%0: u32, %1: u32, %2: ptr):
+    %20 = alloca i16, align 2
+    %21 = alloca i8, align 1
+    %22 = alloca (i32, i32), align 4
+    %23 = alloca i16, align 2
+    call @func.1(%20, %0)
+    br bb1(%1, %2)
+bb1(%3: u32, %4: ptr):
+    %24 = load u16, ptr %20
+    call @func.2(%22, %24)
+    br bb2(%3, %4)
+bb2(%5: u32, %6: ptr):
+    %25 = load u32, ptr %22
+    %26 = const i64 4
+    %27 = gep i8, ptr %22, %26
+    %28 = load i8, ptr %27
+    store i8 %28, ptr %21
+    store u32 %25, ptr %6
+    %29 = load u8, ptr %21
+    %30 = call @func.3(%29)
+    br bb3(%5, %6, %30)
+bb3(%7: u32, %8: ptr, %9: u32):
+    %31 = const i64 4
+    %32 = gep i8, ptr %8, %31
+    store u32 %9, ptr %32
+    %33 = load u16, ptr %20
+    %34 = call @func.4(%33)
+    br bb4(%7, %8, %34)
+bb4(%10: u32, %11: ptr, %12: bool):
+    %35 = const u32 1
+    %36 = const u32 0
+    %37 = select u32 %12, %35, %36
+    %38 = const i64 8
+    %39 = gep i8, ptr %11, %38
+    store u32 %37, ptr %39
+    %40 = trunc u32 %10 to u16
+    call @func.5(%23, %40)
+    br bb5(%11)
+bb5(%13: ptr):
+    %41 = load u16, ptr %20
+    %42 = load u16, ptr %23
+    %43 = call @func.6(%41, %42)
+    br bb6(%13, %43)
+bb6(%14: ptr, %15: bool):
+    %44 = const u32 1
+    %45 = const u32 0
+    %46 = select u32 %15, %44, %45
+    %47 = const i64 12
+    %48 = gep i8, ptr %14, %47
+    store u32 %46, ptr %48
+    %49 = load u16, ptr %20
+    %50 = load u16, ptr %23
+    %51 = call @func.7(%49, %50)
+    br bb7(%14, %51)
+bb7(%16: ptr, %17: bool):
+    %52 = const u32 1
+    %53 = const u32 0
+    %54 = select u32 %17, %52, %53
+    %55 = const i64 16
+    %56 = gep i8, ptr %16, %55
+    store u32 %54, ptr %56
+    %57 = load u16, ptr %20
+    %58 = load u16, ptr %23
+    %59 = call @func.8(%57, %58)
+    br bb8(%16, %59)
+bb8(%18: ptr, %19: bool):
+    %60 = const u32 1
+    %61 = const u32 0
+    %62 = select u32 %19, %60, %61
+    %63 = const i64 20
+    %64 = gep i8, ptr %18, %63
+    store u32 %62, ptr %64
+    ret
+}
+
+fn @opcode_from_index(functy.1) {
+bb0(%0: ptr, %1: u32):
+    switch %1 [ 0: bb261 1: bb260 2: bb259 3: bb258 4: bb257 5: bb256 6: bb255 7: bb254 8: bb253 9: bb252 10: bb251 11: bb250 12: bb249 13: bb248 14: bb247 15: bb246 16: bb245 17: bb244 18: bb243 19: bb242 20: bb241 21: bb240 22: bb239 23: bb238 24: bb237 25: bb236 26: bb235 27: bb234 28: bb233 29: bb232 30: bb231 31: bb230 32: bb229 33: bb228 34: bb227 35: bb226 36: bb225 37: bb224 38: bb223 39: bb222 40: bb221 41: bb220 42: bb219 43: bb218 44: bb217 45: bb216 46: bb215 47: bb214 48: bb213 49: bb212 50: bb211 51: bb210 52: bb209 53: bb208 54: bb207 55: bb206 56: bb205 57: bb204 58: bb203 59: bb202 60: bb201 61: bb200 62: bb199 63: bb198 64: bb197 65: bb196 66: bb195 67: bb194 68: bb193 69: bb192 70: bb191 71: bb190 72: bb189 73: bb188 74: bb187 75: bb186 76: bb185 77: bb184 78: bb183 79: bb182 80: bb181 81: bb180 82: bb179 83: bb178 84: bb177 85: bb176 86: bb175 87: bb174 88: bb173 89: bb172 90: bb171 91: bb170 92: bb169 93: bb168 94: bb167 95: bb166 96: bb165 97: bb164 98: bb163 99: bb162 100: bb161 101: bb160 102: bb159 103: bb158 104: bb157 105: bb156 106: bb155 107: bb154 108: bb153 109: bb152 110: bb151 111: bb150 112: bb149 113: bb148 114: bb147 115: bb146 116: bb145 117: bb144 118: bb143 119: bb142 120: bb141 121: bb140 122: bb139 123: bb138 124: bb137 125: bb136 126: bb135 127: bb134 128: bb133 129: bb132 130: bb131 131: bb130 132: bb129 133: bb128 134: bb127 135: bb126 136: bb125 137: bb124 138: bb123 139: bb122 140: bb121 141: bb120 142: bb119 143: bb118 144: bb117 145: bb116 146: bb115 147: bb114 148: bb113 149: bb112 150: bb111 151: bb110 152: bb109 153: bb108 154: bb107 155: bb106 156: bb105 157: bb104 158: bb103 159: bb102 160: bb101 161: bb100 162: bb99 163: bb98 164: bb97 165: bb96 166: bb95 167: bb94 168: bb93 169: bb92 170: bb91 171: bb90 172: bb89 173: bb88 174: bb87 175: bb86 176: bb85 177: bb84 178: bb83 179: bb82 180: bb81 181: bb80 182: bb79 183: bb78 184: bb77 185: bb76 186: bb75 187: bb74 188: bb73 189: bb72 190: bb71 191: bb70 192: bb69 193: bb68 194: bb67 195: bb66 196: bb65 197: bb64 198: bb63 199: bb62 200: bb61 201: bb60 202: bb59 203: bb58 204: bb57 205: bb56 206: bb55 207: bb54 208: bb53 209: bb52 210: bb51 211: bb50 212: bb49 213: bb48 214: bb47 215: bb46 216: bb45 217: bb44 218: bb43 219: bb42 220: bb41 221: bb40 222: bb39 223: bb38 224: bb37 225: bb36 226: bb35 227: bb34 228: bb33 229: bb32 230: bb31 231: bb30 232: bb29 233: bb28 234: bb27 235: bb26 236: bb25 237: bb24 238: bb23 239: bb22 240: bb21 241: bb20 242: bb19 243: bb18 244: bb17 245: bb16 246: bb15 247: bb14 248: bb13 249: bb12 250: bb11 251: bb10 252: bb9 253: bb8 254: bb7 255: bb6 256: bb5 257: bb4 258: bb3 259: bb2 default: bb1 ]
+bb1:
+    %2 = const i16 254
+    store i16 %2, ptr %0
+    br bb262
+bb2:
+    %3 = const i16 259
+    store i16 %3, ptr %0
+    br bb262
+bb3:
+    %4 = const i16 258
+    store i16 %4, ptr %0
+    br bb262
+bb4:
+    %5 = const i16 257
+    store i16 %5, ptr %0
+    br bb262
+bb5:
+    %6 = const i16 256
+    store i16 %6, ptr %0
+    br bb262
+bb6:
+    %7 = const i16 255
+    store i16 %7, ptr %0
+    br bb262
+bb7:
+    %8 = const i16 254
+    store i16 %8, ptr %0
+    br bb262
+bb8:
+    %9 = const i16 253
+    store i16 %9, ptr %0
+    br bb262
+bb9:
+    %10 = const i16 252
+    store i16 %10, ptr %0
+    br bb262
+bb10:
+    %11 = const i16 251
+    store i16 %11, ptr %0
+    br bb262
+bb11:
+    %12 = const i16 250
+    store i16 %12, ptr %0
+    br bb262
+bb12:
+    %13 = const i16 249
+    store i16 %13, ptr %0
+    br bb262
+bb13:
+    %14 = const i16 248
+    store i16 %14, ptr %0
+    br bb262
+bb14:
+    %15 = const i16 247
+    store i16 %15, ptr %0
+    br bb262
+bb15:
+    %16 = const i16 246
+    store i16 %16, ptr %0
+    br bb262
+bb16:
+    %17 = const i16 245
+    store i16 %17, ptr %0
+    br bb262
+bb17:
+    %18 = const i16 244
+    store i16 %18, ptr %0
+    br bb262
+bb18:
+    %19 = const i16 243
+    store i16 %19, ptr %0
+    br bb262
+bb19:
+    %20 = const i16 242
+    store i16 %20, ptr %0
+    br bb262
+bb20:
+    %21 = const i16 241
+    store i16 %21, ptr %0
+    br bb262
+bb21:
+    %22 = const i16 240
+    store i16 %22, ptr %0
+    br bb262
+bb22:
+    %23 = const i16 239
+    store i16 %23, ptr %0
+    br bb262
+bb23:
+    %24 = const i16 238
+    store i16 %24, ptr %0
+    br bb262
+bb24:
+    %25 = const i16 237
+    store i16 %25, ptr %0
+    br bb262
+bb25:
+    %26 = const i16 236
+    store i16 %26, ptr %0
+    br bb262
+bb26:
+    %27 = const i16 235
+    store i16 %27, ptr %0
+    br bb262
+bb27:
+    %28 = const i16 234
+    store i16 %28, ptr %0
+    br bb262
+bb28:
+    %29 = const i16 233
+    store i16 %29, ptr %0
+    br bb262
+bb29:
+    %30 = const i16 232
+    store i16 %30, ptr %0
+    br bb262
+bb30:
+    %31 = const i16 231
+    store i16 %31, ptr %0
+    br bb262
+bb31:
+    %32 = const i16 230
+    store i16 %32, ptr %0
+    br bb262
+bb32:
+    %33 = const i16 229
+    store i16 %33, ptr %0
+    br bb262
+bb33:
+    %34 = const i16 228
+    store i16 %34, ptr %0
+    br bb262
+bb34:
+    %35 = const i16 227
+    store i16 %35, ptr %0
+    br bb262
+bb35:
+    %36 = const i16 226
+    store i16 %36, ptr %0
+    br bb262
+bb36:
+    %37 = const i16 225
+    store i16 %37, ptr %0
+    br bb262
+bb37:
+    %38 = const i16 224
+    store i16 %38, ptr %0
+    br bb262
+bb38:
+    %39 = const i16 223
+    store i16 %39, ptr %0
+    br bb262
+bb39:
+    %40 = const i16 222
+    store i16 %40, ptr %0
+    br bb262
+bb40:
+    %41 = const i16 221
+    store i16 %41, ptr %0
+    br bb262
+bb41:
+    %42 = const i16 220
+    store i16 %42, ptr %0
+    br bb262
+bb42:
+    %43 = const i16 219
+    store i16 %43, ptr %0
+    br bb262
+bb43:
+    %44 = const i16 218
+    store i16 %44, ptr %0
+    br bb262
+bb44:
+    %45 = const i16 217
+    store i16 %45, ptr %0
+    br bb262
+bb45:
+    %46 = const i16 216
+    store i16 %46, ptr %0
+    br bb262
+bb46:
+    %47 = const i16 215
+    store i16 %47, ptr %0
+    br bb262
+bb47:
+    %48 = const i16 214
+    store i16 %48, ptr %0
+    br bb262
+bb48:
+    %49 = const i16 213
+    store i16 %49, ptr %0
+    br bb262
+bb49:
+    %50 = const i16 212
+    store i16 %50, ptr %0
+    br bb262
+bb50:
+    %51 = const i16 211
+    store i16 %51, ptr %0
+    br bb262
+bb51:
+    %52 = const i16 210
+    store i16 %52, ptr %0
+    br bb262
+bb52:
+    %53 = const i16 209
+    store i16 %53, ptr %0
+    br bb262
+bb53:
+    %54 = const i16 208
+    store i16 %54, ptr %0
+    br bb262
+bb54:
+    %55 = const i16 207
+    store i16 %55, ptr %0
+    br bb262
+bb55:
+    %56 = const i16 206
+    store i16 %56, ptr %0
+    br bb262
+bb56:
+    %57 = const i16 205
+    store i16 %57, ptr %0
+    br bb262
+bb57:
+    %58 = const i16 204
+    store i16 %58, ptr %0
+    br bb262
+bb58:
+    %59 = const i16 203
+    store i16 %59, ptr %0
+    br bb262
+bb59:
+    %60 = const i16 202
+    store i16 %60, ptr %0
+    br bb262
+bb60:
+    %61 = const i16 201
+    store i16 %61, ptr %0
+    br bb262
+bb61:
+    %62 = const i16 200
+    store i16 %62, ptr %0
+    br bb262
+bb62:
+    %63 = const i16 199
+    store i16 %63, ptr %0
+    br bb262
+bb63:
+    %64 = const i16 198
+    store i16 %64, ptr %0
+    br bb262
+bb64:
+    %65 = const i16 197
+    store i16 %65, ptr %0
+    br bb262
+bb65:
+    %66 = const i16 196
+    store i16 %66, ptr %0
+    br bb262
+bb66:
+    %67 = const i16 195
+    store i16 %67, ptr %0
+    br bb262
+bb67:
+    %68 = const i16 194
+    store i16 %68, ptr %0
+    br bb262
+bb68:
+    %69 = const i16 193
+    store i16 %69, ptr %0
+    br bb262
+bb69:
+    %70 = const i16 192
+    store i16 %70, ptr %0
+    br bb262
+bb70:
+    %71 = const i16 191
+    store i16 %71, ptr %0
+    br bb262
+bb71:
+    %72 = const i16 190
+    store i16 %72, ptr %0
+    br bb262
+bb72:
+    %73 = const i16 189
+    store i16 %73, ptr %0
+    br bb262
+bb73:
+    %74 = const i16 188
+    store i16 %74, ptr %0
+    br bb262
+bb74:
+    %75 = const i16 187
+    store i16 %75, ptr %0
+    br bb262
+bb75:
+    %76 = const i16 186
+    store i16 %76, ptr %0
+    br bb262
+bb76:
+    %77 = const i16 185
+    store i16 %77, ptr %0
+    br bb262
+bb77:
+    %78 = const i16 184
+    store i16 %78, ptr %0
+    br bb262
+bb78:
+    %79 = const i16 183
+    store i16 %79, ptr %0
+    br bb262
+bb79:
+    %80 = const i16 182
+    store i16 %80, ptr %0
+    br bb262
+bb80:
+    %81 = const i16 181
+    store i16 %81, ptr %0
+    br bb262
+bb81:
+    %82 = const i16 180
+    store i16 %82, ptr %0
+    br bb262
+bb82:
+    %83 = const i16 179
+    store i16 %83, ptr %0
+    br bb262
+bb83:
+    %84 = const i16 178
+    store i16 %84, ptr %0
+    br bb262
+bb84:
+    %85 = const i16 177
+    store i16 %85, ptr %0
+    br bb262
+bb85:
+    %86 = const i16 176
+    store i16 %86, ptr %0
+    br bb262
+bb86:
+    %87 = const i16 175
+    store i16 %87, ptr %0
+    br bb262
+bb87:
+    %88 = const i16 174
+    store i16 %88, ptr %0
+    br bb262
+bb88:
+    %89 = const i16 173
+    store i16 %89, ptr %0
+    br bb262
+bb89:
+    %90 = const i16 172
+    store i16 %90, ptr %0
+    br bb262
+bb90:
+    %91 = const i16 171
+    store i16 %91, ptr %0
+    br bb262
+bb91:
+    %92 = const i16 170
+    store i16 %92, ptr %0
+    br bb262
+bb92:
+    %93 = const i16 169
+    store i16 %93, ptr %0
+    br bb262
+bb93:
+    %94 = const i16 168
+    store i16 %94, ptr %0
+    br bb262
+bb94:
+    %95 = const i16 167
+    store i16 %95, ptr %0
+    br bb262
+bb95:
+    %96 = const i16 166
+    store i16 %96, ptr %0
+    br bb262
+bb96:
+    %97 = const i16 165
+    store i16 %97, ptr %0
+    br bb262
+bb97:
+    %98 = const i16 164
+    store i16 %98, ptr %0
+    br bb262
+bb98:
+    %99 = const i16 163
+    store i16 %99, ptr %0
+    br bb262
+bb99:
+    %100 = const i16 162
+    store i16 %100, ptr %0
+    br bb262
+bb100:
+    %101 = const i16 161
+    store i16 %101, ptr %0
+    br bb262
+bb101:
+    %102 = const i16 160
+    store i16 %102, ptr %0
+    br bb262
+bb102:
+    %103 = const i16 159
+    store i16 %103, ptr %0
+    br bb262
+bb103:
+    %104 = const i16 158
+    store i16 %104, ptr %0
+    br bb262
+bb104:
+    %105 = const i16 157
+    store i16 %105, ptr %0
+    br bb262
+bb105:
+    %106 = const i16 156
+    store i16 %106, ptr %0
+    br bb262
+bb106:
+    %107 = const i16 155
+    store i16 %107, ptr %0
+    br bb262
+bb107:
+    %108 = const i16 154
+    store i16 %108, ptr %0
+    br bb262
+bb108:
+    %109 = const i16 153
+    store i16 %109, ptr %0
+    br bb262
+bb109:
+    %110 = const i16 152
+    store i16 %110, ptr %0
+    br bb262
+bb110:
+    %111 = const i16 151
+    store i16 %111, ptr %0
+    br bb262
+bb111:
+    %112 = const i16 150
+    store i16 %112, ptr %0
+    br bb262
+bb112:
+    %113 = const i16 149
+    store i16 %113, ptr %0
+    br bb262
+bb113:
+    %114 = const i16 148
+    store i16 %114, ptr %0
+    br bb262
+bb114:
+    %115 = const i16 147
+    store i16 %115, ptr %0
+    br bb262
+bb115:
+    %116 = const i16 146
+    store i16 %116, ptr %0
+    br bb262
+bb116:
+    %117 = const i16 145
+    store i16 %117, ptr %0
+    br bb262
+bb117:
+    %118 = const i16 144
+    store i16 %118, ptr %0
+    br bb262
+bb118:
+    %119 = const i16 143
+    store i16 %119, ptr %0
+    br bb262
+bb119:
+    %120 = const i16 142
+    store i16 %120, ptr %0
+    br bb262
+bb120:
+    %121 = const i16 141
+    store i16 %121, ptr %0
+    br bb262
+bb121:
+    %122 = const i16 140
+    store i16 %122, ptr %0
+    br bb262
+bb122:
+    %123 = const i16 139
+    store i16 %123, ptr %0
+    br bb262
+bb123:
+    %124 = const i16 138
+    store i16 %124, ptr %0
+    br bb262
+bb124:
+    %125 = const i16 137
+    store i16 %125, ptr %0
+    br bb262
+bb125:
+    %126 = const i16 136
+    store i16 %126, ptr %0
+    br bb262
+bb126:
+    %127 = const i16 135
+    store i16 %127, ptr %0
+    br bb262
+bb127:
+    %128 = const i16 134
+    store i16 %128, ptr %0
+    br bb262
+bb128:
+    %129 = const i16 133
+    store i16 %129, ptr %0
+    br bb262
+bb129:
+    %130 = const i16 132
+    store i16 %130, ptr %0
+    br bb262
+bb130:
+    %131 = const i16 131
+    store i16 %131, ptr %0
+    br bb262
+bb131:
+    %132 = const i16 130
+    store i16 %132, ptr %0
+    br bb262
+bb132:
+    %133 = const i16 129
+    store i16 %133, ptr %0
+    br bb262
+bb133:
+    %134 = const i16 128
+    store i16 %134, ptr %0
+    br bb262
+bb134:
+    %135 = const i16 127
+    store i16 %135, ptr %0
+    br bb262
+bb135:
+    %136 = const i16 126
+    store i16 %136, ptr %0
+    br bb262
+bb136:
+    %137 = const i16 125
+    store i16 %137, ptr %0
+    br bb262
+bb137:
+    %138 = const i16 124
+    store i16 %138, ptr %0
+    br bb262
+bb138:
+    %139 = const i16 123
+    store i16 %139, ptr %0
+    br bb262
+bb139:
+    %140 = const i16 122
+    store i16 %140, ptr %0
+    br bb262
+bb140:
+    %141 = const i16 121
+    store i16 %141, ptr %0
+    br bb262
+bb141:
+    %142 = const i16 120
+    store i16 %142, ptr %0
+    br bb262
+bb142:
+    %143 = const i16 119
+    store i16 %143, ptr %0
+    br bb262
+bb143:
+    %144 = const i16 118
+    store i16 %144, ptr %0
+    br bb262
+bb144:
+    %145 = const i16 117
+    store i16 %145, ptr %0
+    br bb262
+bb145:
+    %146 = const i16 116
+    store i16 %146, ptr %0
+    br bb262
+bb146:
+    %147 = const i16 115
+    store i16 %147, ptr %0
+    br bb262
+bb147:
+    %148 = const i16 114
+    store i16 %148, ptr %0
+    br bb262
+bb148:
+    %149 = const i16 113
+    store i16 %149, ptr %0
+    br bb262
+bb149:
+    %150 = const i16 112
+    store i16 %150, ptr %0
+    br bb262
+bb150:
+    %151 = const i16 111
+    store i16 %151, ptr %0
+    br bb262
+bb151:
+    %152 = const i16 110
+    store i16 %152, ptr %0
+    br bb262
+bb152:
+    %153 = const i16 109
+    store i16 %153, ptr %0
+    br bb262
+bb153:
+    %154 = const i16 108
+    store i16 %154, ptr %0
+    br bb262
+bb154:
+    %155 = const i16 107
+    store i16 %155, ptr %0
+    br bb262
+bb155:
+    %156 = const i16 106
+    store i16 %156, ptr %0
+    br bb262
+bb156:
+    %157 = const i16 105
+    store i16 %157, ptr %0
+    br bb262
+bb157:
+    %158 = const i16 104
+    store i16 %158, ptr %0
+    br bb262
+bb158:
+    %159 = const i16 103
+    store i16 %159, ptr %0
+    br bb262
+bb159:
+    %160 = const i16 102
+    store i16 %160, ptr %0
+    br bb262
+bb160:
+    %161 = const i16 101
+    store i16 %161, ptr %0
+    br bb262
+bb161:
+    %162 = const i16 100
+    store i16 %162, ptr %0
+    br bb262
+bb162:
+    %163 = const i16 99
+    store i16 %163, ptr %0
+    br bb262
+bb163:
+    %164 = const i16 98
+    store i16 %164, ptr %0
+    br bb262
+bb164:
+    %165 = const i16 97
+    store i16 %165, ptr %0
+    br bb262
+bb165:
+    %166 = const i16 96
+    store i16 %166, ptr %0
+    br bb262
+bb166:
+    %167 = const i16 95
+    store i16 %167, ptr %0
+    br bb262
+bb167:
+    %168 = const i16 94
+    store i16 %168, ptr %0
+    br bb262
+bb168:
+    %169 = const i16 93
+    store i16 %169, ptr %0
+    br bb262
+bb169:
+    %170 = const i16 92
+    store i16 %170, ptr %0
+    br bb262
+bb170:
+    %171 = const i16 91
+    store i16 %171, ptr %0
+    br bb262
+bb171:
+    %172 = const i16 90
+    store i16 %172, ptr %0
+    br bb262
+bb172:
+    %173 = const i16 89
+    store i16 %173, ptr %0
+    br bb262
+bb173:
+    %174 = const i16 88
+    store i16 %174, ptr %0
+    br bb262
+bb174:
+    %175 = const i16 87
+    store i16 %175, ptr %0
+    br bb262
+bb175:
+    %176 = const i16 86
+    store i16 %176, ptr %0
+    br bb262
+bb176:
+    %177 = const i16 85
+    store i16 %177, ptr %0
+    br bb262
+bb177:
+    %178 = const i16 84
+    store i16 %178, ptr %0
+    br bb262
+bb178:
+    %179 = const i16 83
+    store i16 %179, ptr %0
+    br bb262
+bb179:
+    %180 = const i16 82
+    store i16 %180, ptr %0
+    br bb262
+bb180:
+    %181 = const i16 81
+    store i16 %181, ptr %0
+    br bb262
+bb181:
+    %182 = const i16 80
+    store i16 %182, ptr %0
+    br bb262
+bb182:
+    %183 = const i16 79
+    store i16 %183, ptr %0
+    br bb262
+bb183:
+    %184 = const i16 78
+    store i16 %184, ptr %0
+    br bb262
+bb184:
+    %185 = const i16 77
+    store i16 %185, ptr %0
+    br bb262
+bb185:
+    %186 = const i16 76
+    store i16 %186, ptr %0
+    br bb262
+bb186:
+    %187 = const i16 75
+    store i16 %187, ptr %0
+    br bb262
+bb187:
+    %188 = const i16 74
+    store i16 %188, ptr %0
+    br bb262
+bb188:
+    %189 = const i16 73
+    store i16 %189, ptr %0
+    br bb262
+bb189:
+    %190 = const i16 72
+    store i16 %190, ptr %0
+    br bb262
+bb190:
+    %191 = const i16 71
+    store i16 %191, ptr %0
+    br bb262
+bb191:
+    %192 = const i16 70
+    store i16 %192, ptr %0
+    br bb262
+bb192:
+    %193 = const i16 69
+    store i16 %193, ptr %0
+    br bb262
+bb193:
+    %194 = const i16 68
+    store i16 %194, ptr %0
+    br bb262
+bb194:
+    %195 = const i16 67
+    store i16 %195, ptr %0
+    br bb262
+bb195:
+    %196 = const i16 66
+    store i16 %196, ptr %0
+    br bb262
+bb196:
+    %197 = const i16 65
+    store i16 %197, ptr %0
+    br bb262
+bb197:
+    %198 = const i16 64
+    store i16 %198, ptr %0
+    br bb262
+bb198:
+    %199 = const i16 63
+    store i16 %199, ptr %0
+    br bb262
+bb199:
+    %200 = const i16 62
+    store i16 %200, ptr %0
+    br bb262
+bb200:
+    %201 = const i16 61
+    store i16 %201, ptr %0
+    br bb262
+bb201:
+    %202 = const i16 60
+    store i16 %202, ptr %0
+    br bb262
+bb202:
+    %203 = const i16 59
+    store i16 %203, ptr %0
+    br bb262
+bb203:
+    %204 = const i16 58
+    store i16 %204, ptr %0
+    br bb262
+bb204:
+    %205 = const i16 57
+    store i16 %205, ptr %0
+    br bb262
+bb205:
+    %206 = const i16 56
+    store i16 %206, ptr %0
+    br bb262
+bb206:
+    %207 = const i16 55
+    store i16 %207, ptr %0
+    br bb262
+bb207:
+    %208 = const i16 54
+    store i16 %208, ptr %0
+    br bb262
+bb208:
+    %209 = const i16 53
+    store i16 %209, ptr %0
+    br bb262
+bb209:
+    %210 = const i16 52
+    store i16 %210, ptr %0
+    br bb262
+bb210:
+    %211 = const i16 51
+    store i16 %211, ptr %0
+    br bb262
+bb211:
+    %212 = const i16 50
+    store i16 %212, ptr %0
+    br bb262
+bb212:
+    %213 = const i16 49
+    store i16 %213, ptr %0
+    br bb262
+bb213:
+    %214 = const i16 48
+    store i16 %214, ptr %0
+    br bb262
+bb214:
+    %215 = const i16 47
+    store i16 %215, ptr %0
+    br bb262
+bb215:
+    %216 = const i16 46
+    store i16 %216, ptr %0
+    br bb262
+bb216:
+    %217 = const i16 45
+    store i16 %217, ptr %0
+    br bb262
+bb217:
+    %218 = const i16 44
+    store i16 %218, ptr %0
+    br bb262
+bb218:
+    %219 = const i16 43
+    store i16 %219, ptr %0
+    br bb262
+bb219:
+    %220 = const i16 42
+    store i16 %220, ptr %0
+    br bb262
+bb220:
+    %221 = const i16 41
+    store i16 %221, ptr %0
+    br bb262
+bb221:
+    %222 = const i16 40
+    store i16 %222, ptr %0
+    br bb262
+bb222:
+    %223 = const i16 39
+    store i16 %223, ptr %0
+    br bb262
+bb223:
+    %224 = const i16 38
+    store i16 %224, ptr %0
+    br bb262
+bb224:
+    %225 = const i16 37
+    store i16 %225, ptr %0
+    br bb262
+bb225:
+    %226 = const i16 36
+    store i16 %226, ptr %0
+    br bb262
+bb226:
+    %227 = const i16 35
+    store i16 %227, ptr %0
+    br bb262
+bb227:
+    %228 = const i16 34
+    store i16 %228, ptr %0
+    br bb262
+bb228:
+    %229 = const i16 33
+    store i16 %229, ptr %0
+    br bb262
+bb229:
+    %230 = const i16 32
+    store i16 %230, ptr %0
+    br bb262
+bb230:
+    %231 = const i16 31
+    store i16 %231, ptr %0
+    br bb262
+bb231:
+    %232 = const i16 30
+    store i16 %232, ptr %0
+    br bb262
+bb232:
+    %233 = const i16 29
+    store i16 %233, ptr %0
+    br bb262
+bb233:
+    %234 = const i16 28
+    store i16 %234, ptr %0
+    br bb262
+bb234:
+    %235 = const i16 27
+    store i16 %235, ptr %0
+    br bb262
+bb235:
+    %236 = const i16 26
+    store i16 %236, ptr %0
+    br bb262
+bb236:
+    %237 = const i16 25
+    store i16 %237, ptr %0
+    br bb262
+bb237:
+    %238 = const i16 24
+    store i16 %238, ptr %0
+    br bb262
+bb238:
+    %239 = const i16 23
+    store i16 %239, ptr %0
+    br bb262
+bb239:
+    %240 = const i16 22
+    store i16 %240, ptr %0
+    br bb262
+bb240:
+    %241 = const i16 21
+    store i16 %241, ptr %0
+    br bb262
+bb241:
+    %242 = const i16 20
+    store i16 %242, ptr %0
+    br bb262
+bb242:
+    %243 = const i16 19
+    store i16 %243, ptr %0
+    br bb262
+bb243:
+    %244 = const i16 18
+    store i16 %244, ptr %0
+    br bb262
+bb244:
+    %245 = const i16 17
+    store i16 %245, ptr %0
+    br bb262
+bb245:
+    %246 = const i16 16
+    store i16 %246, ptr %0
+    br bb262
+bb246:
+    %247 = const i16 15
+    store i16 %247, ptr %0
+    br bb262
+bb247:
+    %248 = const i16 14
+    store i16 %248, ptr %0
+    br bb262
+bb248:
+    %249 = const i16 13
+    store i16 %249, ptr %0
+    br bb262
+bb249:
+    %250 = const i16 12
+    store i16 %250, ptr %0
+    br bb262
+bb250:
+    %251 = const i16 11
+    store i16 %251, ptr %0
+    br bb262
+bb251:
+    %252 = const i16 10
+    store i16 %252, ptr %0
+    br bb262
+bb252:
+    %253 = const i16 9
+    store i16 %253, ptr %0
+    br bb262
+bb253:
+    %254 = const i16 8
+    store i16 %254, ptr %0
+    br bb262
+bb254:
+    %255 = const i16 7
+    store i16 %255, ptr %0
+    br bb262
+bb255:
+    %256 = const i16 6
+    store i16 %256, ptr %0
+    br bb262
+bb256:
+    %257 = const i16 5
+    store i16 %257, ptr %0
+    br bb262
+bb257:
+    %258 = const i16 4
+    store i16 %258, ptr %0
+    br bb262
+bb258:
+    %259 = const i16 3
+    store i16 %259, ptr %0
+    br bb262
+bb259:
+    %260 = const i16 2
+    store i16 %260, ptr %0
+    br bb262
+bb260:
+    %261 = const i16 1
+    store i16 %261, ptr %0
+    br bb262
+bb261:
+    %262 = const i16 0
+    store i16 %262, ptr %0
+    br bb262
+bb262:
+    ret
+}
+
+fn @opcode_latency(functy.2) {
+bb0(%0: ptr, %1: u16):
+    %2 = alloca i16, align 2
+    %3 = alloca i8, align 1
+    %4 = alloca i8, align 1
+    %5 = alloca i8, align 1
+    %6 = alloca i8, align 1
+    %7 = alloca i8, align 1
+    %8 = alloca i8, align 1
+    %9 = alloca i8, align 1
+    %10 = alloca i8, align 1
+    %11 = alloca i8, align 1
+    %12 = alloca i8, align 1
+    %13 = alloca i8, align 1
+    %14 = alloca i8, align 1
+    %15 = alloca i8, align 1
+    %16 = alloca i8, align 1
+    %17 = alloca i8, align 1
+    %18 = alloca i8, align 1
+    %19 = alloca i8, align 1
+    %20 = alloca i8, align 1
+    %21 = alloca i8, align 1
+    %22 = alloca i8, align 1
+    %23 = alloca i8, align 1
+    %24 = alloca i8, align 1
+    %25 = alloca i8, align 1
+    %26 = alloca i8, align 1
+    %27 = alloca i8, align 1
+    %28 = alloca i8, align 1
+    %29 = alloca i8, align 1
+    %30 = alloca i8, align 1
+    %31 = alloca i8, align 1
+    %32 = alloca i8, align 1
+    %33 = alloca i8, align 1
+    %34 = alloca i8, align 1
+    %35 = alloca i8, align 1
+    %36 = alloca i8, align 1
+    %37 = alloca i8, align 1
+    %38 = alloca i8, align 1
+    %39 = alloca i8, align 1
+    %40 = alloca i8, align 1
+    %41 = alloca i8, align 1
+    %42 = alloca i8, align 1
+    %43 = alloca i8, align 1
+    %44 = alloca i8, align 1
+    %45 = alloca i8, align 1
+    %46 = alloca i8, align 1
+    %47 = alloca i8, align 1
+    %48 = alloca i8, align 1
+    %49 = alloca i8, align 1
+    %50 = alloca i8, align 1
+    %51 = alloca i8, align 1
+    %52 = alloca i8, align 1
+    %53 = alloca i8, align 1
+    %54 = alloca i8, align 1
+    %55 = alloca i8, align 1
+    %56 = alloca i8, align 1
+    %57 = alloca i8, align 1
+    %58 = alloca i8, align 1
+    %59 = alloca i8, align 1
+    %60 = alloca i8, align 1
+    %61 = alloca i8, align 1
+    %62 = alloca i8, align 1
+    %63 = alloca i8, align 1
+    %64 = alloca i8, align 1
+    %65 = alloca i8, align 1
+    store u16 %1, ptr %2
+    %66 = load i16, ptr %2
+    %67 = bitcast i16 %66 to u16
+    switch %67 [ 0: bb64 1: bb64 2: bb64 3: bb64 4: bb64 5: bb53 6: bb53 7: bb53 8: bb53 9: bb52 10: bb52 11: bb64 12: bb63 13: bb63 14: bb63 15: bb63 16: bb63 17: bb63 18: bb63 19: bb63 20: bb62 21: bb62 22: bb62 23: bb62 24: bb62 25: bb62 26: bb62 27: bb62 28: bb61 29: bb61 30: bb61 31: bb60 32: bb60 33: bb60 34: bb60 35: bb59 36: bb59 37: bb59 38: bb59 39: bb59 40: bb39 41: bb51 42: bb50 43: bb51 44: bb50 45: bb51 46: bb50 47: bb51 48: bb51 49: bb51 50: bb51 51: bb50 52: bb50 53: bb51 54: bb51 55: bb50 56: bb50 57: bb51 58: bb51 59: bb50 60: bb51 61: bb51 62: bb51 63: bb51 64: bb48 65: bb48 66: bb48 67: bb48 68: bb48 69: bb48 70: bb48 71: bb47 72: bb47 73: bb47 74: bb60 75: bb58 76: bb58 77: bb58 78: bb58 79: bb58 80: bb58 81: bb58 82: bb58 83: bb58 84: bb46 85: bb46 86: bb46 87: bb46 88: bb45 89: bb44 90: bb44 91: bb46 92: bb46 93: bb42 94: bb43 95: bb43 96: bb43 97: bb46 98: bb41 99: bb41 100: bb41 101: bb41 102: bb40 103: bb40 104: bb40 105: bb40 106: bb40 107: bb40 108: bb39 109: bb39 110: bb39 111: bb38 112: bb38 113: bb37 114: bb28 115: bb28 116: bb28 117: bb28 118: bb36 119: bb36 120: bb35 121: bb31 122: bb29 123: bb30 124: bb30 125: bb30 126: bb30 127: bb30 128: bb30 129: bb30 130: bb30 131: bb29 132: bb29 133: bb29 134: bb29 135: bb29 136: bb27 137: bb27 138: bb26 139: bb26 140: bb25 141: bb25 142: bb26 143: bb16 144: bb15 145: bb14 146: bb13 147: bb23 148: bb22 149: bb21 150: bb20 151: bb18 152: bb19 153: bb17 154: bb34 155: bb34 156: bb33 157: bb33 158: bb32 159: bb10 160: bb10 161: bb10 162: bb9 163: bb9 164: bb9 165: bb8 166: bb8 167: bb8 168: bb8 169: bb8 170: bb8 171: bb8 172: bb8 173: bb8 174: bb8 175: bb8 176: bb8 177: bb8 178: bb8 179: bb8 180: bb8 181: bb8 182: bb8 183: bb8 184: bb8 185: bb8 186: bb8 187: bb8 188: bb8 189: bb8 190: bb8 191: bb8 192: bb8 193: bb8 194: bb8 195: bb8 196: bb8 197: bb8 198: bb8 199: bb8 200: bb8 201: bb7 202: bb7 203: bb7 204: bb7 205: bb10 206: bb9 207: bb6 208: bb5 209: bb4 210: bb57 211: bb57 212: bb57 213: bb51 214: bb56 215: bb56 216: bb56 217: bb56 218: bb55 219: bb55 220: bb54 221: bb54 222: bb54 223: bb12 224: bb12 225: bb12 226: bb12 227: bb12 228: bb12 229: bb12 230: bb12 231: bb12 232: bb12 233: bb11 234: bb11 235: bb59 236: bb59 237: bb50 238: bb50 239: bb50 240: bb50 241: bb47 242: bb47 243: bb61 244: bb61 245: bb61 246: bb61 247: bb59 248: bb59 249: bb48 250: bb3 251: bb2 252: bb49 253: bb2 254: bb2 255: bb24 256: bb24 257: bb24 258: bb12 259: bb47 default: bb1 ]
+bb1:
+    unreachable
+bb2:
+    %68 = const i8 0
+    store i8 %68, ptr %65
+    %69 = const u32 1
+    store u32 %69, ptr %0
+    %70 = const i64 4
+    %71 = gep i8, ptr %0, %70
+    %72 = load i8, ptr %65
+    store i8 %72, ptr %71
+    br bb65
+bb3:
+    %73 = const i8 0
+    store i8 %73, ptr %64
+    %74 = const u32 4
+    store u32 %74, ptr %0
+    %75 = const i64 4
+    %76 = gep i8, ptr %0, %75
+    %77 = load i8, ptr %64
+    store i8 %77, ptr %76
+    br bb65
+bb4:
+    %78 = const i8 3
+    store i8 %78, ptr %63
+    %79 = const u32 12
+    store u32 %79, ptr %0
+    %80 = const i64 4
+    %81 = gep i8, ptr %0, %80
+    %82 = load i8, ptr %63
+    store i8 %82, ptr %81
+    br bb65
+bb5:
+    %83 = const i8 3
+    store i8 %83, ptr %62
+    %84 = const u32 8
+    store u32 %84, ptr %0
+    %85 = const i64 4
+    %86 = gep i8, ptr %0, %85
+    %87 = load i8, ptr %62
+    store i8 %87, ptr %86
+    br bb65
+bb6:
+    %88 = const i8 3
+    store i8 %88, ptr %61
+    %89 = const u32 4
+    store u32 %89, ptr %0
+    %90 = const i64 4
+    %91 = gep i8, ptr %0, %90
+    %92 = load i8, ptr %61
+    store i8 %92, ptr %91
+    br bb65
+bb7:
+    %93 = const i8 3
+    store i8 %93, ptr %60
+    %94 = const u32 8
+    store u32 %94, ptr %0
+    %95 = const i64 4
+    %96 = gep i8, ptr %0, %95
+    %97 = load i8, ptr %60
+    store i8 %97, ptr %96
+    br bb65
+bb8:
+    %98 = const i8 3
+    store i8 %98, ptr %59
+    %99 = const u32 6
+    store u32 %99, ptr %0
+    %100 = const i64 4
+    %101 = gep i8, ptr %0, %100
+    %102 = load i8, ptr %59
+    store i8 %102, ptr %101
+    br bb65
+bb9:
+    %103 = const i8 3
+    store i8 %103, ptr %58
+    %104 = const u32 2
+    store u32 %104, ptr %0
+    %105 = const i64 4
+    %106 = gep i8, ptr %0, %105
+    %107 = load i8, ptr %58
+    store i8 %107, ptr %106
+    br bb65
+bb10:
+    %108 = const i8 3
+    store i8 %108, ptr %57
+    %109 = const u32 4
+    store u32 %109, ptr %0
+    %110 = const i64 4
+    %111 = gep i8, ptr %0, %110
+    %112 = load i8, ptr %57
+    store i8 %112, ptr %111
+    br bb65
+bb11:
+    %113 = const i8 3
+    store i8 %113, ptr %56
+    %114 = const u32 1
+    store u32 %114, ptr %0
+    %115 = const i64 4
+    %116 = gep i8, ptr %0, %115
+    %117 = load i8, ptr %56
+    store i8 %117, ptr %116
+    br bb65
+bb12:
+    %118 = const i8 4
+    store i8 %118, ptr %55
+    %119 = const u32 1
+    store u32 %119, ptr %0
+    %120 = const i64 4
+    %121 = gep i8, ptr %0, %120
+    %122 = load i8, ptr %55
+    store i8 %122, ptr %121
+    br bb65
+bb13:
+    %123 = const i8 3
+    store i8 %123, ptr %54
+    %124 = const u32 1
+    store u32 %124, ptr %0
+    %125 = const i64 4
+    %126 = gep i8, ptr %0, %125
+    %127 = load i8, ptr %54
+    store i8 %127, ptr %126
+    br bb65
+bb14:
+    %128 = const i8 3
+    store i8 %128, ptr %53
+    %129 = const u32 1
+    store u32 %129, ptr %0
+    %130 = const i64 4
+    %131 = gep i8, ptr %0, %130
+    %132 = load i8, ptr %53
+    store i8 %132, ptr %131
+    br bb65
+bb15:
+    %133 = const i8 3
+    store i8 %133, ptr %52
+    %134 = const u32 4
+    store u32 %134, ptr %0
+    %135 = const i64 4
+    %136 = gep i8, ptr %0, %135
+    %137 = load i8, ptr %52
+    store i8 %137, ptr %136
+    br bb65
+bb16:
+    %138 = const i8 3
+    store i8 %138, ptr %51
+    %139 = const u32 4
+    store u32 %139, ptr %0
+    %140 = const i64 4
+    %141 = gep i8, ptr %0, %140
+    %142 = load i8, ptr %51
+    store i8 %142, ptr %141
+    br bb65
+bb17:
+    %143 = const i8 5
+    store i8 %143, ptr %50
+    %144 = const u32 2
+    store u32 %144, ptr %0
+    %145 = const i64 4
+    %146 = gep i8, ptr %0, %145
+    %147 = load i8, ptr %50
+    store i8 %147, ptr %146
+    br bb65
+bb18:
+    %148 = const i8 5
+    store i8 %148, ptr %49
+    %149 = const u32 2
+    store u32 %149, ptr %0
+    %150 = const i64 4
+    %151 = gep i8, ptr %0, %150
+    %152 = load i8, ptr %49
+    store i8 %152, ptr %151
+    br bb65
+bb19:
+    %153 = const i8 5
+    store i8 %153, ptr %48
+    %154 = const u32 3
+    store u32 %154, ptr %0
+    %155 = const i64 4
+    %156 = gep i8, ptr %0, %155
+    %157 = load i8, ptr %48
+    store i8 %157, ptr %156
+    br bb65
+bb20:
+    %158 = const i8 5
+    store i8 %158, ptr %47
+    %159 = const u32 2
+    store u32 %159, ptr %0
+    %160 = const i64 4
+    %161 = gep i8, ptr %0, %160
+    %162 = load i8, ptr %47
+    store i8 %162, ptr %161
+    br bb65
+bb21:
+    %163 = const i8 5
+    store i8 %163, ptr %46
+    %164 = const u32 3
+    store u32 %164, ptr %0
+    %165 = const i64 4
+    %166 = gep i8, ptr %0, %165
+    %167 = load i8, ptr %46
+    store i8 %167, ptr %166
+    br bb65
+bb22:
+    %168 = const i8 5
+    store i8 %168, ptr %45
+    %169 = const u32 3
+    store u32 %169, ptr %0
+    %170 = const i64 4
+    %171 = gep i8, ptr %0, %170
+    %172 = load i8, ptr %45
+    store i8 %172, ptr %171
+    br bb65
+bb23:
+    %173 = const i8 5
+    store i8 %173, ptr %44
+    %174 = const u32 2
+    store u32 %174, ptr %0
+    %175 = const i64 4
+    %176 = gep i8, ptr %0, %175
+    %177 = load i8, ptr %44
+    store i8 %177, ptr %176
+    br bb65
+bb24:
+    %178 = const i8 5
+    store i8 %178, ptr %43
+    %179 = const u32 2
+    store u32 %179, ptr %0
+    %180 = const i64 4
+    %181 = gep i8, ptr %0, %180
+    %182 = load i8, ptr %43
+    store i8 %182, ptr %181
+    br bb65
+bb25:
+    %183 = const i8 5
+    store i8 %183, ptr %42
+    %184 = const u32 3
+    store u32 %184, ptr %0
+    %185 = const i64 4
+    %186 = gep i8, ptr %0, %185
+    %187 = load i8, ptr %42
+    store i8 %187, ptr %186
+    br bb65
+bb26:
+    %188 = const i8 5
+    store i8 %188, ptr %41
+    %189 = const u32 2
+    store u32 %189, ptr %0
+    %190 = const i64 4
+    %191 = gep i8, ptr %0, %190
+    %192 = load i8, ptr %41
+    store i8 %192, ptr %191
+    br bb65
+bb27:
+    %193 = const i8 5
+    store i8 %193, ptr %40
+    %194 = const u32 3
+    store u32 %194, ptr %0
+    %195 = const i64 4
+    %196 = gep i8, ptr %0, %195
+    %197 = load i8, ptr %40
+    store i8 %197, ptr %196
+    br bb65
+bb28:
+    %198 = const i8 5
+    store i8 %198, ptr %39
+    %199 = const u32 2
+    store u32 %199, ptr %0
+    %200 = const i64 4
+    %201 = gep i8, ptr %0, %200
+    %202 = load i8, ptr %39
+    store i8 %202, ptr %201
+    br bb65
+bb29:
+    %203 = const i8 5
+    store i8 %203, ptr %38
+    %204 = const u32 2
+    store u32 %204, ptr %0
+    %205 = const i64 4
+    %206 = gep i8, ptr %0, %205
+    %207 = load i8, ptr %38
+    store i8 %207, ptr %206
+    br bb65
+bb30:
+    %208 = const i8 5
+    store i8 %208, ptr %37
+    %209 = const u32 1
+    store u32 %209, ptr %0
+    %210 = const i64 4
+    %211 = gep i8, ptr %0, %210
+    %212 = load i8, ptr %37
+    store i8 %212, ptr %211
+    br bb65
+bb31:
+    %213 = const i8 5
+    store i8 %213, ptr %36
+    %214 = const u32 10
+    store u32 %214, ptr %0
+    %215 = const i64 4
+    %216 = gep i8, ptr %0, %215
+    %217 = load i8, ptr %36
+    store i8 %217, ptr %216
+    br bb65
+bb32:
+    %218 = const i8 5
+    store i8 %218, ptr %35
+    %219 = const u32 3
+    store u32 %219, ptr %0
+    %220 = const i64 4
+    %221 = gep i8, ptr %0, %220
+    %222 = load i8, ptr %35
+    store i8 %222, ptr %221
+    br bb65
+bb33:
+    %223 = const i8 5
+    store i8 %223, ptr %34
+    %224 = const u32 3
+    store u32 %224, ptr %0
+    %225 = const i64 4
+    %226 = gep i8, ptr %0, %225
+    %227 = load i8, ptr %34
+    store i8 %227, ptr %226
+    br bb65
+bb34:
+    %228 = const i8 5
+    store i8 %228, ptr %33
+    %229 = const u32 4
+    store u32 %229, ptr %0
+    %230 = const i64 4
+    %231 = gep i8, ptr %0, %230
+    %232 = load i8, ptr %33
+    store i8 %232, ptr %231
+    br bb65
+bb35:
+    %233 = const i8 5
+    store i8 %233, ptr %32
+    %234 = const u32 4
+    store u32 %234, ptr %0
+    %235 = const i64 4
+    %236 = gep i8, ptr %0, %235
+    %237 = load i8, ptr %32
+    store i8 %237, ptr %236
+    br bb65
+bb36:
+    %238 = const i8 5
+    store i8 %238, ptr %31
+    %239 = const u32 3
+    store u32 %239, ptr %0
+    %240 = const i64 4
+    %241 = gep i8, ptr %0, %240
+    %242 = load i8, ptr %31
+    store i8 %242, ptr %241
+    br bb65
+bb37:
+    %243 = const i8 5
+    store i8 %243, ptr %30
+    %244 = const u32 3
+    store u32 %244, ptr %0
+    %245 = const i64 4
+    %246 = gep i8, ptr %0, %245
+    %247 = load i8, ptr %30
+    store i8 %247, ptr %246
+    br bb65
+bb38:
+    %248 = const i8 5
+    store i8 %248, ptr %29
+    %249 = const u32 2
+    store u32 %249, ptr %0
+    %250 = const i64 4
+    %251 = gep i8, ptr %0, %250
+    %252 = load i8, ptr %29
+    store i8 %252, ptr %251
+    br bb65
+bb39:
+    %253 = const i8 5
+    store i8 %253, ptr %28
+    %254 = const u32 1
+    store u32 %254, ptr %0
+    %255 = const i64 4
+    %256 = gep i8, ptr %0, %255
+    %257 = load i8, ptr %28
+    store i8 %257, ptr %256
+    br bb65
+bb40:
+    %258 = const i8 5
+    store i8 %258, ptr %27
+    %259 = const u32 3
+    store u32 %259, ptr %0
+    %260 = const i64 4
+    %261 = gep i8, ptr %0, %260
+    %262 = load i8, ptr %27
+    store i8 %262, ptr %261
+    br bb65
+bb41:
+    %263 = const i8 5
+    store i8 %263, ptr %26
+    %264 = const u32 3
+    store u32 %264, ptr %0
+    %265 = const i64 4
+    %266 = gep i8, ptr %0, %265
+    %267 = load i8, ptr %26
+    store i8 %267, ptr %266
+    br bb65
+bb42:
+    %268 = const i8 5
+    store i8 %268, ptr %25
+    %269 = const u32 12
+    store u32 %269, ptr %0
+    %270 = const i64 4
+    %271 = gep i8, ptr %0, %270
+    %272 = load i8, ptr %25
+    store i8 %272, ptr %271
+    br bb65
+bb43:
+    %273 = const i8 5
+    store i8 %273, ptr %24
+    %274 = const u32 3
+    store u32 %274, ptr %0
+    %275 = const i64 4
+    %276 = gep i8, ptr %0, %275
+    %277 = load i8, ptr %24
+    store i8 %277, ptr %276
+    br bb65
+bb44:
+    %278 = const i8 5
+    store i8 %278, ptr %23
+    %279 = const u32 3
+    store u32 %279, ptr %0
+    %280 = const i64 4
+    %281 = gep i8, ptr %0, %280
+    %282 = load i8, ptr %23
+    store i8 %282, ptr %281
+    br bb65
+bb45:
+    %283 = const i8 5
+    store i8 %283, ptr %22
+    %284 = const u32 4
+    store u32 %284, ptr %0
+    %285 = const i64 4
+    %286 = gep i8, ptr %0, %285
+    %287 = load i8, ptr %22
+    store i8 %287, ptr %286
+    br bb65
+bb46:
+    %288 = const i8 5
+    store i8 %288, ptr %21
+    %289 = const u32 3
+    store u32 %289, ptr %0
+    %290 = const i64 4
+    %291 = gep i8, ptr %0, %290
+    %292 = load i8, ptr %21
+    store i8 %292, ptr %291
+    br bb65
+bb47:
+    %293 = const i8 4
+    store i8 %293, ptr %20
+    %294 = const u32 1
+    store u32 %294, ptr %0
+    %295 = const i64 4
+    %296 = gep i8, ptr %0, %295
+    %297 = load i8, ptr %20
+    store i8 %297, ptr %296
+    br bb65
+bb48:
+    %298 = const i8 4
+    store i8 %298, ptr %19
+    %299 = const u32 1
+    store u32 %299, ptr %0
+    %300 = const i64 4
+    %301 = gep i8, ptr %0, %300
+    %302 = load i8, ptr %19
+    store i8 %302, ptr %301
+    br bb65
+bb49:
+    %303 = const i8 0
+    store i8 %303, ptr %18
+    %304 = const u32 1
+    store u32 %304, ptr %0
+    %305 = const i64 4
+    %306 = gep i8, ptr %0, %305
+    %307 = load i8, ptr %18
+    store i8 %307, ptr %306
+    br bb65
+bb50:
+    %308 = const i8 3
+    store i8 %308, ptr %17
+    %309 = const u32 1
+    store u32 %309, ptr %0
+    %310 = const i64 4
+    %311 = gep i8, ptr %0, %310
+    %312 = load i8, ptr %17
+    store i8 %312, ptr %311
+    br bb65
+bb51:
+    %313 = const i8 3
+    store i8 %313, ptr %16
+    %314 = const u32 4
+    store u32 %314, ptr %0
+    %315 = const i64 4
+    %316 = gep i8, ptr %0, %315
+    %317 = load i8, ptr %16
+    store i8 %317, ptr %316
+    br bb65
+bb52:
+    %318 = const i8 2
+    store i8 %318, ptr %15
+    %319 = const u32 10
+    store u32 %319, ptr %0
+    %320 = const i64 4
+    %321 = gep i8, ptr %0, %320
+    %322 = load i8, ptr %15
+    store i8 %322, ptr %321
+    br bb65
+bb53:
+    %323 = const i8 1
+    store i8 %323, ptr %14
+    %324 = const u32 3
+    store u32 %324, ptr %0
+    %325 = const i64 4
+    %326 = gep i8, ptr %0, %325
+    %327 = load i8, ptr %14
+    store i8 %327, ptr %326
+    br bb65
+bb54:
+    %328 = const i8 1
+    store i8 %328, ptr %13
+    %329 = const u32 3
+    store u32 %329, ptr %0
+    %330 = const i64 4
+    %331 = gep i8, ptr %0, %330
+    %332 = load i8, ptr %13
+    store i8 %332, ptr %331
+    br bb65
+bb55:
+    %333 = const i8 0
+    store i8 %333, ptr %12
+    %334 = const u32 1
+    store u32 %334, ptr %0
+    %335 = const i64 4
+    %336 = gep i8, ptr %0, %335
+    %337 = load i8, ptr %12
+    store i8 %337, ptr %336
+    br bb65
+bb56:
+    %338 = const i8 0
+    store i8 %338, ptr %11
+    %339 = const u32 1
+    store u32 %339, ptr %0
+    %340 = const i64 4
+    %341 = gep i8, ptr %0, %340
+    %342 = load i8, ptr %11
+    store i8 %342, ptr %341
+    br bb65
+bb57:
+    %343 = const i8 0
+    store i8 %343, ptr %10
+    %344 = const u32 1
+    store u32 %344, ptr %0
+    %345 = const i64 4
+    %346 = gep i8, ptr %0, %345
+    %347 = load i8, ptr %10
+    store i8 %347, ptr %346
+    br bb65
+bb58:
+    %348 = const i8 0
+    store i8 %348, ptr %9
+    %349 = const u32 1
+    store u32 %349, ptr %0
+    %350 = const i64 4
+    %351 = gep i8, ptr %0, %350
+    %352 = load i8, ptr %9
+    store i8 %352, ptr %351
+    br bb65
+bb59:
+    %353 = const i8 0
+    store i8 %353, ptr %8
+    %354 = const u32 1
+    store u32 %354, ptr %0
+    %355 = const i64 4
+    %356 = gep i8, ptr %0, %355
+    %357 = load i8, ptr %8
+    store i8 %357, ptr %356
+    br bb65
+bb60:
+    %358 = const i8 0
+    store i8 %358, ptr %7
+    %359 = const u32 1
+    store u32 %359, ptr %0
+    %360 = const i64 4
+    %361 = gep i8, ptr %0, %360
+    %362 = load i8, ptr %7
+    store i8 %362, ptr %361
+    br bb65
+bb61:
+    %363 = const i8 0
+    store i8 %363, ptr %6
+    %364 = const u32 1
+    store u32 %364, ptr %0
+    %365 = const i64 4
+    %366 = gep i8, ptr %0, %365
+    %367 = load i8, ptr %6
+    store i8 %367, ptr %366
+    br bb65
+bb62:
+    %368 = const i8 0
+    store i8 %368, ptr %5
+    %369 = const u32 1
+    store u32 %369, ptr %0
+    %370 = const i64 4
+    %371 = gep i8, ptr %0, %370
+    %372 = load i8, ptr %5
+    store i8 %372, ptr %371
+    br bb65
+bb63:
+    %373 = const i8 0
+    store i8 %373, ptr %4
+    %374 = const u32 1
+    store u32 %374, ptr %0
+    %375 = const i64 4
+    %376 = gep i8, ptr %0, %375
+    %377 = load i8, ptr %4
+    store i8 %377, ptr %376
+    br bb65
+bb64:
+    %378 = const i8 0
+    store i8 %378, ptr %3
+    %379 = const u32 1
+    store u32 %379, ptr %0
+    %380 = const i64 4
+    %381 = gep i8, ptr %0, %380
+    %382 = load i8, ptr %3
+    store i8 %382, ptr %381
+    br bb65
+bb65:
+    ret
+}
+
+fn @port_tag(functy.3) {
+bb0(%0: u8):
+    %2 = alloca i8, align 1
+    store u8 %0, ptr %2
+    %3 = load i8, ptr %2
+    %4 = sext i8 %3 to i64
+    switch %4 [ 0: bb7 1: bb6 2: bb5 3: bb4 4: bb3 5: bb2 default: bb1 ]
+bb1:
+    unreachable
+bb2:
+    %5 = const u32 5
+    br bb8(%5)
+bb3:
+    %6 = const u32 4
+    br bb8(%6)
+bb4:
+    %7 = const u32 3
+    br bb8(%7)
+bb5:
+    %8 = const u32 2
+    br bb8(%8)
+bb6:
+    %9 = const u32 1
+    br bb8(%9)
+bb7:
+    %10 = const u32 0
+    br bb8(%10)
+bb8(%1: u32):
+    ret %1
+}
+
+fn @call_opcode_clobbers_registers(functy.4) {
+bb0(%0: u16):
+    %2 = alloca i16, align 2
+    store u16 %0, ptr %2
+    %3 = load i16, ptr %2
+    %4 = bitcast i16 %3 to u16
+    switch %4 [ 71: bb2 72: bb2 241: bb2 242: bb2 default: bb1 ]
+bb1:
+    %5 = const bool false
+    br bb3(%5)
+bb2:
+    %6 = const bool true
+    br bb3(%6)
+bb3(%1: bool):
+    ret %1
+}
+
+fn @InstFlags__from_bits(functy.5) {
+bb0(%0: ptr, %1: u16):
+    store u16 %1, ptr %0
+    ret
+}
+
+fn @is_proof_reorderable_ordinary_load(functy.6) {
+bb0(%0: u16, %1: u16):
+    %5 = alloca i16, align 2
+    %6 = alloca i16, align 2
+    %7 = alloca i16, align 2
+    %8 = alloca i16, align 2
+    %9 = alloca i16, align 2
+    store u16 %0, ptr %5
+    store u16 %1, ptr %6
+    %10 = const u16 128
+    %11 = const u16 16
+    call @func.9(%8, %10, %11)
+    br bb1
+bb1:
+    %12 = load u16, ptr %8
+    %13 = const u16 1
+    call @func.9(%7, %12, %13)
+    br bb2
+bb2:
+    %14 = load u16, ptr %6
+    %15 = const u16 512
+    %16 = call @func.10(%14, %15)
+    br bb3(%16)
+bb3(%2: bool):
+    condbr %2, bb4, bb8
+bb4:
+    %17 = load u16, ptr %6
+    %18 = load u16, ptr %7
+    call @func.11(%9, %17, %18)
+    br bb5
+bb5:
+    %19 = load u16, ptr %9
+    %20 = call @func.12(%19)
+    br bb6(%20)
+bb6(%3: bool):
+    condbr %3, bb7, bb8
+bb7:
+    %21 = load i16, ptr %5
+    %22 = bitcast i16 %21 to u16
+    switch %22 [ 41: bb10 47: bb10 48: bb10 49: bb10 50: bb10 53: bb10 54: bb10 58: bb10 213: bb10 default: bb9 ]
+bb8:
+    %23 = const bool false
+    br bb11(%23)
+bb9:
+    %24 = const bool false
+    br bb11(%24)
+bb10:
+    %25 = const bool true
+    br bb11(%25)
+bb11(%4: bool):
+    ret %4
+}
+
+fn @is_proof_reorderable_ordinary_ldr_ri(functy.7) {
+bb0(%0: u16, %1: u16):
+    %5 = alloca i16, align 2
+    %6 = alloca i16, align 2
+    %7 = alloca i16, align 2
+    %8 = alloca i16, align 2
+    %9 = alloca i16, align 2
+    store u16 %0, ptr %5
+    store u16 %1, ptr %6
+    %10 = const u16 128
+    %11 = const u16 16
+    call @func.9(%8, %10, %11)
+    br bb1
+bb1:
+    %12 = load u16, ptr %8
+    %13 = const u16 1
+    call @func.9(%7, %12, %13)
+    br bb2
+bb2:
+    %14 = load u16, ptr %6
+    %15 = const u16 512
+    %16 = call @func.10(%14, %15)
+    br bb3(%16)
+bb3(%2: bool):
+    condbr %2, bb4, bb8
+bb4:
+    %17 = load u16, ptr %6
+    %18 = load u16, ptr %7
+    call @func.11(%9, %17, %18)
+    br bb5
+bb5:
+    %19 = load u16, ptr %9
+    %20 = call @func.12(%19)
+    br bb6(%20)
+bb6(%3: bool):
+    condbr %3, bb7, bb8
+bb7:
+    %21 = load i16, ptr %5
+    %22 = bitcast i16 %21 to u16
+    switch %22 [ 41: bb10 default: bb9 ]
+bb8:
+    %23 = const bool false
+    br bb11(%23)
+bb9:
+    %24 = const bool false
+    br bb11(%24)
+bb10:
+    %25 = const bool true
+    br bb11(%25)
+bb11(%4: bool):
+    ret %4
+}
+
+fn @is_proof_reorderable_ordinary_str_ri(functy.8) {
+bb0(%0: u16, %1: u16):
+    %6 = alloca i16, align 2
+    %7 = alloca i16, align 2
+    %8 = alloca i16, align 2
+    %9 = alloca i16, align 2
+    %10 = alloca i16, align 2
+    store u16 %0, ptr %6
+    store u16 %1, ptr %7
+    %11 = const u16 64
+    %12 = const u16 1
+    call @func.9(%9, %11, %12)
+    br bb1
+bb1:
+    %13 = load u16, ptr %9
+    %14 = const u16 32
+    call @func.9(%8, %13, %14)
+    br bb2
+bb2:
+    %15 = load u16, ptr %7
+    %16 = const u16 512
+    %17 = call @func.10(%15, %16)
+    br bb3(%17)
+bb3(%2: bool):
+    condbr %2, bb4, bb10
+bb4:
+    %18 = load u16, ptr %7
+    %19 = const u16 128
+    %20 = call @func.10(%18, %19)
+    br bb5(%20)
+bb5(%3: bool):
+    condbr %3, bb6, bb10
+bb6:
+    %21 = load u16, ptr %7
+    %22 = load u16, ptr %8
+    call @func.11(%10, %21, %22)
+    br bb7
+bb7:
+    %23 = load u16, ptr %10
+    %24 = call @func.12(%23)
+    br bb8(%24)
+bb8(%4: bool):
+    condbr %4, bb9, bb10
+bb9:
+    %25 = load i16, ptr %6
+    %26 = bitcast i16 %25 to u16
+    switch %26 [ 42: bb12 default: bb11 ]
+bb10:
+    %27 = const bool false
+    br bb13(%27)
+bb11:
+    %28 = const bool false
+    br bb13(%28)
+bb12:
+    %29 = const bool true
+    br bb13(%29)
+bb13(%5: bool):
+    ret %5
+}
+
+fn @_InstFlags_as_std__ops__BitOr___bitor(functy.9) {
+bb0(%0: ptr, %1: u16, %2: u16):
+    %3 = alloca i16, align 2
+    %4 = alloca i16, align 2
+    store u16 %1, ptr %3
+    store u16 %2, ptr %4
+    %5 = load u16, ptr %3
+    %6 = load u16, ptr %4
+    call @func.13(%0, %5, %6)
+    br bb1
+bb1:
+    ret
+}
+
+fn @InstFlags__contains(functy.10) {
+bb0(%0: u16, %1: u16):
+    %2 = alloca i16, align 2
+    %3 = alloca i16, align 2
+    store u16 %0, ptr %2
+    store u16 %1, ptr %3
+    %4 = load u16, ptr %2
+    %5 = load u16, ptr %3
+    %6 = and u16 %4, %5
+    %7 = load u16, ptr %3
+    %8 = icmp eq u16 %6, %7
+    ret %8
+}
+
+fn @InstFlags__intersection(functy.11) {
+bb0(%0: ptr, %1: u16, %2: u16):
+    %3 = alloca i16, align 2
+    %4 = alloca i16, align 2
+    store u16 %1, ptr %3
+    store u16 %2, ptr %4
+    %5 = load u16, ptr %3
+    %6 = load u16, ptr %4
+    %7 = and u16 %5, %6
+    store u16 %7, ptr %0
+    ret
+}
+
+fn @InstFlags__is_empty(functy.12) {
+bb0(%0: u16):
+    %1 = alloca i16, align 2
+    store u16 %0, ptr %1
+    %2 = load u16, ptr %1
+    %3 = const u16 0
+    %4 = icmp eq u16 %2, %3
+    ret %4
+}
+
+fn @InstFlags__union(functy.13) {
+bb0(%0: ptr, %1: u16, %2: u16):
+    %3 = alloca i16, align 2
+    %4 = alloca i16, align 2
+    store u16 %1, ptr %3
+    store u16 %2, ptr %4
+    %5 = load u16, ptr %3
+    %6 = load u16, ptr %4
+    %7 = or u16 %5, %6
+    store u16 %7, ptr %0
+    ret
+}

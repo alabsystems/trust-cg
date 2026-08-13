@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "dialect": "trust_ir.vnn",
+  "entry": "model",
+  "tensors": {
+    "%input": {
+      "shape": [1, 3, 32, 32],
+      "dtype": "f32",
+      "layout": "nchw",
+      "role": "input"
+    },
+    "%relu0": {
+      "shape": [1, 3, 32, 32],
+      "dtype": "f32",
+      "layout": "nchw",
+      "role": "output"
+    }
+  },
+  "ops": [
+    {
+      "id": "vnn.0",
+      "op": "trust_ir.vnn.relu",
+      "inputs": ["%input"],
+      "outputs": ["%relu0"],
+      "attrs": {}
+    }
+  ]
+}

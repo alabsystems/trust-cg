@@ -1,0 +1,43 @@
+# trust-cg-cli - Command-line driver for Trust Codegen
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache-2.0
+
+[package]
+name = "trust-cg-cli"
+description = "Command-line driver for the proof-oriented Trust Codegen backend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+
+[[bin]]
+name = "trust-cg"
+path = "src/main.rs"
+
+[[bin]]
+name = "ty_replay_jit_probe"
+path = "src/bin/ty_replay_jit_probe.rs"
+
+[dependencies]
+trust-cg-codegen = { workspace = true }
+trust-cg-ir = { workspace = true }
+trust-cg-opt = { workspace = true }
+trust-cg-verify = { workspace = true }
+trust-ir = { workspace = true, features = ["serde"] }
+serde_json = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+rayon = "1.10"
+
+[dev-dependencies]
+trust-cg-codegen = { workspace = true }
+trust-ir = { workspace = true, features = ["serde"] }
+trust-ir-build = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

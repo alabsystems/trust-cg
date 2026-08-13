@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "dialect": "trust_ir.vnn",
+  "entry": "model",
+  "tensors": {
+    "%input": {
+      "dtype": "f32",
+      "layout": "nchw",
+      "role": "input"
+    },
+    "%relu0": {
+      "shape": [1, 3, 32, 32],
+      "dtype": "f32",
+      "layout": "nchw",
+      "role": "output"
+    }
+  },
+  "ops": [
+    {
+      "id": "vnn.0",
+      "op": "trust_ir.vnn.relu",
+      "inputs": ["%input"],
+      "outputs": ["%relu0"],
+      "attrs": {},
+      "provenance": {
+        "gamma_layer_id": "layer.0",
+        "gamma_layer_type": "ReLU",
+        "onnx_node_name": "Relu_0",
+        "onnx_op_type": "Relu",
+        "onnx_outputs": ["relu0_out"]
+      }
+    }
+  ]
+}

@@ -1,0 +1,1094 @@
+; TrustIr text format v1
+module "mir::closure::clobbers_root"
+target "aarch64-apple-darwin" 8 little
+file 0 "trust_f5_norepr_clobbers_slice.rs"
+
+functy.0 = (u32) -> (u32)
+
+functy.1 = (ptr, u32) -> ()
+
+functy.2 = (u16) -> (bool)
+
+fn @clobbers_root(functy.0) {
+bb0(%0: u32):
+    %2 = alloca i16, align 2
+    call @func.1(%2, %0)
+    br bb1
+bb1:
+    %3 = load u16, ptr %2
+    %4 = call @func.2(%3)
+    br bb2(%4)
+bb2(%1: bool):
+    %5 = const u32 1
+    %6 = const u32 0
+    %7 = select u32 %1, %5, %6
+    ret %7
+}
+
+fn @opcode_from_index(functy.1) {
+bb0(%0: ptr, %1: u32):
+    switch %1 [ 0: bb261 1: bb260 2: bb259 3: bb258 4: bb257 5: bb256 6: bb255 7: bb254 8: bb253 9: bb252 10: bb251 11: bb250 12: bb249 13: bb248 14: bb247 15: bb246 16: bb245 17: bb244 18: bb243 19: bb242 20: bb241 21: bb240 22: bb239 23: bb238 24: bb237 25: bb236 26: bb235 27: bb234 28: bb233 29: bb232 30: bb231 31: bb230 32: bb229 33: bb228 34: bb227 35: bb226 36: bb225 37: bb224 38: bb223 39: bb222 40: bb221 41: bb220 42: bb219 43: bb218 44: bb217 45: bb216 46: bb215 47: bb214 48: bb213 49: bb212 50: bb211 51: bb210 52: bb209 53: bb208 54: bb207 55: bb206 56: bb205 57: bb204 58: bb203 59: bb202 60: bb201 61: bb200 62: bb199 63: bb198 64: bb197 65: bb196 66: bb195 67: bb194 68: bb193 69: bb192 70: bb191 71: bb190 72: bb189 73: bb188 74: bb187 75: bb186 76: bb185 77: bb184 78: bb183 79: bb182 80: bb181 81: bb180 82: bb179 83: bb178 84: bb177 85: bb176 86: bb175 87: bb174 88: bb173 89: bb172 90: bb171 91: bb170 92: bb169 93: bb168 94: bb167 95: bb166 96: bb165 97: bb164 98: bb163 99: bb162 100: bb161 101: bb160 102: bb159 103: bb158 104: bb157 105: bb156 106: bb155 107: bb154 108: bb153 109: bb152 110: bb151 111: bb150 112: bb149 113: bb148 114: bb147 115: bb146 116: bb145 117: bb144 118: bb143 119: bb142 120: bb141 121: bb140 122: bb139 123: bb138 124: bb137 125: bb136 126: bb135 127: bb134 128: bb133 129: bb132 130: bb131 131: bb130 132: bb129 133: bb128 134: bb127 135: bb126 136: bb125 137: bb124 138: bb123 139: bb122 140: bb121 141: bb120 142: bb119 143: bb118 144: bb117 145: bb116 146: bb115 147: bb114 148: bb113 149: bb112 150: bb111 151: bb110 152: bb109 153: bb108 154: bb107 155: bb106 156: bb105 157: bb104 158: bb103 159: bb102 160: bb101 161: bb100 162: bb99 163: bb98 164: bb97 165: bb96 166: bb95 167: bb94 168: bb93 169: bb92 170: bb91 171: bb90 172: bb89 173: bb88 174: bb87 175: bb86 176: bb85 177: bb84 178: bb83 179: bb82 180: bb81 181: bb80 182: bb79 183: bb78 184: bb77 185: bb76 186: bb75 187: bb74 188: bb73 189: bb72 190: bb71 191: bb70 192: bb69 193: bb68 194: bb67 195: bb66 196: bb65 197: bb64 198: bb63 199: bb62 200: bb61 201: bb60 202: bb59 203: bb58 204: bb57 205: bb56 206: bb55 207: bb54 208: bb53 209: bb52 210: bb51 211: bb50 212: bb49 213: bb48 214: bb47 215: bb46 216: bb45 217: bb44 218: bb43 219: bb42 220: bb41 221: bb40 222: bb39 223: bb38 224: bb37 225: bb36 226: bb35 227: bb34 228: bb33 229: bb32 230: bb31 231: bb30 232: bb29 233: bb28 234: bb27 235: bb26 236: bb25 237: bb24 238: bb23 239: bb22 240: bb21 241: bb20 242: bb19 243: bb18 244: bb17 245: bb16 246: bb15 247: bb14 248: bb13 249: bb12 250: bb11 251: bb10 252: bb9 253: bb8 254: bb7 255: bb6 256: bb5 257: bb4 258: bb3 259: bb2 default: bb1 ]
+bb1:
+    %2 = const i16 254
+    store i16 %2, ptr %0
+    br bb262
+bb2:
+    %3 = const i16 259
+    store i16 %3, ptr %0
+    br bb262
+bb3:
+    %4 = const i16 258
+    store i16 %4, ptr %0
+    br bb262
+bb4:
+    %5 = const i16 257
+    store i16 %5, ptr %0
+    br bb262
+bb5:
+    %6 = const i16 256
+    store i16 %6, ptr %0
+    br bb262
+bb6:
+    %7 = const i16 255
+    store i16 %7, ptr %0
+    br bb262
+bb7:
+    %8 = const i16 254
+    store i16 %8, ptr %0
+    br bb262
+bb8:
+    %9 = const i16 253
+    store i16 %9, ptr %0
+    br bb262
+bb9:
+    %10 = const i16 252
+    store i16 %10, ptr %0
+    br bb262
+bb10:
+    %11 = const i16 251
+    store i16 %11, ptr %0
+    br bb262
+bb11:
+    %12 = const i16 250
+    store i16 %12, ptr %0
+    br bb262
+bb12:
+    %13 = const i16 249
+    store i16 %13, ptr %0
+    br bb262
+bb13:
+    %14 = const i16 248
+    store i16 %14, ptr %0
+    br bb262
+bb14:
+    %15 = const i16 247
+    store i16 %15, ptr %0
+    br bb262
+bb15:
+    %16 = const i16 246
+    store i16 %16, ptr %0
+    br bb262
+bb16:
+    %17 = const i16 245
+    store i16 %17, ptr %0
+    br bb262
+bb17:
+    %18 = const i16 244
+    store i16 %18, ptr %0
+    br bb262
+bb18:
+    %19 = const i16 243
+    store i16 %19, ptr %0
+    br bb262
+bb19:
+    %20 = const i16 242
+    store i16 %20, ptr %0
+    br bb262
+bb20:
+    %21 = const i16 241
+    store i16 %21, ptr %0
+    br bb262
+bb21:
+    %22 = const i16 240
+    store i16 %22, ptr %0
+    br bb262
+bb22:
+    %23 = const i16 239
+    store i16 %23, ptr %0
+    br bb262
+bb23:
+    %24 = const i16 238
+    store i16 %24, ptr %0
+    br bb262
+bb24:
+    %25 = const i16 237
+    store i16 %25, ptr %0
+    br bb262
+bb25:
+    %26 = const i16 236
+    store i16 %26, ptr %0
+    br bb262
+bb26:
+    %27 = const i16 235
+    store i16 %27, ptr %0
+    br bb262
+bb27:
+    %28 = const i16 234
+    store i16 %28, ptr %0
+    br bb262
+bb28:
+    %29 = const i16 233
+    store i16 %29, ptr %0
+    br bb262
+bb29:
+    %30 = const i16 232
+    store i16 %30, ptr %0
+    br bb262
+bb30:
+    %31 = const i16 231
+    store i16 %31, ptr %0
+    br bb262
+bb31:
+    %32 = const i16 230
+    store i16 %32, ptr %0
+    br bb262
+bb32:
+    %33 = const i16 229
+    store i16 %33, ptr %0
+    br bb262
+bb33:
+    %34 = const i16 228
+    store i16 %34, ptr %0
+    br bb262
+bb34:
+    %35 = const i16 227
+    store i16 %35, ptr %0
+    br bb262
+bb35:
+    %36 = const i16 226
+    store i16 %36, ptr %0
+    br bb262
+bb36:
+    %37 = const i16 225
+    store i16 %37, ptr %0
+    br bb262
+bb37:
+    %38 = const i16 224
+    store i16 %38, ptr %0
+    br bb262
+bb38:
+    %39 = const i16 223
+    store i16 %39, ptr %0
+    br bb262
+bb39:
+    %40 = const i16 222
+    store i16 %40, ptr %0
+    br bb262
+bb40:
+    %41 = const i16 221
+    store i16 %41, ptr %0
+    br bb262
+bb41:
+    %42 = const i16 220
+    store i16 %42, ptr %0
+    br bb262
+bb42:
+    %43 = const i16 219
+    store i16 %43, ptr %0
+    br bb262
+bb43:
+    %44 = const i16 218
+    store i16 %44, ptr %0
+    br bb262
+bb44:
+    %45 = const i16 217
+    store i16 %45, ptr %0
+    br bb262
+bb45:
+    %46 = const i16 216
+    store i16 %46, ptr %0
+    br bb262
+bb46:
+    %47 = const i16 215
+    store i16 %47, ptr %0
+    br bb262
+bb47:
+    %48 = const i16 214
+    store i16 %48, ptr %0
+    br bb262
+bb48:
+    %49 = const i16 213
+    store i16 %49, ptr %0
+    br bb262
+bb49:
+    %50 = const i16 212
+    store i16 %50, ptr %0
+    br bb262
+bb50:
+    %51 = const i16 211
+    store i16 %51, ptr %0
+    br bb262
+bb51:
+    %52 = const i16 210
+    store i16 %52, ptr %0
+    br bb262
+bb52:
+    %53 = const i16 209
+    store i16 %53, ptr %0
+    br bb262
+bb53:
+    %54 = const i16 208
+    store i16 %54, ptr %0
+    br bb262
+bb54:
+    %55 = const i16 207
+    store i16 %55, ptr %0
+    br bb262
+bb55:
+    %56 = const i16 206
+    store i16 %56, ptr %0
+    br bb262
+bb56:
+    %57 = const i16 205
+    store i16 %57, ptr %0
+    br bb262
+bb57:
+    %58 = const i16 204
+    store i16 %58, ptr %0
+    br bb262
+bb58:
+    %59 = const i16 203
+    store i16 %59, ptr %0
+    br bb262
+bb59:
+    %60 = const i16 202
+    store i16 %60, ptr %0
+    br bb262
+bb60:
+    %61 = const i16 201
+    store i16 %61, ptr %0
+    br bb262
+bb61:
+    %62 = const i16 200
+    store i16 %62, ptr %0
+    br bb262
+bb62:
+    %63 = const i16 199
+    store i16 %63, ptr %0
+    br bb262
+bb63:
+    %64 = const i16 198
+    store i16 %64, ptr %0
+    br bb262
+bb64:
+    %65 = const i16 197
+    store i16 %65, ptr %0
+    br bb262
+bb65:
+    %66 = const i16 196
+    store i16 %66, ptr %0
+    br bb262
+bb66:
+    %67 = const i16 195
+    store i16 %67, ptr %0
+    br bb262
+bb67:
+    %68 = const i16 194
+    store i16 %68, ptr %0
+    br bb262
+bb68:
+    %69 = const i16 193
+    store i16 %69, ptr %0
+    br bb262
+bb69:
+    %70 = const i16 192
+    store i16 %70, ptr %0
+    br bb262
+bb70:
+    %71 = const i16 191
+    store i16 %71, ptr %0
+    br bb262
+bb71:
+    %72 = const i16 190
+    store i16 %72, ptr %0
+    br bb262
+bb72:
+    %73 = const i16 189
+    store i16 %73, ptr %0
+    br bb262
+bb73:
+    %74 = const i16 188
+    store i16 %74, ptr %0
+    br bb262
+bb74:
+    %75 = const i16 187
+    store i16 %75, ptr %0
+    br bb262
+bb75:
+    %76 = const i16 186
+    store i16 %76, ptr %0
+    br bb262
+bb76:
+    %77 = const i16 185
+    store i16 %77, ptr %0
+    br bb262
+bb77:
+    %78 = const i16 184
+    store i16 %78, ptr %0
+    br bb262
+bb78:
+    %79 = const i16 183
+    store i16 %79, ptr %0
+    br bb262
+bb79:
+    %80 = const i16 182
+    store i16 %80, ptr %0
+    br bb262
+bb80:
+    %81 = const i16 181
+    store i16 %81, ptr %0
+    br bb262
+bb81:
+    %82 = const i16 180
+    store i16 %82, ptr %0
+    br bb262
+bb82:
+    %83 = const i16 179
+    store i16 %83, ptr %0
+    br bb262
+bb83:
+    %84 = const i16 178
+    store i16 %84, ptr %0
+    br bb262
+bb84:
+    %85 = const i16 177
+    store i16 %85, ptr %0
+    br bb262
+bb85:
+    %86 = const i16 176
+    store i16 %86, ptr %0
+    br bb262
+bb86:
+    %87 = const i16 175
+    store i16 %87, ptr %0
+    br bb262
+bb87:
+    %88 = const i16 174
+    store i16 %88, ptr %0
+    br bb262
+bb88:
+    %89 = const i16 173
+    store i16 %89, ptr %0
+    br bb262
+bb89:
+    %90 = const i16 172
+    store i16 %90, ptr %0
+    br bb262
+bb90:
+    %91 = const i16 171
+    store i16 %91, ptr %0
+    br bb262
+bb91:
+    %92 = const i16 170
+    store i16 %92, ptr %0
+    br bb262
+bb92:
+    %93 = const i16 169
+    store i16 %93, ptr %0
+    br bb262
+bb93:
+    %94 = const i16 168
+    store i16 %94, ptr %0
+    br bb262
+bb94:
+    %95 = const i16 167
+    store i16 %95, ptr %0
+    br bb262
+bb95:
+    %96 = const i16 166
+    store i16 %96, ptr %0
+    br bb262
+bb96:
+    %97 = const i16 165
+    store i16 %97, ptr %0
+    br bb262
+bb97:
+    %98 = const i16 164
+    store i16 %98, ptr %0
+    br bb262
+bb98:
+    %99 = const i16 163
+    store i16 %99, ptr %0
+    br bb262
+bb99:
+    %100 = const i16 162
+    store i16 %100, ptr %0
+    br bb262
+bb100:
+    %101 = const i16 161
+    store i16 %101, ptr %0
+    br bb262
+bb101:
+    %102 = const i16 160
+    store i16 %102, ptr %0
+    br bb262
+bb102:
+    %103 = const i16 159
+    store i16 %103, ptr %0
+    br bb262
+bb103:
+    %104 = const i16 158
+    store i16 %104, ptr %0
+    br bb262
+bb104:
+    %105 = const i16 157
+    store i16 %105, ptr %0
+    br bb262
+bb105:
+    %106 = const i16 156
+    store i16 %106, ptr %0
+    br bb262
+bb106:
+    %107 = const i16 155
+    store i16 %107, ptr %0
+    br bb262
+bb107:
+    %108 = const i16 154
+    store i16 %108, ptr %0
+    br bb262
+bb108:
+    %109 = const i16 153
+    store i16 %109, ptr %0
+    br bb262
+bb109:
+    %110 = const i16 152
+    store i16 %110, ptr %0
+    br bb262
+bb110:
+    %111 = const i16 151
+    store i16 %111, ptr %0
+    br bb262
+bb111:
+    %112 = const i16 150
+    store i16 %112, ptr %0
+    br bb262
+bb112:
+    %113 = const i16 149
+    store i16 %113, ptr %0
+    br bb262
+bb113:
+    %114 = const i16 148
+    store i16 %114, ptr %0
+    br bb262
+bb114:
+    %115 = const i16 147
+    store i16 %115, ptr %0
+    br bb262
+bb115:
+    %116 = const i16 146
+    store i16 %116, ptr %0
+    br bb262
+bb116:
+    %117 = const i16 145
+    store i16 %117, ptr %0
+    br bb262
+bb117:
+    %118 = const i16 144
+    store i16 %118, ptr %0
+    br bb262
+bb118:
+    %119 = const i16 143
+    store i16 %119, ptr %0
+    br bb262
+bb119:
+    %120 = const i16 142
+    store i16 %120, ptr %0
+    br bb262
+bb120:
+    %121 = const i16 141
+    store i16 %121, ptr %0
+    br bb262
+bb121:
+    %122 = const i16 140
+    store i16 %122, ptr %0
+    br bb262
+bb122:
+    %123 = const i16 139
+    store i16 %123, ptr %0
+    br bb262
+bb123:
+    %124 = const i16 138
+    store i16 %124, ptr %0
+    br bb262
+bb124:
+    %125 = const i16 137
+    store i16 %125, ptr %0
+    br bb262
+bb125:
+    %126 = const i16 136
+    store i16 %126, ptr %0
+    br bb262
+bb126:
+    %127 = const i16 135
+    store i16 %127, ptr %0
+    br bb262
+bb127:
+    %128 = const i16 134
+    store i16 %128, ptr %0
+    br bb262
+bb128:
+    %129 = const i16 133
+    store i16 %129, ptr %0
+    br bb262
+bb129:
+    %130 = const i16 132
+    store i16 %130, ptr %0
+    br bb262
+bb130:
+    %131 = const i16 131
+    store i16 %131, ptr %0
+    br bb262
+bb131:
+    %132 = const i16 130
+    store i16 %132, ptr %0
+    br bb262
+bb132:
+    %133 = const i16 129
+    store i16 %133, ptr %0
+    br bb262
+bb133:
+    %134 = const i16 128
+    store i16 %134, ptr %0
+    br bb262
+bb134:
+    %135 = const i16 127
+    store i16 %135, ptr %0
+    br bb262
+bb135:
+    %136 = const i16 126
+    store i16 %136, ptr %0
+    br bb262
+bb136:
+    %137 = const i16 125
+    store i16 %137, ptr %0
+    br bb262
+bb137:
+    %138 = const i16 124
+    store i16 %138, ptr %0
+    br bb262
+bb138:
+    %139 = const i16 123
+    store i16 %139, ptr %0
+    br bb262
+bb139:
+    %140 = const i16 122
+    store i16 %140, ptr %0
+    br bb262
+bb140:
+    %141 = const i16 121
+    store i16 %141, ptr %0
+    br bb262
+bb141:
+    %142 = const i16 120
+    store i16 %142, ptr %0
+    br bb262
+bb142:
+    %143 = const i16 119
+    store i16 %143, ptr %0
+    br bb262
+bb143:
+    %144 = const i16 118
+    store i16 %144, ptr %0
+    br bb262
+bb144:
+    %145 = const i16 117
+    store i16 %145, ptr %0
+    br bb262
+bb145:
+    %146 = const i16 116
+    store i16 %146, ptr %0
+    br bb262
+bb146:
+    %147 = const i16 115
+    store i16 %147, ptr %0
+    br bb262
+bb147:
+    %148 = const i16 114
+    store i16 %148, ptr %0
+    br bb262
+bb148:
+    %149 = const i16 113
+    store i16 %149, ptr %0
+    br bb262
+bb149:
+    %150 = const i16 112
+    store i16 %150, ptr %0
+    br bb262
+bb150:
+    %151 = const i16 111
+    store i16 %151, ptr %0
+    br bb262
+bb151:
+    %152 = const i16 110
+    store i16 %152, ptr %0
+    br bb262
+bb152:
+    %153 = const i16 109
+    store i16 %153, ptr %0
+    br bb262
+bb153:
+    %154 = const i16 108
+    store i16 %154, ptr %0
+    br bb262
+bb154:
+    %155 = const i16 107
+    store i16 %155, ptr %0
+    br bb262
+bb155:
+    %156 = const i16 106
+    store i16 %156, ptr %0
+    br bb262
+bb156:
+    %157 = const i16 105
+    store i16 %157, ptr %0
+    br bb262
+bb157:
+    %158 = const i16 104
+    store i16 %158, ptr %0
+    br bb262
+bb158:
+    %159 = const i16 103
+    store i16 %159, ptr %0
+    br bb262
+bb159:
+    %160 = const i16 102
+    store i16 %160, ptr %0
+    br bb262
+bb160:
+    %161 = const i16 101
+    store i16 %161, ptr %0
+    br bb262
+bb161:
+    %162 = const i16 100
+    store i16 %162, ptr %0
+    br bb262
+bb162:
+    %163 = const i16 99
+    store i16 %163, ptr %0
+    br bb262
+bb163:
+    %164 = const i16 98
+    store i16 %164, ptr %0
+    br bb262
+bb164:
+    %165 = const i16 97
+    store i16 %165, ptr %0
+    br bb262
+bb165:
+    %166 = const i16 96
+    store i16 %166, ptr %0
+    br bb262
+bb166:
+    %167 = const i16 95
+    store i16 %167, ptr %0
+    br bb262
+bb167:
+    %168 = const i16 94
+    store i16 %168, ptr %0
+    br bb262
+bb168:
+    %169 = const i16 93
+    store i16 %169, ptr %0
+    br bb262
+bb169:
+    %170 = const i16 92
+    store i16 %170, ptr %0
+    br bb262
+bb170:
+    %171 = const i16 91
+    store i16 %171, ptr %0
+    br bb262
+bb171:
+    %172 = const i16 90
+    store i16 %172, ptr %0
+    br bb262
+bb172:
+    %173 = const i16 89
+    store i16 %173, ptr %0
+    br bb262
+bb173:
+    %174 = const i16 88
+    store i16 %174, ptr %0
+    br bb262
+bb174:
+    %175 = const i16 87
+    store i16 %175, ptr %0
+    br bb262
+bb175:
+    %176 = const i16 86
+    store i16 %176, ptr %0
+    br bb262
+bb176:
+    %177 = const i16 85
+    store i16 %177, ptr %0
+    br bb262
+bb177:
+    %178 = const i16 84
+    store i16 %178, ptr %0
+    br bb262
+bb178:
+    %179 = const i16 83
+    store i16 %179, ptr %0
+    br bb262
+bb179:
+    %180 = const i16 82
+    store i16 %180, ptr %0
+    br bb262
+bb180:
+    %181 = const i16 81
+    store i16 %181, ptr %0
+    br bb262
+bb181:
+    %182 = const i16 80
+    store i16 %182, ptr %0
+    br bb262
+bb182:
+    %183 = const i16 79
+    store i16 %183, ptr %0
+    br bb262
+bb183:
+    %184 = const i16 78
+    store i16 %184, ptr %0
+    br bb262
+bb184:
+    %185 = const i16 77
+    store i16 %185, ptr %0
+    br bb262
+bb185:
+    %186 = const i16 76
+    store i16 %186, ptr %0
+    br bb262
+bb186:
+    %187 = const i16 75
+    store i16 %187, ptr %0
+    br bb262
+bb187:
+    %188 = const i16 74
+    store i16 %188, ptr %0
+    br bb262
+bb188:
+    %189 = const i16 73
+    store i16 %189, ptr %0
+    br bb262
+bb189:
+    %190 = const i16 72
+    store i16 %190, ptr %0
+    br bb262
+bb190:
+    %191 = const i16 71
+    store i16 %191, ptr %0
+    br bb262
+bb191:
+    %192 = const i16 70
+    store i16 %192, ptr %0
+    br bb262
+bb192:
+    %193 = const i16 69
+    store i16 %193, ptr %0
+    br bb262
+bb193:
+    %194 = const i16 68
+    store i16 %194, ptr %0
+    br bb262
+bb194:
+    %195 = const i16 67
+    store i16 %195, ptr %0
+    br bb262
+bb195:
+    %196 = const i16 66
+    store i16 %196, ptr %0
+    br bb262
+bb196:
+    %197 = const i16 65
+    store i16 %197, ptr %0
+    br bb262
+bb197:
+    %198 = const i16 64
+    store i16 %198, ptr %0
+    br bb262
+bb198:
+    %199 = const i16 63
+    store i16 %199, ptr %0
+    br bb262
+bb199:
+    %200 = const i16 62
+    store i16 %200, ptr %0
+    br bb262
+bb200:
+    %201 = const i16 61
+    store i16 %201, ptr %0
+    br bb262
+bb201:
+    %202 = const i16 60
+    store i16 %202, ptr %0
+    br bb262
+bb202:
+    %203 = const i16 59
+    store i16 %203, ptr %0
+    br bb262
+bb203:
+    %204 = const i16 58
+    store i16 %204, ptr %0
+    br bb262
+bb204:
+    %205 = const i16 57
+    store i16 %205, ptr %0
+    br bb262
+bb205:
+    %206 = const i16 56
+    store i16 %206, ptr %0
+    br bb262
+bb206:
+    %207 = const i16 55
+    store i16 %207, ptr %0
+    br bb262
+bb207:
+    %208 = const i16 54
+    store i16 %208, ptr %0
+    br bb262
+bb208:
+    %209 = const i16 53
+    store i16 %209, ptr %0
+    br bb262
+bb209:
+    %210 = const i16 52
+    store i16 %210, ptr %0
+    br bb262
+bb210:
+    %211 = const i16 51
+    store i16 %211, ptr %0
+    br bb262
+bb211:
+    %212 = const i16 50
+    store i16 %212, ptr %0
+    br bb262
+bb212:
+    %213 = const i16 49
+    store i16 %213, ptr %0
+    br bb262
+bb213:
+    %214 = const i16 48
+    store i16 %214, ptr %0
+    br bb262
+bb214:
+    %215 = const i16 47
+    store i16 %215, ptr %0
+    br bb262
+bb215:
+    %216 = const i16 46
+    store i16 %216, ptr %0
+    br bb262
+bb216:
+    %217 = const i16 45
+    store i16 %217, ptr %0
+    br bb262
+bb217:
+    %218 = const i16 44
+    store i16 %218, ptr %0
+    br bb262
+bb218:
+    %219 = const i16 43
+    store i16 %219, ptr %0
+    br bb262
+bb219:
+    %220 = const i16 42
+    store i16 %220, ptr %0
+    br bb262
+bb220:
+    %221 = const i16 41
+    store i16 %221, ptr %0
+    br bb262
+bb221:
+    %222 = const i16 40
+    store i16 %222, ptr %0
+    br bb262
+bb222:
+    %223 = const i16 39
+    store i16 %223, ptr %0
+    br bb262
+bb223:
+    %224 = const i16 38
+    store i16 %224, ptr %0
+    br bb262
+bb224:
+    %225 = const i16 37
+    store i16 %225, ptr %0
+    br bb262
+bb225:
+    %226 = const i16 36
+    store i16 %226, ptr %0
+    br bb262
+bb226:
+    %227 = const i16 35
+    store i16 %227, ptr %0
+    br bb262
+bb227:
+    %228 = const i16 34
+    store i16 %228, ptr %0
+    br bb262
+bb228:
+    %229 = const i16 33
+    store i16 %229, ptr %0
+    br bb262
+bb229:
+    %230 = const i16 32
+    store i16 %230, ptr %0
+    br bb262
+bb230:
+    %231 = const i16 31
+    store i16 %231, ptr %0
+    br bb262
+bb231:
+    %232 = const i16 30
+    store i16 %232, ptr %0
+    br bb262
+bb232:
+    %233 = const i16 29
+    store i16 %233, ptr %0
+    br bb262
+bb233:
+    %234 = const i16 28
+    store i16 %234, ptr %0
+    br bb262
+bb234:
+    %235 = const i16 27
+    store i16 %235, ptr %0
+    br bb262
+bb235:
+    %236 = const i16 26
+    store i16 %236, ptr %0
+    br bb262
+bb236:
+    %237 = const i16 25
+    store i16 %237, ptr %0
+    br bb262
+bb237:
+    %238 = const i16 24
+    store i16 %238, ptr %0
+    br bb262
+bb238:
+    %239 = const i16 23
+    store i16 %239, ptr %0
+    br bb262
+bb239:
+    %240 = const i16 22
+    store i16 %240, ptr %0
+    br bb262
+bb240:
+    %241 = const i16 21
+    store i16 %241, ptr %0
+    br bb262
+bb241:
+    %242 = const i16 20
+    store i16 %242, ptr %0
+    br bb262
+bb242:
+    %243 = const i16 19
+    store i16 %243, ptr %0
+    br bb262
+bb243:
+    %244 = const i16 18
+    store i16 %244, ptr %0
+    br bb262
+bb244:
+    %245 = const i16 17
+    store i16 %245, ptr %0
+    br bb262
+bb245:
+    %246 = const i16 16
+    store i16 %246, ptr %0
+    br bb262
+bb246:
+    %247 = const i16 15
+    store i16 %247, ptr %0
+    br bb262
+bb247:
+    %248 = const i16 14
+    store i16 %248, ptr %0
+    br bb262
+bb248:
+    %249 = const i16 13
+    store i16 %249, ptr %0
+    br bb262
+bb249:
+    %250 = const i16 12
+    store i16 %250, ptr %0
+    br bb262
+bb250:
+    %251 = const i16 11
+    store i16 %251, ptr %0
+    br bb262
+bb251:
+    %252 = const i16 10
+    store i16 %252, ptr %0
+    br bb262
+bb252:
+    %253 = const i16 9
+    store i16 %253, ptr %0
+    br bb262
+bb253:
+    %254 = const i16 8
+    store i16 %254, ptr %0
+    br bb262
+bb254:
+    %255 = const i16 7
+    store i16 %255, ptr %0
+    br bb262
+bb255:
+    %256 = const i16 6
+    store i16 %256, ptr %0
+    br bb262
+bb256:
+    %257 = const i16 5
+    store i16 %257, ptr %0
+    br bb262
+bb257:
+    %258 = const i16 4
+    store i16 %258, ptr %0
+    br bb262
+bb258:
+    %259 = const i16 3
+    store i16 %259, ptr %0
+    br bb262
+bb259:
+    %260 = const i16 2
+    store i16 %260, ptr %0
+    br bb262
+bb260:
+    %261 = const i16 1
+    store i16 %261, ptr %0
+    br bb262
+bb261:
+    %262 = const i16 0
+    store i16 %262, ptr %0
+    br bb262
+bb262:
+    ret
+}
+
+fn @call_opcode_clobbers_registers(functy.2) {
+bb0(%0: u16):
+    %2 = alloca i16, align 2
+    store u16 %0, ptr %2
+    %3 = load i16, ptr %2
+    %4 = sext i16 %3 to i64
+    switch %4 [ 71: bb2 72: bb2 241: bb2 242: bb2 default: bb1 ]
+bb1:
+    %5 = const bool false
+    br bb3(%5)
+bb2:
+    %6 = const bool true
+    br bb3(%6)
+bb3(%1: bool):
+    ret %1
+}

@@ -1,0 +1,46 @@
+# A64-ROW ratchet floor — cross-compile verdict coverage % over the shared
+# real-program corpus rows (program x {O0, O3}, --emit=obj, aarch64-apple-darwin)
+# measured by tests/real_program_corpus_a64.rs.
+#
+# RULES (soundness doctrine, mirror of COVERAGE_FLOOR.txt):
+#   * RAISE when completeness fixes land and the higher number is stable.
+#   * NEVER lower to make the gate pass.
+#   * HARD ERRORS (ICE / non-fail-closed crash) are never tolerated at any floor.
+#
+# This is a COMPILE-verdict row (the box cannot execute aarch64): it proves the
+# full backend pipeline (lowering, mid-end, regalloc, encode, object emission)
+# accepts-or-refuses each guest; run-match teeth arrive with the a64
+# decode-check (ENC-5) / interpreter-oracle rows.
+#
+# MEASUREMENT HISTORY:
+#   2026-07-18 (first sweep): reported 0/26 — RETRACTED. Two artifacts: the
+#   harness required the `-o` object to exist, but a bridge compile emits
+#   MULTIPLE objects (allocator shim + helpers) so rustc ignores `-o` for
+#   --emit=obj and the check misfired on every SUCCESSFUL compile; and the
+#   dylib predated the day's frontend landings (which eliminated the
+#   TCG-PROOF-465 class, 12 rows -> 0).
+#   2026-07-18 (corrected, exit-status verdicts, current dylib):
+#   26 rows | COMPILED 18 | INCOMPLETE 8 | HARD ERRORS 0 -> 69.2%
+#   Gap rows: p01@O0 (TCG-SSA-071 non-scalar loop-path VC — arch-NEUTRAL,
+#   x86 refuses it identically), p06_rdp both, p11@O3, p12_box_tree both,
+#   p13_sort_std both (TCG-MIR-UNSUPPORTED classes shared with x86's own
+#   incomplete rows). The a64 ADMISSION lane is roughly at x86 parity; the
+#   remaining a64 deltas are execution teeth (this row cannot run code) and
+#   the shared frontend completeness classes.
+#   Floor set to 65.3 (measured 69.2 minus a one-row 3.9pt margin).
+#   2026-08-12 (post-ratchet settlement):
+#   26 rows | COMPILED 19 | INCOMPLETE 7 | HARD ERRORS 0 -> 73.1%
+#   What landed since the last epoch: the promotion ratchets
+#   (object-relocation + opcode inventory) landed; the aarch64 Mach-O
+#   relocation lanes registered (9 kinds, incl. the new UNSIGNED
+#   extern/section-rebase/SUBTRACTOR pair proofs); the Movk per-form
+#   binding re-landed after a merge-clobber; MOVN (all 6 legal forms,
+#   W-form upper-32-zero pinned) and UMULL (widening zext multiply,
+#   UMADDL-with-XZR alias) proofs authored and bound in the verifier.
+#   Gap rows (all arch-NEUTRAL frontend classes, none a64-specific):
+#   p01_interp@O0 (TCG-SSA-071 non-scalar loop-path VC +
+#   TCG-MIR-UNSUPPORTED), p06_rdp both, p12_box_tree both, p11_vec_stack@O3,
+#   p13_sort_std@O3 (TCG-MIR-UNSUPPORTED, the @O3 rows additionally
+#   TCG-DATAFLOW-INTEGRITY-WARN) — x86 shares these incomplete classes.
+#   Floor raised to 69.2 (measured 73.1 minus a one-row 3.9pt margin).
+a64_compile_floor_percent = 69.2

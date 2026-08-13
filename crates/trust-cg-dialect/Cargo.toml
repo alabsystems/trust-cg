@@ -1,0 +1,22 @@
+# trust-cg-dialect - Dialect framework and progressive lowering (MLIR-style)
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache-2.0
+
+[package]
+name = "trust-cg-dialect"
+description = "Dialect framework for Trust Codegen (verif.* / trust_ir.* / machir.* progressive lowering)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+
+[dependencies]
+trust-cg-ir = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,60 @@
+# trust-cg-fuzz - Differential fuzzing for Trust Codegen
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache-2.0
+#
+# Part of WS3 (differential fuzzing) in the "proving trust-cg replaces llvm" plan.
+# Three drivers:
+#   - trust-ir-gen: generate random trust-ir, diff interpreter vs compile-pipeline
+#   - csmith-driver: external csmith → clang -O0 oracle vs Trust Codegen (via trust-ir)
+#   - yarpgen-driver: external yarpgen → same wrapping
+
+[package]
+name = "trust-cg-fuzz"
+description = "Differential fuzzing harness for Trust Codegen (csmith / YARPGen / trust-ir-gen)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+
+[dependencies]
+trust-cg-ir = { workspace = true }
+trust-cg-lower = { workspace = true }
+trust-cg-opt = { workspace = true }
+trust-cg-regalloc = { workspace = true }
+trust-cg-codegen = { workspace = true }
+trust-ir = { workspace = true }
+trust-ir-build = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# Used by the JIT-diff harness to fork a sandbox child per JIT invocation so a
+# hardware trap (SIGFPE on idiv #DE, SIGSEGV, etc.) kills only the child and the
+# parent driver survives to finish the campaign and write its JSON summary.
+libc = "0.2"
+
+[[bin]]
+name = "trust-ir-gen"
+path = "src/bin/trust-ir-gen.rs"
+
+[[bin]]
+name = "csmith-driver"
+path = "src/bin/csmith_driver.rs"
+
+[[bin]]
+name = "yarpgen-driver"
+path = "src/bin/yarpgen_driver.rs"
+
+[[bin]]
+# JIT-based differential harness (#436 WS3).
+# Diffs interpreter-oracle vs JIT@O0 vs JIT@O2 on random trust-ir.
+name = "trust-ir-jit-diff"
+path = "src/bin/trust-ir-jit-diff.rs"
+
+[lints]
+workspace = true

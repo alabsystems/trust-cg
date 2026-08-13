@@ -1,0 +1,81 @@
+{
+  "version": 1,
+  "dialect": "trust_ir.vnn",
+  "entry": "model",
+  "tensors": {
+    "%features": {
+      "shape": [1, 64],
+      "dtype": "f32",
+      "layout": "nc",
+      "role": "input"
+    },
+    "%logits": {
+      "shape": [1, 10],
+      "dtype": "f32",
+      "layout": "nc",
+      "role": "activation"
+    },
+    "%probs": {
+      "shape": [1, 10],
+      "dtype": "f32",
+      "layout": "nc",
+      "role": "output"
+    }
+  },
+  "initializers": {
+    "fc.weight": {
+      "shape": [10, 64],
+      "dtype": "f32",
+      "layout": "oi",
+      "storage": { "kind": "external", "name": "fc.weight" },
+      "sha256": "6666666666666666666666666666666666666666666666666666666666666666"
+    },
+    "fc.bias": {
+      "shape": [10],
+      "dtype": "f32",
+      "layout": "vector",
+      "storage": { "kind": "external", "name": "fc.bias" },
+      "sha256": "7777777777777777777777777777777777777777777777777777777777777777"
+    }
+  },
+  "ops": [
+    {
+      "id": "vnn.0",
+      "op": "trust_ir.vnn.linear",
+      "inputs": ["%features"],
+      "outputs": ["%logits"],
+      "weights": ["fc.weight", "fc.bias"],
+      "attrs": { "source_op": "Gemm", "alpha": 1.0, "beta": 1.0, "transA": 0, "transB": 1 },
+      "provenance": {
+        "gamma_layer_id": "layer.3",
+        "gamma_layer_type": "Linear",
+        "onnx_node_name": "Gemm_3",
+        "onnx_op_type": "Gemm",
+        "onnx_outputs": ["logits"]
+      }
+    },
+    {
+      "id": "vnn.1",
+      "op": "trust_ir.vnn.softmax",
+      "inputs": ["%logits"],
+      "outputs": ["%probs"],
+      "attrs": { "axis": 1 },
+      "provenance": {
+        "gamma_layer_id": "layer.4",
+        "gamma_layer_type": "Softmax",
+        "onnx_node_name": "Softmax_4",
+        "onnx_op_type": "Softmax",
+        "onnx_outputs": ["probabilities"]
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from": "%logits",
+      "to": "vnn.1",
+      "from_layer": "layer.3",
+      "to_layer": "layer.4",
+      "onnx_tensor": "logits"
+    }
+  ]
+}

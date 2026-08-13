@@ -1,0 +1,6 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "EmptyRecord",
+  "description": "Empty record — used by `doctor` and other subcommands that don't enumerate per-unit results but still emit a summary.",
+  "type": "object"
+}

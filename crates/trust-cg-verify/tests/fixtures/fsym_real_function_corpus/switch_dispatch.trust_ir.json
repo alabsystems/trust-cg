@@ -1,0 +1,254 @@
+{
+  "name": "fsym_real_switch_dispatch",
+  "functions": [
+    {
+      "id": 0,
+      "name": "dispatch",
+      "ty": 0,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "I32"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Switch": {
+                  "value": 0,
+                  "default": 1,
+                  "default_args": [],
+                  "cases": [
+                    {
+                      "value": {
+                        "Int": 0
+                      },
+                      "target": 2,
+                      "args": []
+                    },
+                    {
+                      "value": {
+                        "Int": 1
+                      },
+                      "target": 3,
+                      "args": []
+                    },
+                    {
+                      "value": {
+                        "Int": 2
+                      },
+                      "target": 4,
+                      "args": []
+                    },
+                    {
+                      "value": {
+                        "Int": 3
+                      },
+                      "target": 5,
+                      "args": []
+                    }
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        },
+        {
+          "id": 1,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": 99
+                  }
+                }
+              },
+              "results": [
+                5
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    5
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        },
+        {
+          "id": 2,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": 10
+                  }
+                }
+              },
+              "results": [
+                1
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    1
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        },
+        {
+          "id": 3,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": 11
+                  }
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    2
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        },
+        {
+          "id": 4,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": 12
+                  }
+                }
+              },
+              "results": [
+                3
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    3
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        },
+        {
+          "id": 5,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": 13
+                  }
+                }
+              },
+              "results": [
+                4
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    4
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External"
+    }
+  ],
+  "structs": [],
+  "enums": [],
+  "records": [],
+  "closure_types": [],
+  "globals": [],
+  "func_types": [
+    {
+      "params": [
+        "I32"
+      ],
+      "returns": [
+        "I32"
+      ],
+      "is_vararg": false
+    }
+  ],
+  "types": [],
+  "proof_obligations": [],
+  "proof_certificates": [],
+  "target_info": null
+}

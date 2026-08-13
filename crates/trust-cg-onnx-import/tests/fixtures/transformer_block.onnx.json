@@ -1,0 +1,34 @@
+{
+  "name": "transformer_block",
+  "inputs": [
+    { "name": "x", "shape": [1, 2, 4], "dtype": "f32", "layout": "nld" }
+  ],
+  "outputs": ["block_out"],
+  "tensors": [
+    { "name": "norm", "shape": [1, 2, 4], "dtype": "f32", "layout": "nld" },
+    { "name": "hidden", "shape": [1, 2, 6], "dtype": "f32", "layout": "nld" },
+    { "name": "hidden_bias", "shape": [1, 2, 6], "dtype": "f32", "layout": "nld" },
+    { "name": "proj", "shape": [1, 2, 4], "dtype": "f32", "layout": "nld" },
+    { "name": "block_out", "shape": [1, 2, 4], "dtype": "f32", "layout": "nld" }
+  ],
+  "initializers": [
+    { "name": "ln.weight", "shape": [4], "dtype": "f32", "layout": "vector", "values": [1.0] },
+    { "name": "ln.bias", "shape": [4], "dtype": "f32", "layout": "vector", "values": [0.0] },
+    { "name": "fc1.weight", "shape": [4, 6], "dtype": "f32", "layout": "oi", "values": [0.1] },
+    { "name": "fc1.bias", "shape": [6], "dtype": "f32", "layout": "vector", "values": [0.0] },
+    { "name": "fc2.weight", "shape": [6, 4], "dtype": "f32", "layout": "oi", "values": [0.1] }
+  ],
+  "nodes": [
+    {
+      "name": "LayerNormalization_0",
+      "op_type": "LayerNormalization",
+      "inputs": ["x", "ln.weight", "ln.bias"],
+      "outputs": ["norm"],
+      "attributes": { "axis": -1, "epsilon": 0.00001 }
+    },
+    { "name": "Fc1_1", "op_type": "MatMul", "inputs": ["norm", "fc1.weight"], "outputs": ["hidden"] },
+    { "name": "Bias_2", "op_type": "Add", "inputs": ["hidden", "fc1.bias"], "outputs": ["hidden_bias"] },
+    { "name": "Fc2_3", "op_type": "MatMul", "inputs": ["hidden_bias", "fc2.weight"], "outputs": ["proj"] },
+    { "name": "Residual_4", "op_type": "Add", "inputs": ["proj", "x"], "outputs": ["block_out"] }
+  ]
+}

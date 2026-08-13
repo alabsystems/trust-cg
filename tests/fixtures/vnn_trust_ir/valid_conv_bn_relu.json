@@ -1,0 +1,143 @@
+{
+  "version": 1,
+  "dialect": "trust_ir.vnn",
+  "entry": "model",
+  "tensors": {
+    "%input": {
+      "shape": [1, 3, 32, 32],
+      "dtype": "f32",
+      "layout": "nchw",
+      "role": "input"
+    },
+    "%conv0": {
+      "shape": [1, 16, 32, 32],
+      "dtype": "f32",
+      "layout": "nchw",
+      "role": "activation"
+    },
+    "%bn0": {
+      "shape": [1, 16, 32, 32],
+      "dtype": "f32",
+      "layout": "nchw",
+      "role": "activation"
+    },
+    "%relu0": {
+      "shape": [1, 16, 32, 32],
+      "dtype": "f32",
+      "layout": "nchw",
+      "role": "output"
+    }
+  },
+  "initializers": {
+    "conv0.weight": {
+      "shape": [16, 3, 3, 3],
+      "dtype": "f32",
+      "layout": "oihw",
+      "storage": { "kind": "external", "name": "conv0.weight" },
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "conv0.bias": {
+      "shape": [16],
+      "dtype": "f32",
+      "layout": "vector",
+      "storage": { "kind": "external", "name": "conv0.bias" },
+      "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+    },
+    "bn0.scale": {
+      "shape": [16],
+      "dtype": "f32",
+      "layout": "vector",
+      "storage": { "kind": "external", "name": "bn0.scale" },
+      "sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+    },
+    "bn0.bias": {
+      "shape": [16],
+      "dtype": "f32",
+      "layout": "vector",
+      "storage": { "kind": "external", "name": "bn0.bias" },
+      "sha256": "3333333333333333333333333333333333333333333333333333333333333333"
+    },
+    "bn0.mean": {
+      "shape": [16],
+      "dtype": "f32",
+      "layout": "vector",
+      "storage": { "kind": "external", "name": "bn0.mean" },
+      "sha256": "4444444444444444444444444444444444444444444444444444444444444444"
+    },
+    "bn0.var": {
+      "shape": [16],
+      "dtype": "f32",
+      "layout": "vector",
+      "storage": { "kind": "external", "name": "bn0.var" },
+      "sha256": "5555555555555555555555555555555555555555555555555555555555555555"
+    }
+  },
+  "ops": [
+    {
+      "id": "vnn.0",
+      "op": "trust_ir.vnn.conv2d",
+      "inputs": ["%input"],
+      "outputs": ["%conv0"],
+      "weights": ["conv0.weight", "conv0.bias"],
+      "attrs": {
+        "kernel_shape": [3, 3],
+        "strides": [1, 1],
+        "pads": [1, 1, 1, 1],
+        "dilations": [1, 1],
+        "groups": 1
+      },
+      "provenance": {
+        "gamma_layer_id": "layer.0",
+        "gamma_layer_type": "Conv2d",
+        "onnx_node_name": "Conv_0",
+        "onnx_op_type": "Conv",
+        "onnx_outputs": ["conv0_out"]
+      }
+    },
+    {
+      "id": "vnn.1",
+      "op": "trust_ir.vnn.batch_norm",
+      "inputs": ["%conv0"],
+      "outputs": ["%bn0"],
+      "weights": ["bn0.scale", "bn0.bias", "bn0.mean", "bn0.var"],
+      "attrs": { "epsilon": 0.00001, "momentum": 0.9 },
+      "provenance": {
+        "gamma_layer_id": "layer.1",
+        "gamma_layer_type": "BatchNorm",
+        "onnx_node_name": "BatchNormalization_1",
+        "onnx_op_type": "BatchNormalization",
+        "onnx_outputs": ["bn0_out"]
+      }
+    },
+    {
+      "id": "vnn.2",
+      "op": "trust_ir.vnn.relu",
+      "inputs": ["%bn0"],
+      "outputs": ["%relu0"],
+      "attrs": {},
+      "provenance": {
+        "gamma_layer_id": "layer.2",
+        "gamma_layer_type": "ReLU",
+        "onnx_node_name": "Relu_2",
+        "onnx_op_type": "Relu",
+        "onnx_outputs": ["relu0_out"]
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from": "%conv0",
+      "to": "vnn.1",
+      "from_layer": "layer.0",
+      "to_layer": "layer.1",
+      "onnx_tensor": "conv0_out"
+    },
+    {
+      "from": "%bn0",
+      "to": "vnn.2",
+      "from_layer": "layer.1",
+      "to_layer": "layer.2",
+      "onnx_tensor": "bn0_out"
+    }
+  ]
+}

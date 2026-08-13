@@ -1,0 +1,35 @@
+# soundness_revs.lock — pinned cross-repo revisions for the LOCAL soundness meta-gate
+#
+# This file pins the audited trust-cg source commit, the Clean checkout used by
+# the executable proof gates, and the AY dependency-source context. It is a text
+# lockfile. Default mode warns on drift; `--pinned` fails closed. The internal
+# development attestation commit may be exactly one child of `trust_cg_rev`
+# only when its sole change is this lockfile.
+#
+# This is NOT GitHub CI. It is a local developer meta-gate. See
+# SOUNDNESS_CHECK.md for the model and how to re-pin (`--update`).
+#
+# Re-pin after a green run with:  scripts/soundness_check.sh --update
+# (rewrites the three SHAs below to the current HEADs, only when every gate
+#  passed with only the explicitly pinned RED inventory debt).
+
+# trust-cg: this repo. Owns the gate test targets (soundness_manifest, the 9
+# differential bridges, coverage, meta-theorems, mutation, proof-gate /
+# non-degeneracy).
+trust_cg_rev = f479927335d32ffb14002defcf9eb571d8069581
+
+# Clean checkout: the Clean kernel + the B-def / LRAT-checker .lean proofs and the
+# kernel diversity gate. The clean-check half of the constellation runs here.
+clean_rev = 93550c617865af7c17edd8dd3efad60c953fdc60
+
+# AY checkout: dependency-source provenance for the release context. The local
+# soundness script does not invoke AY and this pin does not attest fixture
+# generation or solver results.
+#
+# Moved by hand alongside the `ay-pb` / `ay-sat` manifest pins in
+# crates/trust-cg-regalloc/Cargo.toml (ay 0.6.0 -> 0.7.0). This slot records
+# WHICH AY the cargo graph resolves, so it must move in the same commit as
+# those pins or check_lock_drift.sh reports a source it no longer builds
+# against. trust_cg_rev and clean_rev are untouched: they attest gate runs and
+# are re-pinned only by scripts/soundness_check.sh --update after a green run.
+ay_rev = 1f8238bbc02432fb78380f77decf11aaddb1d651

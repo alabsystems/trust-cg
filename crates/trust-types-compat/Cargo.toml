@@ -1,0 +1,22 @@
+# trust-types compatibility surface for Trust Codegen
+#
+# This crate intentionally uses the package name `trust-types` so feature-gated
+# Trust Codegen bridge code can depend on `trust_types` without resolving the full
+# tRust compiler workspace during ordinary Trust Codegen builds.
+
+[package]
+name = "trust-types"
+description = "Small trust-types compatibility surface used by Trust Codegen bridge tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

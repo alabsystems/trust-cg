@@ -1,0 +1,64 @@
+---
+source: crates/trust-cg-test/tests/cli.rs
+expression: "help_of(&[\"report\"])"
+---
+Generate the weekly Trust Codegen dashboard (WS9).
+
+Reads the newest compatible JSON recursively from each known workstream result directory, renders
+the north-star table and per-workstream sections, and marks missing data with `—`. Writes
+`reports/weekly/<iso-date>.md` by default.
+
+# Examples
+
+  trust-cg-test report
+  trust-cg-test report --week 2026-04-19 --format human
+  trust-cg-test report --out /tmp/weekly.md
+
+Usage: trust-cg-test report [OPTIONS]
+
+Options:
+  -f, --format <FORMAT>
+          Output format (human, json, junit)
+
+          Possible values:
+          - human: Pretty table + narrative, targeted at humans
+          - json:  Machine-readable JSON
+          - junit: JUnit XML for CI consumers
+
+          [default: human]
+
+      --week <ISO-DATE>
+          ISO date for the report. Default: today (UTC)
+
+      --markdown-out <PATH>
+          Markdown target path (takes precedence over `--out`)
+
+  -o, --out <PATH>
+          Override the command-specific output file or directory.
+
+          See the selected subcommand's help for its output type and default.
+
+      --publish
+          Also copy the report to `reports/weekly/` and write `reports/dashboard.md`, even when a
+          custom output path is selected
+
+      --timeout <SECS>
+          Per-unit timeout in seconds. Subcommands may apply per-unit defaults when this is unset
+
+      --parallel <N>
+          Worker count (honors cargo-serialization lock). Default: auto
+
+  -q, --quiet
+          Suppress progress bars; errors still go to stderr
+
+  -v, --verbose...
+          Show debug-level events. Repeat for more: -vv, -vvv
+
+      --no-cache
+          Ignore proof / corpus caches
+
+      --dry-run
+          Print what would run without executing external tools
+
+  -h, --help
+          Print help (see a summary with '-h')

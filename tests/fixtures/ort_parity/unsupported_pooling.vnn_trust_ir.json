@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "dialect": "trust_ir.vnn",
+  "entry": "model",
+  "tensors": {
+    "%input": { "shape": [1, 2, 4, 4], "dtype": "f32", "layout": "nchw", "role": "input" },
+    "%pool": { "shape": [1, 2, 2, 2], "dtype": "f32", "layout": "nchw", "role": "output" }
+  },
+  "ops": [
+    {
+      "id": "vnn.0",
+      "op": "trust_ir.vnn.max_pool2d",
+      "inputs": ["%input"],
+      "outputs": ["%pool"],
+      "attrs": {
+        "kernel_shape": [2, 2],
+        "strides": [2, 2],
+        "pads": [0, 0, 0, 0]
+      },
+      "provenance": {
+        "gamma_layer_id": "layer.11",
+        "gamma_layer_type": "MaxPool",
+        "onnx_node_name": "MaxPool_11",
+        "onnx_op_type": "MaxPool",
+        "onnx_outputs": ["pool"]
+      }
+    }
+  ]
+}

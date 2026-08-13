@@ -1,0 +1,27 @@
+; TrustIr text format v1
+module "axpy"
+target "aarch64-apple-darwin" 8 little abi="aapcs64"
+functy.0 = (ptr, ptr, i32, i32) -> ()
+fn @axpy(functy.0) {
+; #param_attrs 0: noalias
+; #param_attrs 1: noalias
+bb0(%0: ptr, %1: ptr, %2: i32, %3: i32):
+    %4 = const i32 0
+    %5 = const i32 1
+    br bb1(%4)
+bb1(%10: i32):
+    %11 = icmp slt i32 %10, %3
+    condbr %11, bb2, bb3
+bb2:
+    %20 = gep i32, ptr %0, %10
+    %21 = load i32, ptr %20
+    %22 = gep i32, ptr %1, %10
+    %23 = load i32, ptr %22
+    %24 = mul i32 %2, %23
+    %25 = add i32 %21, %24
+    store i32 %25, ptr %20
+    %26 = add i32 %10, %5
+    br bb1(%26)
+bb3:
+    ret
+}

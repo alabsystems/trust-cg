@@ -1,0 +1,2191 @@
+{
+  "name": "fsym_real_ws2_nottest",
+  "functions": [
+    {
+      "id": 0,
+      "name": "testBitWiseNot",
+      "ty": 0,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "I32"
+            ],
+            [
+              1,
+              "I32"
+            ],
+            [
+              2,
+              "I32"
+            ],
+            [
+              3,
+              "I32"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Alloca": {
+                  "ty": "I32",
+                  "count": null,
+                  "align": null
+                }
+              },
+              "results": [
+                4
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Alloca": {
+                  "ty": "I32",
+                  "count": null,
+                  "align": null
+                }
+              },
+              "results": [
+                5
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Alloca": {
+                  "ty": "I32",
+                  "count": null,
+                  "align": null
+                }
+              },
+              "results": [
+                6
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Alloca": {
+                  "ty": "I32",
+                  "count": null,
+                  "align": null
+                }
+              },
+              "results": [
+                7
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Store": {
+                  "ty": "I32",
+                  "ptr": 4,
+                  "value": 0,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Store": {
+                  "ty": "I32",
+                  "ptr": 5,
+                  "value": 1,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Store": {
+                  "ty": "I32",
+                  "ptr": 6,
+                  "value": 2,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Store": {
+                  "ty": "I32",
+                  "ptr": 7,
+                  "value": 3,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Load": {
+                  "ty": "I32",
+                  "ptr": 4,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [
+                8
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": -1
+                  }
+                }
+              },
+              "results": [
+                9
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "Xor",
+                  "ty": "I32",
+                  "lhs": 8,
+                  "rhs": 9
+                }
+              },
+              "results": [
+                10
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Load": {
+                  "ty": "I32",
+                  "ptr": 5,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [
+                11
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": -1
+                  }
+                }
+              },
+              "results": [
+                12
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "Xor",
+                  "ty": "I32",
+                  "lhs": 11,
+                  "rhs": 12
+                }
+              },
+              "results": [
+                13
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Load": {
+                  "ty": "I32",
+                  "ptr": 6,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [
+                14
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": -1
+                  }
+                }
+              },
+              "results": [
+                15
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "Xor",
+                  "ty": "I32",
+                  "lhs": 14,
+                  "rhs": 15
+                }
+              },
+              "results": [
+                16
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Load": {
+                  "ty": "I32",
+                  "ptr": 7,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [
+                17
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": -1
+                  }
+                }
+              },
+              "results": [
+                18
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "Xor",
+                  "ty": "I32",
+                  "lhs": 17,
+                  "rhs": 18
+                }
+              },
+              "results": [
+                19
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "Ptr",
+                  "value": {
+                    "Int": 18076885954311749632
+                  }
+                }
+              },
+              "results": [
+                20
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Call": {
+                  "callee": 1,
+                  "args": [
+                    20,
+                    10,
+                    13,
+                    16,
+                    19
+                  ]
+                }
+              },
+              "results": [
+                21
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": []
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External"
+    },
+    {
+      "id": 1,
+      "name": "printf",
+      "ty": 1,
+      "entry": 0,
+      "blocks": [],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External"
+    },
+    {
+      "id": 2,
+      "name": "testBooleanNot",
+      "ty": 2,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "I32"
+            ],
+            [
+              1,
+              "I32"
+            ],
+            [
+              2,
+              "I32"
+            ],
+            [
+              3,
+              "I32"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Alloca": {
+                  "ty": "I32",
+                  "count": null,
+                  "align": null
+                }
+              },
+              "results": [
+                4
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Alloca": {
+                  "ty": "I32",
+                  "count": null,
+                  "align": null
+                }
+              },
+              "results": [
+                5
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Alloca": {
+                  "ty": "I32",
+                  "count": null,
+                  "align": null
+                }
+              },
+              "results": [
+                6
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Alloca": {
+                  "ty": "I32",
+                  "count": null,
+                  "align": null
+                }
+              },
+              "results": [
+                7
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Store": {
+                  "ty": "I32",
+                  "ptr": 4,
+                  "value": 0,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Store": {
+                  "ty": "I32",
+                  "ptr": 5,
+                  "value": 1,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Store": {
+                  "ty": "I32",
+                  "ptr": 6,
+                  "value": 2,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Store": {
+                  "ty": "I32",
+                  "ptr": 7,
+                  "value": 3,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Load": {
+                  "ty": "I32",
+                  "ptr": 4,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [
+                8
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": 0
+                  }
+                }
+              },
+              "results": [
+                9
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "ICmp": {
+                  "op": "Sgt",
+                  "ty": "I32",
+                  "lhs": 8,
+                  "rhs": 9
+                }
+              },
+              "results": [
+                10
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "Bool",
+                  "value": {
+                    "Bool": false
+                  }
+                }
+              },
+              "results": [
+                70
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "CondBr": {
+                  "cond": 10,
+                  "then_target": 1,
+                  "then_args": [],
+                  "else_target": 2,
+                  "else_args": [
+                    70
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        },
+        {
+          "id": 1,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Load": {
+                  "ty": "I32",
+                  "ptr": 5,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [
+                11
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": 0
+                  }
+                }
+              },
+              "results": [
+                12
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "ICmp": {
+                  "op": "Sgt",
+                  "ty": "I32",
+                  "lhs": 11,
+                  "rhs": 12
+                }
+              },
+              "results": [
+                13
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Br": {
+                  "target": 2,
+                  "args": [
+                    13
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        },
+        {
+          "id": 2,
+          "params": [
+            [
+              14,
+              "Bool"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": "Bool",
+                  "value": {
+                    "Bool": true
+                  }
+                }
+              },
+              "results": [
+                15
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "Xor",
+                  "ty": "Bool",
+                  "lhs": 14,
+                  "rhs": 15
+                }
+              },
+              "results": [
+                16
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Cast": {
+                  "op": "ZExt",
+                  "src_ty": "Bool",
+                  "dst_ty": "I32",
+                  "operand": 16
+                }
+              },
+              "results": [
+                17
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Load": {
+                  "ty": "I32",
+                  "ptr": 4,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [
+                18
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": 0
+                  }
+                }
+              },
+              "results": [
+                19
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "ICmp": {
+                  "op": "Sgt",
+                  "ty": "I32",
+                  "lhs": 18,
+                  "rhs": 19
+                }
+              },
+              "results": [
+                20
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "Bool",
+                  "value": {
+                    "Bool": false
+                  }
+                }
+              },
+              "results": [
+                71
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "CondBr": {
+                  "cond": 20,
+                  "then_target": 3,
+                  "then_args": [],
+                  "else_target": 4,
+                  "else_args": [
+                    71
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        },
+        {
+          "id": 3,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Load": {
+                  "ty": "I32",
+                  "ptr": 6,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [
+                21
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": 0
+                  }
+                }
+              },
+              "results": [
+                22
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "ICmp": {
+                  "op": "Sgt",
+                  "ty": "I32",
+                  "lhs": 21,
+                  "rhs": 22
+                }
+              },
+              "results": [
+                23
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Br": {
+                  "target": 4,
+                  "args": [
+                    23
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        },
+        {
+          "id": 4,
+          "params": [
+            [
+              24,
+              "Bool"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": "Bool",
+                  "value": {
+                    "Bool": true
+                  }
+                }
+              },
+              "results": [
+                25
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "Xor",
+                  "ty": "Bool",
+                  "lhs": 24,
+                  "rhs": 25
+                }
+              },
+              "results": [
+                26
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Cast": {
+                  "op": "ZExt",
+                  "src_ty": "Bool",
+                  "dst_ty": "I32",
+                  "operand": 26
+                }
+              },
+              "results": [
+                27
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Load": {
+                  "ty": "I32",
+                  "ptr": 4,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [
+                28
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": 0
+                  }
+                }
+              },
+              "results": [
+                29
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "ICmp": {
+                  "op": "Sgt",
+                  "ty": "I32",
+                  "lhs": 28,
+                  "rhs": 29
+                }
+              },
+              "results": [
+                30
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "Bool",
+                  "value": {
+                    "Bool": false
+                  }
+                }
+              },
+              "results": [
+                72
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "CondBr": {
+                  "cond": 30,
+                  "then_target": 5,
+                  "then_args": [],
+                  "else_target": 6,
+                  "else_args": [
+                    72
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        },
+        {
+          "id": 5,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Load": {
+                  "ty": "I32",
+                  "ptr": 7,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [
+                31
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": 0
+                  }
+                }
+              },
+              "results": [
+                32
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "ICmp": {
+                  "op": "Sgt",
+                  "ty": "I32",
+                  "lhs": 31,
+                  "rhs": 32
+                }
+              },
+              "results": [
+                33
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Br": {
+                  "target": 6,
+                  "args": [
+                    33
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        },
+        {
+          "id": 6,
+          "params": [
+            [
+              34,
+              "Bool"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": "Bool",
+                  "value": {
+                    "Bool": true
+                  }
+                }
+              },
+              "results": [
+                35
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "Xor",
+                  "ty": "Bool",
+                  "lhs": 34,
+                  "rhs": 35
+                }
+              },
+              "results": [
+                36
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Cast": {
+                  "op": "ZExt",
+                  "src_ty": "Bool",
+                  "dst_ty": "I32",
+                  "operand": 36
+                }
+              },
+              "results": [
+                37
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Load": {
+                  "ty": "I32",
+                  "ptr": 5,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [
+                38
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": 0
+                  }
+                }
+              },
+              "results": [
+                39
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "ICmp": {
+                  "op": "Sgt",
+                  "ty": "I32",
+                  "lhs": 38,
+                  "rhs": 39
+                }
+              },
+              "results": [
+                40
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "Bool",
+                  "value": {
+                    "Bool": false
+                  }
+                }
+              },
+              "results": [
+                73
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "CondBr": {
+                  "cond": 40,
+                  "then_target": 7,
+                  "then_args": [],
+                  "else_target": 8,
+                  "else_args": [
+                    73
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        },
+        {
+          "id": 7,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Load": {
+                  "ty": "I32",
+                  "ptr": 6,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [
+                41
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": 0
+                  }
+                }
+              },
+              "results": [
+                42
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "ICmp": {
+                  "op": "Sgt",
+                  "ty": "I32",
+                  "lhs": 41,
+                  "rhs": 42
+                }
+              },
+              "results": [
+                43
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Br": {
+                  "target": 8,
+                  "args": [
+                    43
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        },
+        {
+          "id": 8,
+          "params": [
+            [
+              44,
+              "Bool"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": "Bool",
+                  "value": {
+                    "Bool": true
+                  }
+                }
+              },
+              "results": [
+                45
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "Xor",
+                  "ty": "Bool",
+                  "lhs": 44,
+                  "rhs": 45
+                }
+              },
+              "results": [
+                46
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Cast": {
+                  "op": "ZExt",
+                  "src_ty": "Bool",
+                  "dst_ty": "I32",
+                  "operand": 46
+                }
+              },
+              "results": [
+                47
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Load": {
+                  "ty": "I32",
+                  "ptr": 5,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [
+                48
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": 0
+                  }
+                }
+              },
+              "results": [
+                49
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "ICmp": {
+                  "op": "Sgt",
+                  "ty": "I32",
+                  "lhs": 48,
+                  "rhs": 49
+                }
+              },
+              "results": [
+                50
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "Bool",
+                  "value": {
+                    "Bool": false
+                  }
+                }
+              },
+              "results": [
+                74
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "CondBr": {
+                  "cond": 50,
+                  "then_target": 9,
+                  "then_args": [],
+                  "else_target": 10,
+                  "else_args": [
+                    74
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        },
+        {
+          "id": 9,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Load": {
+                  "ty": "I32",
+                  "ptr": 7,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [
+                51
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": 0
+                  }
+                }
+              },
+              "results": [
+                52
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "ICmp": {
+                  "op": "Sgt",
+                  "ty": "I32",
+                  "lhs": 51,
+                  "rhs": 52
+                }
+              },
+              "results": [
+                53
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Br": {
+                  "target": 10,
+                  "args": [
+                    53
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        },
+        {
+          "id": 10,
+          "params": [
+            [
+              54,
+              "Bool"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": "Bool",
+                  "value": {
+                    "Bool": true
+                  }
+                }
+              },
+              "results": [
+                55
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "Xor",
+                  "ty": "Bool",
+                  "lhs": 54,
+                  "rhs": 55
+                }
+              },
+              "results": [
+                56
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Cast": {
+                  "op": "ZExt",
+                  "src_ty": "Bool",
+                  "dst_ty": "I32",
+                  "operand": 56
+                }
+              },
+              "results": [
+                57
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Load": {
+                  "ty": "I32",
+                  "ptr": 6,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [
+                58
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": 0
+                  }
+                }
+              },
+              "results": [
+                59
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "ICmp": {
+                  "op": "Sgt",
+                  "ty": "I32",
+                  "lhs": 58,
+                  "rhs": 59
+                }
+              },
+              "results": [
+                60
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "Bool",
+                  "value": {
+                    "Bool": false
+                  }
+                }
+              },
+              "results": [
+                75
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "CondBr": {
+                  "cond": 60,
+                  "then_target": 11,
+                  "then_args": [],
+                  "else_target": 12,
+                  "else_args": [
+                    75
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        },
+        {
+          "id": 11,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Load": {
+                  "ty": "I32",
+                  "ptr": 7,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [
+                61
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": 0
+                  }
+                }
+              },
+              "results": [
+                62
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "ICmp": {
+                  "op": "Sgt",
+                  "ty": "I32",
+                  "lhs": 61,
+                  "rhs": 62
+                }
+              },
+              "results": [
+                63
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Br": {
+                  "target": 12,
+                  "args": [
+                    63
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        },
+        {
+          "id": 12,
+          "params": [
+            [
+              64,
+              "Bool"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": "Bool",
+                  "value": {
+                    "Bool": true
+                  }
+                }
+              },
+              "results": [
+                65
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "Xor",
+                  "ty": "Bool",
+                  "lhs": 64,
+                  "rhs": 65
+                }
+              },
+              "results": [
+                66
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Cast": {
+                  "op": "ZExt",
+                  "src_ty": "Bool",
+                  "dst_ty": "I32",
+                  "operand": 66
+                }
+              },
+              "results": [
+                67
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "Ptr",
+                  "value": {
+                    "Int": 18076885958606716928
+                  }
+                }
+              },
+              "results": [
+                68
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Call": {
+                  "callee": 1,
+                  "args": [
+                    68,
+                    17,
+                    27,
+                    37,
+                    47,
+                    57,
+                    67
+                  ]
+                }
+              },
+              "results": [
+                69
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": []
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External"
+    },
+    {
+      "id": 3,
+      "name": "main",
+      "ty": 3,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": 1
+                  }
+                }
+              },
+              "results": [
+                0
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": 2
+                  }
+                }
+              },
+              "results": [
+                1
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": -3
+                  }
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": 5
+                  }
+                }
+              },
+              "results": [
+                3
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Call": {
+                  "callee": 0,
+                  "args": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": 1
+                  }
+                }
+              },
+              "results": [
+                4
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": 2
+                  }
+                }
+              },
+              "results": [
+                5
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": -3
+                  }
+                }
+              },
+              "results": [
+                6
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": 5
+                  }
+                }
+              },
+              "results": [
+                7
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Call": {
+                  "callee": 2,
+                  "args": [
+                    4,
+                    5,
+                    6,
+                    7
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": 0
+                  }
+                }
+              },
+              "results": [
+                8
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    8
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External"
+    }
+  ],
+  "structs": [],
+  "enums": [],
+  "records": [],
+  "closure_types": [],
+  "globals": [
+    {
+      "name": ".str",
+      "ty": "Ptr",
+      "mutable": false,
+      "initializer": {
+        "Aggregate": [
+          {
+            "Int": 66
+          },
+          {
+            "Int": 105
+          },
+          {
+            "Int": 116
+          },
+          {
+            "Int": 119
+          },
+          {
+            "Int": 105
+          },
+          {
+            "Int": 115
+          },
+          {
+            "Int": 101
+          },
+          {
+            "Int": 32
+          },
+          {
+            "Int": 78
+          },
+          {
+            "Int": 111
+          },
+          {
+            "Int": 116
+          },
+          {
+            "Int": 58
+          },
+          {
+            "Int": 32
+          },
+          {
+            "Int": 37
+          },
+          {
+            "Int": 100
+          },
+          {
+            "Int": 32
+          },
+          {
+            "Int": 37
+          },
+          {
+            "Int": 100
+          },
+          {
+            "Int": 32
+          },
+          {
+            "Int": 37
+          },
+          {
+            "Int": 100
+          },
+          {
+            "Int": 32
+          },
+          {
+            "Int": 37
+          },
+          {
+            "Int": 100
+          },
+          {
+            "Int": 10
+          },
+          {
+            "Int": 0
+          }
+        ]
+      },
+      "linkage": "Private"
+    },
+    {
+      "name": ".str.1",
+      "ty": "Ptr",
+      "mutable": false,
+      "initializer": {
+        "Aggregate": [
+          {
+            "Int": 66
+          },
+          {
+            "Int": 111
+          },
+          {
+            "Int": 111
+          },
+          {
+            "Int": 108
+          },
+          {
+            "Int": 101
+          },
+          {
+            "Int": 97
+          },
+          {
+            "Int": 110
+          },
+          {
+            "Int": 32
+          },
+          {
+            "Int": 78
+          },
+          {
+            "Int": 111
+          },
+          {
+            "Int": 116
+          },
+          {
+            "Int": 58
+          },
+          {
+            "Int": 32
+          },
+          {
+            "Int": 37
+          },
+          {
+            "Int": 100
+          },
+          {
+            "Int": 32
+          },
+          {
+            "Int": 37
+          },
+          {
+            "Int": 100
+          },
+          {
+            "Int": 32
+          },
+          {
+            "Int": 37
+          },
+          {
+            "Int": 100
+          },
+          {
+            "Int": 32
+          },
+          {
+            "Int": 37
+          },
+          {
+            "Int": 100
+          },
+          {
+            "Int": 32
+          },
+          {
+            "Int": 37
+          },
+          {
+            "Int": 100
+          },
+          {
+            "Int": 32
+          },
+          {
+            "Int": 37
+          },
+          {
+            "Int": 100
+          },
+          {
+            "Int": 10
+          },
+          {
+            "Int": 0
+          }
+        ]
+      },
+      "linkage": "Private"
+    }
+  ],
+  "func_types": [
+    {
+      "params": [
+        "I32",
+        "I32",
+        "I32",
+        "I32"
+      ],
+      "returns": [],
+      "is_vararg": false
+    },
+    {
+      "params": [
+        "Ptr"
+      ],
+      "returns": [
+        "I32"
+      ],
+      "is_vararg": true
+    },
+    {
+      "params": [
+        "I32",
+        "I32",
+        "I32",
+        "I32"
+      ],
+      "returns": [],
+      "is_vararg": false
+    },
+    {
+      "params": [],
+      "returns": [
+        "I32"
+      ],
+      "is_vararg": false
+    }
+  ],
+  "types": [],
+  "proof_obligations": [],
+  "proof_certificates": [],
+  "target_info": null
+}

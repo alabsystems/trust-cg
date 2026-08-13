@@ -1,0 +1,69 @@
+---
+source: crates/trust-cg-test/tests/cli.rs
+expression: "help_of(&[\"ratchet\", \"tests\"])"
+---
+Monotonic pass-count ratchet for the workspace test matrix.
+
+Compares the newest JSON in `evals/results/tests/` against
+the required `--baseline` JSON. Fails if any `(crate, shard)`
+pair in the baseline has a lower `passed` count in the
+current run, or a higher `failed` count, or has disappeared
+entirely. New shards are OK — the baseline only grows.
+
+Exit codes:
+  0 — current run is at or above baseline on every pair.
+  1 — regression detected.
+  2 — tooling error (missing files, parse error, etc.).
+
+# Examples
+
+  trust-cg-test ratchet tests --baseline path/to/tests-baseline.json
+  trust-cg-test ratchet tests --current current.json --baseline baseline.json
+  trust-cg-test ratchet tests --baseline path/to/tests-baseline.json --format json
+
+Usage: trust-cg-test ratchet tests [OPTIONS] --baseline <PATH>
+
+Options:
+      --current <PATH>
+          Override the "current" test-matrix JSON. Default: newest `*.json` under
+          `evals/results/tests/`
+
+  -f, --format <FORMAT>
+          Output format (human, json, junit)
+
+          Possible values:
+          - human: Pretty table + narrative, targeted at humans
+          - json:  Machine-readable JSON
+          - junit: JUnit XML for CI consumers
+
+          [default: human]
+
+      --baseline <PATH>
+          Baseline JSON to compare against. Required because v0.1.0 ships no universal
+          machine-independent pass-count baseline
+
+  -o, --out <PATH>
+          Override the command-specific output file or directory.
+
+          See the selected subcommand's help for its output type and default.
+
+      --timeout <SECS>
+          Per-unit timeout in seconds. Subcommands may apply per-unit defaults when this is unset
+
+      --parallel <N>
+          Worker count (honors cargo-serialization lock). Default: auto
+
+  -q, --quiet
+          Suppress progress bars; errors still go to stderr
+
+  -v, --verbose...
+          Show debug-level events. Repeat for more: -vv, -vvv
+
+      --no-cache
+          Ignore proof / corpus caches
+
+      --dry-run
+          Print what would run without executing external tools
+
+  -h, --help
+          Print help (see a summary with '-h')

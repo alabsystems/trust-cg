@@ -1,0 +1,79 @@
+# trust-cg-verify - Verification backend
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache-2.0
+
+[package]
+name = "trust-cg-verify"
+description = "Verification backend for Trust Codegen — executable checks and external SMT discharge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+
+[features]
+default = []
+# Solver-backed verification uses the external AY subprocess path in
+# `ay_bridge.rs`. Keeping AY out of this crate's dependency graph preserves the
+# one-way Trust-CG -> AY tool boundary and avoids an AY <-> Trust-CG Cargo cycle.
+# fsym feature: enables the symbolic-execution UB detector pipeline
+# helpers (see designs/2026-04-18-integrated-symbolic-execution.md).
+# Phase 1a (null-deref) lands the scan helper behind this feature so the
+# pipeline wiring can stay off by default while the core detector types
+# remain compiled and testable. Not enabled by default.
+# To enable: `cargo build -p trust-cg-verify --features fsym`.
+fsym = []
+# tRust trust-types Formula <-> trust-cg SmtExpr compatibility adapter.
+# Kept opt-in so the default verification lane does not grow a hard tRust
+# dependency before the #260 integration path flips on.
+trust-types-bridge = ["dep:trust-types"]
+# slow-full-database: enables long-running full ProofDatabase integration
+# checks that are intentionally excluded from the default package lane.
+# To run: `cargo test -p trust-cg-verify --features slow-full-database --test full_proof_suite`.
+slow-full-database = []
+
+[dependencies]
+trust-cg-ir = { workspace = true }
+trust-cg-lower = { workspace = true }
+trust-cg-opt = { workspace = true }
+trust-cg-process-env = { workspace = true }
+trust-ir = { workspace = true }
+thiserror = { workspace = true }
+rmp-serde = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# `asm` selects the ARMv8 SHA2 instruction path (this host reports `sha2` in
+# /proc/cpuinfo). Identical digest, ~4x faster: the solver-identity hash runs
+# over the ~95MB `ay` binary once per compile and cost ~230ms in the software
+# backend -- the largest remaining component of p3_gcd's compile time after the
+# resident-server fix. Same bytes in, same hash out, so the cache identity and
+# its security properties are unchanged.
+sha2 = { version = "0.10", features = ["asm"] }
+rayon = "1.10"
+trust-types = { workspace = true, optional = true }
+tempfile = "3"
+# ENC-6 / CERT-SKIP: the vendored `drat-trim` DRAT proof checker, built as a
+# standalone executable in OUT_DIR. Promoted from dev-only to a production
+# dependency by the canary CERT-SKIP tier (`canary_cert.rs`): the per-compile
+# path now re-checks the committed popcnt canary certificate with this
+# INDEPENDENT checker instead of re-solving it live (~16 s/process). It is a
+# checker, not a solver: it can only confirm or reject a recorded refutation,
+# never mint one, and every rejection falls back to the live solver discharge.
+trust-cg-drat-trim = { workspace = true }
+[dev-dependencies]
+# Property-based testing for panic-fuzz harnesses (#448 / #387).
+# proptest is dev-only; it MUST NOT leak into the production graph.
+proptest = "1.7"
+# Used by the T-silicon route-1 upstream export
+# (tests/t_silicon_sat_export.rs): the in-tree MicroSAT DRAT lane + drat-trim
+# drive the iadd_i8 lowering miter (sat_blast.rs) to a checked (cnf, drat,
+# trace) artifact triple. Dev-only: no solver dependency in the production graph.
+trust-cg-sat-host = { workspace = true }
+
+
+[lints]
+workspace = true

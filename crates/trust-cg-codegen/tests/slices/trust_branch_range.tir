@@ -1,0 +1,162 @@
+; TrustIr text format v1
+module "mir::closure::branch_range_root"
+target "aarch64-apple-darwin" 8 little
+file 0 "trust_branch_range_slice.rs"
+
+functy.0 = (u32, i64, ptr) -> ()
+
+functy.1 = (ptr, u32) -> ()
+
+functy.2 = (ptr, u8) -> ()
+
+functy.3 = (u8, i64) -> (bool)
+
+fn @branch_range_root(functy.0) {
+bb0(%0: u32, %1: i64, %2: ptr):
+    %13 = alloca i8, align 1
+    %14 = alloca (i64, i64), align 8
+    call @func.1(%13, %0)
+    br bb1(%1, %2)
+bb1(%3: i64, %4: ptr):
+    %15 = load u8, ptr %13
+    call @func.2(%14, %15)
+    br bb2(%3, %4)
+bb2(%5: i64, %6: ptr):
+    %16 = load i64, ptr %14
+    %17 = const i64 8
+    %18 = gep i8, ptr %14, %17
+    %19 = load i64, ptr %18
+    store i64 %16, ptr %6
+    %20 = const i64 8
+    %21 = gep i8, ptr %6, %20
+    store i64 %19, ptr %21
+    %22 = load u8, ptr %13
+    %23 = call @func.3(%22, %5)
+    br bb3(%6, %23)
+bb3(%7: ptr, %8: bool):
+    condbr %8, bb4(%7), bb5(%7)
+bb4(%9: ptr):
+    %24 = const u32 1
+    br bb6(%9, %24)
+bb5(%10: ptr):
+    %25 = const u32 0
+    br bb6(%10, %25)
+bb6(%11: ptr, %12: u32):
+    %26 = const i64 16
+    %27 = gep i8, ptr %11, %26
+    store u32 %12, ptr %27
+    ret
+}
+
+fn @br_op_from_tag(functy.1) {
+bb0(%0: ptr, %1: u32):
+    switch %1 [ 0: bb7 1: bb6 2: bb5 3: bb4 4: bb3 5: bb2 default: bb1 ]
+bb1:
+    %2 = const i8 6
+    store i8 %2, ptr %0
+    br bb8
+bb2:
+    %3 = const i8 5
+    store i8 %3, ptr %0
+    br bb8
+bb3:
+    %4 = const i8 4
+    store i8 %4, ptr %0
+    br bb8
+bb4:
+    %5 = const i8 3
+    store i8 %5, ptr %0
+    br bb8
+bb5:
+    %6 = const i8 2
+    store i8 %6, ptr %0
+    br bb8
+bb6:
+    %7 = const i8 1
+    store i8 %7, ptr %0
+    br bb8
+bb7:
+    %8 = const i8 0
+    store i8 %8, ptr %0
+    br bb8
+bb8:
+    ret
+}
+
+fn @branch_range(functy.2) {
+bb0(%0: ptr, %1: u8):
+    %2 = alloca i8, align 1
+    store u8 %1, ptr %2
+    %3 = load i8, ptr %2
+    %4 = bitcast i8 %3 to u8
+    switch %4 [ 0: bb5 1: bb4 2: bb3 3: bb3 4: bb2 5: bb2 6: bb1 default: bb7 ]
+bb1:
+    %5 = const i64 -9223372036854775808
+    store i64 %5, ptr %0
+    %6 = const i64 9223372036854775807
+    %7 = const i64 8
+    %8 = gep i8, ptr %0, %7
+    store i64 %6, ptr %8
+    br bb6
+bb2:
+    %9 = const i64 -32768
+    store i64 %9, ptr %0
+    %10 = const i64 32764
+    %11 = const i64 8
+    %12 = gep i8, ptr %0, %11
+    store i64 %10, ptr %12
+    br bb6
+bb3:
+    %13 = const i64 -1048576
+    store i64 %13, ptr %0
+    %14 = const i64 1048572
+    %15 = const i64 8
+    %16 = gep i8, ptr %0, %15
+    store i64 %14, ptr %16
+    br bb6
+bb4:
+    %17 = const i64 -1048576
+    store i64 %17, ptr %0
+    %18 = const i64 1048572
+    %19 = const i64 8
+    %20 = gep i8, ptr %0, %19
+    store i64 %18, ptr %20
+    br bb6
+bb5:
+    %21 = const i64 -134217728
+    store i64 %21, ptr %0
+    %22 = const i64 134217724
+    %23 = const i64 8
+    %24 = gep i8, ptr %0, %23
+    store i64 %22, ptr %24
+    br bb6
+bb6:
+    ret
+bb7:
+    unreachable
+}
+
+fn @in_range(functy.3) {
+bb0(%0: u8, %1: i64):
+    %6 = alloca i8, align 1
+    %7 = alloca (i64, i64), align 8
+    store u8 %0, ptr %6
+    %8 = load u8, ptr %6
+    call @func.2(%7, %8)
+    br bb1(%1)
+bb1(%2: i64):
+    %9 = load i64, ptr %7
+    %10 = const i64 8
+    %11 = gep i8, ptr %7, %10
+    %12 = load i64, ptr %11
+    %13 = icmp sge i64 %2, %9
+    condbr %13, bb2(%2, %12), bb3
+bb2(%3: i64, %4: i64):
+    %14 = icmp sle i64 %3, %4
+    br bb4(%14)
+bb3:
+    %15 = const bool false
+    br bb4(%15)
+bb4(%5: bool):
+    ret %5
+}

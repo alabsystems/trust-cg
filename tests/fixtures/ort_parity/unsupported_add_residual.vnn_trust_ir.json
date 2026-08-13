@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "dialect": "trust_ir.vnn",
+  "entry": "model",
+  "tensors": {
+    "%lhs": { "shape": [1, 4], "dtype": "f32", "layout": "nc", "role": "input" },
+    "%rhs": { "shape": [4], "dtype": "f32", "layout": "nc", "role": "input" },
+    "%sum": { "shape": [1, 4], "dtype": "f32", "layout": "nc", "role": "output" }
+  },
+  "ops": [
+    {
+      "id": "vnn.0",
+      "op": "trust_ir.vnn.add",
+      "inputs": ["%lhs", "%rhs"],
+      "outputs": ["%sum"],
+      "attrs": { "broadcast": "numpy", "kind": "residual" },
+      "provenance": {
+        "gamma_layer_id": "layer.10",
+        "gamma_layer_type": "Add",
+        "onnx_node_name": "Add_Residual_10",
+        "onnx_op_type": "Add",
+        "onnx_outputs": ["sum"]
+      }
+    }
+  ]
+}

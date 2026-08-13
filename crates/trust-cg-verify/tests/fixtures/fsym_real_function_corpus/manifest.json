@@ -1,0 +1,463 @@
+{
+  "acceptance": {
+    "max_false_positive_basis_points": 500,
+    "min_imported_functions": 20,
+    "min_scanned": 18,
+    "safe_corpus": true
+  },
+  "description": "Fixture-backed fsym real/imported-function corpus gate.",
+  "fixtures": [
+    {
+      "concrete_ub": 0,
+      "diagnostics": [],
+      "false_positive_basis_points": 0,
+      "file": "ws2_divtest.trust_ir.json",
+      "imported_functions": [
+        "testL",
+        "test",
+        "main"
+      ],
+      "module": "fsym_real_ws2_divtest",
+      "module_function_names": [
+        "testL",
+        "printf",
+        "test",
+        "main"
+      ],
+      "module_functions": 4,
+      "provenance": [
+        "crates/trust-cg-llvm-import/tests/divtest_e2e.rs::LL_DIVTEST"
+      ],
+      "scanned": 3,
+      "skipped": 1,
+      "skips": [
+        {
+          "detail": "function has no blocks",
+          "function": "printf",
+          "reason": "malformed-cfg"
+        }
+      ],
+      "solver": {
+        "concrete_ub": 0,
+        "proven_safe": 0,
+        "remaining_unknown": 0,
+        "results": 0
+      },
+      "solver_statuses": [],
+      "source_family": "divtest",
+      "unknown": 0,
+      "unknowns": []
+    },
+    {
+      "concrete_ub": 0,
+      "diagnostics": [],
+      "false_positive_basis_points": 0,
+      "file": "switch_dispatch.trust_ir.json",
+      "imported_functions": [
+        "dispatch"
+      ],
+      "module": "fsym_real_switch_dispatch",
+      "module_function_names": [
+        "dispatch"
+      ],
+      "module_functions": 1,
+      "provenance": [
+        "crates/trust-cg-llvm-import/tests/switch_e2e.rs::DISPATCH_LL"
+      ],
+      "scanned": 1,
+      "skipped": 0,
+      "skips": [],
+      "solver": {
+        "concrete_ub": 0,
+        "proven_safe": 0,
+        "remaining_unknown": 0,
+        "results": 0
+      },
+      "solver_statuses": [],
+      "source_family": "switch dispatch",
+      "unknown": 0,
+      "unknowns": []
+    },
+    {
+      "concrete_ub": 0,
+      "diagnostics": [],
+      "false_positive_basis_points": 0,
+      "file": "switch_narrow_widths.trust_ir.json",
+      "imported_functions": [
+        "switch_narrow_i1",
+        "switch_narrow_i8",
+        "switch_narrow_i16",
+        "switch_narrow_i32",
+        "switch_narrow_i64"
+      ],
+      "module": "fsym_real_switch_narrow_widths",
+      "module_function_names": [
+        "switch_narrow_i1",
+        "switch_narrow_i8",
+        "switch_narrow_i16",
+        "switch_narrow_i32",
+        "switch_narrow_i64"
+      ],
+      "module_functions": 5,
+      "provenance": [
+        "crates/trust-cg-llvm-import/tests/switch_e2e.rs::switch_narrow_widths_round_trip"
+      ],
+      "scanned": 4,
+      "skipped": 1,
+      "skips": [
+        {
+          "detail": "bb0 switch selector type Bool is outside bounded fsym support",
+          "function": "switch_narrow_i1",
+          "reason": "switch"
+        }
+      ],
+      "solver": {
+        "concrete_ub": 0,
+        "proven_safe": 0,
+        "remaining_unknown": 0,
+        "results": 0
+      },
+      "solver_statuses": [],
+      "source_family": "switch narrow widths",
+      "unknown": 0,
+      "unknowns": []
+    },
+    {
+      "concrete_ub": 0,
+      "diagnostics": [],
+      "false_positive_basis_points": 0,
+      "file": "casttest_trunc_i8.trust_ir.json",
+      "imported_functions": [
+        "test",
+        "main"
+      ],
+      "module": "fsym_real_casttest_trunc_i8",
+      "module_function_names": [
+        "test",
+        "main",
+        "printf"
+      ],
+      "module_functions": 3,
+      "provenance": [
+        "crates/trust-cg-llvm-import/tests/cast_e2e.rs::LL_CASTTEST_TRUNC_I8"
+      ],
+      "scanned": 2,
+      "skipped": 1,
+      "skips": [
+        {
+          "detail": "function has no blocks",
+          "function": "printf",
+          "reason": "malformed-cfg"
+        }
+      ],
+      "solver": {
+        "concrete_ub": 0,
+        "proven_safe": 0,
+        "remaining_unknown": 0,
+        "results": 0
+      },
+      "solver_statuses": [],
+      "source_family": "cast tests",
+      "unknown": 0,
+      "unknowns": []
+    },
+    {
+      "concrete_ub": 0,
+      "diagnostics": [],
+      "false_positive_basis_points": 0,
+      "file": "casttest3.trust_ir.json",
+      "imported_functions": [
+        "main"
+      ],
+      "module": "fsym_real_casttest3",
+      "module_function_names": [
+        "printf",
+        "main"
+      ],
+      "module_functions": 2,
+      "provenance": [
+        "crates/trust-cg-llvm-import/tests/casttest3_e2e.rs::CASTTEST3_LL"
+      ],
+      "scanned": 1,
+      "skipped": 1,
+      "skips": [
+        {
+          "detail": "function has no blocks",
+          "function": "printf",
+          "reason": "malformed-cfg"
+        }
+      ],
+      "solver": {
+        "concrete_ub": 0,
+        "proven_safe": 0,
+        "remaining_unknown": 0,
+        "results": 0
+      },
+      "solver_statuses": [],
+      "source_family": "cast tests",
+      "unknown": 0,
+      "unknowns": []
+    },
+    {
+      "concrete_ub": 0,
+      "diagnostics": [],
+      "false_positive_basis_points": 0,
+      "file": "printf_string_global.trust_ir.json",
+      "imported_functions": [
+        "main"
+      ],
+      "module": "fsym_real_printf_string_global",
+      "module_function_names": [
+        "printf",
+        "main"
+      ],
+      "module_functions": 2,
+      "provenance": [
+        "crates/trust-cg-llvm-import/tests/printf_globals.rs::LL_PRINTF_STRING_GLOBAL"
+      ],
+      "scanned": 1,
+      "skipped": 1,
+      "skips": [
+        {
+          "detail": "function has no blocks",
+          "function": "printf",
+          "reason": "malformed-cfg"
+        }
+      ],
+      "solver": {
+        "concrete_ub": 0,
+        "proven_safe": 0,
+        "remaining_unknown": 0,
+        "results": 0
+      },
+      "solver_statuses": [],
+      "source_family": "printf globals",
+      "unknown": 0,
+      "unknowns": []
+    },
+    {
+      "concrete_ub": 0,
+      "diagnostics": [],
+      "false_positive_basis_points": 0,
+      "file": "mutable_byte_globals.trust_ir.json",
+      "imported_functions": [
+        "main"
+      ],
+      "module": "fsym_real_mutable_byte_globals",
+      "module_function_names": [
+        "main"
+      ],
+      "module_functions": 1,
+      "provenance": [
+        "crates/trust-cg-llvm-import/tests/printf_globals.rs::LL_MUTABLE_BYTE_GLOBALS"
+      ],
+      "scanned": 1,
+      "skipped": 0,
+      "skips": [],
+      "solver": {
+        "concrete_ub": 0,
+        "proven_safe": 0,
+        "remaining_unknown": 0,
+        "results": 0
+      },
+      "solver_statuses": [],
+      "source_family": "printf globals",
+      "unknown": 0,
+      "unknowns": []
+    },
+    {
+      "concrete_ub": 0,
+      "diagnostics": [],
+      "false_positive_basis_points": 0,
+      "file": "ws2_nottest.trust_ir.json",
+      "imported_functions": [
+        "testBitWiseNot",
+        "testBooleanNot",
+        "main"
+      ],
+      "module": "fsym_real_ws2_nottest",
+      "module_function_names": [
+        "testBitWiseNot",
+        "printf",
+        "testBooleanNot",
+        "main"
+      ],
+      "module_functions": 4,
+      "provenance": [
+        "crates/trust-cg-llvm-import/tests/printf_globals.rs::LL_NOTTEST"
+      ],
+      "scanned": 3,
+      "skipped": 1,
+      "skips": [
+        {
+          "detail": "function has no blocks",
+          "function": "printf",
+          "reason": "malformed-cfg"
+        }
+      ],
+      "solver": {
+        "concrete_ub": 0,
+        "proven_safe": 0,
+        "remaining_unknown": 0,
+        "results": 0
+      },
+      "solver_statuses": [],
+      "source_family": "nottest",
+      "unknown": 0,
+      "unknowns": []
+    },
+    {
+      "concrete_ub": 0,
+      "diagnostics": [],
+      "false_positive_basis_points": 0,
+      "file": "fp_core_binops.trust_ir.json",
+      "imported_functions": [
+        "add_f",
+        "add_d",
+        "cmp_lt",
+        "roundtrip",
+        "neg",
+        "binop_fadd",
+        "binop_fsub",
+        "binop_fmul",
+        "binop_fdiv"
+      ],
+      "module": "fsym_real_fp_core_binops",
+      "module_function_names": [
+        "add_f",
+        "add_d",
+        "cmp_lt",
+        "roundtrip",
+        "neg",
+        "binop_fadd",
+        "binop_fsub",
+        "binop_fmul",
+        "binop_fdiv"
+      ],
+      "module_functions": 9,
+      "provenance": [
+        "crates/trust-cg-llvm-import/tests/fp_e2e.rs::LL_ADD_F32",
+        "crates/trust-cg-llvm-import/tests/fp_e2e.rs::LL_ADD_F64",
+        "crates/trust-cg-llvm-import/tests/fp_e2e.rs::LL_CMP_LT",
+        "crates/trust-cg-llvm-import/tests/fp_e2e.rs::LL_INT_DOUBLE_ROUNDTRIP",
+        "crates/trust-cg-llvm-import/tests/fp_e2e.rs::LL_FNEG_F64",
+        "crates/trust-cg-llvm-import/tests/fp_e2e.rs::all_fbinops_full_pipeline_aarch64_o0"
+      ],
+      "scanned": 9,
+      "skipped": 0,
+      "skips": [],
+      "solver": {
+        "concrete_ub": 0,
+        "proven_safe": 0,
+        "remaining_unknown": 0,
+        "results": 0
+      },
+      "solver_statuses": [],
+      "source_family": "fp core/binops",
+      "unknown": 0,
+      "unknowns": []
+    },
+    {
+      "concrete_ub": 0,
+      "diagnostics": [],
+      "false_positive_basis_points": 0,
+      "file": "objectsize_intrinsic.trust_ir.json",
+      "imported_functions": [
+        "main"
+      ],
+      "module": "fsym_real_objectsize_intrinsic",
+      "module_function_names": [
+        "llvm.objectsize.i64.p0",
+        "main"
+      ],
+      "module_functions": 2,
+      "provenance": [
+        "crates/trust-cg-llvm-import/tests/objectsize_intrinsic.rs::LL_OBJECTSIZE_INTRINSIC"
+      ],
+      "scanned": 1,
+      "skipped": 1,
+      "skips": [
+        {
+          "detail": "function has no blocks",
+          "function": "llvm.objectsize.i64.p0",
+          "reason": "malformed-cfg"
+        }
+      ],
+      "solver": {
+        "concrete_ub": 0,
+        "proven_safe": 0,
+        "remaining_unknown": 0,
+        "results": 0
+      },
+      "solver_statuses": [],
+      "source_family": "objectsize intrinsic",
+      "unknown": 0,
+      "unknowns": []
+    },
+    {
+      "concrete_ub": 0,
+      "diagnostics": [],
+      "false_positive_basis_points": 0,
+      "file": "bitreverse_intrinsics.trust_ir.json",
+      "imported_functions": [
+        "main"
+      ],
+      "module": "fsym_real_bitreverse_intrinsics",
+      "module_function_names": [
+        "llvm.bitreverse.i32",
+        "llvm.bitreverse.i64",
+        "main"
+      ],
+      "module_functions": 3,
+      "provenance": [
+        "crates/trust-cg-llvm-import/tests/bitreverse_intrinsics.rs::LL_BITREVERSE_INTRINSICS"
+      ],
+      "scanned": 1,
+      "skipped": 2,
+      "skips": [
+        {
+          "detail": "function has no blocks",
+          "function": "llvm.bitreverse.i32",
+          "reason": "malformed-cfg"
+        },
+        {
+          "detail": "function has no blocks",
+          "function": "llvm.bitreverse.i64",
+          "reason": "malformed-cfg"
+        }
+      ],
+      "solver": {
+        "concrete_ub": 0,
+        "proven_safe": 0,
+        "remaining_unknown": 0,
+        "results": 0
+      },
+      "solver_statuses": [],
+      "source_family": "bitreverse intrinsic",
+      "unknown": 0,
+      "unknowns": []
+    }
+  ],
+  "generated_with": {
+    "fixture_format": "serde_json::to_string_pretty::<trust_ir::Module>",
+    "import_api": "trust_cg_llvm_import::import_text",
+    "source_commit": "eef2d0389af7baa4f0372158c842b81bc5294547"
+  },
+  "issue": 862,
+  "parent_issue": 377,
+  "totals": {
+    "concrete_ub": 0,
+    "false_positive_basis_points": 0,
+    "imported_functions": 28,
+    "module_functions": 36,
+    "scanned": 27,
+    "skipped": 9,
+    "solver": {
+      "concrete_ub": 0,
+      "proven_safe": 0,
+      "remaining_unknown": 0,
+      "results": 0
+    },
+    "unknown": 0
+  }
+}

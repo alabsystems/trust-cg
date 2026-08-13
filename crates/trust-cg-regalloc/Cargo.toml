@@ -1,0 +1,59 @@
+# trust-cg-regalloc - Register allocation for Trust Codegen
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache-2.0
+
+[package]
+name = "trust-cg-regalloc"
+description = "Liveness analysis and register allocation for Trust Codegen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+
+[features]
+default = []
+# ay-regalloc: opt-in AY-PBO optimal register allocation (STAGE 3).
+# Links the in-process ay-pb pseudo-Boolean optimizer and enables the
+# `ay_regalloc` pass. DEFAULT OFF: the normal build/pipeline is byte-identical
+# to origin, and even with the feature compiled in the pass is only entered
+# when the `TCG_AY_REGALLOC` env var is set (opt-in behind a high -O tier).
+# A wrong AY allocation can never ship: it is validated by the same always-on
+# translation validator greedy passes, and any rejection / timeout / oversize
+# falls back to the greedy allocation.
+ay-regalloc = ["dep:ay-pb", "dep:ay-sat", "dep:trust-cg-process-env"]
+
+[dependencies]
+# Shared machine IR model (canonical type definitions)
+trust-cg-ir = { workspace = true }
+trust-cg-process-env = { workspace = true, optional = true }
+thiserror = { workspace = true }
+# AY pseudo-Boolean optimizer (UNTRUSTED). Bind the optional lane to the frozen,
+# audited AY baseline so this crate resolves from any checkout location. The
+# package is not compiled unless `ay-regalloc` is enabled. Keep default features
+# disabled and NEVER enable ay-pb's `trust-cg-backend` feature here: that feature
+# points back into trust-cg and would create an AY <-> trust-cg dependency cycle.
+# Local sibling development may use an uncommitted Cargo patch; committed
+# manifests remain identity-bound.
+ay-pb = { version = "0.9.0", git = "https://github.com/alabsystems/ay.git", rev = "882800fa351d5045e6f8ca67c756b4081ffbf2cf", default-features = false, optional = true }
+# AY SAT core (UNTRUSTED), declared only to unify one feature. `ay-pb` depends on
+# `ay-sat` through AY's workspace, which sets `default-features = false` and so
+# selects the generic watched-literal BCP. Naming `ay-sat` here turns the
+# reviewed `raw-pointer-bcp` traversal back on for the single `ay-sat` build that
+# `ay-pb` links -- Cargo unifies features per package, so this reaches the SAT
+# core without touching any `ay-pb` feature.
+# Keep this list at exactly `raw-pointer-bcp`. `jit` would enable ay-sat's own
+# JIT BCP path, which AY retired from production in #8517, and
+# `trust-cg-backend` would pull trust-cg-jit-matrix/trust-cg-codegen back in and
+# close an AY <-> trust-cg dependency cycle. (Note: the ay-jit *crate* is already
+# in this graph regardless, via ay-pb -> ay-milp -> ay-dpll/jit; what matters
+# here is that ay-sat's own jit path stays off.)
+# Pinned to the same audited revision as ay-pb; the two must never diverge.
+ay-sat = { version = "0.9.0", git = "https://github.com/alabsystems/ay.git", rev = "882800fa351d5045e6f8ca67c756b4081ffbf2cf", default-features = false, features = ["raw-pointer-bcp"], optional = true }
+
+[lints]
+workspace = true

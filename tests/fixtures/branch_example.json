@@ -1,0 +1,183 @@
+{
+  "name": "branch_example",
+  "functions": [
+    {
+      "id": 0,
+      "name": "max_i64",
+      "ty": {
+        "params": [
+          {
+            "Primitive": {
+              "Int": {
+                "width": "I64",
+                "signed": true
+              }
+            }
+          },
+          {
+            "Primitive": {
+              "Int": {
+                "width": "I64",
+                "signed": true
+              }
+            }
+          }
+        ],
+        "returns": [
+          {
+            "Primitive": {
+              "Int": {
+                "width": "I64",
+                "signed": true
+              }
+            }
+          }
+        ]
+      },
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              {
+                "Primitive": {
+                  "Int": {
+                    "width": "I64",
+                    "signed": true
+                  }
+                }
+              }
+            ],
+            [
+              1,
+              {
+                "Primitive": {
+                  "Int": {
+                    "width": "I64",
+                    "signed": true
+                  }
+                }
+              }
+            ]
+          ],
+          "body": [
+            {
+              "instr": {
+                "Cmp": {
+                  "op": "Sgt",
+                  "ty": {
+                    "Primitive": {
+                      "Int": {
+                        "width": "I64",
+                        "signed": true
+                      }
+                    }
+                  },
+                  "lhs": {
+                    "Value": 0
+                  },
+                  "rhs": {
+                    "Value": 1
+                  }
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": []
+            },
+            {
+              "instr": {
+                "CondBr": {
+                  "cond": {
+                    "Value": 2
+                  },
+                  "then_target": 1,
+                  "then_args": [
+                    {
+                      "Value": 0
+                    }
+                  ],
+                  "else_target": 2,
+                  "else_args": [
+                    {
+                      "Value": 1
+                    }
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": []
+            }
+          ]
+        },
+        {
+          "id": 1,
+          "params": [
+            [
+              3,
+              {
+                "Primitive": {
+                  "Int": {
+                    "width": "I64",
+                    "signed": true
+                  }
+                }
+              }
+            ]
+          ],
+          "body": [
+            {
+              "instr": {
+                "Return": {
+                  "values": [
+                    {
+                      "Value": 3
+                    }
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": []
+            }
+          ]
+        },
+        {
+          "id": 2,
+          "params": [
+            [
+              4,
+              {
+                "Primitive": {
+                  "Int": {
+                    "width": "I64",
+                    "signed": true
+                  }
+                }
+              }
+            ]
+          ],
+          "body": [
+            {
+              "instr": {
+                "Return": {
+                  "values": [
+                    {
+                      "Value": 4
+                    }
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": []
+            }
+          ]
+        }
+      ],
+      "proofs": []
+    }
+  ],
+  "structs": []
+}

@@ -1,0 +1,66 @@
+---
+source: crates/trust-cg-test/tests/cli.rs
+expression: "help_of(&[\"ratchet\", \"panic-clippy\"])"
+---
+Baseline-aware clippy gate for production panic-family diagnostics.
+
+Runs `scripts/check_panic_clippy.sh` through the `trust-cg-test` ratchet dispatcher, preserving the
+script's workspace package discovery, `--package` filtering, deny-level panic-family clippy lints,
+and `ratchet/unwrap_baseline.json` comparison behavior. Full runs also execute the unwrap regex
+ratchet unless `--skip-ratchet` is set.
+
+Exit codes match the underlying script:
+  0 — panic-family diagnostics are within baseline.
+  1 — production panic-family diagnostics exceed baseline.
+  2 — tooling error, missing baseline, or invalid args.
+
+# Examples
+
+  trust-cg-test ratchet panic-clippy
+  trust-cg-test ratchet panic-clippy --package trust-cg-test
+  trust-cg-test ratchet panic-clippy --package trust-cg-test --skip-ratchet
+
+Usage: trust-cg-test ratchet panic-clippy [OPTIONS]
+
+Options:
+  -f, --format <FORMAT>
+          Output format (human, json, junit)
+
+          Possible values:
+          - human: Pretty table + narrative, targeted at humans
+          - json:  Machine-readable JSON
+          - junit: JUnit XML for CI consumers
+
+          [default: human]
+
+  -p, --package <NAME>
+          Check only one workspace package. May be repeated
+
+  -o, --out <PATH>
+          Override the command-specific output file or directory.
+
+          See the selected subcommand's help for its output type and default.
+
+      --skip-ratchet
+          Skip the full unwrap ratchet; intended for focused local clippy probes
+
+      --timeout <SECS>
+          Per-unit timeout in seconds. Subcommands may apply per-unit defaults when this is unset
+
+      --parallel <N>
+          Worker count (honors cargo-serialization lock). Default: auto
+
+  -q, --quiet
+          Suppress progress bars; errors still go to stderr
+
+  -v, --verbose...
+          Show debug-level events. Repeat for more: -vv, -vvv
+
+      --no-cache
+          Ignore proof / corpus caches
+
+      --dry-run
+          Print what would run without executing external tools
+
+  -h, --help
+          Print help (see a summary with '-h')

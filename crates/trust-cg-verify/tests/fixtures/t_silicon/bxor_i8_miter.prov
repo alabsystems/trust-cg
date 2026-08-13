@@ -1,0 +1,33 @@
+satprov1
+rule Bxor_I8 -> XOR (8-bit)
+width 8
+vars 40
+input a 1 2 3 4 5 6 7 8
+input b 9 10 11 12 13 14 15 16
+gate ir xor2 17 1 9
+gate ir xor2 18 2 10
+gate ir xor2 19 3 11
+gate ir xor2 20 4 12
+gate ir xor2 21 5 13
+gate ir xor2 22 6 14
+gate ir xor2 23 7 15
+gate ir xor2 24 8 16
+gate mc xor2 25 1 9
+gate mc xor2 26 2 10
+gate mc xor2 27 3 11
+gate mc xor2 28 4 12
+gate mc xor2 29 5 13
+gate mc xor2 30 6 14
+gate mc xor2 31 7 15
+gate mc xor2 32 8 16
+gate diff xor2 33 17 25
+gate diff xor2 34 18 26
+gate diff xor2 35 19 27
+gate diff xor2 36 20 28
+gate diff xor2 37 21 29
+gate diff xor2 38 22 30
+gate diff xor2 39 23 31
+gate diff xor2 40 24 32
+irout 17 18 19 20 21 22 23 24
+mcout 25 26 27 28 29 30 31 32
+diff 33 34 35 36 37 38 39 40

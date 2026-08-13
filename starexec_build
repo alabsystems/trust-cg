@@ -1,0 +1,95 @@
+#!/bin/sh
+# starexec_build.sh - StarExec / SAT-Comp 2026 build entry point for
+# trust-cg-sat.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache-2.0
+#
+# The SAT-Competition / StarExec convention is that a submission tarball
+# unpacks to a directory containing a `starexec_build` script which,
+# when invoked with no arguments inside the unpacked tree, produces the
+# solver binary that the per-instance wrapper (`starexec_run_default`)
+# will exec. This file is that build script.
+#
+# Contract
+# --------
+# * Run with the unpacked submission directory as CWD.
+# * Build the solver from a clean tree (we accept being re-run on top of
+#   a previous build; cargo handles incremental).
+# * Leave a working solver binary at `./bin/trust_cg_sat` on success.
+# * Exit 0 on success, non-zero on failure (StarExec gates submissions
+#   on this).
+#
+# What this script does NOT do
+# ----------------------------
+# Cross-compile from a non-Linux host. The script assumes the build
+# environment matches the SAT-Comp deployment target (Linux x86-64). For
+# building from a non-Linux host (e.g., the author's M-series Mac), use
+# the Docker image described in `docker/sat-comp-2026/Dockerfile`, which
+# wraps this same script inside a `linux/amd64` container.
+#
+# POSIX `sh` only (no bashisms): `set -e -u`, `printf`, no arrays, no
+# `[[ ... ]]`, no process substitution.
+
+set -e
+set -u
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+cd "$SCRIPT_DIR"
+
+log() {
+    # SAT-Comp build logs are captured to a build.log per the StarExec
+    # convention; prefix our lines so a grader can see who wrote what.
+    printf 'starexec_build: %s\n' "$*"
+}
+
+log "build host: $(uname -a)"
+log "build cwd:  $SCRIPT_DIR"
+
+# Locate cargo. Rustup installs to ~/.cargo/bin by default, which is
+# not on the StarExec build sandbox's PATH. Fall back gracefully.
+if ! command -v cargo >/dev/null 2>&1; then
+    if [ -x "$HOME/.cargo/bin/cargo" ]; then
+        PATH="$HOME/.cargo/bin:$PATH"
+        export PATH
+    else
+        log "ERROR: cargo not found on PATH and ~/.cargo/bin/cargo is absent."
+        log "Install rustup before invoking starexec_build, or use the"
+        log "Docker image at docker/sat-comp-2026/Dockerfile which"
+        log "provisions cargo automatically."
+        exit 1
+    fi
+fi
+
+log "rustc:  $(rustc --version 2>&1)"
+log "cargo:  $(cargo --version 2>&1)"
+
+# Sanity check: the vendored MicroSAT source must be present, or the
+# `trust-cg-sat-host` build script will fail with an opaque "no such
+# file" error.
+if [ ! -f third_party/vendor/microsat/microsat.c ]; then
+    log "ERROR: third_party/vendor/microsat/microsat.c is missing."
+    log "The release must include the pinned vendored MicroSAT source."
+    exit 1
+fi
+
+log "cargo build --release --locked --bin trust_cg_sat"
+cargo build --release --locked --bin trust_cg_sat
+
+# StarExec expects the binary at a stable in-tree path. We use ./bin/
+# (created on demand) and symlink-or-copy the cargo-produced artifact
+# there, matching the convention used by other SAT-Comp submissions.
+mkdir -p bin
+cp -f target/release/trust_cg_sat bin/trust_cg_sat
+chmod +x bin/trust_cg_sat
+
+log "produced binary: $SCRIPT_DIR/bin/trust_cg_sat"
+log "size:            $(wc -c < bin/trust_cg_sat) bytes"
+
+# Smoke test: invoke --help so a complete misbuild (e.g. dynamic linker
+# error) fails inside the build script rather than the first per-
+# instance run.
+log "smoke test: bin/trust_cg_sat --help"
+./bin/trust_cg_sat --help >/dev/null
+
+log "build OK"

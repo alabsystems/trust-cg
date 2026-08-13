@@ -1,0 +1,630 @@
+{
+  "name": "fsym_real_casttest3",
+  "functions": [
+    {
+      "id": 0,
+      "name": "printf",
+      "ty": 0,
+      "entry": 0,
+      "blocks": [],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External"
+    },
+    {
+      "id": 1,
+      "name": "main",
+      "ty": 1,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "I32"
+            ],
+            [
+              1,
+              "Ptr"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Alloca": {
+                  "ty": "I32",
+                  "count": null,
+                  "align": null
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Alloca": {
+                  "ty": "I32",
+                  "count": null,
+                  "align": null
+                }
+              },
+              "results": [
+                3
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Alloca": {
+                  "ty": "Ptr",
+                  "count": null,
+                  "align": null
+                }
+              },
+              "results": [
+                4
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Alloca": {
+                  "ty": "I16",
+                  "count": null,
+                  "align": null
+                }
+              },
+              "results": [
+                5
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Alloca": {
+                  "ty": "I16",
+                  "count": null,
+                  "align": null
+                }
+              },
+              "results": [
+                6
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": 0
+                  }
+                }
+              },
+              "results": [
+                7
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Store": {
+                  "ty": "I32",
+                  "ptr": 2,
+                  "value": 7,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Store": {
+                  "ty": "I32",
+                  "ptr": 3,
+                  "value": 0,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Store": {
+                  "ty": "Ptr",
+                  "ptr": 4,
+                  "value": 1,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Load": {
+                  "ty": "I32",
+                  "ptr": 3,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [
+                8
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": 3
+                  }
+                }
+              },
+              "results": [
+                9
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "ICmp": {
+                  "op": "Sge",
+                  "ty": "I32",
+                  "lhs": 8,
+                  "rhs": 9
+                }
+              },
+              "results": [
+                10
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "CondBr": {
+                  "cond": 10,
+                  "then_target": 1,
+                  "then_args": [],
+                  "else_target": 2,
+                  "else_args": []
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        },
+        {
+          "id": 1,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Load": {
+                  "ty": "I32",
+                  "ptr": 3,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [
+                11
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Br": {
+                  "target": 3,
+                  "args": [
+                    11
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        },
+        {
+          "id": 2,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": -769
+                  }
+                }
+              },
+              "results": [
+                24
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Br": {
+                  "target": 3,
+                  "args": [
+                    24
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        },
+        {
+          "id": 3,
+          "params": [
+            [
+              12,
+              "I32"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Cast": {
+                  "op": "Trunc",
+                  "src_ty": "I32",
+                  "dst_ty": "I16",
+                  "operand": 12
+                }
+              },
+              "results": [
+                13
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Store": {
+                  "ty": "I16",
+                  "ptr": 5,
+                  "value": 13,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Load": {
+                  "ty": "I16",
+                  "ptr": 5,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [
+                14
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Store": {
+                  "ty": "I16",
+                  "ptr": 6,
+                  "value": 14,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Load": {
+                  "ty": "I16",
+                  "ptr": 5,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [
+                15
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Cast": {
+                  "op": "SExt",
+                  "src_ty": "I16",
+                  "dst_ty": "I32",
+                  "operand": 15
+                }
+              },
+              "results": [
+                16
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "Ptr",
+                  "value": {
+                    "Int": 18076885954311749632
+                  }
+                }
+              },
+              "results": [
+                17
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Call": {
+                  "callee": 0,
+                  "args": [
+                    17,
+                    16
+                  ]
+                }
+              },
+              "results": [
+                18
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Load": {
+                  "ty": "I16",
+                  "ptr": 6,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [
+                19
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Cast": {
+                  "op": "ZExt",
+                  "src_ty": "I16",
+                  "dst_ty": "I32",
+                  "operand": 19
+                }
+              },
+              "results": [
+                20
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "Ptr",
+                  "value": {
+                    "Int": 18076885958606716928
+                  }
+                }
+              },
+              "results": [
+                21
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Call": {
+                  "callee": 0,
+                  "args": [
+                    21,
+                    20
+                  ]
+                }
+              },
+              "results": [
+                22
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": 0
+                  }
+                }
+              },
+              "results": [
+                23
+              ],
+              "proofs": [],
+              "span": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    23
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External"
+    }
+  ],
+  "structs": [],
+  "enums": [],
+  "records": [],
+  "closure_types": [],
+  "globals": [
+    {
+      "name": ".str",
+      "ty": "Ptr",
+      "mutable": false,
+      "initializer": {
+        "Aggregate": [
+          {
+            "Int": 115
+          },
+          {
+            "Int": 49
+          },
+          {
+            "Int": 32
+          },
+          {
+            "Int": 32
+          },
+          {
+            "Int": 32
+          },
+          {
+            "Int": 61
+          },
+          {
+            "Int": 32
+          },
+          {
+            "Int": 37
+          },
+          {
+            "Int": 100
+          },
+          {
+            "Int": 10
+          },
+          {
+            "Int": 0
+          }
+        ]
+      },
+      "linkage": "Private"
+    },
+    {
+      "name": ".str.1",
+      "ty": "Ptr",
+      "mutable": false,
+      "initializer": {
+        "Aggregate": [
+          {
+            "Int": 117
+          },
+          {
+            "Int": 115
+          },
+          {
+            "Int": 50
+          },
+          {
+            "Int": 32
+          },
+          {
+            "Int": 32
+          },
+          {
+            "Int": 61
+          },
+          {
+            "Int": 32
+          },
+          {
+            "Int": 37
+          },
+          {
+            "Int": 117
+          },
+          {
+            "Int": 10
+          },
+          {
+            "Int": 0
+          }
+        ]
+      },
+      "linkage": "Private"
+    }
+  ],
+  "func_types": [
+    {
+      "params": [
+        "Ptr"
+      ],
+      "returns": [
+        "I32"
+      ],
+      "is_vararg": true
+    },
+    {
+      "params": [
+        "I32",
+        "Ptr"
+      ],
+      "returns": [
+        "I32"
+      ],
+      "is_vararg": false
+    }
+  ],
+  "types": [],
+  "proof_obligations": [],
+  "proof_certificates": [],
+  "target_info": null
+}

@@ -1,0 +1,116 @@
+{
+  "schema": "trust-cg.phase5.ay_lra_replay_cases.v1",
+  "issue": "#663",
+  "mode": "fixture_contract",
+  "non_promoting": true,
+  "artifacts": {
+    "manifest_sha256": "blocked:#663:phase5-ay-lra-manifest",
+    "proof_sha256": "blocked:#663:phase5-ay-lra-proof",
+    "replay_sha256": "blocked:#663:phase5-ay-lra-replay",
+    "telemetry_sha256": "blocked:#663:phase5-ay-lra-telemetry"
+  },
+  "cases": [
+    {
+      "id": "sparse_substitute_shadow_ok",
+      "operation": "sparse_substitute",
+      "description": "Sparse substitute accepts a shadow-only replay row without product promotion.",
+      "tuple": {
+        "basis_id": "basis:ay-lra:fixture:0001",
+        "basis_epoch": 12,
+        "bounds_epoch": 9,
+        "entering_column": "x7",
+        "leaving_row": "r3",
+        "coefficient_num": 5,
+        "coefficient_den": 2,
+        "rhs_bound_num": 17,
+        "rhs_bound_den": 4,
+        "shadow_row": true
+      },
+      "status": {
+        "kind": "ok",
+        "typed": "shadow_ok",
+        "rows_committed": 0
+      },
+      "deopt": {
+        "kind": "none",
+        "field": null,
+        "reason": null
+      }
+    },
+    {
+      "id": "sparse_substitute_stale_basis_reject",
+      "operation": "sparse_substitute",
+      "description": "Sparse substitute rejects a stale basis epoch with a typed deopt.",
+      "tuple": {
+        "basis_id": "basis:ay-lra:fixture:0002",
+        "basis_epoch": 11,
+        "bounds_epoch": 9,
+        "entering_column": "x9",
+        "leaving_row": "r4",
+        "coefficient_num": 7,
+        "coefficient_den": 3,
+        "rhs_bound_num": 19,
+        "rhs_bound_den": 5,
+        "shadow_row": false
+      },
+      "status": {
+        "kind": "typed_reject",
+        "typed": "stale_basis_epoch",
+        "rows_committed": 0
+      },
+      "deopt": {
+        "kind": "stale_basis",
+        "field": "basis_epoch",
+        "reason": "basis_epoch is older than the replay contract epoch"
+      }
+    },
+    {
+      "id": "basis_row_batch_ok_rows_committed",
+      "operation": "basis_row_batch",
+      "description": "Basis row-batch replay commits the accepted prefix only.",
+      "tuple": {
+        "basis_id": "basis:ay-lra:fixture:0003",
+        "basis_epoch": 13,
+        "bounds_epoch": 10,
+        "batch_start_row": 16,
+        "batch_row_count": 4,
+        "committed_prefix_rows": 4,
+        "rollback_to_row": null
+      },
+      "status": {
+        "kind": "ok",
+        "typed": "rows_committed",
+        "rows_committed": 4
+      },
+      "deopt": {
+        "kind": "none",
+        "field": null,
+        "reason": null
+      }
+    },
+    {
+      "id": "basis_row_batch_bounds_reject",
+      "operation": "basis_row_batch",
+      "description": "Basis row-batch replay rejects stale bounds before committing rows.",
+      "tuple": {
+        "basis_id": "basis:ay-lra:fixture:0004",
+        "basis_epoch": 13,
+        "bounds_epoch": 8,
+        "batch_start_row": 20,
+        "batch_row_count": 3,
+        "committed_prefix_rows": 0,
+        "rollback_to_row": 20
+      },
+      "status": {
+        "kind": "typed_reject",
+        "typed": "stale_bounds",
+        "rows_committed": 0
+      },
+      "deopt": {
+        "kind": "stale_bounds",
+        "field": "bounds_epoch",
+        "reason": "bounds_epoch is older than the replay contract epoch"
+      }
+    }
+  ]
+}

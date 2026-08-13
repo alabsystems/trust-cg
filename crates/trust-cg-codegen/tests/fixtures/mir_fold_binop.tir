@@ -1,0 +1,200 @@
+; TrustIr text format v1
+module "mir::closure::fold_binop"
+
+functy.0 = (ptr, ptr) -> ()
+
+functy.1 = (ptr) -> ()
+
+functy.2 = (ptr, i128, i128) -> ()
+
+functy.3 = (ptr, i128, i128) -> ()
+
+functy.4 = (ptr, i128, i128) -> ()
+
+functy.5 = (ptr, i128, u32) -> ()
+
+functy.6 = (ptr, u8, ptr, ptr) -> ()
+
+functy.7 = (ptr, ptr, ptr) -> ()
+
+functy.8 = (ptr, i128, i128) -> ()
+
+functy.9 = (ptr, ptr, i128) -> ()
+
+fn @_RNvXsJ_NtCs2EYQwhfuABO_4core6optionINtB5_6OptionnENtNtNtB7_3ops9try_trait3Try6branchCs99MkpMfQ48c_23trust_fold_binop2_slice(functy.0) {
+}
+
+fn @_RNvXsK_NtCs2EYQwhfuABO_4core6optionINtB5_6OptionnEINtNtNtB7_3ops9try_trait12FromResidualIBy_NtNtB7_7convert10InfallibleEE13from_residualCs99MkpMfQ48c_23trust_fold_binop2_slice(functy.1) {
+}
+
+fn @_RNvMs2_NtCs2EYQwhfuABO_4core3numn11checked_mulCs99MkpMfQ48c_23trust_fold_binop2_slice(functy.2) {
+}
+
+fn @_RNvMs2_NtCs2EYQwhfuABO_4core3numn11checked_subCs99MkpMfQ48c_23trust_fold_binop2_slice(functy.3) {
+}
+
+fn @_RNvMs2_NtCs2EYQwhfuABO_4core3numn11checked_addCs99MkpMfQ48c_23trust_fold_binop2_slice(functy.4) {
+}
+
+fn @_RNvMs2_NtCs2EYQwhfuABO_4core3numn11checked_shlCs99MkpMfQ48c_23trust_fold_binop2_slice(functy.5) {
+}
+
+fn @fold_binop(functy.6) {
+bb0(%0: ptr, %1: u8, %2: ptr, %3: ptr):
+    %15 = alloca i8, align 1
+    %16 = alloca i128, align 16
+    %17 = alloca (i128, i128), align 16
+    %18 = alloca (i128, i128), align 16
+    %19 = alloca (i128, i128), align 16
+    %20 = alloca (i128, i128), align 16
+    %21 = alloca i64, align 8
+    store u8 %1, ptr %15
+    call @func.0(%18, %2)
+    br bb1
+bb1:
+    %22 = load i128, ptr %18
+    %23 = trunc i128 %22 to i64
+    switch %23 [ 0: bb3 1: bb4 default: bb2 ]
+bb2:
+    unreachable
+bb3:
+    %24 = const i64 16
+    %25 = gep i8, ptr %18, %24
+    %26 = load i128, ptr %25
+    call @func.0(%19, %3)
+    br bb5(%26)
+bb4:
+    call @func.1(%0)
+    br bb20
+bb5(%4: i128):
+    %27 = load i128, ptr %19
+    %28 = trunc i128 %27 to i64
+    switch %28 [ 0: bb6(%4) 1: bb7 default: bb2 ]
+bb6(%5: i128):
+    %29 = const i64 16
+    %30 = gep i8, ptr %19, %29
+    %31 = load i128, ptr %30
+    store i128 %5, ptr %17
+    %32 = const i64 16
+    %33 = gep i8, ptr %17, %32
+    store i128 %31, ptr %33
+    %34 = load i128, ptr %17
+    store i128 %34, ptr %16
+    %35 = const i64 16
+    %36 = gep i8, ptr %17, %35
+    %37 = load i128, ptr %36
+    %38 = load i8, ptr %15
+    %39 = sext i8 %38 to i64
+    switch %39 [ 0: bb15(%37) 1: bb14(%37) 2: bb13(%37) 14: bb12(%37) 15: bb11(%37) 16: bb10(%37) 17: bb9(%37) default: bb8 ]
+bb7:
+    call @func.1(%0)
+    br bb20
+bb8:
+    %40 = const i128 0
+    store i128 %40, ptr %0
+    br bb20
+bb9(%6: i128):
+    %41 = const i128 0
+    %42 = icmp slt i128 %6, %41
+    condbr %42, bb17, bb16(%6)
+bb10(%7: i128):
+    %43 = load i128, ptr %16
+    %44 = xor i128 %43, %7
+    %45 = const i64 16
+    %46 = gep i8, ptr %0, %45
+    store i128 %44, ptr %46
+    %47 = const i128 1
+    store i128 %47, ptr %0
+    br bb20
+bb11(%8: i128):
+    %48 = load i128, ptr %16
+    %49 = or i128 %48, %8
+    %50 = const i64 16
+    %51 = gep i8, ptr %0, %50
+    store i128 %49, ptr %51
+    %52 = const i128 1
+    store i128 %52, ptr %0
+    br bb20
+bb12(%9: i128):
+    %53 = load i128, ptr %16
+    %54 = and i128 %53, %9
+    %55 = const i64 16
+    %56 = gep i8, ptr %0, %55
+    store i128 %54, ptr %56
+    %57 = const i128 1
+    store i128 %57, ptr %0
+    br bb20
+bb13(%10: i128):
+    %58 = load i128, ptr %16
+    call @func.2(%0, %58, %10)
+    br bb20
+bb14(%11: i128):
+    %59 = load i128, ptr %16
+    call @func.3(%0, %59, %11)
+    br bb20
+bb15(%12: i128):
+    %60 = load i128, ptr %16
+    call @func.4(%0, %60, %12)
+    br bb20
+bb16(%13: i128):
+    %61 = const i128 128
+    %62 = icmp sge i128 %13, %61
+    condbr %62, bb17, bb18(%13)
+bb17:
+    %63 = const i128 0
+    store i128 %63, ptr %0
+    br bb20
+bb18(%14: i128):
+    %64 = trunc i128 %14 to u32
+    %65 = const i128 1
+    call @func.5(%20, %65, %64)
+    br bb19
+bb19:
+    store ptr %16, ptr %21
+    call @func.7(%0, %20, %21)
+    br bb20
+bb20:
+    ret
+}
+
+fn @std__option__Option___T___and_then__mono94d7478bc0df42bb(functy.7) {
+bb0(%0: ptr, %1: ptr, %2: ptr):
+    %3 = alloca i64, align 8
+    %4 = alloca i128, align 16
+    %5 = load i128, ptr %1
+    %6 = trunc i128 %5 to i64
+    switch %6 [ 0: bb2 1: bb3 default: bb1 ]
+bb1:
+    unreachable
+bb2:
+    %7 = const i128 0
+    store i128 %7, ptr %0
+    br bb5
+bb3:
+    %8 = const i64 16
+    %9 = gep i8, ptr %1, %8
+    %10 = load i128, ptr %9
+    %11 = load i64, ptr %2
+    store i64 %11, ptr %3
+    store i128 %10, ptr %4
+    %12 = load i128, ptr %4
+    call @func.9(%0, %3, %12)
+    br bb4
+bb4:
+    br bb5
+bb5:
+    ret
+}
+
+fn @_RNvMs2_NtCs2EYQwhfuABO_4core3numn11checked_mulCs99MkpMfQ48c_23trust_fold_binop2_slice(functy.8) {
+}
+
+fn @fold_binop___closure_0_(functy.9) {
+bb0(%0: ptr, %1: ptr, %2: i128):
+    %3 = load ptr, ptr %1
+    %4 = load i128, ptr %3
+    call @func.8(%0, %4, %2)
+    br bb1
+bb1:
+    ret
+}

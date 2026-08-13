@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+#
+# pre-push — optional local enforcement for the soundness gate.
+#
+# In a clone where this hook is installed, a push that updates `main` is
+# blocked unless the clean pushed commit matches the pinned release context and
+# every configured local gate is green.
+#
+# This is deliberately NOT a .github/workflows action. It is a git hook a
+# developer installs locally (scripts/install-hooks.sh sets
+# core.hooksPath=hooks). The gate itself shells into the configured Clean checkout,
+# so a single main push verifies the entire cross-repo constellation.
+#
+# Only `main` pushes are gated (feature-branch pushes are not, to stay
+# practical). Emergency override (discouraged — breaks monotonicity):
+#     git push --no-verify
+#
+set -u
+
+z40="0000000000000000000000000000000000000000"
+gating=0
+main_sha=""
+# git feeds "<local ref> <local sha> <remote ref> <remote sha>" lines on stdin.
+while read -r local_ref local_sha remote_ref remote_sha; do
+  if [ "$remote_ref" = "refs/heads/main" ] && [ "$local_sha" != "$z40" ]; then
+    gating=1
+    main_sha="$local_sha"
+  fi
+done
+
+if [ "$gating" -eq 0 ]; then
+  exit 0   # not pushing main → nothing to gate
+fi
+
+repo_root="$(git rev-parse --show-toplevel)"
+gate="$repo_root/scripts/soundness_check.sh"
+
+head_sha="$(git -C "$repo_root" rev-parse HEAD)"
+if [ "$head_sha" != "$main_sha" ]; then
+  echo "pre-push: FATAL — pushed main SHA $main_sha is not checked-out HEAD $head_sha." >&2
+  echo "          Push to main BLOCKED; check out the exact commit and retry." >&2
+  exit 1
+fi
+if [ -n "$(git -C "$repo_root" status --porcelain)" ]; then
+  echo "pre-push: FATAL — worktree is dirty; committed-source attestation is impossible." >&2
+  echo "          Push to main BLOCKED; commit or remove local changes and retry." >&2
+  exit 1
+fi
+
+if [ ! -x "$gate" ]; then
+  echo "pre-push: FATAL — $gate missing/not executable; cannot verify soundness." >&2
+  echo "          Push to main BLOCKED (fail-closed). Override: git push --no-verify" >&2
+  exit 1
+fi
+
+echo "pre-push: push to 'main' detected → running the soundness meta-gate."
+echo "pre-push: (this runs the FULL cross-repo constellation; it can take several minutes.)"
+"$gate" --pinned
+rc=$?
+if [ "$rc" -ne 0 ]; then
+  echo "" >&2
+  echo "pre-push: ✗ soundness meta-gate FAILED (rc=$rc) — push to main BLOCKED." >&2
+  echo "          Fix the red gate (per-gate log paths are printed above), then re-push." >&2
+  echo "          Emergency override (discouraged, breaks monotonicity): git push --no-verify" >&2
+  exit "$rc"
+fi
+echo "pre-push: ✓ soundness meta-gate GREEN — allowing push to main."
+exit 0

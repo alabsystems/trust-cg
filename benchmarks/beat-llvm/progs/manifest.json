@@ -1,0 +1,39 @@
+{
+  "schema": "trust-cg-corpus-v1",
+  "notes": [
+    "BENCH-3 corpus manifest — the source of truth for the default program set, categories,",
+    "and pinned LLVM-lane exit codes. run.py refuses to run (exit 2) if progs/*.rs and this",
+    "manifest disagree, and dies (exit 2) if the LLVM lane's observed exit differs from",
+    "expected_exit (detects a silent LLVM-side change, per roadmap BENCH-3).",
+    "Category membership determines which staged gate a program counts toward",
+    "(metrics-contract.md section 1/section 10): scalar -> G1a; vectorizable -> G1b;",
+    "everything -> G1c/GATE-SB + G5 coverage (intent-to-treat).",
+    "expected_bridge is INFORMATIONAL (intent-to-treat status at commit time, x86_64,",
+    "dylib of 2026-07-02): an expected-INCOMPLETE row that flips to MATCH is a completeness",
+    "improvement (run.py prints a note); an expected-MATCH row that fails closed is a",
+    "candidate regression (the coverage ratchet catches it). Never edit expected_exit",
+    "without re-measuring the LLVM lane.",
+    "Exit codes are the full-width u64 checksum of the whole computation folded mod 126",
+    "(contract section 6 collision caveat applies to every MATCH)."
+  ],
+  "programs": {
+    "p1_xorshift": { "category": "scalar", "expected_exit": 41, "expected_bridge": "MATCH", "gates": ["G1a", "G1c", "G5"], "note": "xorshift64 hot loop, 400M iters" },
+    "p2_collatz": { "category": "scalar", "expected_exit": 88, "expected_bridge": "MATCH", "gates": ["G1a", "G1c", "G5"], "note": "collatz step counts to 2M" },
+    "p3_gcd": { "category": "scalar", "expected_exit": 104, "expected_bridge": "MATCH", "gates": ["G1a", "G1c", "G5"], "note": "euclid gcd over LCG pairs, div/rem-heavy" },
+    "p4_matmul": { "category": "vectorizable", "expected_exit": 111, "expected_bridge": "MATCH", "gates": ["G1b", "G1c", "G5"], "note": "24x24 i64 matmul reps — the audited 9.7x auto-vectorization loss" },
+    "p5_struct_acc": { "category": "scalar", "expected_exit": 87, "expected_bridge": "MATCH", "gates": ["G1a", "G1c", "G5"], "note": "3-field struct accumulator loop" },
+    "p6_branch_match": { "category": "scalar", "expected_exit": 62, "expected_bridge": "MATCH", "gates": ["G1a", "G1c", "G5"], "note": "7-way match dispatch on RNG stream" },
+    "p7_sieve": { "category": "vectorizable", "expected_exit": 72, "expected_bridge": "MATCH", "gates": ["G1b", "G1c", "G5"], "note": "1KB sieve of eratosthenes reps (contract names the matmul/sieve class G1b)" },
+    "p8_closure_nest": { "category": "scalar", "expected_exit": 46, "expected_bridge": "MATCH", "gates": ["G1a", "G1c", "G5"], "note": "capturing closure in nested loop" },
+    "v1_saxpy": { "category": "vectorizable", "expected_exit": 118, "expected_bridge": "MATCH", "gates": ["G1b", "G1c", "G5"], "note": "i32 saxpy a[i]=a[i]*k+b[i] over 4096, 200k reps" },
+    "v2_memfill": { "category": "vectorizable", "expected_exit": 44, "expected_bridge": "MATCH", "gates": ["G1b", "G1c", "G5"], "note": "memset-shaped whole-array byte fill, black_box'd probe" },
+    "v3_popcount": { "category": "vectorizable", "expected_exit": 38, "expected_bridge": "MATCH", "gates": ["G1b", "G1c", "G5"], "note": "byte-array popcount loop (proven width-32 popcnt in the bridge)" },
+    "h1_vec_push_sum": { "category": "heap", "expected_exit": 60, "expected_bridge": "MATCH", "gates": ["G1c", "G5"], "note": "Vec push 300k + 300 index-sum passes, exit without drop" },
+    "h2_vec_grow": { "category": "heap", "expected_exit": 66, "expected_bridge": "MATCH", "gates": ["G1c", "G5"], "note": "growth-heavy Vec to 6M elems, interleaved data-dependent reads" },
+    "h3_box_leak": { "category": "heap", "expected_exit": 76, "expected_bridge": "MATCH", "gates": ["G1c", "G5"], "note": "Vec<Box<u64>> deref-sum: bridge=llvm=76 after the scalar-collapsed-newtype read arm accepts a thin &Box<u64> pointee (*v[k] -> ((*_r).0).0: NonNull<u64>) — landed 2026-07-18" },
+    "h4_vec_dropper": { "category": "heap", "expected_exit": 68, "expected_bridge": "MATCH", "gates": ["G1c", "G5"], "note": "per-rep fresh Vec DROPPED in-loop (drop_in_place glue) — verified MATCH 2026-07-02" },
+    "m1_call_chain": { "category": "multifn", "expected_exit": 61, "expected_bridge": "MATCH", "gates": ["G1c", "G5"], "note": "inlining-shaped f1->f2->f3->f4 chain, 30M iters (inlining gap, OPT-4)" },
+    "m2_call_heavy": { "category": "multifn", "expected_exit": 26, "expected_bridge": "MATCH", "gates": ["G1c", "G5"], "note": "#[inline(never)] callees, ~80M real calls (call ABI + regalloc-around-call)" },
+    "b1_mispredict": { "category": "branch", "expected_exit": 44, "expected_bridge": "MATCH", "gates": ["G1c", "G5"], "note": "data-dependent unpredictable branches, per-arm stores defeat if-conversion" }
+  }
+}

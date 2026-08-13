@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "dialect": "trust_ir.vnn",
+  "entry": "model",
+  "tensors": {
+    "%input": { "shape": [1, 3, 4], "dtype": "f32", "layout": "nld", "role": "input" },
+    "%norm": { "shape": [1, 3, 4], "dtype": "f32", "layout": "nld", "role": "output" }
+  },
+  "initializers": {
+    "ln.scale": {
+      "shape": [4],
+      "dtype": "f32",
+      "layout": "vector",
+      "storage": { "kind": "external", "name": "ln.scale" },
+      "sha256": "8888888888888888888888888888888888888888888888888888888888888888"
+    },
+    "ln.bias": {
+      "shape": [4],
+      "dtype": "f32",
+      "layout": "vector",
+      "storage": { "kind": "external", "name": "ln.bias" },
+      "sha256": "9999999999999999999999999999999999999999999999999999999999999999"
+    }
+  },
+  "ops": [
+    {
+      "id": "vnn.0",
+      "op": "trust_ir.vnn.layer_norm",
+      "inputs": ["%input"],
+      "outputs": ["%norm"],
+      "weights": ["ln.scale", "ln.bias"],
+      "attrs": { "axis": -1, "epsilon": 0.00001 },
+      "provenance": {
+        "gamma_layer_id": "layer.12",
+        "gamma_layer_type": "LayerNorm",
+        "onnx_node_name": "LayerNormalization_12",
+        "onnx_op_type": "LayerNormalization",
+        "onnx_outputs": ["norm"]
+      }
+    }
+  ]
+}

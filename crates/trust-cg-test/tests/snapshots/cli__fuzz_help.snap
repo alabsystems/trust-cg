@@ -1,0 +1,74 @@
+---
+source: crates/trust-cg-test/tests/cli.rs
+expression: "help_of(&[\"fuzz\"])"
+---
+Planned differential-fuzzing dispatcher (WS3).
+
+This command is not implemented in trust-cg 0.1.0. It exits 2 without generating programs, invoking
+tools, filing issues, or writing a result artifact. Its options are reserved for a future release.
+
+Usage: trust-cg-test fuzz [OPTIONS]
+
+Options:
+      --driver <DRIVER>
+          Planned fuzz driver; ignored in v0.1.0
+
+          Possible values:
+          - csmith:     Planned csmith random C program generator
+          - yarpgen:    Planned YARPGen random C/C++ program generator
+          - trustirgen: Planned in-tree trust_ir random IR generator
+          - all:        Planned selection of every driver
+
+          [default: all]
+
+  -f, --format <FORMAT>
+          Output format (human, json, junit)
+
+          Possible values:
+          - human: Pretty table + narrative, targeted at humans
+          - json:  Machine-readable JSON
+          - junit: JUnit XML for CI consumers
+
+          [default: human]
+
+      --duration <DUR>
+          Planned wall-clock duration; ignored in v0.1.0
+
+          [default: 10m]
+
+  -o, --out <PATH>
+          Override the command-specific output file or directory.
+
+          See the selected subcommand's help for its output type and default.
+
+      --seeds <N>
+          Planned seed cap; ignored in v0.1.0
+
+      --timeout <SECS>
+          Per-unit timeout in seconds. Subcommands may apply per-unit defaults when this is unset
+
+      --optlevel <N>
+          Planned optimization level; ignored in v0.1.0
+
+          [default: 2]
+
+      --parallel <N>
+          Worker count (honors cargo-serialization lock). Default: auto
+
+  -q, --quiet
+          Suppress progress bars; errors still go to stderr
+
+      --reduce
+          Planned reduction control; no reducer runs in v0.1.0
+
+  -v, --verbose...
+          Show debug-level events. Repeat for more: -vv, -vvv
+
+      --no-cache
+          Ignore proof / corpus caches
+
+      --dry-run
+          Print what would run without executing external tools
+
+  -h, --help
+          Print help (see a summary with '-h')

@@ -1,0 +1,3352 @@
+; TrustIr text format v1
+module "mir::closure::sprop_infer_sort_root"
+target "aarch64-apple-darwin" 8 little
+file 0 "clean_sprop_slice.rs"
+
+functy.0 = (u64) -> (u64)
+
+functy.1 = (ptr) -> ()
+
+functy.2 = (ptr, u64) -> ()
+
+functy.3 = (ptr) -> ()
+
+functy.4 = (ptr) -> ()
+
+functy.5 = (ptr) -> ()
+
+functy.6 = (ptr, ptr, ptr) -> ()
+
+functy.7 = (ptr, ptr) -> ()
+
+functy.8 = (ptr, ptr, ptr, u32) -> ()
+
+functy.9 = (ptr, ptr) -> ()
+
+functy.10 = (ptr, u32) -> (u32)
+
+functy.11 = (ptr, ptr, ptr) -> ()
+
+functy.12 = (ptr) -> (ptr)
+
+functy.13 = (ptr, ptr, ptr) -> ()
+
+functy.14 = (u64, u64) -> (u64)
+
+functy.15 = (ptr, ptr) -> ()
+
+functy.16 = (ptr) -> ()
+
+functy.17 = (ptr, ptr, ptr) -> ()
+
+functy.18 = (ptr, u32) -> ()
+
+functy.19 = (ptr, ptr) -> ()
+
+functy.20 = (ptr, ptr, ptr) -> ()
+
+functy.21 = (ptr, ptr, ptr) -> ()
+
+functy.22 = (u64, u64) -> (u64)
+
+functy.23 = (u64, u64) -> (u64)
+
+functy.24 = (ptr, ptr) -> (bool)
+
+functy.25 = (ptr) -> ()
+
+functy.26 = (ptr) -> ()
+
+functy.27 = (ptr) -> ()
+
+functy.28 = (ptr) -> ()
+
+functy.29 = (ptr) -> ()
+
+functy.30 = (ptr) -> ()
+
+functy.31 = (ptr, ptr) -> ()
+
+functy.32 = (ptr, ptr) -> ()
+
+functy.33 = (ptr, ptr) -> ()
+
+functy.34 = (ptr, ptr, ptr, u32) -> ()
+
+functy.35 = (ptr, ptr) -> ()
+
+functy.36 = (ptr, ptr) -> ()
+
+functy.37 = (ptr, ptr) -> ()
+
+fn @sprop_infer_sort_root(functy.0) {
+bb0(%0: u64):
+    %8 = alloca i8, align 1
+    %9 = alloca (i8, i8, i8), align 1
+    %10 = alloca i8, align 1
+    %11 = alloca (i64, i64, i64, i64, i64, i64), align 8
+    %12 = alloca i64, align 8
+    %13 = alloca i64, align 8
+    %14 = alloca i64, align 8
+    %15 = alloca (i32, i32), align 4
+    %16 = const u64 255
+    %17 = and u64 %0, %16
+    %18 = const u64 256
+    %19 = and u64 %0, %18
+    %20 = const u64 0
+    %21 = icmp ne u64 %19, %20
+    condbr %21, bb1(%17), bb2(%17)
+bb1(%1: u64):
+    %22 = const i8 0
+    store i8 %22, ptr %8
+    br bb3(%1)
+bb2(%2: u64):
+    %23 = const i8 1
+    store i8 %23, ptr %8
+    br bb3(%2)
+bb3(%3: u64):
+    %24 = load i8, ptr %8
+    store i8 %24, ptr %10
+    %25 = const i64 1
+    %26 = gep i8, ptr %9, %25
+    %27 = load i8, ptr %10
+    store i8 %27, ptr %26
+    %28 = const u8 0
+    %29 = const i64 2
+    %30 = gep i8, ptr %9, %29
+    store u8 %28, ptr %30
+    %31 = const bool false
+    store bool %31, ptr %9
+    %32 = const u64 0
+    %33 = icmp eq u64 %3, %32
+    condbr %33, bb4, bb6(%3)
+bb4:
+    call @func.1(%12)
+    br bb5
+bb5:
+    %34 = load u64, ptr %12
+    call @func.2(%11, %34)
+    br bb20
+bb6(%4: u64):
+    %35 = const u64 1
+    %36 = icmp eq u64 %4, %35
+    condbr %36, bb7, bb9(%4)
+bb7:
+    call @func.3(%13)
+    br bb8
+bb8:
+    %37 = load u64, ptr %13
+    call @func.2(%11, %37)
+    br bb21
+bb9(%5: u64):
+    %38 = const u64 2
+    %39 = icmp eq u64 %5, %38
+    condbr %39, bb10, bb12
+bb10:
+    call @func.4(%14)
+    br bb11
+bb11:
+    %40 = load u64, ptr %14
+    call @func.2(%11, %40)
+    br bb22
+bb12:
+    call @func.5(%11)
+    br bb23
+bb13:
+    call @func.6(%15, %9, %11)
+    br bb14
+bb14:
+    %41 = load i8, ptr %15
+    %42 = sext i8 %41 to i64
+    switch %42 [ 0: bb17 1: bb16 default: bb15 ]
+bb15:
+    unreachable
+bb16:
+    %43 = const u64 18446744073709551615
+    br bb18(%43)
+bb17:
+    %44 = const i64 4
+    %45 = gep i8, ptr %15, %44
+    %46 = load u32, ptr %45
+    %47 = zext u32 %46 to u64
+    br bb18(%47)
+bb18(%6: u64):
+    br bb19(%6)
+bb19(%7: u64):
+    ret %7
+bb20:
+    br bb13
+bb21:
+    br bb13
+bb22:
+    br bb13
+bb23:
+    br bb13
+}
+
+fn @nm_P(functy.1) {
+bb0(%0: ptr):
+    %1 = const u64 10
+    store u64 %1, ptr %0
+    ret
+}
+
+fn @Expr__cnst(functy.2) {
+bb0(%0: ptr, %1: u64):
+    %2 = alloca i64, align 8
+    %3 = alloca (i64, i64, i64, i64), align 8
+    store u64 %1, ptr %2
+    %4 = const i64 8
+    %5 = gep i8, ptr %3, %4
+    %6 = load i64, ptr %2
+    store i64 %6, ptr %5
+    %7 = const i32 3
+    store i32 %7, ptr %3
+    call @func.7(%0, %3)
+    br bb1
+bb1:
+    ret
+}
+
+fn @nm_Q(functy.3) {
+bb0(%0: ptr):
+    %1 = const u64 30
+    store u64 %1, ptr %0
+    ret
+}
+
+fn @nm_Foo(functy.4) {
+bb0(%0: ptr):
+    %1 = const u64 20
+    store u64 %1, ptr %0
+    ret
+}
+
+fn @Expr__sprop(functy.5) {
+bb0(%0: ptr):
+    %1 = alloca (i64, i64, i64, i64), align 8
+    %2 = const i32 11
+    store i32 %2, ptr %1
+    call @func.7(%0, %1)
+    br bb1
+bb1:
+    ret
+}
+
+fn @Verifier__infer_sort(functy.6) {
+bb0(%0: ptr, %1: ptr, %2: ptr):
+    %3 = const u32 0
+    call @func.8(%0, %1, %2, %3)
+    br bb1
+bb1:
+    ret
+}
+
+fn @Expr__from_kind(functy.7) {
+bb0(%0: ptr, %1: ptr):
+    %2 = alloca (i64, i64), align 8
+    %3 = alloca (i64, i64, i64, i64), align 8
+    call @func.9(%2, %1)
+    br bb1
+bb1:
+    %4 = load i64, ptr %1
+    store i64 %4, ptr %3
+    %5 = const i64 8
+    %6 = gep i8, ptr %1, %5
+    %7 = const i64 8
+    %8 = gep i8, ptr %3, %7
+    %9 = load i64, ptr %6
+    store i64 %9, ptr %8
+    %10 = const i64 16
+    %11 = gep i8, ptr %1, %10
+    %12 = const i64 16
+    %13 = gep i8, ptr %3, %12
+    %14 = load i64, ptr %11
+    store i64 %14, ptr %13
+    %15 = const i64 24
+    %16 = gep i8, ptr %1, %15
+    %17 = const i64 24
+    %18 = gep i8, ptr %3, %17
+    %19 = load i64, ptr %16
+    store i64 %19, ptr %18
+    %20 = load i64, ptr %3
+    store i64 %20, ptr %0
+    %21 = const i64 8
+    %22 = gep i8, ptr %3, %21
+    %23 = const i64 8
+    %24 = gep i8, ptr %0, %23
+    %25 = load i64, ptr %22
+    store i64 %25, ptr %24
+    %26 = const i64 16
+    %27 = gep i8, ptr %3, %26
+    %28 = const i64 16
+    %29 = gep i8, ptr %0, %28
+    %30 = load i64, ptr %27
+    store i64 %30, ptr %29
+    %31 = const i64 24
+    %32 = gep i8, ptr %3, %31
+    %33 = const i64 24
+    %34 = gep i8, ptr %0, %33
+    %35 = load i64, ptr %32
+    store i64 %35, ptr %34
+    %36 = const i64 32
+    %37 = gep i8, ptr %0, %36
+    %38 = load i64, ptr %2
+    store i64 %38, ptr %37
+    %39 = const i64 8
+    %40 = gep i8, ptr %2, %39
+    %41 = const i64 8
+    %42 = gep i8, ptr %37, %41
+    %43 = load i64, ptr %40
+    store i64 %43, ptr %42
+    ret
+}
+
+fn @Verifier__infer_sort_inner(functy.8) {
+bb0(%0: ptr, %1: ptr, %2: ptr, %3: u32):
+    %6 = alloca (i64, i64, i64, i64, i64, i64), align 8
+    %7 = alloca (i64, i64, i64, i64, i64, i64), align 8
+    %8 = alloca (i64, i64, i64, i64, i64, i64), align 8
+    %9 = alloca i8, align 1
+    %10 = alloca (i64, i64, i64, i64, i64, i64), align 8
+    %11 = alloca i64, align 8
+    %12 = alloca i8, align 1
+    %13 = alloca i8, align 1
+    call @func.11(%7, %1, %2)
+    br bb1(%1)
+bb1(%4: ptr):
+    %14 = load i32, ptr %7
+    %15 = const i32 12
+    %16 = icmp eq i32 %14, %15
+    %17 = const i64 1
+    %18 = const i64 0
+    %19 = select i64 %16, %17, %18
+    switch %19 [ 0: bb4(%4) 1: bb3 default: bb2 ]
+bb2:
+    unreachable
+bb3:
+    %20 = const i64 4
+    %21 = gep i8, ptr %7, %20
+    %22 = load i8, ptr %21
+    store i8 %22, ptr %9
+    %23 = const i64 1
+    %24 = gep i8, ptr %0, %23
+    %25 = load i8, ptr %9
+    store i8 %25, ptr %24
+    %26 = const i8 1
+    store i8 %26, ptr %0
+    br bb12
+bb4(%5: ptr):
+    %27 = load i64, ptr %7
+    store i64 %27, ptr %8
+    %28 = const i64 8
+    %29 = gep i8, ptr %7, %28
+    %30 = const i64 8
+    %31 = gep i8, ptr %8, %30
+    %32 = load i64, ptr %29
+    store i64 %32, ptr %31
+    %33 = const i64 16
+    %34 = gep i8, ptr %7, %33
+    %35 = const i64 16
+    %36 = gep i8, ptr %8, %35
+    %37 = load i64, ptr %34
+    store i64 %37, ptr %36
+    %38 = const i64 24
+    %39 = gep i8, ptr %7, %38
+    %40 = const i64 24
+    %41 = gep i8, ptr %8, %40
+    %42 = load i64, ptr %39
+    store i64 %42, ptr %41
+    %43 = const i64 32
+    %44 = gep i8, ptr %7, %43
+    %45 = const i64 32
+    %46 = gep i8, ptr %8, %45
+    %47 = load i64, ptr %44
+    store i64 %47, ptr %46
+    %48 = const i64 40
+    %49 = gep i8, ptr %7, %48
+    %50 = const i64 40
+    %51 = gep i8, ptr %8, %50
+    %52 = load i64, ptr %49
+    store i64 %52, ptr %51
+    %53 = load i64, ptr %8
+    store i64 %53, ptr %6
+    %54 = const i64 8
+    %55 = gep i8, ptr %8, %54
+    %56 = const i64 8
+    %57 = gep i8, ptr %6, %56
+    %58 = load i64, ptr %55
+    store i64 %58, ptr %57
+    %59 = const i64 16
+    %60 = gep i8, ptr %8, %59
+    %61 = const i64 16
+    %62 = gep i8, ptr %6, %61
+    %63 = load i64, ptr %60
+    store i64 %63, ptr %62
+    %64 = const i64 24
+    %65 = gep i8, ptr %8, %64
+    %66 = const i64 24
+    %67 = gep i8, ptr %6, %66
+    %68 = load i64, ptr %65
+    store i64 %68, ptr %67
+    %69 = const i64 32
+    %70 = gep i8, ptr %8, %69
+    %71 = const i64 32
+    %72 = gep i8, ptr %6, %71
+    %73 = load i64, ptr %70
+    store i64 %73, ptr %72
+    %74 = const i64 40
+    %75 = gep i8, ptr %8, %74
+    %76 = const i64 40
+    %77 = gep i8, ptr %6, %76
+    %78 = load i64, ptr %75
+    store i64 %78, ptr %77
+    call @func.13(%10, %5, %6)
+    br bb5
+bb5:
+    store ptr %10, ptr %11
+    %79 = load ptr, ptr %11
+    %80 = load i32, ptr %79
+    %81 = sext i32 %80 to i64
+    switch %81 [ 2: bb9 6: bb7 11: bb8 default: bb6 ]
+bb6:
+    %82 = const i8 1
+    store i8 %82, ptr %13
+    %83 = const i64 1
+    %84 = gep i8, ptr %0, %83
+    %85 = load i8, ptr %13
+    store i8 %85, ptr %84
+    %86 = const i8 1
+    store i8 %86, ptr %0
+    br bb10
+bb7:
+    %87 = load ptr, ptr %11
+    %88 = const i64 8
+    %89 = gep i8, ptr %87, %88
+    %90 = load ptr, ptr %11
+    %91 = const i64 16
+    %92 = gep i8, ptr %90, %91
+    %93 = const i8 2
+    store i8 %93, ptr %12
+    %94 = const i64 1
+    %95 = gep i8, ptr %0, %94
+    %96 = load i8, ptr %12
+    store i8 %96, ptr %95
+    %97 = const i8 1
+    store i8 %97, ptr %0
+    br bb10
+bb8:
+    %98 = const u32 0
+    %99 = const i64 4
+    %100 = gep i8, ptr %0, %99
+    store u32 %98, ptr %100
+    %101 = const i8 0
+    store i8 %101, ptr %0
+    br bb10
+bb9:
+    %102 = load ptr, ptr %11
+    %103 = const i64 4
+    %104 = gep i8, ptr %102, %103
+    %105 = load u32, ptr %104
+    %106 = const i64 4
+    %107 = gep i8, ptr %0, %106
+    store u32 %105, ptr %107
+    %108 = const i8 0
+    store i8 %108, ptr %0
+    br bb10
+bb10:
+    br bb11
+bb11:
+    br bb12
+bb12:
+    ret
+}
+
+fn @ExprKind__compute_meta(functy.9) {
+bb0(%0: ptr, %1: ptr):
+    %142 = alloca i64, align 8
+    %143 = alloca i64, align 8
+    store ptr %1, ptr %142
+    %144 = load ptr, ptr %142
+    %145 = load i32, ptr %144
+    %146 = sext i32 %145 to i64
+    switch %146 [ 0: bb13 1: bb12 2: bb11 3: bb10 4: bb9 5: bb8 6: bb7 7: bb6 8: bb5 9: bb4 10: bb3 11: bb2 default: bb1 ]
+bb1:
+    unreachable
+bb2:
+    %147 = const u64 12
+    %148 = const u64 0
+    %149 = call @func.14(%147, %148)
+    br bb67(%149)
+bb3:
+    %150 = load ptr, ptr %142
+    %151 = const i64 8
+    %152 = gep i8, ptr %150, %151
+    %153 = load ptr, ptr %152
+    %154 = const i64 16
+    %155 = gep i8, ptr %153, %154
+    br bb64(%152, %155)
+bb4:
+    %156 = load ptr, ptr %142
+    %157 = const i64 8
+    %158 = gep i8, ptr %156, %157
+    %159 = load ptr, ptr %142
+    %160 = const i64 4
+    %161 = gep i8, ptr %159, %160
+    %162 = load ptr, ptr %142
+    %163 = const i64 16
+    %164 = gep i8, ptr %162, %163
+    %165 = load ptr, ptr %164
+    %166 = const i64 16
+    %167 = gep i8, ptr %165, %166
+    br bb59(%158, %161, %164, %167)
+bb5:
+    %168 = load ptr, ptr %142
+    %169 = const i64 8
+    %170 = gep i8, ptr %168, %169
+    store ptr %170, ptr %143
+    %171 = load ptr, ptr %143
+    %172 = load u64, ptr %171
+    %173 = const u64 9
+    %174 = call @func.14(%173, %172)
+    br bb58(%174)
+bb6:
+    %175 = load ptr, ptr %142
+    %176 = const i64 8
+    %177 = gep i8, ptr %175, %176
+    %178 = load ptr, ptr %142
+    %179 = const i64 16
+    %180 = gep i8, ptr %178, %179
+    %181 = load ptr, ptr %142
+    %182 = const i64 24
+    %183 = gep i8, ptr %181, %182
+    %184 = load ptr, ptr %177
+    %185 = const i64 16
+    %186 = gep i8, ptr %184, %185
+    br bb45(%177, %180, %183, %186)
+bb7:
+    %187 = load ptr, ptr %142
+    %188 = const i64 8
+    %189 = gep i8, ptr %187, %188
+    %190 = load ptr, ptr %142
+    %191 = const i64 16
+    %192 = gep i8, ptr %190, %191
+    %193 = load ptr, ptr %189
+    %194 = const i64 16
+    %195 = gep i8, ptr %193, %194
+    br bb36(%189, %192, %195)
+bb8:
+    %196 = load ptr, ptr %142
+    %197 = const i64 8
+    %198 = gep i8, ptr %196, %197
+    %199 = load ptr, ptr %142
+    %200 = const i64 16
+    %201 = gep i8, ptr %199, %200
+    %202 = load ptr, ptr %198
+    %203 = const i64 16
+    %204 = gep i8, ptr %202, %203
+    br bb27(%198, %201, %204)
+bb9:
+    %205 = load ptr, ptr %142
+    %206 = const i64 8
+    %207 = gep i8, ptr %205, %206
+    %208 = load ptr, ptr %142
+    %209 = const i64 16
+    %210 = gep i8, ptr %208, %209
+    %211 = load ptr, ptr %207
+    %212 = const i64 16
+    %213 = gep i8, ptr %211, %212
+    br bb18(%207, %210, %213)
+bb10:
+    %214 = load ptr, ptr %142
+    %215 = const i64 8
+    %216 = gep i8, ptr %214, %215
+    %217 = load u64, ptr %216
+    %218 = const u64 4
+    %219 = call @func.14(%218, %217)
+    br bb17(%219)
+bb11:
+    %220 = load ptr, ptr %142
+    %221 = const i64 4
+    %222 = gep i8, ptr %220, %221
+    %223 = load u32, ptr %222
+    %224 = zext u32 %223 to u64
+    %225 = const u64 3
+    %226 = call @func.14(%225, %224)
+    br bb16(%226)
+bb12:
+    %227 = load ptr, ptr %142
+    %228 = const i64 8
+    %229 = gep i8, ptr %227, %228
+    %230 = load u64, ptr %229
+    %231 = const u64 2
+    %232 = call @func.14(%231, %230)
+    br bb15(%232)
+bb13:
+    %233 = load ptr, ptr %142
+    %234 = const i64 4
+    %235 = gep i8, ptr %233, %234
+    %236 = load u32, ptr %235
+    %237 = zext u32 %236 to u64
+    %238 = const u64 1
+    %239 = call @func.14(%238, %237)
+    br bb14(%239)
+bb14(%2: u64):
+    %240 = const bool false
+    %241 = const i64 8
+    %242 = gep i8, ptr %0, %241
+    store bool %240, ptr %242
+    store u64 %2, ptr %0
+    br bb68
+bb15(%3: u64):
+    %243 = const bool true
+    %244 = const i64 8
+    %245 = gep i8, ptr %0, %244
+    store bool %243, ptr %245
+    store u64 %3, ptr %0
+    br bb68
+bb16(%4: u64):
+    %246 = const bool false
+    %247 = const i64 8
+    %248 = gep i8, ptr %0, %247
+    store bool %246, ptr %248
+    store u64 %4, ptr %0
+    br bb68
+bb17(%5: u64):
+    %249 = const bool false
+    %250 = const i64 8
+    %251 = gep i8, ptr %0, %250
+    store bool %249, ptr %251
+    store u64 %5, ptr %0
+    br bb68
+bb18(%6: ptr, %7: ptr, %8: ptr):
+    %252 = const i64 40
+    %253 = gep i8, ptr %8, %252
+    %254 = load bool, ptr %253
+    condbr %254, bb19(%6, %7), bb20(%6, %7)
+bb19(%9: ptr, %10: ptr):
+    %255 = const bool true
+    br bb22(%9, %10, %255)
+bb20(%11: ptr, %12: ptr):
+    %256 = load ptr, ptr %12
+    %257 = const i64 16
+    %258 = gep i8, ptr %256, %257
+    br bb21(%11, %12, %258)
+bb21(%13: ptr, %14: ptr, %15: ptr):
+    %259 = const i64 40
+    %260 = gep i8, ptr %15, %259
+    %261 = load bool, ptr %260
+    br bb22(%13, %14, %261)
+bb22(%16: ptr, %17: ptr, %18: bool):
+    %262 = load ptr, ptr %16
+    %263 = const i64 16
+    %264 = gep i8, ptr %262, %263
+    br bb23(%17, %18, %264)
+bb23(%19: ptr, %20: bool, %21: ptr):
+    %265 = const i64 32
+    %266 = gep i8, ptr %21, %265
+    %267 = load u64, ptr %266
+    %268 = load ptr, ptr %19
+    %269 = const i64 16
+    %270 = gep i8, ptr %268, %269
+    br bb24(%20, %267, %270)
+bb24(%22: bool, %23: u64, %24: ptr):
+    %271 = const i64 32
+    %272 = gep i8, ptr %24, %271
+    %273 = load u64, ptr %272
+    %274 = call @func.14(%23, %273)
+    br bb25(%22, %274)
+bb25(%25: bool, %26: u64):
+    %275 = const u64 5
+    %276 = call @func.14(%275, %26)
+    br bb26(%25, %276)
+bb26(%27: bool, %28: u64):
+    %277 = const i64 8
+    %278 = gep i8, ptr %0, %277
+    store bool %27, ptr %278
+    store u64 %28, ptr %0
+    br bb68
+bb27(%29: ptr, %30: ptr, %31: ptr):
+    %279 = const i64 40
+    %280 = gep i8, ptr %31, %279
+    %281 = load bool, ptr %280
+    condbr %281, bb28(%29, %30), bb29(%29, %30)
+bb28(%32: ptr, %33: ptr):
+    %282 = const bool true
+    br bb31(%32, %33, %282)
+bb29(%34: ptr, %35: ptr):
+    %283 = load ptr, ptr %35
+    %284 = const i64 16
+    %285 = gep i8, ptr %283, %284
+    br bb30(%34, %35, %285)
+bb30(%36: ptr, %37: ptr, %38: ptr):
+    %286 = const i64 40
+    %287 = gep i8, ptr %38, %286
+    %288 = load bool, ptr %287
+    br bb31(%36, %37, %288)
+bb31(%39: ptr, %40: ptr, %41: bool):
+    %289 = load ptr, ptr %39
+    %290 = const i64 16
+    %291 = gep i8, ptr %289, %290
+    br bb32(%40, %41, %291)
+bb32(%42: ptr, %43: bool, %44: ptr):
+    %292 = const i64 32
+    %293 = gep i8, ptr %44, %292
+    %294 = load u64, ptr %293
+    %295 = load ptr, ptr %42
+    %296 = const i64 16
+    %297 = gep i8, ptr %295, %296
+    br bb33(%43, %294, %297)
+bb33(%45: bool, %46: u64, %47: ptr):
+    %298 = const i64 32
+    %299 = gep i8, ptr %47, %298
+    %300 = load u64, ptr %299
+    %301 = call @func.14(%46, %300)
+    br bb34(%45, %301)
+bb34(%48: bool, %49: u64):
+    %302 = const u64 6
+    %303 = call @func.14(%302, %49)
+    br bb35(%48, %303)
+bb35(%50: bool, %51: u64):
+    %304 = const i64 8
+    %305 = gep i8, ptr %0, %304
+    store bool %50, ptr %305
+    store u64 %51, ptr %0
+    br bb68
+bb36(%52: ptr, %53: ptr, %54: ptr):
+    %306 = const i64 40
+    %307 = gep i8, ptr %54, %306
+    %308 = load bool, ptr %307
+    condbr %308, bb37(%52, %53), bb38(%52, %53)
+bb37(%55: ptr, %56: ptr):
+    %309 = const bool true
+    br bb40(%55, %56, %309)
+bb38(%57: ptr, %58: ptr):
+    %310 = load ptr, ptr %58
+    %311 = const i64 16
+    %312 = gep i8, ptr %310, %311
+    br bb39(%57, %58, %312)
+bb39(%59: ptr, %60: ptr, %61: ptr):
+    %313 = const i64 40
+    %314 = gep i8, ptr %61, %313
+    %315 = load bool, ptr %314
+    br bb40(%59, %60, %315)
+bb40(%62: ptr, %63: ptr, %64: bool):
+    %316 = load ptr, ptr %62
+    %317 = const i64 16
+    %318 = gep i8, ptr %316, %317
+    br bb41(%63, %64, %318)
+bb41(%65: ptr, %66: bool, %67: ptr):
+    %319 = const i64 32
+    %320 = gep i8, ptr %67, %319
+    %321 = load u64, ptr %320
+    %322 = load ptr, ptr %65
+    %323 = const i64 16
+    %324 = gep i8, ptr %322, %323
+    br bb42(%66, %321, %324)
+bb42(%68: bool, %69: u64, %70: ptr):
+    %325 = const i64 32
+    %326 = gep i8, ptr %70, %325
+    %327 = load u64, ptr %326
+    %328 = call @func.14(%69, %327)
+    br bb43(%68, %328)
+bb43(%71: bool, %72: u64):
+    %329 = const u64 7
+    %330 = call @func.14(%329, %72)
+    br bb44(%71, %330)
+bb44(%73: bool, %74: u64):
+    %331 = const i64 8
+    %332 = gep i8, ptr %0, %331
+    store bool %73, ptr %332
+    store u64 %74, ptr %0
+    br bb68
+bb45(%75: ptr, %76: ptr, %77: ptr, %78: ptr):
+    %333 = const i64 40
+    %334 = gep i8, ptr %78, %333
+    %335 = load bool, ptr %334
+    condbr %335, bb48(%75, %76, %77), bb46(%75, %76, %77)
+bb46(%79: ptr, %80: ptr, %81: ptr):
+    %336 = load ptr, ptr %80
+    %337 = const i64 16
+    %338 = gep i8, ptr %336, %337
+    br bb47(%79, %80, %81, %338)
+bb47(%82: ptr, %83: ptr, %84: ptr, %85: ptr):
+    %339 = const i64 40
+    %340 = gep i8, ptr %85, %339
+    %341 = load bool, ptr %340
+    condbr %341, bb48(%82, %83, %84), bb49(%82, %83, %84)
+bb48(%86: ptr, %87: ptr, %88: ptr):
+    %342 = const bool true
+    br bb51(%86, %87, %88, %342)
+bb49(%89: ptr, %90: ptr, %91: ptr):
+    %343 = load ptr, ptr %91
+    %344 = const i64 16
+    %345 = gep i8, ptr %343, %344
+    br bb50(%89, %90, %91, %345)
+bb50(%92: ptr, %93: ptr, %94: ptr, %95: ptr):
+    %346 = const i64 40
+    %347 = gep i8, ptr %95, %346
+    %348 = load bool, ptr %347
+    br bb51(%92, %93, %94, %348)
+bb51(%96: ptr, %97: ptr, %98: ptr, %99: bool):
+    %349 = load ptr, ptr %96
+    %350 = const i64 16
+    %351 = gep i8, ptr %349, %350
+    br bb52(%97, %98, %99, %351)
+bb52(%100: ptr, %101: ptr, %102: bool, %103: ptr):
+    %352 = const i64 32
+    %353 = gep i8, ptr %103, %352
+    %354 = load u64, ptr %353
+    %355 = load ptr, ptr %100
+    %356 = const i64 16
+    %357 = gep i8, ptr %355, %356
+    br bb53(%101, %102, %354, %357)
+bb53(%104: ptr, %105: bool, %106: u64, %107: ptr):
+    %358 = const i64 32
+    %359 = gep i8, ptr %107, %358
+    %360 = load u64, ptr %359
+    %361 = load ptr, ptr %104
+    %362 = const i64 16
+    %363 = gep i8, ptr %361, %362
+    br bb54(%105, %106, %360, %363)
+bb54(%108: bool, %109: u64, %110: u64, %111: ptr):
+    %364 = const i64 32
+    %365 = gep i8, ptr %111, %364
+    %366 = load u64, ptr %365
+    %367 = call @func.14(%110, %366)
+    br bb55(%108, %109, %367)
+bb55(%112: bool, %113: u64, %114: u64):
+    %368 = call @func.14(%113, %114)
+    br bb56(%112, %368)
+bb56(%115: bool, %116: u64):
+    %369 = const u64 8
+    %370 = call @func.14(%369, %116)
+    br bb57(%115, %370)
+bb57(%117: bool, %118: u64):
+    %371 = const i64 8
+    %372 = gep i8, ptr %0, %371
+    store bool %117, ptr %372
+    store u64 %118, ptr %0
+    br bb68
+bb58(%119: u64):
+    %373 = const bool false
+    %374 = const i64 8
+    %375 = gep i8, ptr %0, %374
+    store bool %373, ptr %375
+    store u64 %119, ptr %0
+    br bb68
+bb59(%120: ptr, %121: ptr, %122: ptr, %123: ptr):
+    %376 = const i64 40
+    %377 = gep i8, ptr %123, %376
+    %378 = load bool, ptr %377
+    %379 = load u64, ptr %120
+    %380 = load u32, ptr %121
+    %381 = zext u32 %380 to u64
+    %382 = load ptr, ptr %122
+    %383 = const i64 16
+    %384 = gep i8, ptr %382, %383
+    br bb60(%378, %379, %381, %384)
+bb60(%124: bool, %125: u64, %126: u64, %127: ptr):
+    %385 = const i64 32
+    %386 = gep i8, ptr %127, %385
+    %387 = load u64, ptr %386
+    %388 = call @func.14(%126, %387)
+    br bb61(%124, %125, %388)
+bb61(%128: bool, %129: u64, %130: u64):
+    %389 = call @func.14(%129, %130)
+    br bb62(%128, %389)
+bb62(%131: bool, %132: u64):
+    %390 = const u64 10
+    %391 = call @func.14(%390, %132)
+    br bb63(%131, %391)
+bb63(%133: bool, %134: u64):
+    %392 = const i64 8
+    %393 = gep i8, ptr %0, %392
+    store bool %133, ptr %393
+    store u64 %134, ptr %0
+    br bb68
+bb64(%135: ptr, %136: ptr):
+    %394 = const i64 40
+    %395 = gep i8, ptr %136, %394
+    %396 = load bool, ptr %395
+    %397 = load ptr, ptr %135
+    %398 = const i64 16
+    %399 = gep i8, ptr %397, %398
+    br bb65(%396, %399)
+bb65(%137: bool, %138: ptr):
+    %400 = const i64 32
+    %401 = gep i8, ptr %138, %400
+    %402 = load u64, ptr %401
+    %403 = const u64 11
+    %404 = call @func.14(%403, %402)
+    br bb66(%137, %404)
+bb66(%139: bool, %140: u64):
+    %405 = const i64 8
+    %406 = gep i8, ptr %0, %405
+    store bool %139, ptr %406
+    store u64 %140, ptr %0
+    br bb68
+bb67(%141: u64):
+    %407 = const bool false
+    %408 = const i64 8
+    %409 = gep i8, ptr %0, %408
+    store bool %407, ptr %409
+    store u64 %141, ptr %0
+    br bb68
+bb68:
+    ret
+}
+
+fn @_RNvXsn_NtNtCs2EYQwhfuABO_4core3ops5arithRmINtB5_3AddmE3addCsbl3Kp9dptzX_17clean_sprop_slice(functy.10) {
+}
+
+fn @Verifier__infer_type_infer_only_core(functy.11) {
+bb0(%0: ptr, %1: ptr, %2: ptr):
+    %9 = alloca i64, align 8
+    %10 = alloca i64, align 8
+    %11 = alloca (i64, i64, i64, i64, i64, i64), align 8
+    %12 = alloca (i64, i64, i64, i64, i64, i64), align 8
+    %13 = alloca i8, align 1
+    %14 = alloca (i64, i64, i64, i64, i64, i64), align 8
+    %15 = alloca (i64, i64, i64, i64, i64, i64), align 8
+    %16 = alloca i64, align 8
+    %17 = alloca i8, align 1
+    store ptr %2, ptr %9
+    %18 = load ptr, ptr %9
+    store ptr %18, ptr %10
+    %19 = load ptr, ptr %10
+    %20 = load i32, ptr %19
+    %21 = sext i32 %20 to i64
+    switch %21 [ 2: bb5 3: bb6(%1) 8: bb4 10: bb3(%1) 11: bb2(%1) default: bb1 ]
+bb1:
+    %22 = const i8 2
+    store i8 %22, ptr %17
+    %23 = const i64 4
+    %24 = gep i8, ptr %0, %23
+    %25 = load i8, ptr %17
+    store i8 %25, ptr %24
+    %26 = const i32 12
+    store i32 %26, ptr %0
+    br bb16
+bb2(%3: ptr):
+    call @func.15(%0, %3)
+    br bb16
+bb3(%4: ptr):
+    %27 = load ptr, ptr %10
+    %28 = const i64 8
+    %29 = gep i8, ptr %27, %28
+    %30 = load ptr, ptr %29
+    %31 = const i64 16
+    %32 = gep i8, ptr %30, %31
+    br bb15(%4, %32)
+bb4:
+    %33 = load ptr, ptr %10
+    %34 = const i64 8
+    %35 = gep i8, ptr %33, %34
+    call @func.16(%16)
+    br bb13
+bb5:
+    %36 = load ptr, ptr %10
+    %37 = const i64 4
+    %38 = gep i8, ptr %36, %37
+    %39 = const u32 1
+    %40 = call @func.10(%38, %39)
+    br bb11(%40)
+bb6(%5: ptr):
+    %41 = load ptr, ptr %10
+    %42 = const i64 8
+    %43 = gep i8, ptr %41, %42
+    call @func.17(%11, %5, %43)
+    br bb7
+bb7:
+    %44 = load i32, ptr %11
+    %45 = const i32 12
+    %46 = icmp eq i32 %44, %45
+    %47 = const i64 0
+    %48 = const i64 1
+    %49 = select i64 %46, %47, %48
+    switch %49 [ 0: bb9 1: bb10 default: bb8 ]
+bb8:
+    unreachable
+bb9:
+    %50 = const i8 2
+    store i8 %50, ptr %13
+    %51 = const i64 4
+    %52 = gep i8, ptr %0, %51
+    %53 = load i8, ptr %13
+    store i8 %53, ptr %52
+    %54 = const i32 12
+    store i32 %54, ptr %0
+    br bb16
+bb10:
+    %55 = load i64, ptr %11
+    store i64 %55, ptr %12
+    %56 = const i64 8
+    %57 = gep i8, ptr %11, %56
+    %58 = const i64 8
+    %59 = gep i8, ptr %12, %58
+    %60 = load i64, ptr %57
+    store i64 %60, ptr %59
+    %61 = const i64 16
+    %62 = gep i8, ptr %11, %61
+    %63 = const i64 16
+    %64 = gep i8, ptr %12, %63
+    %65 = load i64, ptr %62
+    store i64 %65, ptr %64
+    %66 = const i64 24
+    %67 = gep i8, ptr %11, %66
+    %68 = const i64 24
+    %69 = gep i8, ptr %12, %68
+    %70 = load i64, ptr %67
+    store i64 %70, ptr %69
+    %71 = const i64 32
+    %72 = gep i8, ptr %11, %71
+    %73 = const i64 32
+    %74 = gep i8, ptr %12, %73
+    %75 = load i64, ptr %72
+    store i64 %75, ptr %74
+    %76 = const i64 40
+    %77 = gep i8, ptr %11, %76
+    %78 = const i64 40
+    %79 = gep i8, ptr %12, %78
+    %80 = load i64, ptr %77
+    store i64 %80, ptr %79
+    %81 = load i64, ptr %12
+    store i64 %81, ptr %0
+    %82 = const i64 8
+    %83 = gep i8, ptr %12, %82
+    %84 = const i64 8
+    %85 = gep i8, ptr %0, %84
+    %86 = load i64, ptr %83
+    store i64 %86, ptr %85
+    %87 = const i64 16
+    %88 = gep i8, ptr %12, %87
+    %89 = const i64 16
+    %90 = gep i8, ptr %0, %89
+    %91 = load i64, ptr %88
+    store i64 %91, ptr %90
+    %92 = const i64 24
+    %93 = gep i8, ptr %12, %92
+    %94 = const i64 24
+    %95 = gep i8, ptr %0, %94
+    %96 = load i64, ptr %93
+    store i64 %96, ptr %95
+    %97 = const i64 32
+    %98 = gep i8, ptr %12, %97
+    %99 = const i64 32
+    %100 = gep i8, ptr %0, %99
+    %101 = load i64, ptr %98
+    store i64 %101, ptr %100
+    %102 = const i64 40
+    %103 = gep i8, ptr %12, %102
+    %104 = const i64 40
+    %105 = gep i8, ptr %0, %104
+    %106 = load i64, ptr %103
+    store i64 %106, ptr %105
+    br bb16
+bb11(%6: u32):
+    call @func.18(%14, %6)
+    br bb12
+bb12:
+    %107 = load i64, ptr %14
+    store i64 %107, ptr %0
+    %108 = const i64 8
+    %109 = gep i8, ptr %14, %108
+    %110 = const i64 8
+    %111 = gep i8, ptr %0, %110
+    %112 = load i64, ptr %109
+    store i64 %112, ptr %111
+    %113 = const i64 16
+    %114 = gep i8, ptr %14, %113
+    %115 = const i64 16
+    %116 = gep i8, ptr %0, %115
+    %117 = load i64, ptr %114
+    store i64 %117, ptr %116
+    %118 = const i64 24
+    %119 = gep i8, ptr %14, %118
+    %120 = const i64 24
+    %121 = gep i8, ptr %0, %120
+    %122 = load i64, ptr %119
+    store i64 %122, ptr %121
+    %123 = const i64 32
+    %124 = gep i8, ptr %14, %123
+    %125 = const i64 32
+    %126 = gep i8, ptr %0, %125
+    %127 = load i64, ptr %124
+    store i64 %127, ptr %126
+    %128 = const i64 40
+    %129 = gep i8, ptr %14, %128
+    %130 = const i64 40
+    %131 = gep i8, ptr %0, %130
+    %132 = load i64, ptr %129
+    store i64 %132, ptr %131
+    br bb16
+bb13:
+    %133 = load u64, ptr %16
+    call @func.2(%15, %133)
+    br bb14
+bb14:
+    %134 = load i64, ptr %15
+    store i64 %134, ptr %0
+    %135 = const i64 8
+    %136 = gep i8, ptr %15, %135
+    %137 = const i64 8
+    %138 = gep i8, ptr %0, %137
+    %139 = load i64, ptr %136
+    store i64 %139, ptr %138
+    %140 = const i64 16
+    %141 = gep i8, ptr %15, %140
+    %142 = const i64 16
+    %143 = gep i8, ptr %0, %142
+    %144 = load i64, ptr %141
+    store i64 %144, ptr %143
+    %145 = const i64 24
+    %146 = gep i8, ptr %15, %145
+    %147 = const i64 24
+    %148 = gep i8, ptr %0, %147
+    %149 = load i64, ptr %146
+    store i64 %149, ptr %148
+    %150 = const i64 32
+    %151 = gep i8, ptr %15, %150
+    %152 = const i64 32
+    %153 = gep i8, ptr %0, %152
+    %154 = load i64, ptr %151
+    store i64 %154, ptr %153
+    %155 = const i64 40
+    %156 = gep i8, ptr %15, %155
+    %157 = const i64 40
+    %158 = gep i8, ptr %0, %157
+    %159 = load i64, ptr %156
+    store i64 %159, ptr %158
+    br bb16
+bb15(%7: ptr, %8: ptr):
+    call @func.11(%0, %7, %8)
+    br bb16
+bb16:
+    ret
+}
+
+fn @_RNvXs1j_NtCskTzINo8ZBH9_5alloc4syncINtB6_3ArcNtCsbl3Kp9dptzX_17clean_sprop_slice4ExprEINtNtCs2EYQwhfuABO_4core7convert5AsRefBH_E6as_refBJ_(functy.12) {
+}
+
+fn @Verifier__whnf_impl(functy.13) {
+bb0(%0: ptr, %1: ptr, %2: ptr):
+    %54 = alloca (i64, i64, i64, i64, i64, i64), align 8
+    %55 = alloca i64, align 8
+    %56 = alloca (i64, i64, i64, i64, i64, i64), align 8
+    %57 = alloca (i64, i64, i64, i64, i64, i64), align 8
+    %58 = alloca (i64, i64, i64, i64, i64, i64), align 8
+    %59 = alloca i64, align 8
+    %60 = alloca (i64, i64, i64, i64, i64, i64), align 8
+    %61 = alloca (i64, i64, i64, i64), align 8
+    %62 = alloca i64, align 8
+    %63 = alloca (i64, i64, i64, i64, i64, i64), align 8
+    %64 = alloca i64, align 8
+    %65 = alloca (i64, i64, i64, i64, i64, i64), align 8
+    %66 = alloca (i64, i64, i64, i64, i64, i64), align 8
+    %67 = alloca (i64, i64, i64, i64, i64, i64), align 8
+    %68 = const bool false
+    %69 = const bool false
+    %70 = const bool true
+    call @func.19(%54, %2)
+    br bb1(%1, %70)
+bb1(%3: ptr, %4: bool):
+    store ptr %54, ptr %55
+    %71 = load ptr, ptr %55
+    %72 = load i32, ptr %71
+    %73 = sext i32 %72 to i64
+    switch %73 [ 3: bb6(%3) 4: bb5(%3, %4) 7: bb4(%3) 10: bb3(%3) default: bb2 ]
+bb2:
+    %74 = const bool false
+    %75 = load i64, ptr %54
+    store i64 %75, ptr %0
+    %76 = const i64 8
+    %77 = gep i8, ptr %54, %76
+    %78 = const i64 8
+    %79 = gep i8, ptr %0, %78
+    %80 = load i64, ptr %77
+    store i64 %80, ptr %79
+    %81 = const i64 16
+    %82 = gep i8, ptr %54, %81
+    %83 = const i64 16
+    %84 = gep i8, ptr %0, %83
+    %85 = load i64, ptr %82
+    store i64 %85, ptr %84
+    %86 = const i64 24
+    %87 = gep i8, ptr %54, %86
+    %88 = const i64 24
+    %89 = gep i8, ptr %0, %88
+    %90 = load i64, ptr %87
+    store i64 %90, ptr %89
+    %91 = const i64 32
+    %92 = gep i8, ptr %54, %91
+    %93 = const i64 32
+    %94 = gep i8, ptr %0, %93
+    %95 = load i64, ptr %92
+    store i64 %95, ptr %94
+    %96 = const i64 40
+    %97 = gep i8, ptr %54, %96
+    %98 = const i64 40
+    %99 = gep i8, ptr %0, %98
+    %100 = load i64, ptr %97
+    store i64 %100, ptr %99
+    br bb33(%74)
+bb3(%5: ptr):
+    %101 = load ptr, ptr %55
+    %102 = const i64 8
+    %103 = gep i8, ptr %101, %102
+    %104 = call @func.12(%103)
+    br bb30(%5, %104)
+bb4(%6: ptr):
+    %105 = load ptr, ptr %55
+    %106 = const i64 8
+    %107 = gep i8, ptr %105, %106
+    %108 = load ptr, ptr %55
+    %109 = const i64 16
+    %110 = gep i8, ptr %108, %109
+    %111 = load ptr, ptr %55
+    %112 = const i64 24
+    %113 = gep i8, ptr %111, %112
+    %114 = load ptr, ptr %113
+    %115 = const i64 16
+    %116 = gep i8, ptr %114, %115
+    br bb26(%6, %110, %116)
+bb5(%7: ptr, %8: bool):
+    %117 = load ptr, ptr %55
+    %118 = const i64 8
+    %119 = gep i8, ptr %117, %118
+    %120 = load ptr, ptr %55
+    %121 = const i64 16
+    %122 = gep i8, ptr %120, %121
+    %123 = load ptr, ptr %119
+    %124 = const i64 16
+    %125 = gep i8, ptr %123, %124
+    br bb12(%7, %122, %125, %8)
+bb6(%9: ptr):
+    %126 = load ptr, ptr %55
+    %127 = const i64 8
+    %128 = gep i8, ptr %126, %127
+    call @func.20(%56, %9, %128)
+    br bb7(%9)
+bb7(%10: ptr):
+    %129 = load i32, ptr %56
+    %130 = const i32 12
+    %131 = icmp eq i32 %129, %130
+    %132 = const i64 0
+    %133 = const i64 1
+    %134 = select i64 %131, %132, %133
+    switch %134 [ 0: bb9 1: bb10(%10) default: bb8 ]
+bb8:
+    unreachable
+bb9:
+    %135 = const bool false
+    %136 = load i64, ptr %54
+    store i64 %136, ptr %0
+    %137 = const i64 8
+    %138 = gep i8, ptr %54, %137
+    %139 = const i64 8
+    %140 = gep i8, ptr %0, %139
+    %141 = load i64, ptr %138
+    store i64 %141, ptr %140
+    %142 = const i64 16
+    %143 = gep i8, ptr %54, %142
+    %144 = const i64 16
+    %145 = gep i8, ptr %0, %144
+    %146 = load i64, ptr %143
+    store i64 %146, ptr %145
+    %147 = const i64 24
+    %148 = gep i8, ptr %54, %147
+    %149 = const i64 24
+    %150 = gep i8, ptr %0, %149
+    %151 = load i64, ptr %148
+    store i64 %151, ptr %150
+    %152 = const i64 32
+    %153 = gep i8, ptr %54, %152
+    %154 = const i64 32
+    %155 = gep i8, ptr %0, %154
+    %156 = load i64, ptr %153
+    store i64 %156, ptr %155
+    %157 = const i64 40
+    %158 = gep i8, ptr %54, %157
+    %159 = const i64 40
+    %160 = gep i8, ptr %0, %159
+    %161 = load i64, ptr %158
+    store i64 %161, ptr %160
+    br bb33(%135)
+bb10(%11: ptr):
+    %162 = load i64, ptr %56
+    store i64 %162, ptr %57
+    %163 = const i64 8
+    %164 = gep i8, ptr %56, %163
+    %165 = const i64 8
+    %166 = gep i8, ptr %57, %165
+    %167 = load i64, ptr %164
+    store i64 %167, ptr %166
+    %168 = const i64 16
+    %169 = gep i8, ptr %56, %168
+    %170 = const i64 16
+    %171 = gep i8, ptr %57, %170
+    %172 = load i64, ptr %169
+    store i64 %172, ptr %171
+    %173 = const i64 24
+    %174 = gep i8, ptr %56, %173
+    %175 = const i64 24
+    %176 = gep i8, ptr %57, %175
+    %177 = load i64, ptr %174
+    store i64 %177, ptr %176
+    %178 = const i64 32
+    %179 = gep i8, ptr %56, %178
+    %180 = const i64 32
+    %181 = gep i8, ptr %57, %180
+    %182 = load i64, ptr %179
+    store i64 %182, ptr %181
+    %183 = const i64 40
+    %184 = gep i8, ptr %56, %183
+    %185 = const i64 40
+    %186 = gep i8, ptr %57, %185
+    %187 = load i64, ptr %184
+    store i64 %187, ptr %186
+    br bb11(%11)
+bb11(%12: ptr):
+    %188 = const bool true
+    %189 = load i64, ptr %57
+    store i64 %189, ptr %54
+    %190 = const i64 8
+    %191 = gep i8, ptr %57, %190
+    %192 = const i64 8
+    %193 = gep i8, ptr %54, %192
+    %194 = load i64, ptr %191
+    store i64 %194, ptr %193
+    %195 = const i64 16
+    %196 = gep i8, ptr %57, %195
+    %197 = const i64 16
+    %198 = gep i8, ptr %54, %197
+    %199 = load i64, ptr %196
+    store i64 %199, ptr %198
+    %200 = const i64 24
+    %201 = gep i8, ptr %57, %200
+    %202 = const i64 24
+    %203 = gep i8, ptr %54, %202
+    %204 = load i64, ptr %201
+    store i64 %204, ptr %203
+    %205 = const i64 32
+    %206 = gep i8, ptr %57, %205
+    %207 = const i64 32
+    %208 = gep i8, ptr %54, %207
+    %209 = load i64, ptr %206
+    store i64 %209, ptr %208
+    %210 = const i64 40
+    %211 = gep i8, ptr %57, %210
+    %212 = const i64 40
+    %213 = gep i8, ptr %54, %212
+    %214 = load i64, ptr %211
+    store i64 %214, ptr %213
+    br bb1(%12, %188)
+bb12(%13: ptr, %14: ptr, %15: ptr, %16: bool):
+    call @func.13(%58, %13, %15)
+    br bb13(%13, %14, %16)
+bb13(%17: ptr, %18: ptr, %19: bool):
+    %215 = const bool true
+    store ptr %58, ptr %59
+    %216 = load ptr, ptr %59
+    %217 = load i32, ptr %216
+    %218 = sext i32 %217 to i64
+    switch %218 [ 5: bb15(%17, %18) default: bb14(%18, %19) ]
+bb14(%20: ptr, %21: bool):
+    %219 = const bool false
+    %220 = load i64, ptr %58
+    store i64 %220, ptr %63
+    %221 = const i64 8
+    %222 = gep i8, ptr %58, %221
+    %223 = const i64 8
+    %224 = gep i8, ptr %63, %223
+    %225 = load i64, ptr %222
+    store i64 %225, ptr %224
+    %226 = const i64 16
+    %227 = gep i8, ptr %58, %226
+    %228 = const i64 16
+    %229 = gep i8, ptr %63, %228
+    %230 = load i64, ptr %227
+    store i64 %230, ptr %229
+    %231 = const i64 24
+    %232 = gep i8, ptr %58, %231
+    %233 = const i64 24
+    %234 = gep i8, ptr %63, %233
+    %235 = load i64, ptr %232
+    store i64 %235, ptr %234
+    %236 = const i64 32
+    %237 = gep i8, ptr %58, %236
+    %238 = const i64 32
+    %239 = gep i8, ptr %63, %238
+    %240 = load i64, ptr %237
+    store i64 %240, ptr %239
+    %241 = const i64 40
+    %242 = gep i8, ptr %58, %241
+    %243 = const i64 40
+    %244 = gep i8, ptr %63, %243
+    %245 = load i64, ptr %242
+    store i64 %245, ptr %244
+    %246 = const i64 64
+    %247 = heap_alloc rust_heap i8, %246, align 8
+    %248 = const u64 1
+    store u64 %248, ptr %247
+    %249 = const i64 8
+    %250 = gep i8, ptr %247, %249
+    %251 = const u64 1
+    store u64 %251, ptr %250
+    %252 = const i64 16
+    %253 = gep i8, ptr %247, %252
+    %254 = load i64, ptr %63
+    store i64 %254, ptr %253
+    %255 = const i64 8
+    %256 = gep i8, ptr %63, %255
+    %257 = const i64 8
+    %258 = gep i8, ptr %253, %257
+    %259 = load i64, ptr %256
+    store i64 %259, ptr %258
+    %260 = const i64 16
+    %261 = gep i8, ptr %63, %260
+    %262 = const i64 16
+    %263 = gep i8, ptr %253, %262
+    %264 = load i64, ptr %261
+    store i64 %264, ptr %263
+    %265 = const i64 24
+    %266 = gep i8, ptr %63, %265
+    %267 = const i64 24
+    %268 = gep i8, ptr %253, %267
+    %269 = load i64, ptr %266
+    store i64 %269, ptr %268
+    %270 = const i64 32
+    %271 = gep i8, ptr %63, %270
+    %272 = const i64 32
+    %273 = gep i8, ptr %253, %272
+    %274 = load i64, ptr %271
+    store i64 %274, ptr %273
+    %275 = const i64 40
+    %276 = gep i8, ptr %63, %275
+    %277 = const i64 40
+    %278 = gep i8, ptr %253, %277
+    %279 = load i64, ptr %276
+    store i64 %279, ptr %278
+    store ptr %247, ptr %62
+    br bb20(%20, %21)
+bb15(%22: ptr, %23: ptr):
+    %280 = load ptr, ptr %59
+    %281 = const i64 8
+    %282 = gep i8, ptr %280, %281
+    %283 = load ptr, ptr %59
+    %284 = const i64 16
+    %285 = gep i8, ptr %283, %284
+    %286 = load ptr, ptr %285
+    %287 = const i64 16
+    %288 = gep i8, ptr %286, %287
+    br bb16(%22, %23, %288)
+bb16(%24: ptr, %25: ptr, %26: ptr):
+    %289 = load ptr, ptr %25
+    %290 = const i64 16
+    %291 = gep i8, ptr %289, %290
+    br bb17(%24, %26, %291)
+bb17(%27: ptr, %28: ptr, %29: ptr):
+    call @func.21(%60, %28, %29)
+    br bb18(%27)
+bb18(%30: ptr):
+    br bb19(%30)
+bb19(%31: ptr):
+    %292 = const bool true
+    %293 = load i64, ptr %60
+    store i64 %293, ptr %54
+    %294 = const i64 8
+    %295 = gep i8, ptr %60, %294
+    %296 = const i64 8
+    %297 = gep i8, ptr %54, %296
+    %298 = load i64, ptr %295
+    store i64 %298, ptr %297
+    %299 = const i64 16
+    %300 = gep i8, ptr %60, %299
+    %301 = const i64 16
+    %302 = gep i8, ptr %54, %301
+    %303 = load i64, ptr %300
+    store i64 %303, ptr %302
+    %304 = const i64 24
+    %305 = gep i8, ptr %60, %304
+    %306 = const i64 24
+    %307 = gep i8, ptr %54, %306
+    %308 = load i64, ptr %305
+    store i64 %308, ptr %307
+    %309 = const i64 32
+    %310 = gep i8, ptr %60, %309
+    %311 = const i64 32
+    %312 = gep i8, ptr %54, %311
+    %313 = load i64, ptr %310
+    store i64 %313, ptr %312
+    %314 = const i64 40
+    %315 = gep i8, ptr %60, %314
+    %316 = const i64 40
+    %317 = gep i8, ptr %54, %316
+    %318 = load i64, ptr %315
+    store i64 %318, ptr %317
+    br bb25(%31, %292)
+bb20(%32: ptr, %33: bool):
+    %319 = call @func.12(%32)
+    br bb21(%319, %33)
+bb21(%34: ptr, %35: bool):
+    call @func.19(%65, %34)
+    br bb22(%35)
+bb22(%36: bool):
+    %320 = const i64 64
+    %321 = heap_alloc rust_heap i8, %320, align 8
+    %322 = const u64 1
+    store u64 %322, ptr %321
+    %323 = const i64 8
+    %324 = gep i8, ptr %321, %323
+    %325 = const u64 1
+    store u64 %325, ptr %324
+    %326 = const i64 16
+    %327 = gep i8, ptr %321, %326
+    %328 = load i64, ptr %65
+    store i64 %328, ptr %327
+    %329 = const i64 8
+    %330 = gep i8, ptr %65, %329
+    %331 = const i64 8
+    %332 = gep i8, ptr %327, %331
+    %333 = load i64, ptr %330
+    store i64 %333, ptr %332
+    %334 = const i64 16
+    %335 = gep i8, ptr %65, %334
+    %336 = const i64 16
+    %337 = gep i8, ptr %327, %336
+    %338 = load i64, ptr %335
+    store i64 %338, ptr %337
+    %339 = const i64 24
+    %340 = gep i8, ptr %65, %339
+    %341 = const i64 24
+    %342 = gep i8, ptr %327, %341
+    %343 = load i64, ptr %340
+    store i64 %343, ptr %342
+    %344 = const i64 32
+    %345 = gep i8, ptr %65, %344
+    %346 = const i64 32
+    %347 = gep i8, ptr %327, %346
+    %348 = load i64, ptr %345
+    store i64 %348, ptr %347
+    %349 = const i64 40
+    %350 = gep i8, ptr %65, %349
+    %351 = const i64 40
+    %352 = gep i8, ptr %327, %351
+    %353 = load i64, ptr %350
+    store i64 %353, ptr %352
+    store ptr %321, ptr %64
+    br bb23(%36)
+bb23(%37: bool):
+    %354 = load ptr, ptr %62
+    %355 = const i64 8
+    %356 = gep i8, ptr %61, %355
+    store ptr %354, ptr %356
+    %357 = load ptr, ptr %64
+    %358 = const i64 16
+    %359 = gep i8, ptr %61, %358
+    store ptr %357, ptr %359
+    %360 = const i32 4
+    store i32 %360, ptr %61
+    call @func.7(%0, %61)
+    br bb24(%37)
+bb24(%38: bool):
+    %361 = const bool false
+    br bb33(%38)
+bb25(%39: ptr, %40: bool):
+    %362 = const bool false
+    br bb1(%39, %40)
+bb26(%41: ptr, %42: ptr, %43: ptr):
+    %363 = load ptr, ptr %42
+    %364 = const i64 16
+    %365 = gep i8, ptr %363, %364
+    br bb27(%41, %43, %365)
+bb27(%44: ptr, %45: ptr, %46: ptr):
+    call @func.21(%66, %45, %46)
+    br bb28(%44)
+bb28(%47: ptr):
+    br bb29(%47)
+bb29(%48: ptr):
+    %366 = const bool true
+    %367 = load i64, ptr %66
+    store i64 %367, ptr %54
+    %368 = const i64 8
+    %369 = gep i8, ptr %66, %368
+    %370 = const i64 8
+    %371 = gep i8, ptr %54, %370
+    %372 = load i64, ptr %369
+    store i64 %372, ptr %371
+    %373 = const i64 16
+    %374 = gep i8, ptr %66, %373
+    %375 = const i64 16
+    %376 = gep i8, ptr %54, %375
+    %377 = load i64, ptr %374
+    store i64 %377, ptr %376
+    %378 = const i64 24
+    %379 = gep i8, ptr %66, %378
+    %380 = const i64 24
+    %381 = gep i8, ptr %54, %380
+    %382 = load i64, ptr %379
+    store i64 %382, ptr %381
+    %383 = const i64 32
+    %384 = gep i8, ptr %66, %383
+    %385 = const i64 32
+    %386 = gep i8, ptr %54, %385
+    %387 = load i64, ptr %384
+    store i64 %387, ptr %386
+    %388 = const i64 40
+    %389 = gep i8, ptr %66, %388
+    %390 = const i64 40
+    %391 = gep i8, ptr %54, %390
+    %392 = load i64, ptr %389
+    store i64 %392, ptr %391
+    br bb1(%48, %366)
+bb30(%49: ptr, %50: ptr):
+    call @func.19(%67, %50)
+    br bb31(%49)
+bb31(%51: ptr):
+    br bb32(%51)
+bb32(%52: ptr):
+    %393 = const bool true
+    %394 = load i64, ptr %67
+    store i64 %394, ptr %54
+    %395 = const i64 8
+    %396 = gep i8, ptr %67, %395
+    %397 = const i64 8
+    %398 = gep i8, ptr %54, %397
+    %399 = load i64, ptr %396
+    store i64 %399, ptr %398
+    %400 = const i64 16
+    %401 = gep i8, ptr %67, %400
+    %402 = const i64 16
+    %403 = gep i8, ptr %54, %402
+    %404 = load i64, ptr %401
+    store i64 %404, ptr %403
+    %405 = const i64 24
+    %406 = gep i8, ptr %67, %405
+    %407 = const i64 24
+    %408 = gep i8, ptr %54, %407
+    %409 = load i64, ptr %406
+    store i64 %409, ptr %408
+    %410 = const i64 32
+    %411 = gep i8, ptr %67, %410
+    %412 = const i64 32
+    %413 = gep i8, ptr %54, %412
+    %414 = load i64, ptr %411
+    store i64 %414, ptr %413
+    %415 = const i64 40
+    %416 = gep i8, ptr %67, %415
+    %417 = const i64 40
+    %418 = gep i8, ptr %54, %417
+    %419 = load i64, ptr %416
+    store i64 %419, ptr %418
+    br bb1(%52, %393)
+bb33(%53: bool):
+    condbr %53, bb35, bb34
+bb34:
+    %420 = const bool false
+    ret
+bb35:
+    br bb34
+}
+
+fn @mix2(functy.14) {
+bb0(%0: u64, %1: u64):
+    %3 = xor u64 %0, %1
+    %4 = const u64 1099511628211
+    %5 = call @func.23(%3, %4)
+    br bb1(%5)
+bb1(%2: u64):
+    ret %2
+}
+
+fn @Verifier__infer_sprop(functy.15) {
+bb0(%0: ptr, %1: ptr):
+    %2 = alloca i8, align 1
+    %3 = alloca (i64, i64, i64, i64, i64, i64), align 8
+    %4 = const i64 1
+    %5 = gep i8, ptr %1, %4
+    %6 = load i8, ptr %5
+    %7 = sext i8 %6 to i64
+    switch %7 [ 1: bb2 4: bb2 5: bb2 default: bb1 ]
+bb1:
+    %8 = const i8 0
+    store i8 %8, ptr %2
+    %9 = const i64 4
+    %10 = gep i8, ptr %0, %9
+    %11 = load i8, ptr %2
+    store i8 %11, ptr %10
+    %12 = const i32 12
+    store i32 %12, ptr %0
+    br bb4
+bb2:
+    %13 = const u32 1
+    call @func.18(%3, %13)
+    br bb3
+bb3:
+    %14 = load i64, ptr %3
+    store i64 %14, ptr %0
+    %15 = const i64 8
+    %16 = gep i8, ptr %3, %15
+    %17 = const i64 8
+    %18 = gep i8, ptr %0, %17
+    %19 = load i64, ptr %16
+    store i64 %19, ptr %18
+    %20 = const i64 16
+    %21 = gep i8, ptr %3, %20
+    %22 = const i64 16
+    %23 = gep i8, ptr %0, %22
+    %24 = load i64, ptr %21
+    store i64 %24, ptr %23
+    %25 = const i64 24
+    %26 = gep i8, ptr %3, %25
+    %27 = const i64 24
+    %28 = gep i8, ptr %0, %27
+    %29 = load i64, ptr %26
+    store i64 %29, ptr %28
+    %30 = const i64 32
+    %31 = gep i8, ptr %3, %30
+    %32 = const i64 32
+    %33 = gep i8, ptr %0, %32
+    %34 = load i64, ptr %31
+    store i64 %34, ptr %33
+    %35 = const i64 40
+    %36 = gep i8, ptr %3, %35
+    %37 = const i64 40
+    %38 = gep i8, ptr %0, %37
+    %39 = load i64, ptr %36
+    store i64 %39, ptr %38
+    br bb4
+bb4:
+    ret
+}
+
+fn @nat_type_name(functy.16) {
+bb0(%0: ptr):
+    %1 = const u64 1
+    store u64 %1, ptr %0
+    ret
+}
+
+fn @Verifier__const_type(functy.17) {
+bb0(%0: ptr, %1: ptr, %2: ptr):
+    %41 = alloca i64, align 8
+    %42 = alloca (i64, i64, i64, i64, i64, i64), align 8
+    %43 = alloca i64, align 8
+    %44 = alloca i64, align 8
+    %45 = alloca (i64, i64, i64, i64, i64, i64), align 8
+    %46 = alloca i64, align 8
+    %47 = alloca i64, align 8
+    %48 = alloca (i64, i64, i64, i64, i64, i64), align 8
+    %49 = alloca i64, align 8
+    %50 = alloca i64, align 8
+    %51 = alloca (i64, i64, i64, i64, i64, i64), align 8
+    %52 = alloca i64, align 8
+    %53 = alloca i64, align 8
+    %54 = alloca (i64, i64, i64, i64, i64, i64), align 8
+    %55 = alloca i64, align 8
+    %56 = alloca i64, align 8
+    %57 = alloca (i64, i64, i64, i64, i64, i64), align 8
+    %58 = alloca i64, align 8
+    %59 = alloca i64, align 8
+    %60 = alloca (i64, i64, i64, i64, i64, i64), align 8
+    call @func.1(%41)
+    br bb1(%2)
+bb1(%3: ptr):
+    %61 = call @func.24(%3, %41)
+    br bb2(%3, %61)
+bb2(%4: ptr, %5: bool):
+    condbr %5, bb3, bb5(%4)
+bb3:
+    call @func.5(%42)
+    br bb4
+bb4:
+    %62 = load i64, ptr %42
+    store i64 %62, ptr %0
+    %63 = const i64 8
+    %64 = gep i8, ptr %42, %63
+    %65 = const i64 8
+    %66 = gep i8, ptr %0, %65
+    %67 = load i64, ptr %64
+    store i64 %67, ptr %66
+    %68 = const i64 16
+    %69 = gep i8, ptr %42, %68
+    %70 = const i64 16
+    %71 = gep i8, ptr %0, %70
+    %72 = load i64, ptr %69
+    store i64 %72, ptr %71
+    %73 = const i64 24
+    %74 = gep i8, ptr %42, %73
+    %75 = const i64 24
+    %76 = gep i8, ptr %0, %75
+    %77 = load i64, ptr %74
+    store i64 %77, ptr %76
+    %78 = const i64 32
+    %79 = gep i8, ptr %42, %78
+    %80 = const i64 32
+    %81 = gep i8, ptr %0, %80
+    %82 = load i64, ptr %79
+    store i64 %82, ptr %81
+    %83 = const i64 40
+    %84 = gep i8, ptr %42, %83
+    %85 = const i64 40
+    %86 = gep i8, ptr %0, %85
+    %87 = load i64, ptr %84
+    store i64 %87, ptr %86
+    br bb48
+bb5(%6: ptr):
+    call @func.25(%43)
+    br bb6(%6)
+bb6(%7: ptr):
+    %88 = call @func.24(%7, %43)
+    br bb7(%7, %88)
+bb7(%8: ptr, %9: bool):
+    condbr %9, bb11, bb8(%8)
+bb8(%10: ptr):
+    call @func.26(%44)
+    br bb9(%10)
+bb9(%11: ptr):
+    %89 = call @func.24(%11, %44)
+    br bb10(%11, %89)
+bb10(%12: ptr, %13: bool):
+    condbr %13, bb11, bb14(%12)
+bb11:
+    call @func.1(%46)
+    br bb12
+bb12:
+    %90 = load u64, ptr %46
+    call @func.2(%45, %90)
+    br bb13
+bb13:
+    %91 = load i64, ptr %45
+    store i64 %91, ptr %0
+    %92 = const i64 8
+    %93 = gep i8, ptr %45, %92
+    %94 = const i64 8
+    %95 = gep i8, ptr %0, %94
+    %96 = load i64, ptr %93
+    store i64 %96, ptr %95
+    %97 = const i64 16
+    %98 = gep i8, ptr %45, %97
+    %99 = const i64 16
+    %100 = gep i8, ptr %0, %99
+    %101 = load i64, ptr %98
+    store i64 %101, ptr %100
+    %102 = const i64 24
+    %103 = gep i8, ptr %45, %102
+    %104 = const i64 24
+    %105 = gep i8, ptr %0, %104
+    %106 = load i64, ptr %103
+    store i64 %106, ptr %105
+    %107 = const i64 32
+    %108 = gep i8, ptr %45, %107
+    %109 = const i64 32
+    %110 = gep i8, ptr %0, %109
+    %111 = load i64, ptr %108
+    store i64 %111, ptr %110
+    %112 = const i64 40
+    %113 = gep i8, ptr %45, %112
+    %114 = const i64 40
+    %115 = gep i8, ptr %0, %114
+    %116 = load i64, ptr %113
+    store i64 %116, ptr %115
+    br bb48
+bb14(%14: ptr):
+    call @func.4(%47)
+    br bb15(%14)
+bb15(%15: ptr):
+    %117 = call @func.24(%15, %47)
+    br bb16(%15, %117)
+bb16(%16: ptr, %17: bool):
+    condbr %17, bb17, bb19(%16)
+bb17:
+    %118 = const u32 1
+    call @func.18(%48, %118)
+    br bb18
+bb18:
+    %119 = load i64, ptr %48
+    store i64 %119, ptr %0
+    %120 = const i64 8
+    %121 = gep i8, ptr %48, %120
+    %122 = const i64 8
+    %123 = gep i8, ptr %0, %122
+    %124 = load i64, ptr %121
+    store i64 %124, ptr %123
+    %125 = const i64 16
+    %126 = gep i8, ptr %48, %125
+    %127 = const i64 16
+    %128 = gep i8, ptr %0, %127
+    %129 = load i64, ptr %126
+    store i64 %129, ptr %128
+    %130 = const i64 24
+    %131 = gep i8, ptr %48, %130
+    %132 = const i64 24
+    %133 = gep i8, ptr %0, %132
+    %134 = load i64, ptr %131
+    store i64 %134, ptr %133
+    %135 = const i64 32
+    %136 = gep i8, ptr %48, %135
+    %137 = const i64 32
+    %138 = gep i8, ptr %0, %137
+    %139 = load i64, ptr %136
+    store i64 %139, ptr %138
+    %140 = const i64 40
+    %141 = gep i8, ptr %48, %140
+    %142 = const i64 40
+    %143 = gep i8, ptr %0, %142
+    %144 = load i64, ptr %141
+    store i64 %144, ptr %143
+    br bb48
+bb19(%18: ptr):
+    call @func.27(%49)
+    br bb20(%18)
+bb20(%19: ptr):
+    %145 = call @func.24(%19, %49)
+    br bb21(%19, %145)
+bb21(%20: ptr, %21: bool):
+    condbr %21, bb25, bb22(%20)
+bb22(%22: ptr):
+    call @func.28(%50)
+    br bb23(%22)
+bb23(%23: ptr):
+    %146 = call @func.24(%23, %50)
+    br bb24(%23, %146)
+bb24(%24: ptr, %25: bool):
+    condbr %25, bb25, bb28(%24)
+bb25:
+    call @func.4(%52)
+    br bb26
+bb26:
+    %147 = load u64, ptr %52
+    call @func.2(%51, %147)
+    br bb27
+bb27:
+    %148 = load i64, ptr %51
+    store i64 %148, ptr %0
+    %149 = const i64 8
+    %150 = gep i8, ptr %51, %149
+    %151 = const i64 8
+    %152 = gep i8, ptr %0, %151
+    %153 = load i64, ptr %150
+    store i64 %153, ptr %152
+    %154 = const i64 16
+    %155 = gep i8, ptr %51, %154
+    %156 = const i64 16
+    %157 = gep i8, ptr %0, %156
+    %158 = load i64, ptr %155
+    store i64 %158, ptr %157
+    %159 = const i64 24
+    %160 = gep i8, ptr %51, %159
+    %161 = const i64 24
+    %162 = gep i8, ptr %0, %161
+    %163 = load i64, ptr %160
+    store i64 %163, ptr %162
+    %164 = const i64 32
+    %165 = gep i8, ptr %51, %164
+    %166 = const i64 32
+    %167 = gep i8, ptr %0, %166
+    %168 = load i64, ptr %165
+    store i64 %168, ptr %167
+    %169 = const i64 40
+    %170 = gep i8, ptr %51, %169
+    %171 = const i64 40
+    %172 = gep i8, ptr %0, %171
+    %173 = load i64, ptr %170
+    store i64 %173, ptr %172
+    br bb48
+bb28(%26: ptr):
+    call @func.3(%53)
+    br bb29(%26)
+bb29(%27: ptr):
+    %174 = call @func.24(%27, %53)
+    br bb30(%27, %174)
+bb30(%28: ptr, %29: bool):
+    condbr %29, bb31, bb33(%28)
+bb31:
+    %175 = const u32 0
+    call @func.18(%54, %175)
+    br bb32
+bb32:
+    %176 = load i64, ptr %54
+    store i64 %176, ptr %0
+    %177 = const i64 8
+    %178 = gep i8, ptr %54, %177
+    %179 = const i64 8
+    %180 = gep i8, ptr %0, %179
+    %181 = load i64, ptr %178
+    store i64 %181, ptr %180
+    %182 = const i64 16
+    %183 = gep i8, ptr %54, %182
+    %184 = const i64 16
+    %185 = gep i8, ptr %0, %184
+    %186 = load i64, ptr %183
+    store i64 %186, ptr %185
+    %187 = const i64 24
+    %188 = gep i8, ptr %54, %187
+    %189 = const i64 24
+    %190 = gep i8, ptr %0, %189
+    %191 = load i64, ptr %188
+    store i64 %191, ptr %190
+    %192 = const i64 32
+    %193 = gep i8, ptr %54, %192
+    %194 = const i64 32
+    %195 = gep i8, ptr %0, %194
+    %196 = load i64, ptr %193
+    store i64 %196, ptr %195
+    %197 = const i64 40
+    %198 = gep i8, ptr %54, %197
+    %199 = const i64 40
+    %200 = gep i8, ptr %0, %199
+    %201 = load i64, ptr %198
+    store i64 %201, ptr %200
+    br bb48
+bb33(%30: ptr):
+    call @func.29(%55)
+    br bb34(%30)
+bb34(%31: ptr):
+    %202 = call @func.24(%31, %55)
+    br bb35(%31, %202)
+bb35(%32: ptr, %33: bool):
+    condbr %33, bb39, bb36(%32)
+bb36(%34: ptr):
+    call @func.30(%56)
+    br bb37(%34)
+bb37(%35: ptr):
+    %203 = call @func.24(%35, %56)
+    br bb38(%35, %203)
+bb38(%36: ptr, %37: bool):
+    condbr %37, bb39, bb42(%36)
+bb39:
+    call @func.3(%58)
+    br bb40
+bb40:
+    %204 = load u64, ptr %58
+    call @func.2(%57, %204)
+    br bb41
+bb41:
+    %205 = load i64, ptr %57
+    store i64 %205, ptr %0
+    %206 = const i64 8
+    %207 = gep i8, ptr %57, %206
+    %208 = const i64 8
+    %209 = gep i8, ptr %0, %208
+    %210 = load i64, ptr %207
+    store i64 %210, ptr %209
+    %211 = const i64 16
+    %212 = gep i8, ptr %57, %211
+    %213 = const i64 16
+    %214 = gep i8, ptr %0, %213
+    %215 = load i64, ptr %212
+    store i64 %215, ptr %214
+    %216 = const i64 24
+    %217 = gep i8, ptr %57, %216
+    %218 = const i64 24
+    %219 = gep i8, ptr %0, %218
+    %220 = load i64, ptr %217
+    store i64 %220, ptr %219
+    %221 = const i64 32
+    %222 = gep i8, ptr %57, %221
+    %223 = const i64 32
+    %224 = gep i8, ptr %0, %223
+    %225 = load i64, ptr %222
+    store i64 %225, ptr %224
+    %226 = const i64 40
+    %227 = gep i8, ptr %57, %226
+    %228 = const i64 40
+    %229 = gep i8, ptr %0, %228
+    %230 = load i64, ptr %227
+    store i64 %230, ptr %229
+    br bb48
+bb42(%38: ptr):
+    call @func.16(%59)
+    br bb43(%38)
+bb43(%39: ptr):
+    %231 = call @func.24(%39, %59)
+    br bb44(%231)
+bb44(%40: bool):
+    condbr %40, bb45, bb47
+bb45:
+    %232 = const u32 1
+    call @func.18(%60, %232)
+    br bb46
+bb46:
+    %233 = load i64, ptr %60
+    store i64 %233, ptr %0
+    %234 = const i64 8
+    %235 = gep i8, ptr %60, %234
+    %236 = const i64 8
+    %237 = gep i8, ptr %0, %236
+    %238 = load i64, ptr %235
+    store i64 %238, ptr %237
+    %239 = const i64 16
+    %240 = gep i8, ptr %60, %239
+    %241 = const i64 16
+    %242 = gep i8, ptr %0, %241
+    %243 = load i64, ptr %240
+    store i64 %243, ptr %242
+    %244 = const i64 24
+    %245 = gep i8, ptr %60, %244
+    %246 = const i64 24
+    %247 = gep i8, ptr %0, %246
+    %248 = load i64, ptr %245
+    store i64 %248, ptr %247
+    %249 = const i64 32
+    %250 = gep i8, ptr %60, %249
+    %251 = const i64 32
+    %252 = gep i8, ptr %0, %251
+    %253 = load i64, ptr %250
+    store i64 %253, ptr %252
+    %254 = const i64 40
+    %255 = gep i8, ptr %60, %254
+    %256 = const i64 40
+    %257 = gep i8, ptr %0, %256
+    %258 = load i64, ptr %255
+    store i64 %258, ptr %257
+    br bb48
+bb47:
+    %259 = const i32 12
+    store i32 %259, ptr %0
+    br bb48
+bb48:
+    ret
+}
+
+fn @Expr__sort(functy.18) {
+bb0(%0: ptr, %1: u32):
+    %2 = alloca (i64, i64, i64, i64), align 8
+    %3 = const i64 4
+    %4 = gep i8, ptr %2, %3
+    store u32 %1, ptr %4
+    %5 = const i32 2
+    store i32 %5, ptr %2
+    call @func.7(%0, %2)
+    br bb1
+bb1:
+    ret
+}
+
+fn @_Expr_as_std__clone__Clone___clone(functy.19) {
+bb0(%0: ptr, %1: ptr):
+    %2 = alloca i64, align 8
+    %3 = alloca (i64, i64, i64, i64), align 8
+    %4 = alloca (i64, i64), align 8
+    store ptr %1, ptr %2
+    %5 = load ptr, ptr %2
+    call @func.32(%3, %5)
+    br bb1
+bb1:
+    %6 = load ptr, ptr %2
+    %7 = const i64 32
+    %8 = gep i8, ptr %6, %7
+    call @func.33(%4, %8)
+    br bb2
+bb2:
+    %9 = load i64, ptr %3
+    store i64 %9, ptr %0
+    %10 = const i64 8
+    %11 = gep i8, ptr %3, %10
+    %12 = const i64 8
+    %13 = gep i8, ptr %0, %12
+    %14 = load i64, ptr %11
+    store i64 %14, ptr %13
+    %15 = const i64 16
+    %16 = gep i8, ptr %3, %15
+    %17 = const i64 16
+    %18 = gep i8, ptr %0, %17
+    %19 = load i64, ptr %16
+    store i64 %19, ptr %18
+    %20 = const i64 24
+    %21 = gep i8, ptr %3, %20
+    %22 = const i64 24
+    %23 = gep i8, ptr %0, %22
+    %24 = load i64, ptr %21
+    store i64 %24, ptr %23
+    %25 = const i64 32
+    %26 = gep i8, ptr %0, %25
+    %27 = load i64, ptr %4
+    store i64 %27, ptr %26
+    %28 = const i64 8
+    %29 = gep i8, ptr %4, %28
+    %30 = const i64 8
+    %31 = gep i8, ptr %26, %30
+    %32 = load i64, ptr %29
+    store i64 %32, ptr %31
+    ret
+}
+
+fn @Verifier__unfold_definition_model(functy.20) {
+bb0(%0: ptr, %1: ptr, %2: ptr):
+    %3 = const i32 12
+    store i32 %3, ptr %0
+    ret
+}
+
+fn @Expr__instantiate(functy.21) {
+bb0(%0: ptr, %1: ptr, %2: ptr):
+    %3 = const u32 0
+    call @func.34(%0, %1, %2, %3)
+    br bb1
+bb1:
+    ret
+}
+
+fn @_RNvMs7_NtCs2EYQwhfuABO_4core3numy12wrapping_mul(functy.22) {
+}
+
+fn @wmul(functy.23) {
+bb0(%0: u64, %1: u64):
+    %3 = call @func.22(%0, %1)
+    br bb1(%3)
+bb1(%2: u64):
+    ret %2
+}
+
+fn @name_eq(functy.24) {
+bb0(%0: ptr, %1: ptr):
+    %2 = load u64, ptr %0
+    %3 = load u64, ptr %1
+    %4 = icmp eq u64 %2, %3
+    ret %4
+}
+
+fn @nm_hp1(functy.25) {
+bb0(%0: ptr):
+    %1 = const u64 11
+    store u64 %1, ptr %0
+    ret
+}
+
+fn @nm_hp2(functy.26) {
+bb0(%0: ptr):
+    %1 = const u64 12
+    store u64 %1, ptr %0
+    ret
+}
+
+fn @nm_a(functy.27) {
+bb0(%0: ptr):
+    %1 = const u64 21
+    store u64 %1, ptr %0
+    ret
+}
+
+fn @nm_b(functy.28) {
+bb0(%0: ptr):
+    %1 = const u64 22
+    store u64 %1, ptr %0
+    ret
+}
+
+fn @nm_q1(functy.29) {
+bb0(%0: ptr):
+    %1 = const u64 31
+    store u64 %1, ptr %0
+    ret
+}
+
+fn @nm_q2(functy.30) {
+bb0(%0: ptr):
+    %1 = const u64 32
+    store u64 %1, ptr %0
+    ret
+}
+
+fn @_RNvXsu_NtCskTzINo8ZBH9_5alloc4syncINtB5_3ArcNtCsbl3Kp9dptzX_17clean_sprop_slice4ExprENtNtCs2EYQwhfuABO_4core5clone5Clone5cloneBI_(functy.31) {
+}
+
+fn @_ExprKind_as_std__clone__Clone___clone(functy.32) {
+bb0(%0: ptr, %1: ptr):
+    %11 = alloca i64, align 8
+    %12 = alloca i64, align 8
+    %13 = alloca i64, align 8
+    %14 = alloca i64, align 8
+    %15 = alloca i64, align 8
+    %16 = alloca i64, align 8
+    %17 = alloca i64, align 8
+    %18 = alloca i64, align 8
+    %19 = alloca i64, align 8
+    %20 = alloca i64, align 8
+    %21 = alloca i64, align 8
+    %22 = alloca i64, align 8
+    %23 = alloca i64, align 8
+    %24 = alloca i64, align 8
+    %25 = alloca i64, align 8
+    %26 = alloca i64, align 8
+    store ptr %1, ptr %11
+    %27 = load ptr, ptr %11
+    %28 = load i32, ptr %27
+    %29 = sext i32 %28 to i64
+    switch %29 [ 0: bb13 1: bb12 2: bb11 3: bb10 4: bb9 5: bb8 6: bb7 7: bb6 8: bb5 9: bb4 10: bb3 11: bb2 default: bb1 ]
+bb1:
+    unreachable
+bb2:
+    %30 = const i32 11
+    store i32 %30, ptr %0
+    br bb29
+bb3:
+    %31 = load ptr, ptr %11
+    %32 = const i64 8
+    %33 = gep i8, ptr %31, %32
+    call @func.31(%26, %33)
+    br bb28
+bb4:
+    %34 = load ptr, ptr %11
+    %35 = const i64 8
+    %36 = gep i8, ptr %34, %35
+    %37 = load ptr, ptr %11
+    %38 = const i64 4
+    %39 = gep i8, ptr %37, %38
+    %40 = load ptr, ptr %11
+    %41 = const i64 16
+    %42 = gep i8, ptr %40, %41
+    call @func.35(%24, %36)
+    br bb26(%39, %42)
+bb5:
+    %43 = load ptr, ptr %11
+    %44 = const i64 8
+    %45 = gep i8, ptr %43, %44
+    call @func.36(%23, %45)
+    br bb25
+bb6:
+    %46 = load ptr, ptr %11
+    %47 = const i64 8
+    %48 = gep i8, ptr %46, %47
+    %49 = load ptr, ptr %11
+    %50 = const i64 16
+    %51 = gep i8, ptr %49, %50
+    %52 = load ptr, ptr %11
+    %53 = const i64 24
+    %54 = gep i8, ptr %52, %53
+    call @func.31(%20, %48)
+    br bb22(%51, %54)
+bb7:
+    %55 = load ptr, ptr %11
+    %56 = const i64 8
+    %57 = gep i8, ptr %55, %56
+    %58 = load ptr, ptr %11
+    %59 = const i64 16
+    %60 = gep i8, ptr %58, %59
+    call @func.31(%18, %57)
+    br bb20(%60)
+bb8:
+    %61 = load ptr, ptr %11
+    %62 = const i64 8
+    %63 = gep i8, ptr %61, %62
+    %64 = load ptr, ptr %11
+    %65 = const i64 16
+    %66 = gep i8, ptr %64, %65
+    call @func.31(%16, %63)
+    br bb18(%66)
+bb9:
+    %67 = load ptr, ptr %11
+    %68 = const i64 8
+    %69 = gep i8, ptr %67, %68
+    %70 = load ptr, ptr %11
+    %71 = const i64 16
+    %72 = gep i8, ptr %70, %71
+    call @func.31(%14, %69)
+    br bb16(%72)
+bb10:
+    %73 = load ptr, ptr %11
+    %74 = const i64 8
+    %75 = gep i8, ptr %73, %74
+    call @func.35(%13, %75)
+    br bb15
+bb11:
+    %76 = load ptr, ptr %11
+    %77 = const i64 4
+    %78 = gep i8, ptr %76, %77
+    %79 = load u32, ptr %78
+    %80 = const i64 4
+    %81 = gep i8, ptr %0, %80
+    store u32 %79, ptr %81
+    %82 = const i32 2
+    store i32 %82, ptr %0
+    br bb29
+bb12:
+    %83 = load ptr, ptr %11
+    %84 = const i64 8
+    %85 = gep i8, ptr %83, %84
+    call @func.37(%12, %85)
+    br bb14
+bb13:
+    %86 = load ptr, ptr %11
+    %87 = const i64 4
+    %88 = gep i8, ptr %86, %87
+    %89 = load u32, ptr %88
+    %90 = const i64 4
+    %91 = gep i8, ptr %0, %90
+    store u32 %89, ptr %91
+    %92 = const i32 0
+    store i32 %92, ptr %0
+    br bb29
+bb14:
+    %93 = const i64 8
+    %94 = gep i8, ptr %0, %93
+    %95 = load i64, ptr %12
+    store i64 %95, ptr %94
+    %96 = const i32 1
+    store i32 %96, ptr %0
+    br bb29
+bb15:
+    %97 = const i64 8
+    %98 = gep i8, ptr %0, %97
+    %99 = load i64, ptr %13
+    store i64 %99, ptr %98
+    %100 = const i32 3
+    store i32 %100, ptr %0
+    br bb29
+bb16(%2: ptr):
+    call @func.31(%15, %2)
+    br bb17
+bb17:
+    %101 = load ptr, ptr %14
+    %102 = const i64 8
+    %103 = gep i8, ptr %0, %102
+    store ptr %101, ptr %103
+    %104 = load ptr, ptr %15
+    %105 = const i64 16
+    %106 = gep i8, ptr %0, %105
+    store ptr %104, ptr %106
+    %107 = const i32 4
+    store i32 %107, ptr %0
+    br bb29
+bb18(%3: ptr):
+    call @func.31(%17, %3)
+    br bb19
+bb19:
+    %108 = load ptr, ptr %16
+    %109 = const i64 8
+    %110 = gep i8, ptr %0, %109
+    store ptr %108, ptr %110
+    %111 = load ptr, ptr %17
+    %112 = const i64 16
+    %113 = gep i8, ptr %0, %112
+    store ptr %111, ptr %113
+    %114 = const i32 5
+    store i32 %114, ptr %0
+    br bb29
+bb20(%4: ptr):
+    call @func.31(%19, %4)
+    br bb21
+bb21:
+    %115 = load ptr, ptr %18
+    %116 = const i64 8
+    %117 = gep i8, ptr %0, %116
+    store ptr %115, ptr %117
+    %118 = load ptr, ptr %19
+    %119 = const i64 16
+    %120 = gep i8, ptr %0, %119
+    store ptr %118, ptr %120
+    %121 = const i32 6
+    store i32 %121, ptr %0
+    br bb29
+bb22(%5: ptr, %6: ptr):
+    call @func.31(%21, %5)
+    br bb23(%6)
+bb23(%7: ptr):
+    call @func.31(%22, %7)
+    br bb24
+bb24:
+    %122 = load ptr, ptr %20
+    %123 = const i64 8
+    %124 = gep i8, ptr %0, %123
+    store ptr %122, ptr %124
+    %125 = load ptr, ptr %21
+    %126 = const i64 16
+    %127 = gep i8, ptr %0, %126
+    store ptr %125, ptr %127
+    %128 = load ptr, ptr %22
+    %129 = const i64 24
+    %130 = gep i8, ptr %0, %129
+    store ptr %128, ptr %130
+    %131 = const i32 7
+    store i32 %131, ptr %0
+    br bb29
+bb25:
+    %132 = const i64 8
+    %133 = gep i8, ptr %0, %132
+    %134 = load i64, ptr %23
+    store i64 %134, ptr %133
+    %135 = const i32 8
+    store i32 %135, ptr %0
+    br bb29
+bb26(%8: ptr, %9: ptr):
+    %136 = load u32, ptr %8
+    call @func.31(%25, %9)
+    br bb27(%136)
+bb27(%10: u32):
+    %137 = const i64 8
+    %138 = gep i8, ptr %0, %137
+    %139 = load i64, ptr %24
+    store i64 %139, ptr %138
+    %140 = const i64 4
+    %141 = gep i8, ptr %0, %140
+    store u32 %10, ptr %141
+    %142 = load ptr, ptr %25
+    %143 = const i64 16
+    %144 = gep i8, ptr %0, %143
+    store ptr %142, ptr %144
+    %145 = const i32 9
+    store i32 %145, ptr %0
+    br bb29
+bb28:
+    %146 = load ptr, ptr %26
+    %147 = const i64 8
+    %148 = gep i8, ptr %0, %147
+    store ptr %146, ptr %148
+    %149 = const i32 10
+    store i32 %149, ptr %0
+    br bb29
+bb29:
+    ret
+}
+
+fn @_ExprMeta_as_std__clone__Clone___clone(functy.33) {
+bb0(%0: ptr, %1: ptr):
+    %2 = load i64, ptr %1
+    store i64 %2, ptr %0
+    %3 = const i64 8
+    %4 = gep i8, ptr %1, %3
+    %5 = const i64 8
+    %6 = gep i8, ptr %0, %5
+    %7 = load i64, ptr %4
+    store i64 %7, ptr %6
+    ret
+}
+
+fn @Expr__inst_at(functy.34) {
+bb0(%0: ptr, %1: ptr, %2: ptr, %3: u32):
+    %99 = alloca i64, align 8
+    %100 = alloca i64, align 8
+    %101 = alloca (i64, i64, i64, i64), align 8
+    %102 = alloca i64, align 8
+    %103 = alloca (i64, i64, i64, i64, i64, i64), align 8
+    %104 = alloca i64, align 8
+    %105 = alloca (i64, i64, i64, i64, i64, i64), align 8
+    %106 = alloca (i64, i64, i64, i64), align 8
+    %107 = alloca i64, align 8
+    %108 = alloca (i64, i64, i64, i64, i64, i64), align 8
+    %109 = alloca i64, align 8
+    %110 = alloca (i64, i64, i64, i64, i64, i64), align 8
+    %111 = alloca (i32, i32), align 4
+    %112 = alloca (i64, i64, i64, i64), align 8
+    %113 = alloca i64, align 8
+    %114 = alloca (i64, i64, i64, i64, i64, i64), align 8
+    %115 = alloca i64, align 8
+    %116 = alloca (i64, i64, i64, i64, i64, i64), align 8
+    %117 = alloca (i32, i32), align 4
+    %118 = alloca (i64, i64, i64, i64), align 8
+    %119 = alloca i64, align 8
+    %120 = alloca (i64, i64, i64, i64, i64, i64), align 8
+    %121 = alloca i64, align 8
+    %122 = alloca (i64, i64, i64, i64, i64, i64), align 8
+    %123 = alloca i64, align 8
+    %124 = alloca (i64, i64, i64, i64, i64, i64), align 8
+    %125 = alloca (i32, i32), align 4
+    %126 = alloca (i64, i64, i64, i64), align 8
+    %127 = alloca i64, align 8
+    %128 = alloca i64, align 8
+    %129 = alloca (i64, i64, i64, i64, i64, i64), align 8
+    %130 = alloca (i64, i64, i64, i64), align 8
+    %131 = alloca i64, align 8
+    %132 = alloca (i64, i64, i64, i64, i64, i64), align 8
+    store ptr %1, ptr %99
+    %133 = load ptr, ptr %99
+    store ptr %133, ptr %100
+    %134 = load ptr, ptr %100
+    %135 = load i32, ptr %134
+    %136 = sext i32 %135 to i64
+    switch %136 [ 0: bb8(%2, %3) 4: bb7(%2, %3) 5: bb6(%2, %3) 6: bb5(%2, %3) 7: bb4(%2, %3) 9: bb3(%2, %3) 10: bb2(%2, %3) default: bb1 ]
+bb1:
+    %137 = load ptr, ptr %99
+    call @func.19(%0, %137)
+    br bb47
+bb2(%4: ptr, %5: u32):
+    %138 = load ptr, ptr %100
+    %139 = const i64 8
+    %140 = gep i8, ptr %138, %139
+    %141 = load ptr, ptr %140
+    %142 = const i64 16
+    %143 = gep i8, ptr %141, %142
+    br bb44(%4, %5, %143)
+bb3(%6: ptr, %7: u32):
+    %144 = load ptr, ptr %100
+    %145 = const i64 8
+    %146 = gep i8, ptr %144, %145
+    %147 = load ptr, ptr %100
+    %148 = const i64 4
+    %149 = gep i8, ptr %147, %148
+    %150 = load ptr, ptr %100
+    %151 = const i64 16
+    %152 = gep i8, ptr %150, %151
+    %153 = load i64, ptr %146
+    store i64 %153, ptr %127
+    %154 = load u32, ptr %149
+    %155 = load ptr, ptr %152
+    %156 = const i64 16
+    %157 = gep i8, ptr %155, %156
+    br bb41(%6, %7, %154, %157)
+bb4(%8: ptr, %9: u32):
+    %158 = load ptr, ptr %100
+    %159 = const i64 8
+    %160 = gep i8, ptr %158, %159
+    %161 = load ptr, ptr %100
+    %162 = const i64 16
+    %163 = gep i8, ptr %161, %162
+    %164 = load ptr, ptr %100
+    %165 = const i64 24
+    %166 = gep i8, ptr %164, %165
+    %167 = load ptr, ptr %160
+    %168 = const i64 16
+    %169 = gep i8, ptr %167, %168
+    br bb31(%8, %9, %163, %166, %169)
+bb5(%10: ptr, %11: u32):
+    %170 = load ptr, ptr %100
+    %171 = const i64 8
+    %172 = gep i8, ptr %170, %171
+    %173 = load ptr, ptr %100
+    %174 = const i64 16
+    %175 = gep i8, ptr %173, %174
+    %176 = load ptr, ptr %172
+    %177 = const i64 16
+    %178 = gep i8, ptr %176, %177
+    br bb24(%10, %11, %175, %178)
+bb6(%12: ptr, %13: u32):
+    %179 = load ptr, ptr %100
+    %180 = const i64 8
+    %181 = gep i8, ptr %179, %180
+    %182 = load ptr, ptr %100
+    %183 = const i64 16
+    %184 = gep i8, ptr %182, %183
+    %185 = load ptr, ptr %181
+    %186 = const i64 16
+    %187 = gep i8, ptr %185, %186
+    br bb17(%12, %13, %184, %187)
+bb7(%14: ptr, %15: u32):
+    %188 = load ptr, ptr %100
+    %189 = const i64 8
+    %190 = gep i8, ptr %188, %189
+    %191 = load ptr, ptr %100
+    %192 = const i64 16
+    %193 = gep i8, ptr %191, %192
+    %194 = load ptr, ptr %190
+    %195 = const i64 16
+    %196 = gep i8, ptr %194, %195
+    br bb11(%14, %15, %193, %196)
+bb8(%16: ptr, %17: u32):
+    %197 = load ptr, ptr %100
+    %198 = const i64 4
+    %199 = gep i8, ptr %197, %198
+    %200 = load u32, ptr %199
+    %201 = icmp eq u32 %200, %17
+    condbr %201, bb9(%16), bb10
+bb9(%18: ptr):
+    call @func.19(%0, %18)
+    br bb47
+bb10:
+    %202 = load ptr, ptr %99
+    call @func.19(%0, %202)
+    br bb47
+bb11(%19: ptr, %20: u32, %21: ptr, %22: ptr):
+    call @func.34(%103, %22, %19, %20)
+    br bb12(%19, %20, %21)
+bb12(%23: ptr, %24: u32, %25: ptr):
+    %203 = const i64 64
+    %204 = heap_alloc rust_heap i8, %203, align 8
+    %205 = const u64 1
+    store u64 %205, ptr %204
+    %206 = const i64 8
+    %207 = gep i8, ptr %204, %206
+    %208 = const u64 1
+    store u64 %208, ptr %207
+    %209 = const i64 16
+    %210 = gep i8, ptr %204, %209
+    %211 = load i64, ptr %103
+    store i64 %211, ptr %210
+    %212 = const i64 8
+    %213 = gep i8, ptr %103, %212
+    %214 = const i64 8
+    %215 = gep i8, ptr %210, %214
+    %216 = load i64, ptr %213
+    store i64 %216, ptr %215
+    %217 = const i64 16
+    %218 = gep i8, ptr %103, %217
+    %219 = const i64 16
+    %220 = gep i8, ptr %210, %219
+    %221 = load i64, ptr %218
+    store i64 %221, ptr %220
+    %222 = const i64 24
+    %223 = gep i8, ptr %103, %222
+    %224 = const i64 24
+    %225 = gep i8, ptr %210, %224
+    %226 = load i64, ptr %223
+    store i64 %226, ptr %225
+    %227 = const i64 32
+    %228 = gep i8, ptr %103, %227
+    %229 = const i64 32
+    %230 = gep i8, ptr %210, %229
+    %231 = load i64, ptr %228
+    store i64 %231, ptr %230
+    %232 = const i64 40
+    %233 = gep i8, ptr %103, %232
+    %234 = const i64 40
+    %235 = gep i8, ptr %210, %234
+    %236 = load i64, ptr %233
+    store i64 %236, ptr %235
+    store ptr %204, ptr %102
+    br bb13(%23, %24, %25)
+bb13(%26: ptr, %27: u32, %28: ptr):
+    %237 = load ptr, ptr %28
+    %238 = const i64 16
+    %239 = gep i8, ptr %237, %238
+    br bb14(%26, %27, %239)
+bb14(%29: ptr, %30: u32, %31: ptr):
+    call @func.34(%105, %31, %29, %30)
+    br bb15
+bb15:
+    %240 = const i64 64
+    %241 = heap_alloc rust_heap i8, %240, align 8
+    %242 = const u64 1
+    store u64 %242, ptr %241
+    %243 = const i64 8
+    %244 = gep i8, ptr %241, %243
+    %245 = const u64 1
+    store u64 %245, ptr %244
+    %246 = const i64 16
+    %247 = gep i8, ptr %241, %246
+    %248 = load i64, ptr %105
+    store i64 %248, ptr %247
+    %249 = const i64 8
+    %250 = gep i8, ptr %105, %249
+    %251 = const i64 8
+    %252 = gep i8, ptr %247, %251
+    %253 = load i64, ptr %250
+    store i64 %253, ptr %252
+    %254 = const i64 16
+    %255 = gep i8, ptr %105, %254
+    %256 = const i64 16
+    %257 = gep i8, ptr %247, %256
+    %258 = load i64, ptr %255
+    store i64 %258, ptr %257
+    %259 = const i64 24
+    %260 = gep i8, ptr %105, %259
+    %261 = const i64 24
+    %262 = gep i8, ptr %247, %261
+    %263 = load i64, ptr %260
+    store i64 %263, ptr %262
+    %264 = const i64 32
+    %265 = gep i8, ptr %105, %264
+    %266 = const i64 32
+    %267 = gep i8, ptr %247, %266
+    %268 = load i64, ptr %265
+    store i64 %268, ptr %267
+    %269 = const i64 40
+    %270 = gep i8, ptr %105, %269
+    %271 = const i64 40
+    %272 = gep i8, ptr %247, %271
+    %273 = load i64, ptr %270
+    store i64 %273, ptr %272
+    store ptr %241, ptr %104
+    br bb16
+bb16:
+    %274 = load ptr, ptr %102
+    %275 = const i64 8
+    %276 = gep i8, ptr %101, %275
+    store ptr %274, ptr %276
+    %277 = load ptr, ptr %104
+    %278 = const i64 16
+    %279 = gep i8, ptr %101, %278
+    store ptr %277, ptr %279
+    %280 = const i32 4
+    store i32 %280, ptr %101
+    call @func.7(%0, %101)
+    br bb47
+bb17(%32: ptr, %33: u32, %34: ptr, %35: ptr):
+    call @func.34(%108, %35, %32, %33)
+    br bb18(%32, %33, %34)
+bb18(%36: ptr, %37: u32, %38: ptr):
+    %281 = const i64 64
+    %282 = heap_alloc rust_heap i8, %281, align 8
+    %283 = const u64 1
+    store u64 %283, ptr %282
+    %284 = const i64 8
+    %285 = gep i8, ptr %282, %284
+    %286 = const u64 1
+    store u64 %286, ptr %285
+    %287 = const i64 16
+    %288 = gep i8, ptr %282, %287
+    %289 = load i64, ptr %108
+    store i64 %289, ptr %288
+    %290 = const i64 8
+    %291 = gep i8, ptr %108, %290
+    %292 = const i64 8
+    %293 = gep i8, ptr %288, %292
+    %294 = load i64, ptr %291
+    store i64 %294, ptr %293
+    %295 = const i64 16
+    %296 = gep i8, ptr %108, %295
+    %297 = const i64 16
+    %298 = gep i8, ptr %288, %297
+    %299 = load i64, ptr %296
+    store i64 %299, ptr %298
+    %300 = const i64 24
+    %301 = gep i8, ptr %108, %300
+    %302 = const i64 24
+    %303 = gep i8, ptr %288, %302
+    %304 = load i64, ptr %301
+    store i64 %304, ptr %303
+    %305 = const i64 32
+    %306 = gep i8, ptr %108, %305
+    %307 = const i64 32
+    %308 = gep i8, ptr %288, %307
+    %309 = load i64, ptr %306
+    store i64 %309, ptr %308
+    %310 = const i64 40
+    %311 = gep i8, ptr %108, %310
+    %312 = const i64 40
+    %313 = gep i8, ptr %288, %312
+    %314 = load i64, ptr %311
+    store i64 %314, ptr %313
+    store ptr %282, ptr %107
+    br bb19(%36, %37, %38)
+bb19(%39: ptr, %40: u32, %41: ptr):
+    %315 = load ptr, ptr %41
+    %316 = const i64 16
+    %317 = gep i8, ptr %315, %316
+    br bb20(%39, %40, %317)
+bb20(%42: ptr, %43: u32, %44: ptr):
+    %318 = const u32 1
+    %319, %320 = add.overflow u32 %43, %318
+    store u32 %319, ptr %111
+    %321 = const i64 4
+    %322 = gep i8, ptr %111, %321
+    store bool %320, ptr %322
+    %323 = const i64 4
+    %324 = gep i8, ptr %111, %323
+    %325 = load bool, ptr %324
+    %326 = const bool false
+    %327 = icmp eq bool %325, %326
+    condbr %327, bb21(%42, %44), bb48
+bb21(%45: ptr, %46: ptr):
+    %328 = load u32, ptr %111
+    call @func.34(%110, %46, %45, %328)
+    br bb22
+bb22:
+    %329 = const i64 64
+    %330 = heap_alloc rust_heap i8, %329, align 8
+    %331 = const u64 1
+    store u64 %331, ptr %330
+    %332 = const i64 8
+    %333 = gep i8, ptr %330, %332
+    %334 = const u64 1
+    store u64 %334, ptr %333
+    %335 = const i64 16
+    %336 = gep i8, ptr %330, %335
+    %337 = load i64, ptr %110
+    store i64 %337, ptr %336
+    %338 = const i64 8
+    %339 = gep i8, ptr %110, %338
+    %340 = const i64 8
+    %341 = gep i8, ptr %336, %340
+    %342 = load i64, ptr %339
+    store i64 %342, ptr %341
+    %343 = const i64 16
+    %344 = gep i8, ptr %110, %343
+    %345 = const i64 16
+    %346 = gep i8, ptr %336, %345
+    %347 = load i64, ptr %344
+    store i64 %347, ptr %346
+    %348 = const i64 24
+    %349 = gep i8, ptr %110, %348
+    %350 = const i64 24
+    %351 = gep i8, ptr %336, %350
+    %352 = load i64, ptr %349
+    store i64 %352, ptr %351
+    %353 = const i64 32
+    %354 = gep i8, ptr %110, %353
+    %355 = const i64 32
+    %356 = gep i8, ptr %336, %355
+    %357 = load i64, ptr %354
+    store i64 %357, ptr %356
+    %358 = const i64 40
+    %359 = gep i8, ptr %110, %358
+    %360 = const i64 40
+    %361 = gep i8, ptr %336, %360
+    %362 = load i64, ptr %359
+    store i64 %362, ptr %361
+    store ptr %330, ptr %109
+    br bb23
+bb23:
+    %363 = load ptr, ptr %107
+    %364 = const i64 8
+    %365 = gep i8, ptr %106, %364
+    store ptr %363, ptr %365
+    %366 = load ptr, ptr %109
+    %367 = const i64 16
+    %368 = gep i8, ptr %106, %367
+    store ptr %366, ptr %368
+    %369 = const i32 5
+    store i32 %369, ptr %106
+    call @func.7(%0, %106)
+    br bb47
+bb24(%47: ptr, %48: u32, %49: ptr, %50: ptr):
+    call @func.34(%114, %50, %47, %48)
+    br bb25(%47, %48, %49)
+bb25(%51: ptr, %52: u32, %53: ptr):
+    %370 = const i64 64
+    %371 = heap_alloc rust_heap i8, %370, align 8
+    %372 = const u64 1
+    store u64 %372, ptr %371
+    %373 = const i64 8
+    %374 = gep i8, ptr %371, %373
+    %375 = const u64 1
+    store u64 %375, ptr %374
+    %376 = const i64 16
+    %377 = gep i8, ptr %371, %376
+    %378 = load i64, ptr %114
+    store i64 %378, ptr %377
+    %379 = const i64 8
+    %380 = gep i8, ptr %114, %379
+    %381 = const i64 8
+    %382 = gep i8, ptr %377, %381
+    %383 = load i64, ptr %380
+    store i64 %383, ptr %382
+    %384 = const i64 16
+    %385 = gep i8, ptr %114, %384
+    %386 = const i64 16
+    %387 = gep i8, ptr %377, %386
+    %388 = load i64, ptr %385
+    store i64 %388, ptr %387
+    %389 = const i64 24
+    %390 = gep i8, ptr %114, %389
+    %391 = const i64 24
+    %392 = gep i8, ptr %377, %391
+    %393 = load i64, ptr %390
+    store i64 %393, ptr %392
+    %394 = const i64 32
+    %395 = gep i8, ptr %114, %394
+    %396 = const i64 32
+    %397 = gep i8, ptr %377, %396
+    %398 = load i64, ptr %395
+    store i64 %398, ptr %397
+    %399 = const i64 40
+    %400 = gep i8, ptr %114, %399
+    %401 = const i64 40
+    %402 = gep i8, ptr %377, %401
+    %403 = load i64, ptr %400
+    store i64 %403, ptr %402
+    store ptr %371, ptr %113
+    br bb26(%51, %52, %53)
+bb26(%54: ptr, %55: u32, %56: ptr):
+    %404 = load ptr, ptr %56
+    %405 = const i64 16
+    %406 = gep i8, ptr %404, %405
+    br bb27(%54, %55, %406)
+bb27(%57: ptr, %58: u32, %59: ptr):
+    %407 = const u32 1
+    %408, %409 = add.overflow u32 %58, %407
+    store u32 %408, ptr %117
+    %410 = const i64 4
+    %411 = gep i8, ptr %117, %410
+    store bool %409, ptr %411
+    %412 = const i64 4
+    %413 = gep i8, ptr %117, %412
+    %414 = load bool, ptr %413
+    %415 = const bool false
+    %416 = icmp eq bool %414, %415
+    condbr %416, bb28(%57, %59), bb48
+bb28(%60: ptr, %61: ptr):
+    %417 = load u32, ptr %117
+    call @func.34(%116, %61, %60, %417)
+    br bb29
+bb29:
+    %418 = const i64 64
+    %419 = heap_alloc rust_heap i8, %418, align 8
+    %420 = const u64 1
+    store u64 %420, ptr %419
+    %421 = const i64 8
+    %422 = gep i8, ptr %419, %421
+    %423 = const u64 1
+    store u64 %423, ptr %422
+    %424 = const i64 16
+    %425 = gep i8, ptr %419, %424
+    %426 = load i64, ptr %116
+    store i64 %426, ptr %425
+    %427 = const i64 8
+    %428 = gep i8, ptr %116, %427
+    %429 = const i64 8
+    %430 = gep i8, ptr %425, %429
+    %431 = load i64, ptr %428
+    store i64 %431, ptr %430
+    %432 = const i64 16
+    %433 = gep i8, ptr %116, %432
+    %434 = const i64 16
+    %435 = gep i8, ptr %425, %434
+    %436 = load i64, ptr %433
+    store i64 %436, ptr %435
+    %437 = const i64 24
+    %438 = gep i8, ptr %116, %437
+    %439 = const i64 24
+    %440 = gep i8, ptr %425, %439
+    %441 = load i64, ptr %438
+    store i64 %441, ptr %440
+    %442 = const i64 32
+    %443 = gep i8, ptr %116, %442
+    %444 = const i64 32
+    %445 = gep i8, ptr %425, %444
+    %446 = load i64, ptr %443
+    store i64 %446, ptr %445
+    %447 = const i64 40
+    %448 = gep i8, ptr %116, %447
+    %449 = const i64 40
+    %450 = gep i8, ptr %425, %449
+    %451 = load i64, ptr %448
+    store i64 %451, ptr %450
+    store ptr %419, ptr %115
+    br bb30
+bb30:
+    %452 = load ptr, ptr %113
+    %453 = const i64 8
+    %454 = gep i8, ptr %112, %453
+    store ptr %452, ptr %454
+    %455 = load ptr, ptr %115
+    %456 = const i64 16
+    %457 = gep i8, ptr %112, %456
+    store ptr %455, ptr %457
+    %458 = const i32 6
+    store i32 %458, ptr %112
+    call @func.7(%0, %112)
+    br bb47
+bb31(%62: ptr, %63: u32, %64: ptr, %65: ptr, %66: ptr):
+    call @func.34(%120, %66, %62, %63)
+    br bb32(%62, %63, %64, %65)
+bb32(%67: ptr, %68: u32, %69: ptr, %70: ptr):
+    %459 = const i64 64
+    %460 = heap_alloc rust_heap i8, %459, align 8
+    %461 = const u64 1
+    store u64 %461, ptr %460
+    %462 = const i64 8
+    %463 = gep i8, ptr %460, %462
+    %464 = const u64 1
+    store u64 %464, ptr %463
+    %465 = const i64 16
+    %466 = gep i8, ptr %460, %465
+    %467 = load i64, ptr %120
+    store i64 %467, ptr %466
+    %468 = const i64 8
+    %469 = gep i8, ptr %120, %468
+    %470 = const i64 8
+    %471 = gep i8, ptr %466, %470
+    %472 = load i64, ptr %469
+    store i64 %472, ptr %471
+    %473 = const i64 16
+    %474 = gep i8, ptr %120, %473
+    %475 = const i64 16
+    %476 = gep i8, ptr %466, %475
+    %477 = load i64, ptr %474
+    store i64 %477, ptr %476
+    %478 = const i64 24
+    %479 = gep i8, ptr %120, %478
+    %480 = const i64 24
+    %481 = gep i8, ptr %466, %480
+    %482 = load i64, ptr %479
+    store i64 %482, ptr %481
+    %483 = const i64 32
+    %484 = gep i8, ptr %120, %483
+    %485 = const i64 32
+    %486 = gep i8, ptr %466, %485
+    %487 = load i64, ptr %484
+    store i64 %487, ptr %486
+    %488 = const i64 40
+    %489 = gep i8, ptr %120, %488
+    %490 = const i64 40
+    %491 = gep i8, ptr %466, %490
+    %492 = load i64, ptr %489
+    store i64 %492, ptr %491
+    store ptr %460, ptr %119
+    br bb33(%67, %68, %69, %70)
+bb33(%71: ptr, %72: u32, %73: ptr, %74: ptr):
+    %493 = load ptr, ptr %73
+    %494 = const i64 16
+    %495 = gep i8, ptr %493, %494
+    br bb34(%71, %72, %74, %495)
+bb34(%75: ptr, %76: u32, %77: ptr, %78: ptr):
+    call @func.34(%122, %78, %75, %76)
+    br bb35(%75, %76, %77)
+bb35(%79: ptr, %80: u32, %81: ptr):
+    %496 = const i64 64
+    %497 = heap_alloc rust_heap i8, %496, align 8
+    %498 = const u64 1
+    store u64 %498, ptr %497
+    %499 = const i64 8
+    %500 = gep i8, ptr %497, %499
+    %501 = const u64 1
+    store u64 %501, ptr %500
+    %502 = const i64 16
+    %503 = gep i8, ptr %497, %502
+    %504 = load i64, ptr %122
+    store i64 %504, ptr %503
+    %505 = const i64 8
+    %506 = gep i8, ptr %122, %505
+    %507 = const i64 8
+    %508 = gep i8, ptr %503, %507
+    %509 = load i64, ptr %506
+    store i64 %509, ptr %508
+    %510 = const i64 16
+    %511 = gep i8, ptr %122, %510
+    %512 = const i64 16
+    %513 = gep i8, ptr %503, %512
+    %514 = load i64, ptr %511
+    store i64 %514, ptr %513
+    %515 = const i64 24
+    %516 = gep i8, ptr %122, %515
+    %517 = const i64 24
+    %518 = gep i8, ptr %503, %517
+    %519 = load i64, ptr %516
+    store i64 %519, ptr %518
+    %520 = const i64 32
+    %521 = gep i8, ptr %122, %520
+    %522 = const i64 32
+    %523 = gep i8, ptr %503, %522
+    %524 = load i64, ptr %521
+    store i64 %524, ptr %523
+    %525 = const i64 40
+    %526 = gep i8, ptr %122, %525
+    %527 = const i64 40
+    %528 = gep i8, ptr %503, %527
+    %529 = load i64, ptr %526
+    store i64 %529, ptr %528
+    store ptr %497, ptr %121
+    br bb36(%79, %80, %81)
+bb36(%82: ptr, %83: u32, %84: ptr):
+    %530 = load ptr, ptr %84
+    %531 = const i64 16
+    %532 = gep i8, ptr %530, %531
+    br bb37(%82, %83, %532)
+bb37(%85: ptr, %86: u32, %87: ptr):
+    %533 = const u32 1
+    %534, %535 = add.overflow u32 %86, %533
+    store u32 %534, ptr %125
+    %536 = const i64 4
+    %537 = gep i8, ptr %125, %536
+    store bool %535, ptr %537
+    %538 = const i64 4
+    %539 = gep i8, ptr %125, %538
+    %540 = load bool, ptr %539
+    %541 = const bool false
+    %542 = icmp eq bool %540, %541
+    condbr %542, bb38(%85, %87), bb48
+bb38(%88: ptr, %89: ptr):
+    %543 = load u32, ptr %125
+    call @func.34(%124, %89, %88, %543)
+    br bb39
+bb39:
+    %544 = const i64 64
+    %545 = heap_alloc rust_heap i8, %544, align 8
+    %546 = const u64 1
+    store u64 %546, ptr %545
+    %547 = const i64 8
+    %548 = gep i8, ptr %545, %547
+    %549 = const u64 1
+    store u64 %549, ptr %548
+    %550 = const i64 16
+    %551 = gep i8, ptr %545, %550
+    %552 = load i64, ptr %124
+    store i64 %552, ptr %551
+    %553 = const i64 8
+    %554 = gep i8, ptr %124, %553
+    %555 = const i64 8
+    %556 = gep i8, ptr %551, %555
+    %557 = load i64, ptr %554
+    store i64 %557, ptr %556
+    %558 = const i64 16
+    %559 = gep i8, ptr %124, %558
+    %560 = const i64 16
+    %561 = gep i8, ptr %551, %560
+    %562 = load i64, ptr %559
+    store i64 %562, ptr %561
+    %563 = const i64 24
+    %564 = gep i8, ptr %124, %563
+    %565 = const i64 24
+    %566 = gep i8, ptr %551, %565
+    %567 = load i64, ptr %564
+    store i64 %567, ptr %566
+    %568 = const i64 32
+    %569 = gep i8, ptr %124, %568
+    %570 = const i64 32
+    %571 = gep i8, ptr %551, %570
+    %572 = load i64, ptr %569
+    store i64 %572, ptr %571
+    %573 = const i64 40
+    %574 = gep i8, ptr %124, %573
+    %575 = const i64 40
+    %576 = gep i8, ptr %551, %575
+    %577 = load i64, ptr %574
+    store i64 %577, ptr %576
+    store ptr %545, ptr %123
+    br bb40
+bb40:
+    %578 = load ptr, ptr %119
+    %579 = const i64 8
+    %580 = gep i8, ptr %118, %579
+    store ptr %578, ptr %580
+    %581 = load ptr, ptr %121
+    %582 = const i64 16
+    %583 = gep i8, ptr %118, %582
+    store ptr %581, ptr %583
+    %584 = load ptr, ptr %123
+    %585 = const i64 24
+    %586 = gep i8, ptr %118, %585
+    store ptr %584, ptr %586
+    %587 = const i32 7
+    store i32 %587, ptr %118
+    call @func.7(%0, %118)
+    br bb47
+bb41(%90: ptr, %91: u32, %92: u32, %93: ptr):
+    call @func.34(%129, %93, %90, %91)
+    br bb42(%92)
+bb42(%94: u32):
+    %588 = const i64 64
+    %589 = heap_alloc rust_heap i8, %588, align 8
+    %590 = const u64 1
+    store u64 %590, ptr %589
+    %591 = const i64 8
+    %592 = gep i8, ptr %589, %591
+    %593 = const u64 1
+    store u64 %593, ptr %592
+    %594 = const i64 16
+    %595 = gep i8, ptr %589, %594
+    %596 = load i64, ptr %129
+    store i64 %596, ptr %595
+    %597 = const i64 8
+    %598 = gep i8, ptr %129, %597
+    %599 = const i64 8
+    %600 = gep i8, ptr %595, %599
+    %601 = load i64, ptr %598
+    store i64 %601, ptr %600
+    %602 = const i64 16
+    %603 = gep i8, ptr %129, %602
+    %604 = const i64 16
+    %605 = gep i8, ptr %595, %604
+    %606 = load i64, ptr %603
+    store i64 %606, ptr %605
+    %607 = const i64 24
+    %608 = gep i8, ptr %129, %607
+    %609 = const i64 24
+    %610 = gep i8, ptr %595, %609
+    %611 = load i64, ptr %608
+    store i64 %611, ptr %610
+    %612 = const i64 32
+    %613 = gep i8, ptr %129, %612
+    %614 = const i64 32
+    %615 = gep i8, ptr %595, %614
+    %616 = load i64, ptr %613
+    store i64 %616, ptr %615
+    %617 = const i64 40
+    %618 = gep i8, ptr %129, %617
+    %619 = const i64 40
+    %620 = gep i8, ptr %595, %619
+    %621 = load i64, ptr %618
+    store i64 %621, ptr %620
+    store ptr %589, ptr %128
+    br bb43(%94)
+bb43(%95: u32):
+    %622 = const i64 8
+    %623 = gep i8, ptr %126, %622
+    %624 = load i64, ptr %127
+    store i64 %624, ptr %623
+    %625 = const i64 4
+    %626 = gep i8, ptr %126, %625
+    store u32 %95, ptr %626
+    %627 = load ptr, ptr %128
+    %628 = const i64 16
+    %629 = gep i8, ptr %126, %628
+    store ptr %627, ptr %629
+    %630 = const i32 9
+    store i32 %630, ptr %126
+    call @func.7(%0, %126)
+    br bb47
+bb44(%96: ptr, %97: u32, %98: ptr):
+    call @func.34(%132, %98, %96, %97)
+    br bb45
+bb45:
+    %631 = const i64 64
+    %632 = heap_alloc rust_heap i8, %631, align 8
+    %633 = const u64 1
+    store u64 %633, ptr %632
+    %634 = const i64 8
+    %635 = gep i8, ptr %632, %634
+    %636 = const u64 1
+    store u64 %636, ptr %635
+    %637 = const i64 16
+    %638 = gep i8, ptr %632, %637
+    %639 = load i64, ptr %132
+    store i64 %639, ptr %638
+    %640 = const i64 8
+    %641 = gep i8, ptr %132, %640
+    %642 = const i64 8
+    %643 = gep i8, ptr %638, %642
+    %644 = load i64, ptr %641
+    store i64 %644, ptr %643
+    %645 = const i64 16
+    %646 = gep i8, ptr %132, %645
+    %647 = const i64 16
+    %648 = gep i8, ptr %638, %647
+    %649 = load i64, ptr %646
+    store i64 %649, ptr %648
+    %650 = const i64 24
+    %651 = gep i8, ptr %132, %650
+    %652 = const i64 24
+    %653 = gep i8, ptr %638, %652
+    %654 = load i64, ptr %651
+    store i64 %654, ptr %653
+    %655 = const i64 32
+    %656 = gep i8, ptr %132, %655
+    %657 = const i64 32
+    %658 = gep i8, ptr %638, %657
+    %659 = load i64, ptr %656
+    store i64 %659, ptr %658
+    %660 = const i64 40
+    %661 = gep i8, ptr %132, %660
+    %662 = const i64 40
+    %663 = gep i8, ptr %638, %662
+    %664 = load i64, ptr %661
+    store i64 %664, ptr %663
+    store ptr %632, ptr %131
+    br bb46
+bb46:
+    %665 = load ptr, ptr %131
+    %666 = const i64 8
+    %667 = gep i8, ptr %130, %666
+    store ptr %665, ptr %667
+    %668 = const i32 10
+    store i32 %668, ptr %130
+    call @func.7(%0, %130)
+    br bb47
+bb47:
+    ret
+bb48:
+    unreachable
+}
+
+fn @_Name_as_std__clone__Clone___clone(functy.35) {
+bb0(%0: ptr, %1: ptr):
+    %2 = load i64, ptr %1
+    store i64 %2, ptr %0
+    ret
+}
+
+fn @_Literal_as_std__clone__Clone___clone(functy.36) {
+bb0(%0: ptr, %1: ptr):
+    %2 = load i64, ptr %1
+    store i64 %2, ptr %0
+    ret
+}
+
+fn @_FVarId_as_std__clone__Clone___clone(functy.37) {
+bb0(%0: ptr, %1: ptr):
+    %2 = load i64, ptr %1
+    store i64 %2, ptr %0
+    ret
+}

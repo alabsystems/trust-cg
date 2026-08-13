@@ -1,0 +1,47 @@
+satprov1
+rule Isub_I8 -> SUB (8-bit)
+width 8
+vars 54
+input a 1 2 3 4 5 6 7 8
+input b 9 10 11 12 13 14 15 16
+gate ir xor2 17 1 -9
+gate ir and2 18 -1 9
+gate ir xor3 19 2 -10 -18
+gate ir maj3 20 2 -10 -18
+gate ir xor3 21 3 -11 20
+gate ir maj3 22 3 -11 20
+gate ir xor3 23 4 -12 22
+gate ir maj3 24 4 -12 22
+gate ir xor3 25 5 -13 24
+gate ir maj3 26 5 -13 24
+gate ir xor3 27 6 -14 26
+gate ir maj3 28 6 -14 26
+gate ir xor3 29 7 -15 28
+gate ir maj3 30 7 -15 28
+gate ir xor3 31 8 -16 30
+gate mc xor2 32 1 -9
+gate mc and2 33 -1 9
+gate mc xor3 34 2 -10 -33
+gate mc maj3 35 2 -10 -33
+gate mc xor3 36 3 -11 35
+gate mc maj3 37 3 -11 35
+gate mc xor3 38 4 -12 37
+gate mc maj3 39 4 -12 37
+gate mc xor3 40 5 -13 39
+gate mc maj3 41 5 -13 39
+gate mc xor3 42 6 -14 41
+gate mc maj3 43 6 -14 41
+gate mc xor3 44 7 -15 43
+gate mc maj3 45 7 -15 43
+gate mc xor3 46 8 -16 45
+gate diff xor2 47 -17 -32
+gate diff xor2 48 19 34
+gate diff xor2 49 21 36
+gate diff xor2 50 23 38
+gate diff xor2 51 25 40
+gate diff xor2 52 27 42
+gate diff xor2 53 29 44
+gate diff xor2 54 31 46
+irout -17 19 21 23 25 27 29 31
+mcout -32 34 36 38 40 42 44 46
+diff 47 48 49 50 51 52 53 54

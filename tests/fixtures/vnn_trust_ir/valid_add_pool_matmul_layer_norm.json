@@ -1,0 +1,196 @@
+{
+  "version": 1,
+  "dialect": "trust_ir.vnn",
+  "entry": "model",
+  "tensors": {
+    "%residual_a": {
+      "shape": [1, 1, 4, 4],
+      "dtype": "f32",
+      "layout": "nchw",
+      "role": "input"
+    },
+    "%residual_b": {
+      "shape": [1, 1, 4, 4],
+      "dtype": "f32",
+      "layout": "nchw",
+      "role": "input"
+    },
+    "%sum": {
+      "shape": [1, 1, 4, 4],
+      "dtype": "f32",
+      "layout": "nchw",
+      "role": "activation"
+    },
+    "%avg": {
+      "shape": [1, 1, 2, 2],
+      "dtype": "f32",
+      "layout": "nchw",
+      "role": "activation"
+    },
+    "%pool": {
+      "shape": [1, 1, 1, 1],
+      "dtype": "f32",
+      "layout": "nchw",
+      "role": "output"
+    },
+    "%matrix": {
+      "shape": [2, 3],
+      "dtype": "f32",
+      "layout": "nc",
+      "role": "input"
+    },
+    "%matmul": {
+      "shape": [2, 2],
+      "dtype": "f32",
+      "layout": "nc",
+      "role": "activation"
+    },
+    "%norm": {
+      "shape": [2, 2],
+      "dtype": "f32",
+      "layout": "nc",
+      "role": "output"
+    }
+  },
+  "initializers": {
+    "matmul.weight": {
+      "shape": [3, 2],
+      "dtype": "f32",
+      "layout": "strided",
+      "storage": {
+        "kind": "external",
+        "name": "matmul.weight"
+      },
+      "sha256": "8888888888888888888888888888888888888888888888888888888888888888"
+    },
+    "ln.scale": {
+      "shape": [2],
+      "dtype": "f32",
+      "layout": "vector",
+      "storage": {
+        "kind": "external",
+        "name": "ln.scale"
+      },
+      "sha256": "9999999999999999999999999999999999999999999999999999999999999999"
+    },
+    "ln.bias": {
+      "shape": [2],
+      "dtype": "f32",
+      "layout": "vector",
+      "storage": {
+        "kind": "external",
+        "name": "ln.bias"
+      },
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  },
+  "ops": [
+    {
+      "id": "vnn.0",
+      "op": "trust_ir.vnn.add",
+      "inputs": ["%residual_a", "%residual_b"],
+      "outputs": ["%sum"],
+      "attrs": {},
+      "provenance": {
+        "gamma_layer_id": "layer.5",
+        "gamma_layer_type": "Add",
+        "onnx_node_name": "Add_5",
+        "onnx_op_type": "Add",
+        "onnx_outputs": ["sum"]
+      }
+    },
+    {
+      "id": "vnn.1",
+      "op": "trust_ir.vnn.avg_pool2d",
+      "inputs": ["%sum"],
+      "outputs": ["%avg"],
+      "attrs": {
+        "kernel_shape": [2, 2],
+        "strides": [2, 2],
+        "pads": [0, 0, 0, 0],
+        "count_include_pad": 0
+      },
+      "provenance": {
+        "gamma_layer_id": "layer.6",
+        "gamma_layer_type": "AveragePool",
+        "onnx_node_name": "AveragePool_6",
+        "onnx_op_type": "AveragePool",
+        "onnx_outputs": ["avg"]
+      }
+    },
+    {
+      "id": "vnn.2",
+      "op": "trust_ir.vnn.max_pool2d",
+      "inputs": ["%avg"],
+      "outputs": ["%pool"],
+      "attrs": {
+        "kernel_shape": [2, 2],
+        "strides": [2, 2],
+        "pads": [0, 0, 0, 0]
+      },
+      "provenance": {
+        "gamma_layer_id": "layer.7",
+        "gamma_layer_type": "MaxPool",
+        "onnx_node_name": "MaxPool_7",
+        "onnx_op_type": "MaxPool",
+        "onnx_outputs": ["pool"]
+      }
+    },
+    {
+      "id": "vnn.3",
+      "op": "trust_ir.vnn.matmul",
+      "inputs": ["%matrix"],
+      "outputs": ["%matmul"],
+      "weights": ["matmul.weight"],
+      "attrs": {},
+      "provenance": {
+        "gamma_layer_id": "layer.8",
+        "gamma_layer_type": "MatMul",
+        "onnx_node_name": "MatMul_8",
+        "onnx_op_type": "MatMul",
+        "onnx_outputs": ["matmul"]
+      }
+    },
+    {
+      "id": "vnn.4",
+      "op": "trust_ir.vnn.layer_norm",
+      "inputs": ["%matmul"],
+      "outputs": ["%norm"],
+      "weights": ["ln.scale", "ln.bias"],
+      "attrs": {
+        "axis": -1,
+        "epsilon": 1e-05
+      },
+      "provenance": {
+        "gamma_layer_id": "layer.9",
+        "gamma_layer_type": "LayerNorm",
+        "onnx_node_name": "LayerNormalization_9",
+        "onnx_op_type": "LayerNormalization",
+        "onnx_outputs": ["norm"]
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from": "%sum",
+      "to": "vnn.1",
+      "from_layer": "layer.5",
+      "to_layer": "layer.6",
+      "onnx_tensor": "sum"
+    },
+    {
+      "from": "%avg",
+      "to": "vnn.2",
+      "from_layer": "layer.6",
+      "to_layer": "layer.7",
+      "onnx_tensor": "avg"
+    },
+    {
+      "from": "%matmul",
+      "to": "vnn.4",
+      "from_layer": "layer.8",
+      "to_layer": "layer.9",
+      "onnx_tensor": "matmul"
+    }
+  ]
+}

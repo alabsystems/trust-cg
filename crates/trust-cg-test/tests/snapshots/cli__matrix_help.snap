@@ -1,0 +1,67 @@
+---
+source: crates/trust-cg-test/tests/cli.rs
+expression: "help_of(&[\"matrix\"])"
+---
+Run the workspace unit/integration test matrix (WS1).
+
+Delegates to the maintained full matrix runner in `scripts/run_full_test_matrix.sh`. Writes
+`evals/results/tests/<iso-date>.json` with per-crate `{passed, failed, ignored, time_s}`.
+Regular-test or rustdoc ignored counts and failed/timeout/incomplete shards make the CLI return exit
+1.
+
+# Examples
+
+  trust-cg-test matrix --format human
+  trust-cg-test matrix --crate trust-cg-codegen --shard integration-jit-runtime --format json
+  trust-cg-test matrix --compare path/to/tests-baseline.json
+
+Usage: trust-cg-test matrix [OPTIONS]
+
+Options:
+      --crate <CRATE>
+          Only run the named crate (e.g. `trust-cg-codegen`)
+
+  -f, --format <FORMAT>
+          Output format (human, json, junit)
+
+          Possible values:
+          - human: Pretty table + narrative, targeted at humans
+          - json:  Machine-readable JSON
+          - junit: JUnit XML for CI consumers
+
+          [default: human]
+
+  -o, --out <PATH>
+          Override the command-specific output file or directory.
+
+          See the selected subcommand's help for its output type and default.
+
+      --shard <NAME>
+          Shard of a crate to run (e.g. `aarch64`, `macho`). Requires `--crate`
+
+      --since <REF>
+          Only run tests changed since the given git ref
+
+      --timeout <SECS>
+          Per-unit timeout in seconds. Subcommands may apply per-unit defaults when this is unset
+
+      --compare <PATH>
+          Caller-supplied baseline JSON file to diff the run against
+
+      --parallel <N>
+          Worker count (honors cargo-serialization lock). Default: auto
+
+  -q, --quiet
+          Suppress progress bars; errors still go to stderr
+
+  -v, --verbose...
+          Show debug-level events. Repeat for more: -vv, -vvv
+
+      --no-cache
+          Ignore proof / corpus caches
+
+      --dry-run
+          Print what would run without executing external tools
+
+  -h, --help
+          Print help (see a summary with '-h')

@@ -1,0 +1,1059 @@
+// trust-cg-codegen - Compact unwind info emission for AArch64 macOS
+//
+// Author: Andrew Yates <andrewyates.name@gmail.com>
+// Copyright 2026 Andrew Yates | License: Apache-2.0
+//
+// Reference: ~/llvm-project-ref/llvm/lib/MC/MCObjectFileInfo.cpp
+//            (compact unwind section creation, line 213)
+// Reference: ~/llvm-project-ref/llvm/lib/Target/AArch64/MCTargetDesc/AArch64AsmBackend.cpp
+//            (generateCompactUnwindEncoding, line 576)
+// Reference: Apple Mach-O compact_unwind_encoding.h
+
+//! AArch64 Darwin compact unwind info emission.
+//!
+//! On macOS, the `__LD,__compact_unwind` section is required for usable
+//! binaries. Each function gets a 32-byte entry that encodes how to unwind
+//! its stack frame. The linker (`ld`) processes these entries and produces
+//! the final `__TEXT,__unwind_info` section in the linked binary.
+//!
+//! # Compact unwind entry format
+//!
+//! ```text
+//! struct compact_unwind_entry {
+//!     uint64_t function_offset;     // start address of function (relocated)
+//!     uint32_t function_length;     // length of function in bytes
+//!     uint32_t compact_encoding;    // unwind encoding (from frame.rs)
+//!     uint64_t personality;         // compact-mode personality pointer
+//!     uint64_t lsda;               // compact-mode LSDA pointer
+//! }
+//! // Total: 32 bytes per entry, little-endian
+//! ```
+//!
+//! # Relocations
+//!
+//! The `function_offset` field requires an `ARM64_RELOC_UNSIGNED` relocation
+//! (length=3, quad) pointing to the function's symbol. Personality and LSDA
+//! fields also need relocations when the entry carries those symbol references,
+//! even if the serialized placeholder value is zero.
+//!
+//! # Section attributes
+//!
+//! The section is `__LD,__compact_unwind` with `S_ATTR_DEBUG` flag. It lives
+//! in the object file's single unnamed segment alongside `__text` and `__data`.
+
+use crate::frame::{FrameLayout, encode_compact_unwind};
+use crate::macho::reloc::Relocation;
+use crate::macho::writer::MachOWriter;
+use thiserror::Error;
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// Size of one compact unwind entry in bytes.
+pub const COMPACT_UNWIND_ENTRY_SIZE: u32 = 32;
+
+/// Section attribute: debug information section.
+/// Reference: mach-o/loader.h S_ATTR_DEBUG
+pub const S_ATTR_DEBUG: u32 = 0x0200_0000;
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum CompactUnwindError {
+    #[error("Mach-O compact-unwind relocation emission failed: {0}")]
+    MachORelocation(#[from] crate::macho::MachORelocationError),
+    #[error(
+        "compact-unwind table with {entry_count} entries requires relocation offset {max_relocation_offset}, exceeding Mach-O non-scattered r_address maximum {max_supported_offset}"
+    )]
+    RelocationAddressOutOfRange {
+        entry_count: usize,
+        max_relocation_offset: u128,
+        max_supported_offset: u32,
+    },
+    #[error(
+        "compact-unwind table with {entry_count} entries requires {byte_len} bytes, exceeding host usize maximum {max_supported_len}"
+    )]
+    ByteLengthOutOfRange {
+        entry_count: usize,
+        byte_len: u128,
+        max_supported_len: usize,
+    },
+    #[error(
+        "compact-unwind table with {entry_count} entries requires {relocation_count} relocations, exceeding host usize maximum {max_supported_count}"
+    )]
+    RelocationCountOutOfRange {
+        entry_count: usize,
+        relocation_count: u128,
+        max_supported_count: usize,
+    },
+    #[error("compact-unwind {operation} allocation for {requested_capacity} elements failed")]
+    AllocationFailed {
+        operation: &'static str,
+        requested_capacity: usize,
+    },
+}
+
+fn checked_compact_unwind_layout(entry_count: usize) -> Result<usize, CompactUnwindError> {
+    let byte_len = (entry_count as u128) * u128::from(COMPACT_UNWIND_ENTRY_SIZE);
+    let byte_len_usize =
+        usize::try_from(byte_len).map_err(|_| CompactUnwindError::ByteLengthOutOfRange {
+            entry_count,
+            byte_len,
+            max_supported_len: usize::MAX,
+        })?;
+    if entry_count != 0 {
+        let max_relocation_offset =
+            ((entry_count - 1) as u128) * u128::from(COMPACT_UNWIND_ENTRY_SIZE) + 24;
+        if max_relocation_offset > i32::MAX as u128 {
+            return Err(CompactUnwindError::RelocationAddressOutOfRange {
+                entry_count,
+                max_relocation_offset,
+                max_supported_offset: i32::MAX as u32,
+            });
+        }
+    }
+    Ok(byte_len_usize)
+}
+
+fn checked_compact_unwind_relocation_offset(
+    entry_count: usize,
+    entry_index: usize,
+    field_offset: u32,
+) -> Result<u32, CompactUnwindError> {
+    let offset =
+        (entry_index as u128) * u128::from(COMPACT_UNWIND_ENTRY_SIZE) + u128::from(field_offset);
+    if offset > i32::MAX as u128 {
+        return Err(CompactUnwindError::RelocationAddressOutOfRange {
+            entry_count,
+            max_relocation_offset: offset,
+            max_supported_offset: i32::MAX as u32,
+        });
+    }
+    // The signed-i32 check above is stricter than this conversion, but retain a
+    // fallible conversion so the serialized width remains explicit.
+    u32::try_from(offset).map_err(|_| CompactUnwindError::RelocationAddressOutOfRange {
+        entry_count,
+        max_relocation_offset: offset,
+        max_supported_offset: i32::MAX as u32,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// CompactUnwindEntry
+// ---------------------------------------------------------------------------
+
+/// A single compact unwind entry for one function.
+///
+/// Represents the 32-byte `compact_unwind_entry` structure that the
+/// macOS linker uses to build the final `__TEXT,__unwind_info` section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactUnwindEntry {
+    /// Virtual address of the function start (will be relocated).
+    pub function_offset: u64,
+    /// Length of the function in bytes.
+    pub function_length: u32,
+    /// Compact unwind encoding (from `encode_compact_unwind()`).
+    pub compact_encoding: u32,
+    /// Personality function pointer for compact-mode EH entries.
+    pub personality: u64,
+    /// Language-specific data area pointer for compact-mode EH entries.
+    pub lsda: u64,
+    /// Symbol index for the function (used to generate relocations).
+    pub symbol_index: u32,
+    /// Final Mach-O symbol index for the personality relocation, if present.
+    pub personality_symbol_index: Option<u32>,
+    /// Final Mach-O symbol index for the LSDA relocation, if present.
+    pub lsda_symbol_index: Option<u32>,
+}
+
+impl CompactUnwindEntry {
+    /// Create a new compact unwind entry for a simple C/Rust function
+    /// (no personality, no LSDA).
+    pub fn new(
+        function_offset: u64,
+        function_length: u32,
+        compact_encoding: u32,
+        symbol_index: u32,
+    ) -> Self {
+        Self {
+            function_offset,
+            function_length,
+            compact_encoding,
+            personality: 0,
+            lsda: 0,
+            symbol_index,
+            personality_symbol_index: None,
+            lsda_symbol_index: None,
+        }
+    }
+
+    /// Create a compact unwind entry from a FrameLayout and function metadata.
+    ///
+    /// If the frame layout takes Trust Codegen's conservative DWARF fallback path
+    /// (currently runtime-sized stack metadata, frameless layouts, etc.), the compact encoding will be
+    /// `UNWIND_ARM64_MODE_DWARF`.
+    /// Object emission must include a corresponding FDE in `__eh_frame`;
+    /// Darwin libunwind consults that FDE for the function's address range.
+    pub fn from_layout(
+        layout: &FrameLayout,
+        function_offset: u64,
+        function_length: u32,
+        symbol_index: u32,
+    ) -> Self {
+        let encoding = encode_compact_unwind(layout);
+        Self::new(
+            function_offset,
+            function_length,
+            encoding.encoding,
+            symbol_index,
+        )
+    }
+
+    /// Request a relocation for the personality pointer field.
+    pub fn with_personality_symbol(mut self, symbol_index: u32) -> Self {
+        self.personality_symbol_index = Some(symbol_index);
+        self
+    }
+
+    /// Request a relocation for the LSDA pointer field.
+    ///
+    /// Also sets the `UNWIND_HAS_LSDA` bit in the compact encoding. Darwin's
+    /// `ld` only carries the LSDA into the synthesized `__TEXT,__unwind_info`
+    /// (and thus only lets the runtime unwinder consult the personality) when
+    /// this bit is present; relocating the `lsda` field alone is not enough.
+    /// Without it the personality is never run and a thrown exception unwinds
+    /// straight past the landing pad to `std::terminate` — the classic
+    /// "catch silently fails / aborts" symptom.
+    pub fn with_lsda_symbol(mut self, symbol_index: u32) -> Self {
+        self.lsda_symbol_index = Some(symbol_index);
+        self.compact_encoding |= crate::frame::UNWIND_HAS_LSDA;
+        self
+    }
+
+    /// Returns true if this entry uses DWARF CFI fallback instead of
+    /// inline compact unwind encoding.
+    ///
+    /// When true, the unwinder will look for a matching FDE in `__eh_frame`
+    /// rather than using the compact_encoding bits directly.
+    pub fn needs_dwarf_fallback(&self) -> bool {
+        use crate::frame::UNWIND_ARM64_MODE_DWARF;
+        (self.compact_encoding & 0x0F00_0000) == UNWIND_ARM64_MODE_DWARF
+    }
+
+    /// Serialize this entry to 32 bytes (little-endian).
+    pub fn to_bytes(&self) -> [u8; 32] {
+        let mut buf = [0u8; 32];
+        buf[0..8].copy_from_slice(&self.function_offset.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.function_length.to_le_bytes());
+        buf[12..16].copy_from_slice(&self.compact_encoding.to_le_bytes());
+        buf[16..24].copy_from_slice(&self.personality.to_le_bytes());
+        buf[24..32].copy_from_slice(&self.lsda.to_le_bytes());
+        buf
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CompactUnwindReloc
+// ---------------------------------------------------------------------------
+
+/// A relocation needed by the compact unwind section.
+///
+/// Each function_offset field needs an ARM64_RELOC_UNSIGNED relocation
+/// pointing to the function's symbol. Personality and LSDA fields also
+/// need relocations when their symbol references are present.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactUnwindReloc {
+    /// Byte offset within the compact unwind section data.
+    pub offset: u32,
+    /// Symbol index in the Mach-O symbol table.
+    pub symbol_index: u32,
+}
+
+// ---------------------------------------------------------------------------
+// CompactUnwindSection
+// ---------------------------------------------------------------------------
+
+/// Collects compact unwind entries and emits the `__LD,__compact_unwind`
+/// section data and relocations.
+///
+/// # Usage
+///
+/// ```no_run
+/// use trust_cg_codegen::unwind::{CompactUnwindSection, CompactUnwindEntry};
+/// use trust_cg_codegen::frame::UNWIND_ARM64_MODE_FRAME;
+///
+/// let mut section = CompactUnwindSection::new();
+/// section.add_entry(CompactUnwindEntry::new(0, 64, UNWIND_ARM64_MODE_FRAME, 0));
+/// let bytes = section.to_bytes().expect("compact-unwind serialization");
+/// let relocs = section.relocations().expect("compact-unwind relocations");
+/// ```
+#[derive(Debug, Clone)]
+pub struct CompactUnwindSection {
+    entries: Vec<CompactUnwindEntry>,
+}
+
+impl CompactUnwindSection {
+    /// Create a new empty compact unwind section.
+    pub fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    /// Add a compact unwind entry for a function.
+    pub fn add_entry(&mut self, entry: CompactUnwindEntry) {
+        self.entries.push(entry);
+    }
+
+    /// Returns the number of entries in this section.
+    pub fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns true if the section has no entries.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Serialize all entries to bytes.
+    ///
+    /// Returns a byte vector of length `entry_count * 32`.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, CompactUnwindError> {
+        let byte_len = checked_compact_unwind_layout(self.entries.len())?;
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(byte_len)
+            .map_err(|_| CompactUnwindError::AllocationFailed {
+                operation: "byte serialization",
+                requested_capacity: byte_len,
+            })?;
+        for entry in &self.entries {
+            buf.extend_from_slice(&entry.to_bytes());
+        }
+        Ok(buf)
+    }
+
+    /// Generate the relocations needed for this section.
+    ///
+    /// Each entry generates at least one relocation for the `function_offset`
+    /// field (ARM64_RELOC_UNSIGNED, quad). Personality and LSDA fields
+    /// generate additional relocations when their symbol references are present.
+    pub fn relocations(&self) -> Result<Vec<CompactUnwindReloc>, CompactUnwindError> {
+        checked_compact_unwind_layout(self.entries.len())?;
+        let relocation_count = self.entries.iter().fold(0u128, |count, entry| {
+            count
+                + 1
+                + u128::from(entry.personality_symbol_index.is_some())
+                + u128::from(entry.lsda_symbol_index.is_some())
+        });
+        let relocation_count = usize::try_from(relocation_count).map_err(|_| {
+            CompactUnwindError::RelocationCountOutOfRange {
+                entry_count: self.entries.len(),
+                relocation_count,
+                max_supported_count: usize::MAX,
+            }
+        })?;
+        let mut relocs = Vec::new();
+        relocs.try_reserve_exact(relocation_count).map_err(|_| {
+            CompactUnwindError::AllocationFailed {
+                operation: "relocation table",
+                requested_capacity: relocation_count,
+            }
+        })?;
+        for (i, entry) in self.entries.iter().enumerate() {
+            let base_offset = checked_compact_unwind_relocation_offset(self.entries.len(), i, 0)?;
+
+            // function_offset at byte 0 of each entry
+            relocs.push(CompactUnwindReloc {
+                offset: base_offset,
+                symbol_index: entry.symbol_index,
+            });
+
+            // personality at byte 16 of each entry (if requested)
+            if let Some(symbol_index) = entry.personality_symbol_index {
+                relocs.push(CompactUnwindReloc {
+                    offset: checked_compact_unwind_relocation_offset(self.entries.len(), i, 16)?,
+                    symbol_index,
+                });
+            }
+
+            // lsda at byte 24 of each entry (if requested)
+            if let Some(symbol_index) = entry.lsda_symbol_index {
+                relocs.push(CompactUnwindReloc {
+                    offset: checked_compact_unwind_relocation_offset(self.entries.len(), i, 24)?,
+                    symbol_index,
+                });
+            }
+        }
+        Ok(relocs)
+    }
+
+    /// Total size of the section data in bytes.
+    pub fn data_size(&self) -> Result<u32, CompactUnwindError> {
+        let byte_len = checked_compact_unwind_layout(self.entries.len())?;
+        u32::try_from(byte_len).map_err(|_| CompactUnwindError::ByteLengthOutOfRange {
+            entry_count: self.entries.len(),
+            byte_len: byte_len as u128,
+            max_supported_len: u32::MAX as usize,
+        })
+    }
+}
+
+impl Default for CompactUnwindSection {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MachOWriter integration
+// ---------------------------------------------------------------------------
+
+/// Add the compact unwind section to a MachOWriter.
+///
+/// This adds the `__LD,__compact_unwind` section with the serialized
+/// entry data and the requested ARM64_RELOC_UNSIGNED relocations for
+/// function, personality, and LSDA fields.
+///
+/// # Arguments
+/// * `writer` - The MachOWriter to add the section to.
+/// * `section` - The compact unwind section with all entries.
+///
+/// # Returns
+/// The 0-based section index of the newly added compact unwind section,
+/// or `None` if the section is empty (no entries to emit).
+pub fn add_compact_unwind_to_writer(
+    writer: &mut MachOWriter,
+    section: &CompactUnwindSection,
+) -> Result<Option<usize>, CompactUnwindError> {
+    if section.is_empty() {
+        return Ok(None);
+    }
+
+    // Complete every fallible validation/allocation before mutating the writer,
+    // so callers never observe a half-added section after an error.
+    let data = section.to_bytes()?;
+    let relocs = section.relocations()?;
+    let section_index = writer.add_custom_section(
+        b"__compact_unwind",
+        b"__LD",
+        &data,
+        3, // 2^3 = 8-byte alignment
+        S_ATTR_DEBUG,
+    );
+
+    // Add relocations for function_offset (and personality/lsda if needed).
+    for reloc in &relocs {
+        writer.add_relocation(
+            section_index,
+            Relocation::unsigned_ptr(reloc.offset, reloc.symbol_index),
+        )?;
+    }
+
+    Ok(Some(section_index))
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compact_unwind_layout_rejects_scattered_relocation_bit_without_allocation() {
+        let last_fitting_count = ((i32::MAX as usize - 24) / 32) + 1;
+        assert_eq!(
+            checked_compact_unwind_layout(last_fitting_count).unwrap(),
+            last_fitting_count * 32,
+        );
+        assert_eq!(
+            checked_compact_unwind_relocation_offset(
+                last_fitting_count,
+                last_fitting_count - 1,
+                24,
+            )
+            .unwrap(),
+            ((last_fitting_count - 1) * 32 + 24) as u32,
+        );
+
+        let error = checked_compact_unwind_layout(last_fitting_count + 1)
+            .expect_err("bit 31 in r_address would select scattered relocation encoding");
+        assert!(matches!(
+            error,
+            CompactUnwindError::RelocationAddressOutOfRange { .. }
+        ));
+        assert!(matches!(
+            checked_compact_unwind_relocation_offset(last_fitting_count + 1, last_fitting_count, 0,),
+            Err(CompactUnwindError::RelocationAddressOutOfRange { .. })
+        ));
+    }
+    use crate::frame::{
+        UNWIND_ARM64_FRAME_D8_D9_PAIR, UNWIND_ARM64_FRAME_D10_D11_PAIR,
+        UNWIND_ARM64_FRAME_D12_D13_PAIR, UNWIND_ARM64_FRAME_D14_D15_PAIR,
+        UNWIND_ARM64_FRAME_X19_X20_PAIR, UNWIND_ARM64_FRAME_X21_X22_PAIR,
+        UNWIND_ARM64_FRAME_X23_X24_PAIR, UNWIND_ARM64_FRAME_X25_X26_PAIR,
+        UNWIND_ARM64_FRAME_X27_X28_PAIR, UNWIND_ARM64_MODE_DWARF, UNWIND_ARM64_MODE_FRAME,
+        UNWIND_ARM64_MODE_FRAMELESS,
+    };
+
+    #[test]
+    fn test_entry_size_is_32_bytes() {
+        let entry = CompactUnwindEntry::new(0, 0, 0, 0);
+        let bytes = entry.to_bytes();
+        assert_eq!(bytes.len(), 32);
+        assert_eq!(COMPACT_UNWIND_ENTRY_SIZE, 32);
+    }
+
+    #[test]
+    fn test_entry_serialization_zeros() {
+        let entry = CompactUnwindEntry::new(0, 0, 0, 0);
+        let bytes = entry.to_bytes();
+        assert_eq!(bytes, [0u8; 32]);
+    }
+
+    #[test]
+    fn test_entry_serialization_fields() {
+        let entry = CompactUnwindEntry::new(
+            0x1000,                  // function_offset
+            64,                      // function_length
+            UNWIND_ARM64_MODE_FRAME, // compact_encoding
+            0,                       // symbol_index (for relocs, not serialized)
+        );
+        let bytes = entry.to_bytes();
+
+        // function_offset at bytes 0..8 (little-endian)
+        assert_eq!(u64::from_le_bytes(bytes[0..8].try_into().unwrap()), 0x1000);
+        // function_length at bytes 8..12
+        assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 64);
+        // compact_encoding at bytes 12..16
+        assert_eq!(
+            u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+            UNWIND_ARM64_MODE_FRAME
+        );
+        // personality at bytes 16..24
+        assert_eq!(u64::from_le_bytes(bytes[16..24].try_into().unwrap()), 0);
+        // lsda at bytes 24..32
+        assert_eq!(u64::from_le_bytes(bytes[24..32].try_into().unwrap()), 0);
+    }
+
+    #[test]
+    fn test_entry_with_all_callee_saved() {
+        let encoding = UNWIND_ARM64_MODE_FRAME
+            | UNWIND_ARM64_FRAME_X19_X20_PAIR
+            | UNWIND_ARM64_FRAME_D8_D9_PAIR;
+        let entry = CompactUnwindEntry::new(0x2000, 128, encoding, 1);
+        let bytes = entry.to_bytes();
+
+        assert_eq!(
+            u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+            encoding
+        );
+        assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 128);
+    }
+
+    #[test]
+    fn test_entry_with_personality() {
+        let mut entry = CompactUnwindEntry::new(0x1000, 32, UNWIND_ARM64_MODE_FRAME, 0);
+        entry.personality = 0xDEAD_BEEF;
+        entry.personality_symbol_index = Some(5);
+        let bytes = entry.to_bytes();
+
+        assert_eq!(
+            u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
+            0xDEAD_BEEF
+        );
+    }
+
+    #[test]
+    fn test_empty_section() {
+        let section = CompactUnwindSection::new();
+        assert_eq!(section.entry_count(), 0);
+        assert!(section.is_empty());
+        assert_eq!(section.to_bytes().unwrap().len(), 0);
+        assert_eq!(section.relocations().unwrap().len(), 0);
+        assert_eq!(section.data_size().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_section_single_entry() {
+        let mut section = CompactUnwindSection::new();
+        section.add_entry(CompactUnwindEntry::new(
+            0x1000,
+            64,
+            UNWIND_ARM64_MODE_FRAME,
+            0,
+        ));
+
+        assert_eq!(section.entry_count(), 1);
+        assert!(!section.is_empty());
+        assert_eq!(section.data_size().unwrap(), 32);
+
+        let bytes = section.to_bytes().unwrap();
+        assert_eq!(bytes.len(), 32);
+
+        // Verify the serialized data
+        assert_eq!(u64::from_le_bytes(bytes[0..8].try_into().unwrap()), 0x1000);
+    }
+
+    #[test]
+    fn test_section_multiple_entries() {
+        let mut section = CompactUnwindSection::new();
+        section.add_entry(CompactUnwindEntry::new(
+            0x0000,
+            32,
+            UNWIND_ARM64_MODE_FRAME,
+            0,
+        ));
+        section.add_entry(CompactUnwindEntry::new(
+            0x0020,
+            16,
+            UNWIND_ARM64_MODE_FRAMELESS,
+            1,
+        ));
+        section.add_entry(CompactUnwindEntry::new(
+            0x0030,
+            48,
+            UNWIND_ARM64_MODE_DWARF,
+            2,
+        ));
+
+        assert_eq!(section.entry_count(), 3);
+        assert_eq!(section.data_size().unwrap(), 96);
+
+        let bytes = section.to_bytes().unwrap();
+        assert_eq!(bytes.len(), 96);
+
+        // Verify each entry's function_offset
+        assert_eq!(u64::from_le_bytes(bytes[0..8].try_into().unwrap()), 0x0000);
+        assert_eq!(
+            u64::from_le_bytes(bytes[32..40].try_into().unwrap()),
+            0x0020
+        );
+        assert_eq!(
+            u64::from_le_bytes(bytes[64..72].try_into().unwrap()),
+            0x0030
+        );
+
+        // Verify each entry's encoding
+        assert_eq!(
+            u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+            UNWIND_ARM64_MODE_FRAME
+        );
+        assert_eq!(
+            u32::from_le_bytes(bytes[44..48].try_into().unwrap()),
+            UNWIND_ARM64_MODE_FRAMELESS
+        );
+        assert_eq!(
+            u32::from_le_bytes(bytes[76..80].try_into().unwrap()),
+            UNWIND_ARM64_MODE_DWARF
+        );
+    }
+
+    #[test]
+    fn test_relocations_simple() {
+        let mut section = CompactUnwindSection::new();
+        section.add_entry(CompactUnwindEntry::new(0, 32, UNWIND_ARM64_MODE_FRAME, 0));
+        section.add_entry(CompactUnwindEntry::new(0, 64, UNWIND_ARM64_MODE_FRAME, 1));
+
+        let relocs = section.relocations().unwrap();
+        // Two entries, each with one relocation for function_offset
+        assert_eq!(relocs.len(), 2);
+
+        // First entry relocation at offset 0
+        assert_eq!(relocs[0].offset, 0);
+        assert_eq!(relocs[0].symbol_index, 0);
+
+        // Second entry relocation at offset 32 (start of second entry)
+        assert_eq!(relocs[1].offset, 32);
+        assert_eq!(relocs[1].symbol_index, 1);
+    }
+
+    #[test]
+    fn test_relocations_with_personality() {
+        let mut section = CompactUnwindSection::new();
+
+        let mut entry = CompactUnwindEntry::new(0, 32, UNWIND_ARM64_MODE_FRAME, 0);
+        entry.personality = 0x1000;
+        entry.personality_symbol_index = Some(5);
+        section.add_entry(entry);
+
+        let relocs = section.relocations().unwrap();
+        // One function_offset reloc + one personality reloc
+        assert_eq!(relocs.len(), 2);
+
+        assert_eq!(relocs[0].offset, 0); // function_offset
+        assert_eq!(relocs[0].symbol_index, 0);
+
+        assert_eq!(relocs[1].offset, 16); // personality
+        assert_eq!(relocs[1].symbol_index, 5);
+    }
+
+    #[test]
+    fn test_relocations_with_lsda() {
+        let mut section = CompactUnwindSection::new();
+
+        let mut entry = CompactUnwindEntry::new(0, 32, UNWIND_ARM64_MODE_FRAME, 0);
+        entry.lsda = 0x2000;
+        entry.lsda_symbol_index = Some(10);
+        section.add_entry(entry);
+
+        let relocs = section.relocations().unwrap();
+        assert_eq!(relocs.len(), 2);
+
+        assert_eq!(relocs[0].offset, 0); // function_offset
+        assert_eq!(relocs[1].offset, 24); // lsda
+        assert_eq!(relocs[1].symbol_index, 10);
+    }
+
+    #[test]
+    fn test_relocations_with_all_fields() {
+        let mut section = CompactUnwindSection::new();
+
+        let mut entry = CompactUnwindEntry::new(0, 32, UNWIND_ARM64_MODE_FRAME, 0);
+        entry.personality = 0x1000;
+        entry.personality_symbol_index = Some(5);
+        entry.lsda = 0x2000;
+        entry.lsda_symbol_index = Some(10);
+        section.add_entry(entry);
+
+        let relocs = section.relocations().unwrap();
+        // function_offset + personality + lsda = 3 relocs
+        assert_eq!(relocs.len(), 3);
+
+        assert_eq!(relocs[0].offset, 0);
+        assert_eq!(relocs[1].offset, 16);
+        assert_eq!(relocs[2].offset, 24);
+    }
+
+    #[test]
+    fn test_relocations_with_zero_personality_placeholder() {
+        let mut section = CompactUnwindSection::new();
+        let entry =
+            CompactUnwindEntry::new(0, 32, UNWIND_ARM64_MODE_FRAME, 0).with_personality_symbol(5);
+        section.add_entry(entry);
+
+        let bytes = section.to_bytes().unwrap();
+        assert_eq!(u64::from_le_bytes(bytes[16..24].try_into().unwrap()), 0);
+
+        let relocs = section.relocations().unwrap();
+        assert_eq!(relocs.len(), 2);
+        assert_eq!(relocs[1].offset, 16);
+        assert_eq!(relocs[1].symbol_index, 5);
+    }
+
+    #[test]
+    fn test_relocations_with_zero_lsda_placeholder() {
+        let mut section = CompactUnwindSection::new();
+        let entry = CompactUnwindEntry::new(0, 32, UNWIND_ARM64_MODE_FRAME, 0).with_lsda_symbol(10);
+        section.add_entry(entry);
+
+        let bytes = section.to_bytes().unwrap();
+        assert_eq!(u64::from_le_bytes(bytes[24..32].try_into().unwrap()), 0);
+
+        let relocs = section.relocations().unwrap();
+        assert_eq!(relocs.len(), 2);
+        assert_eq!(relocs[1].offset, 24);
+        assert_eq!(relocs[1].symbol_index, 10);
+    }
+
+    #[test]
+    fn test_relocations_with_zero_personality_and_lsda_placeholders() {
+        let mut section = CompactUnwindSection::new();
+        let entry = CompactUnwindEntry::new(0, 32, UNWIND_ARM64_MODE_FRAME, 0)
+            .with_personality_symbol(5)
+            .with_lsda_symbol(10);
+        section.add_entry(entry);
+
+        let relocs = section.relocations().unwrap();
+        assert_eq!(relocs.len(), 3);
+        assert_eq!((relocs[0].offset, relocs[0].symbol_index), (0, 0));
+        assert_eq!((relocs[1].offset, relocs[1].symbol_index), (16, 5));
+        assert_eq!((relocs[2].offset, relocs[2].symbol_index), (24, 10));
+    }
+
+    #[test]
+    fn test_relocation_offsets_multi_entry() {
+        let mut section = CompactUnwindSection::new();
+        for i in 0..5 {
+            section.add_entry(CompactUnwindEntry::new(0, 32, UNWIND_ARM64_MODE_FRAME, i));
+        }
+
+        let relocs = section.relocations().unwrap();
+        assert_eq!(relocs.len(), 5);
+
+        for (i, reloc) in relocs.iter().enumerate() {
+            assert_eq!(reloc.offset, (i as u32) * COMPACT_UNWIND_ENTRY_SIZE);
+            assert_eq!(reloc.symbol_index, i as u32);
+        }
+    }
+
+    #[test]
+    fn test_entry_round_trip() {
+        // Verify exact byte layout matches the compact_unwind_entry struct.
+        let entry = CompactUnwindEntry {
+            function_offset: 0x0000_0000_0000_4000,
+            function_length: 0x100,
+            compact_encoding: 0x0400_0003, // FRAME + X19/X20 + X21/X22
+            personality: 0,
+            lsda: 0,
+            symbol_index: 0,
+            personality_symbol_index: None,
+            lsda_symbol_index: None,
+        };
+        let bytes = entry.to_bytes();
+
+        // Read back each field
+        let fn_off = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+        let fn_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        let enc = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+        let pers = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+        let lsda_val = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
+
+        assert_eq!(fn_off, 0x4000);
+        assert_eq!(fn_len, 0x100);
+        assert_eq!(enc, 0x0400_0003);
+        assert_eq!(pers, 0);
+        assert_eq!(lsda_val, 0);
+    }
+
+    #[test]
+    fn test_s_attr_debug_constant() {
+        // Verify S_ATTR_DEBUG matches the Mach-O spec value.
+        assert_eq!(S_ATTR_DEBUG, 0x0200_0000);
+    }
+
+    #[test]
+    fn test_default_trait() {
+        let section = CompactUnwindSection::default();
+        assert!(section.is_empty());
+    }
+
+    // --- DWARF fallback tests ---
+
+    #[test]
+    fn test_entry_needs_dwarf_fallback_frame_mode() {
+        let entry = CompactUnwindEntry::new(0, 32, UNWIND_ARM64_MODE_FRAME, 0);
+        assert!(!entry.needs_dwarf_fallback());
+    }
+
+    #[test]
+    fn test_entry_needs_dwarf_fallback_dwarf_mode() {
+        let entry = CompactUnwindEntry::new(0, 32, UNWIND_ARM64_MODE_DWARF, 0);
+        assert!(entry.needs_dwarf_fallback());
+    }
+
+    #[test]
+    fn test_entry_needs_dwarf_fallback_frameless_mode() {
+        let entry = CompactUnwindEntry::new(0, 32, UNWIND_ARM64_MODE_FRAMELESS, 0);
+        assert!(!entry.needs_dwarf_fallback());
+    }
+
+    #[test]
+    fn test_entry_needs_dwarf_with_register_flags() {
+        // DWARF mode with register flags set (should still be DWARF)
+        let encoding = UNWIND_ARM64_MODE_DWARF | UNWIND_ARM64_FRAME_X19_X20_PAIR;
+        let entry = CompactUnwindEntry::new(0, 32, encoding, 0);
+        assert!(entry.needs_dwarf_fallback());
+    }
+
+    #[test]
+    fn test_from_layout_standard_frame() {
+        use crate::frame::{CalleeSavedPair, FrameLayout};
+        use trust_cg_ir::regs::{X19, X20, X29, X30};
+
+        let layout = FrameLayout {
+            callee_saved_pairs: vec![
+                CalleeSavedPair {
+                    reg1: X29,
+                    reg2: X30,
+                    fp_offset: 0,
+                    is_fpr: false,
+                },
+                CalleeSavedPair {
+                    reg1: X19,
+                    reg2: X20,
+                    fp_offset: -16,
+                    is_fpr: false,
+                },
+            ],
+            callee_saved_area_size: 32,
+            spill_area_size: 0,
+            local_area_size: 0,
+            outgoing_arg_area_size: 0,
+            total_frame_size: 32,
+            uses_frame_pointer: true,
+            is_leaf: true,
+            uses_red_zone: false,
+            fp_to_spill_offset: -32,
+            has_dynamic_alloc: false,
+        };
+
+        let entry = CompactUnwindEntry::from_layout(&layout, 0x1000, 64, 0);
+        assert!(!entry.needs_dwarf_fallback());
+        let expected = UNWIND_ARM64_MODE_FRAME | UNWIND_ARM64_FRAME_X19_X20_PAIR;
+        assert_eq!(entry.compact_encoding, expected);
+        assert_eq!(entry.function_offset, 0x1000);
+        assert_eq!(entry.function_length, 64);
+    }
+
+    #[test]
+    fn test_from_layout_dynamic_alloc_falls_back_to_dwarf() {
+        use crate::frame::{CalleeSavedPair, FrameLayout};
+        use trust_cg_ir::regs::{X29, X30};
+
+        let layout = FrameLayout {
+            callee_saved_pairs: vec![CalleeSavedPair {
+                reg1: X29,
+                reg2: X30,
+                fp_offset: 0,
+                is_fpr: false,
+            }],
+            callee_saved_area_size: 16,
+            spill_area_size: 0,
+            local_area_size: 0,
+            outgoing_arg_area_size: 0,
+            total_frame_size: 16,
+            uses_frame_pointer: true,
+            is_leaf: false,
+            uses_red_zone: false,
+            fp_to_spill_offset: -16,
+            has_dynamic_alloc: true,
+        };
+
+        let entry = CompactUnwindEntry::from_layout(&layout, 0x2000, 128, 1);
+        assert!(entry.needs_dwarf_fallback());
+        assert_eq!(entry.compact_encoding, UNWIND_ARM64_MODE_DWARF);
+    }
+
+    #[test]
+    fn test_from_layout_encoding_bits_all_callee_saved() {
+        use crate::frame::{CalleeSavedPair, FrameLayout};
+        use trust_cg_ir::regs::{
+            V8, V9, V10, V11, V12, V13, V14, V15, X19, X20, X21, X22, X23, X24, X25, X26, X27, X28,
+            X29, X30,
+        };
+
+        let layout = FrameLayout {
+            callee_saved_pairs: vec![
+                CalleeSavedPair {
+                    reg1: X29,
+                    reg2: X30,
+                    fp_offset: 0,
+                    is_fpr: false,
+                },
+                CalleeSavedPair {
+                    reg1: X19,
+                    reg2: X20,
+                    fp_offset: -16,
+                    is_fpr: false,
+                },
+                CalleeSavedPair {
+                    reg1: X21,
+                    reg2: X22,
+                    fp_offset: -32,
+                    is_fpr: false,
+                },
+                CalleeSavedPair {
+                    reg1: X23,
+                    reg2: X24,
+                    fp_offset: -48,
+                    is_fpr: false,
+                },
+                CalleeSavedPair {
+                    reg1: X25,
+                    reg2: X26,
+                    fp_offset: -64,
+                    is_fpr: false,
+                },
+                CalleeSavedPair {
+                    reg1: X27,
+                    reg2: X28,
+                    fp_offset: -80,
+                    is_fpr: false,
+                },
+                CalleeSavedPair {
+                    reg1: V8,
+                    reg2: V9,
+                    fp_offset: -96,
+                    is_fpr: true,
+                },
+                CalleeSavedPair {
+                    reg1: V10,
+                    reg2: V11,
+                    fp_offset: -112,
+                    is_fpr: true,
+                },
+                CalleeSavedPair {
+                    reg1: V12,
+                    reg2: V13,
+                    fp_offset: -128,
+                    is_fpr: true,
+                },
+                CalleeSavedPair {
+                    reg1: V14,
+                    reg2: V15,
+                    fp_offset: -144,
+                    is_fpr: true,
+                },
+            ],
+            callee_saved_area_size: 160,
+            spill_area_size: 0,
+            local_area_size: 0,
+            outgoing_arg_area_size: 0,
+            total_frame_size: 160,
+            uses_frame_pointer: true,
+            is_leaf: false,
+            uses_red_zone: false,
+            fp_to_spill_offset: -160,
+            has_dynamic_alloc: false,
+        };
+
+        let entry = CompactUnwindEntry::from_layout(&layout, 0, 256, 0);
+        assert!(!entry.needs_dwarf_fallback());
+
+        // Verify all register pair flags are set
+        let enc = entry.compact_encoding;
+        assert_ne!(enc & UNWIND_ARM64_FRAME_X19_X20_PAIR, 0);
+        assert_ne!(enc & UNWIND_ARM64_FRAME_X21_X22_PAIR, 0);
+        assert_ne!(enc & UNWIND_ARM64_FRAME_X23_X24_PAIR, 0);
+        assert_ne!(enc & UNWIND_ARM64_FRAME_X25_X26_PAIR, 0);
+        assert_ne!(enc & UNWIND_ARM64_FRAME_X27_X28_PAIR, 0);
+        assert_ne!(enc & UNWIND_ARM64_FRAME_D8_D9_PAIR, 0);
+        assert_ne!(enc & UNWIND_ARM64_FRAME_D10_D11_PAIR, 0);
+        assert_ne!(enc & UNWIND_ARM64_FRAME_D12_D13_PAIR, 0);
+        assert_ne!(enc & UNWIND_ARM64_FRAME_D14_D15_PAIR, 0);
+    }
+
+    #[test]
+    fn test_section_mixed_frame_and_dwarf_entries() {
+        let mut section = CompactUnwindSection::new();
+        section.add_entry(CompactUnwindEntry::new(0, 32, UNWIND_ARM64_MODE_FRAME, 0));
+        section.add_entry(CompactUnwindEntry::new(32, 64, UNWIND_ARM64_MODE_DWARF, 1));
+        section.add_entry(CompactUnwindEntry::new(
+            96,
+            48,
+            UNWIND_ARM64_MODE_FRAME | UNWIND_ARM64_FRAME_X19_X20_PAIR,
+            2,
+        ));
+
+        assert_eq!(section.entry_count(), 3);
+
+        let bytes = section.to_bytes().unwrap();
+        assert_eq!(bytes.len(), 96);
+
+        // Entry 0: FRAME
+        let enc0 = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+        assert_eq!(enc0, UNWIND_ARM64_MODE_FRAME);
+
+        // Entry 1: DWARF
+        let enc1 = u32::from_le_bytes(bytes[44..48].try_into().unwrap());
+        assert_eq!(enc1, UNWIND_ARM64_MODE_DWARF);
+
+        // Entry 2: FRAME + X19/X20
+        let enc2 = u32::from_le_bytes(bytes[76..80].try_into().unwrap());
+        assert_eq!(
+            enc2,
+            UNWIND_ARM64_MODE_FRAME | UNWIND_ARM64_FRAME_X19_X20_PAIR
+        );
+    }
+}

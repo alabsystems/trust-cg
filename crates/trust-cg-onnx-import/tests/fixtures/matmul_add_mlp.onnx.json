@@ -1,0 +1,30 @@
+{
+  "name": "matmul_add_mlp",
+  "inputs": [
+    { "name": "input", "shape": [1, 4], "dtype": "f32", "layout": "nc" }
+  ],
+  "outputs": ["biased"],
+  "tensors": [
+    { "name": "mm", "shape": [1, 3], "dtype": "f32", "layout": "nc" },
+    { "name": "biased", "shape": [1, 3], "dtype": "f32", "layout": "nc" }
+  ],
+  "initializers": [
+    { "name": "matmul.weight", "shape": [4, 3], "dtype": "f32", "layout": "oi", "values": [0.1, 0.2] },
+    { "name": "bias", "shape": [3], "dtype": "f32", "layout": "vector", "values": [0.0] }
+  ],
+  "nodes": [
+    {
+      "name": "MatMul_0",
+      "op_type": "MatMul",
+      "inputs": ["input", "matmul.weight"],
+      "outputs": ["mm"]
+    },
+    {
+      "name": "Add_1",
+      "op_type": "Add",
+      "inputs": ["mm", "bias"],
+      "outputs": ["biased"],
+      "attributes": { "broadcast": "bias_channel" }
+    }
+  ]
+}

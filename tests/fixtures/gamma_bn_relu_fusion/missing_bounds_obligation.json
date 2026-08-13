@@ -1,0 +1,70 @@
+{
+  "format_version": "trust-cg.gamma.bn_relu_fusion_obligation.v1",
+  "source_pattern": {
+    "ops": ["vnn.1", "vnn.2"],
+    "op_kinds": ["trust_ir.vnn.batch_norm", "trust_ir.vnn.relu"],
+    "edge": "%bn0",
+    "single_consumer": true,
+    "gamma_layer_ids": ["layer.1", "layer.2"],
+    "onnx_node_names": ["BatchNormalization_1", "Relu_2"]
+  },
+  "rewrite_pattern": {
+    "op": "trust_ir.vnn.batch_norm_relu",
+    "id": "vnn.fused.1_2",
+    "fused_gamma_layer_ids": ["layer.1", "layer.2"],
+    "output": "%relu0"
+  },
+  "tensors": {
+    "input": {
+      "id": "%conv0",
+      "dtype": "f32",
+      "shape": [1, 2, 1, 1],
+      "layout": "nchw",
+      "bounds": {
+        "kind": "per_channel_interval",
+        "lower": [0.0, -2.0],
+        "upper": [3.0, 2.0]
+      }
+    },
+    "preactivation": {
+      "id": "%bn0",
+      "dtype": "f32",
+      "shape": [1, 2, 1, 1],
+      "layout": "nchw"
+    },
+    "output": {
+      "id": "%relu0",
+      "dtype": "f32",
+      "shape": [1, 2, 1, 1],
+      "layout": "nchw",
+      "bounds": {
+        "kind": "per_channel_interval",
+        "lower": [0.0, 0.0],
+        "upper": [2.0, 1.5]
+      }
+    }
+  },
+  "batch_norm": {
+    "mode": "inference",
+    "axis": 1,
+    "epsilon": 1.0,
+    "scale": [2.0, 0.5],
+    "bias": [0.0, 0.0],
+    "mean": [1.0, -1.0],
+    "variance": [3.0, 0.0]
+  },
+  "fused": {
+    "affine_scale": [1.0, 0.5],
+    "affine_bias": [-1.0, 0.5],
+    "relu": true
+  },
+  "relaxation": {
+    "relation": "same",
+    "source": {
+      "kind": "relu_triangle"
+    },
+    "rewrite": {
+      "kind": "relu_triangle"
+    }
+  }
+}

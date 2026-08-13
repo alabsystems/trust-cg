@@ -1,0 +1,86 @@
+# trust-cg-jit-matrix - JIT benchmark matrix runners
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache-2.0
+
+[package]
+name = "trust-cg-jit-matrix"
+description = "JIT benchmark matrix runners for Trust Codegen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+
+[[bin]]
+name = "ay_subsumption_matrix"
+path = "src/bin/ay_subsumption_matrix.rs"
+
+[[bin]]
+name = "bcp_matrix"
+path = "src/bin/bcp_matrix.rs"
+
+[[bin]]
+name = "jit_compile_breakdown_table"
+path = "src/bin/jit_compile_breakdown_table.rs"
+required-features = ["unsafe-unrelocated-buffer-cache-test-hooks"]
+
+[features]
+default = []
+# Benchmark-only access to same-process executable-buffer cache hooks. The
+# production environment gate remains incapable of enabling unrelocated replay.
+unsafe-unrelocated-buffer-cache-test-hooks = []
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+thiserror = { workspace = true }
+trust-cg-codegen = { path = "../trust-cg-codegen", default-features = false }
+trust-cg-ir = { workspace = true }
+trust-cg-process-env = { workspace = true }
+trust-ir = { workspace = true }
+trust-ir-build = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+
+[build-dependencies]
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"
+criterion = "0.5"
+
+[[bench]]
+name = "bcp_baseline_bench"
+harness = false
+
+[[bench]]
+name = "parent_loop_bench"
+harness = false
+
+[[bench]]
+name = "jit_vs_native_bcp_bench"
+harness = false
+
+[[bench]]
+name = "jit_compile_breakdown_bench"
+harness = false
+
+[[bench]]
+name = "parent_loop_jit_vs_native_bench"
+harness = false
+
+[[bench]]
+name = "parent_loop_compile_breakdown_bench"
+harness = false
+
+[[bench]]
+name = "parent_loop_dense_jit_vs_native_bench"
+harness = false
+
+[lints]
+workspace = true

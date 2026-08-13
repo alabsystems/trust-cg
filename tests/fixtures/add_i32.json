@@ -1,0 +1,111 @@
+{
+  "name": "add_example",
+  "functions": [
+    {
+      "id": 0,
+      "name": "add_i32",
+      "ty": {
+        "params": [
+          {
+            "Primitive": {
+              "Int": {
+                "width": "I32",
+                "signed": true
+              }
+            }
+          },
+          {
+            "Primitive": {
+              "Int": {
+                "width": "I32",
+                "signed": true
+              }
+            }
+          }
+        ],
+        "returns": [
+          {
+            "Primitive": {
+              "Int": {
+                "width": "I32",
+                "signed": true
+              }
+            }
+          }
+        ]
+      },
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              {
+                "Primitive": {
+                  "Int": {
+                    "width": "I32",
+                    "signed": true
+                  }
+                }
+              }
+            ],
+            [
+              1,
+              {
+                "Primitive": {
+                  "Int": {
+                    "width": "I32",
+                    "signed": true
+                  }
+                }
+              }
+            ]
+          ],
+          "body": [
+            {
+              "instr": {
+                "BinOp": {
+                  "op": "Add",
+                  "ty": {
+                    "Primitive": {
+                      "Int": {
+                        "width": "I32",
+                        "signed": true
+                      }
+                    }
+                  },
+                  "lhs": {
+                    "Value": 0
+                  },
+                  "rhs": {
+                    "Value": 1
+                  }
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": []
+            },
+            {
+              "instr": {
+                "Return": {
+                  "values": [
+                    {
+                      "Value": 2
+                    }
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": []
+            }
+          ]
+        }
+      ],
+      "proofs": []
+    }
+  ],
+  "structs": []
+}

@@ -1,0 +1,12 @@
+[env]
+# Proof database construction currently needs a larger debug-build stack than
+# libtest's default thread stack on macOS. Keep cargo-driven test lanes on the
+# 16 MiB stack that covers the #592 exact repros while preserving explicit
+# caller overrides.
+RUST_MIN_STACK = { value = "16777216", force = false }
+
+[net]
+# Resolve exact Git dependencies through the system Git CLI. Development
+# credential helpers remain available, while public HTTPS sources stay
+# anonymous.
+git-fetch-with-cli = true

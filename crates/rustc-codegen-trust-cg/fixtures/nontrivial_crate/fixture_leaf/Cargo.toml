@@ -1,0 +1,12 @@
+[package]
+name = "rustc_codegen_trust_cg_fixture_leaf"
+version = "0.1.0"
+edition = "2021"
+authors = ["Andrew Yates <andrewyates.name@gmail.com>"]
+license = "Apache-2.0"
+repository = "https://github.com/alabsystems/trust-cg"
+homepage = "https://github.com/alabsystems/trust-cg"
+publish = false
+
+[lib]
+path = "src/lib.rs"

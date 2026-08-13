@@ -1,0 +1,19 @@
+[package]
+name = "rustc_codegen_trust_cg_nontrivial"
+version = "0.1.0"
+edition = "2021"
+authors = ["Andrew Yates <andrewyates.name@gmail.com>"]
+license = "Apache-2.0"
+repository = "https://github.com/alabsystems/trust-cg"
+homepage = "https://github.com/alabsystems/trust-cg"
+publish = false
+
+[features]
+default = ["cargo-dependency-fixture"]
+cargo-dependency-fixture = ["dep:rustc_codegen_trust_cg_fixture_dep"]
+
+[dependencies]
+rustc_codegen_trust_cg_fixture_dep = { path = "fixture_dep", optional = true }
+
+[workspace]
+members = ["fixture_dep", "fixture_leaf"]

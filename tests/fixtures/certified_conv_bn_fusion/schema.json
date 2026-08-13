@@ -1,0 +1,207 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://trust-cg.local/schemas/certified-conv-bn-fusion-obligation.schema.json",
+  "title": "Certified Conv/Gemm + BatchNorm fusion obligation fixture",
+  "type": "object",
+  "required": [
+    "format_version",
+    "pass",
+    "contract",
+    "semantic_policy",
+    "source",
+    "rewrite",
+    "obligation_hash",
+    "expected"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "format_version": { "const": "trust-cg.conv_bn_fusion_obligation.v1" },
+    "pass": {
+      "type": "object",
+      "required": ["name", "version", "mode"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "const": "conv-bn-fusion" },
+        "version": { "type": "string", "minLength": 1 },
+        "mode": { "const": "certified" }
+      }
+    },
+    "contract": {
+      "type": "object",
+      "required": ["mode", "metric", "epsilon"],
+      "additionalProperties": false,
+      "properties": {
+        "mode": { "const": "epsilon_equivalence" },
+        "metric": { "const": "absolute_per_element" },
+        "epsilon": { "type": "number", "minimum": 0 }
+      }
+    },
+    "semantic_policy": {
+      "type": "object",
+      "required": ["dtype", "rounding", "nan", "signed_zero", "denormals"],
+      "additionalProperties": false,
+      "properties": {
+        "dtype": { "const": "f32" },
+        "rounding": { "const": "rne" },
+        "nan": { "const": "disallowed" },
+        "signed_zero": { "const": "preserved" },
+        "denormals": { "const": "ieee" }
+      }
+    },
+    "source": {
+      "type": "object",
+      "required": ["op", "bn", "provenance"],
+      "additionalProperties": false,
+      "properties": {
+        "op": { "$ref": "#/$defs/source_op" },
+        "bn": { "$ref": "#/$defs/batch_norm" },
+        "provenance": { "$ref": "#/$defs/provenance" }
+      }
+    },
+    "rewrite": {
+      "type": "object",
+      "required": ["op", "fused_weight", "fused_bias", "provenance"],
+      "additionalProperties": false,
+      "properties": {
+        "op": { "$ref": "#/$defs/rewrite_op" },
+        "fused_weight": { "$ref": "#/$defs/parameter" },
+        "fused_bias": { "$ref": "#/$defs/parameter" },
+        "provenance": { "$ref": "#/$defs/rewrite_provenance" }
+      }
+    },
+    "obligation_hash": {
+      "type": "string",
+      "pattern": "^trust-cg-pass-obligation-v1:sha256:[0-9a-f]{64}$"
+    },
+    "expected": {
+      "type": "object",
+      "required": ["eligible"],
+      "additionalProperties": false,
+      "properties": {
+        "eligible": { "type": "boolean" },
+        "reason": { "type": "string" }
+      }
+    }
+  },
+  "$defs": {
+    "shape": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "integer", "minimum": 1 }
+    },
+    "tensor": {
+      "type": "object",
+      "required": ["id", "shape", "dtype", "layout"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "shape": { "$ref": "#/$defs/shape" },
+        "dtype": { "const": "f32" },
+        "layout": { "enum": ["nchw", "nc"] }
+      }
+    },
+    "parameter": {
+      "type": "object",
+      "required": ["id", "shape", "dtype", "layout", "values"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "shape": { "$ref": "#/$defs/shape" },
+        "dtype": { "const": "f32" },
+        "layout": { "enum": ["oihw", "oi", "vector"] },
+        "values": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "number" }
+        }
+      }
+    },
+    "source_op": {
+      "type": "object",
+      "required": ["id", "kind", "input", "output", "weight", "attrs"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "pattern": "^vnn\\.[0-9]+$" },
+        "kind": { "enum": ["trust_ir.vnn.conv2d", "trust_ir.vnn.linear"] },
+        "input": { "$ref": "#/$defs/tensor" },
+        "output": { "$ref": "#/$defs/tensor" },
+        "weight": { "$ref": "#/$defs/parameter" },
+        "bias": { "$ref": "#/$defs/parameter" },
+        "attrs": { "type": "object" }
+      }
+    },
+    "batch_norm": {
+      "type": "object",
+      "required": [
+        "id",
+        "input",
+        "output",
+        "inference_mode",
+        "statistics",
+        "epsilon",
+        "scale",
+        "bias",
+        "mean",
+        "variance"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "pattern": "^vnn\\.[0-9]+$" },
+        "input": { "$ref": "#/$defs/tensor" },
+        "output": { "$ref": "#/$defs/tensor" },
+        "inference_mode": { "type": "boolean" },
+        "statistics": { "enum": ["static", "runtime"] },
+        "epsilon": { "type": "number", "exclusiveMinimum": 0 },
+        "scale": { "$ref": "#/$defs/parameter" },
+        "bias": { "$ref": "#/$defs/parameter" },
+        "mean": { "$ref": "#/$defs/parameter" },
+        "variance": { "$ref": "#/$defs/parameter" }
+      }
+    },
+    "rewrite_op": {
+      "type": "object",
+      "required": ["id", "kind", "input", "output", "attrs"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "pattern": "^vnn\\.[0-9]+\\.fused$" },
+        "kind": { "enum": ["trust_ir.vnn.conv2d", "trust_ir.vnn.linear"] },
+        "input": { "$ref": "#/$defs/tensor" },
+        "output": { "$ref": "#/$defs/tensor" },
+        "attrs": { "type": "object" }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "required": ["source_gamma_layer_ids", "source_onnx_nodes"],
+      "additionalProperties": false,
+      "properties": {
+        "source_gamma_layer_ids": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": { "type": "string", "pattern": "^layer\\.[0-9]+$" }
+        },
+        "source_onnx_nodes": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "rewrite_provenance": {
+      "type": "object",
+      "required": ["fused_gamma_layer_ids", "source_obligation"],
+      "additionalProperties": false,
+      "properties": {
+        "fused_gamma_layer_ids": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": { "type": "string", "pattern": "^layer\\.[0-9]+$" }
+        },
+        "source_obligation": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

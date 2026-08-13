@@ -1,0 +1,23 @@
+{
+  "schema": "trust-cg-perf-ratchet-v1",
+  "notes": [
+    "BENCH-5 perf ratchet thresholds — consumed by scripts/check_perf_ratchet.py.",
+    "Thresholds live HERE (not in the script) so tightening/loosening is an explicit",
+    "reviewed commit, never an in-run adjustment (metrics-contract.md section 13).",
+    "The ratchet is deliberately looser than the contract gates (regression ALARM during",
+    "the climb to parity, not a parity gate): it fails on cliffs, not on parity misses.",
+    "The regression baseline is NOT stored here: it is derived as the best committed",
+    "EVIDENCE row per metric from ratchet/ledger.jsonl (headline_eligible only, same",
+    "host_arch). LOADED/dirty/smoke rows never become baselines. MISMATCH != 0 and",
+    "proof-weakening env (TCG_NO_PROOF_CERTS / TCG_REFINE_SOLVER=0 / TCG_NO_PROOF_CACHE)",
+    "are unconditional rejects regardless of any threshold — not ratchetable.",
+    "Noise floor rationale (contract section 2): runtime 10% > the max(5%, 2x spread)",
+    "significance floor on a quiet machine; compile 25% catches the popcnt-canary class",
+    "(~9x) and the greedy-interferes class while tolerating verdict-cache variance."
+  ],
+  "thresholds": {
+    "runtime_geomean_max_regress_pct": 10,
+    "compile_warm_o2_max_regress_pct": 25,
+    "coverage_drop_is_red": true
+  }
+}

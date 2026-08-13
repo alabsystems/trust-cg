@@ -1,0 +1,101 @@
+{
+  "local_required_fixes_present": {
+    "3b69945172c75ea424f9501c078468b69433f72b": true,
+    "4574b115e5103d4ba20331b51912f86b8c9a50f4": true
+  },
+  "missing_artifacts": [
+    {
+      "id": "public_trust_cg_snapshot_with_required_fixes",
+      "issue": "#719",
+      "kind": "external_publication",
+      "observed": {
+        "local_required_fixes_present": {
+          "3b69945172c75ea424f9501c078468b69433f72b": true,
+          "4574b115e5103d4ba20331b51912f86b8c9a50f4": true
+        },
+        "public_head_known_in_local_graph": true,
+        "public_trust_cg_head": "fc7623c069c63b95b14bd4886157ab4044b00bd2",
+        "public_required_fixes_present": {
+          "3b69945172c75ea424f9501c078468b69433f72b": false,
+          "4574b115e5103d4ba20331b51912f86b8c9a50f4": false
+        }
+      },
+      "reasons": [
+        "public_trust_cg_head_is_stale_719_pin",
+        "public_trust_cg_missing_required_fix:3b69945172c75ea424f9501c078468b69433f72b",
+        "public_trust_cg_missing_required_fix:4574b115e5103d4ba20331b51912f86b8c9a50f4"
+      ],
+      "required_evidence": "Public alabsystems/trust-cg HEAD contains every required #719 Trust Codegen fix and is visible to the local source graph.",
+      "status": "missing"
+    },
+    {
+      "id": "ay_trust_cg_rev_repin_to_public_head",
+      "issue": "#719",
+      "kind": "ay_repin",
+      "observed": {
+        "public_trust_cg_head": "fc7623c069c63b95b14bd4886157ab4044b00bd2",
+        "ay_trust_cg_dependency": {
+          "git": "https://github.com/alabsystems/trust-cg.git",
+          "path": null,
+          "rev": "fc7623c069c63b95b14bd4886157ab4044b00bd2"
+        }
+      },
+      "reasons": [
+        "ay_trust_cg_rev_is_stale_719_pin"
+      ],
+      "required_evidence": "ay trust-cg-codegen.rev equals the public Trust Codegen HEAD that contains the required fixes.",
+      "status": "missing"
+    },
+    {
+      "id": "ay_unpatched_trust_cg_pivot_gate_evidence",
+      "issue": "#719",
+      "kind": "downstream_gate",
+      "observed": {
+        "blocking_reasons": [
+          "ay_trust_cg_rev_is_stale_719_pin",
+          "public_trust_cg_head_is_stale_719_pin",
+          "public_trust_cg_missing_required_fix:3b69945172c75ea424f9501c078468b69433f72b",
+          "public_trust_cg_missing_required_fix:4574b115e5103d4ba20331b51912f86b8c9a50f4"
+        ],
+        "public_source_preflight_ok": false
+      },
+      "reasons": [
+        "ay_trust_cg_rev_is_stale_719_pin",
+        "public_trust_cg_head_is_stale_719_pin",
+        "public_trust_cg_missing_required_fix:3b69945172c75ea424f9501c078468b69433f72b",
+        "public_trust_cg_missing_required_fix:4574b115e5103d4ba20331b51912f86b8c9a50f4"
+      ],
+      "required_command": "RUSTC_WRAPPER= cargo test -p ay-lra --features trust-cg-backend trust_cg_pivot -- --nocapture",
+      "required_evidence": "After public source identity and ay repin pass, the normal unpatched ay trust_cg_pivot gate exits successfully.",
+      "status": "missing"
+    }
+  ],
+  "ok": false,
+  "public_trust_cg_head": "fc7623c069c63b95b14bd4886157ab4044b00bd2",
+  "public_trust_cg_trust_ir_build_dependency": {
+    "git": "https://github.com/alabsystems/trust-ir",
+    "path": null,
+    "rev": null
+  },
+  "public_trust_cg_trust_ir_dependency": {
+    "git": "https://github.com/alabsystems/trust-ir",
+    "path": null,
+    "rev": null
+  },
+  "public_required_fixes_present": {
+    "3b69945172c75ea424f9501c078468b69433f72b": false,
+    "4574b115e5103d4ba20331b51912f86b8c9a50f4": false
+  },
+  "public_trust_ir_head": "02b4f872948b67fe61632765c31542da7166dfe4",
+  "reasons": [
+    "ay_trust_cg_rev_is_stale_719_pin",
+    "public_trust_cg_head_is_stale_719_pin",
+    "public_trust_cg_missing_required_fix:3b69945172c75ea424f9501c078468b69433f72b",
+    "public_trust_cg_missing_required_fix:4574b115e5103d4ba20331b51912f86b8c9a50f4"
+  ],
+  "ay_trust_cg_dependency": {
+    "git": "https://github.com/alabsystems/trust-cg.git",
+    "path": null,
+    "rev": "fc7623c069c63b95b14bd4886157ab4044b00bd2"
+  }
+}
