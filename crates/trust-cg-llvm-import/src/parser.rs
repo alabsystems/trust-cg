@@ -35,6 +35,7 @@ use trust_ir::{
     ValueId, inst::Inst,
 };
 
+use crate::native_vector::{NativeForm, NativePlan, Shape};
 use crate::{Error, Result};
 use trust_cg_lower::{
     LLVM_LIBM_PURE_FUNCTION_ATTR_TAG, LLVM_STACK_PROTECTOR_FUNCTION_ATTR_TAG,
@@ -281,6 +282,28 @@ struct FuncScratch {
     pointer_stack_slots: HashSet<ValueId>,
     /// Imported proof facts attached to SSA pointer values.
     imported_pointer_proofs: HashMap<ValueId, Vec<ProofAnnotation>>,
+    /// Operand-token aliases installed by the vector lane expander (see
+    /// [`crate::vector`]): SSA name (no `%`) -> the token it stands for.
+    ///
+    /// `extractelement` / `insertelement` / `shufflevector` are pure lane
+    /// RENAMINGS, so they emit no instruction at all: the result name simply
+    /// resolves to the source lane's token, which may itself be another lane
+    /// name or a literal. Resolution happens in `lookup_operand` /
+    /// `lookup_phi_operand`, and `check_alias_registration_order` proves no
+    /// alias was installed after a use of the same name had already been
+    /// interned.
+    token_alias: HashMap<String, String>,
+    /// SSA names `intern_value` resolved WITHOUT an alias being in force.
+    /// Used only by `check_alias_registration_order`.
+    interned_unaliased: HashSet<String>,
+    /// Monotone counter naming the address temporaries a scalarized vector
+    /// load/store needs. Function-local and sequential, so it is stable
+    /// across runs (reproducible-builds requirement).
+    vec_uid: u32,
+    /// Which of this function's vector SSA values are carried as ONE native
+    /// 128-bit value rather than as scalar lanes. Computed once, before the
+    /// body is parsed, by [`crate::native_vector::plan_function`].
+    native_plan: NativePlan,
 }
 
 #[derive(Clone, Debug)]
@@ -308,6 +331,10 @@ impl FuncScratch {
             pending_phis: Vec::new(),
             pointer_stack_slots: HashSet::new(),
             imported_pointer_proofs: HashMap::new(),
+            token_alias: HashMap::new(),
+            interned_unaliased: HashSet::new(),
+            vec_uid: 0,
+            native_plan: NativePlan::default(),
         }
     }
 
@@ -318,12 +345,102 @@ impl FuncScratch {
     }
 
     fn intern_value(&mut self, name: &str) -> ValueId {
+        if !self.token_alias.contains_key(name) {
+            self.interned_unaliased.insert(name.to_string());
+        }
         if let Some(v) = self.value_map.get(name) {
             return *v;
         }
         let v = self.fresh_value();
         self.value_map.insert(name.to_string(), v);
         v
+    }
+
+    /// Resolve an operand token through the vector lane-alias chain.
+    ///
+    /// `%r` -> `%a#v2` -> `3` collapses to `3`. The chain is finite because an
+    /// alias is only ever installed for a FRESH SSA result name, so following
+    /// it strictly walks backwards through already-defined names; the bound is
+    /// belt-and-braces against a malformed input.
+    fn resolve_token_alias(&self, tok: &str) -> String {
+        let mut cur = tok.trim().to_string();
+        for _ in 0..self.token_alias.len() + 1 {
+            let Some(name) = cur.strip_prefix('%') else {
+                return cur;
+            };
+            match self.token_alias.get(name) {
+                Some(next) => cur = next.clone(),
+                None => return cur,
+            }
+        }
+        cur
+    }
+
+    /// Fail closed if any lane alias was installed AFTER a use of the same
+    /// name had already been interned as a plain SSA value.
+    ///
+    /// LLVM prints a definition before its non-phi uses, so this cannot happen
+    /// on well-formed clang output — but if it ever did, the use would have
+    /// been bound to a value with no definition, which is a MISCOMPILE. This
+    /// converts that into a clean `Unsupported`.
+    fn check_alias_registration_order(&self) -> Result<()> {
+        let mut late: Vec<&str> = self
+            .token_alias
+            .keys()
+            .filter(|k| self.interned_unaliased.contains(*k))
+            .map(String::as_str)
+            .collect();
+        if late.is_empty() {
+            return Ok(());
+        }
+        late.sort_unstable();
+        Err(Error::Unsupported(format!(
+            "vector lane alias for `%{}` was installed after the name was already \
+             used (definition does not textually precede its use)",
+            late[0]
+        )))
+    }
+
+    /// Fail closed if a named SSA value was referenced but never defined.
+    ///
+    /// Every `%name` the parser interns must end up as a block parameter or as
+    /// the result of some instruction. A name that is only ever READ would
+    /// lower to an uninitialized register — the exact silent-miscompile shape
+    /// that lane expansion could introduce if a vector value's producer were
+    /// ever skipped instead of refused.
+    fn check_all_named_values_defined(&self) -> Result<()> {
+        let mut defined: HashSet<ValueId> = HashSet::new();
+        for block in &self.blocks {
+            for (v, _) in &block.params {
+                defined.insert(*v);
+            }
+            for node in &block.body {
+                for r in &node.results {
+                    defined.insert(*r);
+                }
+            }
+        }
+        let mut undefined: Vec<&str> = self
+            .value_map
+            .iter()
+            .filter(|(_, v)| !defined.contains(v))
+            .map(|(k, _)| k.as_str())
+            .collect();
+        if undefined.is_empty() {
+            return Ok(());
+        }
+        undefined.sort_unstable();
+        Err(Error::Unsupported(format!(
+            "SSA value `%{}` is used but never defined ({} such value(s))",
+            undefined[0],
+            undefined.len()
+        )))
+    }
+
+    fn next_vec_uid(&mut self) -> u32 {
+        let id = self.vec_uid;
+        self.vec_uid += 1;
+        id
     }
 
     fn intern_block(&mut self, label: &str) -> BlockId {
@@ -1661,12 +1778,31 @@ impl Parser {
     // --- Declare / define --------------------------------------------------
 
     fn parse_declare(&mut self, line: &str, lineno: usize) -> Result<()> {
-        let mut sig = parse_function_signature(
+        let sig = parse_function_signature(
             line,
             lineno,
             /*is_define=*/ false,
             &self.attribute_groups,
-        )?;
+        );
+        let mut sig = match sig {
+            Ok(sig) => sig,
+            // A `declare` is a SIGNATURE ANNOUNCEMENT with no semantics of its
+            // own, so a declaration whose types the importer does not model is
+            // simply not registered instead of killing the module. This is
+            // fail-closed, not permissive: an unregistered callee cannot be
+            // called silently — `parse_call` still has to type every argument
+            // and result at the CALL SITE, and the `@llvm.*` classifier still
+            // rejects any intrinsic without a modelled lowering. It matters
+            // because clang emits `declare <4 x double> @llvm.fmuladd.v4f64(…)`
+            // for intrinsics the lane expander rewrites away entirely, so the
+            // declaration describes a function the module never calls.
+            //
+            // The libm purity license reads `unwrap_or(false)` per intrinsic,
+            // so a skipped declaration REVOKES the license rather than granting
+            // one — the conservative direction.
+            Err(Error::Unsupported(_)) => return Ok(()),
+            Err(e) => return Err(e),
+        };
         // De-mangle a `\01` asm-label callee name (e.g. `declare @"\01_fopen"`)
         // and record its origin so a later plain-`@fopen` collision fails closed.
         sig.name = self.canon_and_note_symbol(&sig.name)?;
@@ -1742,6 +1878,17 @@ impl Parser {
 
         // Walk the body, assigning ValueIds and BlockIds.
         let mut scratch = FuncScratch::new();
+
+        // NATIVE VECTOR PLAN. Decide, over the WHOLE body and before a single
+        // instruction is emitted, which vector SSA values are carried as one
+        // 128-bit value instead of as scalar lanes. It has to be a whole-body
+        // decision: a value's representation is fixed at its definition, but
+        // whether that representation pays depends on its CONSUMERS, which the
+        // line-at-a-time walk below has not seen yet.
+        scratch.native_plan = crate::native_vector::plan_function(
+            &native_vector_plan_input(body),
+            !vector_import_disabled() && !crate::native_vector::native_lower_disabled(),
+        );
 
         // Entry block and its parameters.
         let entry_id = scratch.intern_block("entry");
@@ -1826,7 +1973,9 @@ impl Parser {
             bi += 1;
         }
 
+        scratch.check_alias_registration_order()?;
         self.apply_pending_phis(&mut scratch)?;
+        scratch.check_all_named_values_defined()?;
         scratch.propagate_imported_o0_pointer_proofs(entry_id);
 
         // Install blocks into the function. Every block must have a
@@ -2263,7 +2412,419 @@ impl Parser {
             r
         };
 
-        // Dispatch on the leading opcode keyword.
+        // NATIVE VECTOR LOWERING. Before falling back to lane scalarization,
+        // ask the plan whether THIS instruction was chosen to be carried in a
+        // single 128-bit register. The plan is subtractive and shape-gated, so
+        // an instruction only gets here if every operand shape, lane index and
+        // shuffle mask it uses was proven lowerable.
+        if !f.native_plan.is_empty()
+            && self.try_native_vector(result_name.as_deref(), rest, lineno, f)?
+        {
+            return Ok(());
+        }
+
+        // VECTOR LANE EXPANSION. clang -O2/-O3 emits fixed-width vector types
+        // and the element operations; `crate::vector::expand` rewrites one
+        // vector instruction into the equivalent sequence of SCALAR textual
+        // instructions, which are then parsed by the ordinary scalar paths
+        // below. Anything vector-typed without a proven lane-wise expansion
+        // comes back as `Err` and fails closed here. `TCG_NO_VECTOR_IMPORT=1`
+        // restores the pre-expansion behaviour byte for byte.
+        if !vector_import_disabled() {
+            let uid = f.vec_uid;
+            match crate::vector::expand(result_name.as_deref(), rest, uid) {
+                Ok(Some(expansion)) => {
+                    let _ = f.next_vec_uid();
+                    for (name, token) in expansion.aliases {
+                        f.token_alias.insert(name, token);
+                    }
+                    for (name, text) in expansion.insts {
+                        self.dispatch_body_inst(name, &text, lineno, f)?;
+                    }
+                    // BOUNDARY (lanes -> native). This value scalarized, but
+                    // some consumer of it was planned native, so pack the lanes
+                    // into one register HERE — at the definition, where the
+                    // packed value dominates exactly what the lanes dominate.
+                    if let Some(name) = result_name.as_deref()
+                        && let Some(shape) = f.native_plan.pack_needed(name)
+                    {
+                        self.emit_pack_lanes(name, shape, f)?;
+                    }
+                    return Ok(());
+                }
+                Ok(None) => {}
+                Err(reason) => return Err(self.err_unsupported(&reason)),
+            }
+        }
+
+        self.dispatch_body_inst(result_name, rest, lineno, f)
+    }
+
+    // --- Native 128-bit vector lowering ------------------------------------
+
+    /// Emit `rest` as a NATIVE vector instruction if the function's plan chose
+    /// that representation for it. Returns `false` when the instruction is not
+    /// native (the caller then falls through to lane scalarization).
+    ///
+    /// The plan has already proven the shape, the operand spellings, the lane
+    /// index and the shuffle mask; this function does no re-deciding, it only
+    /// builds the `trust_ir` node the plan asked for. Anything the plan did not
+    /// mark stays on the scalarizing path, which is why an unrecognized form
+    /// can never be lowered natively by accident.
+    fn try_native_vector(
+        &mut self,
+        result: Option<&str>,
+        rest: &str,
+        lineno: usize,
+        f: &mut FuncScratch,
+    ) -> Result<bool> {
+        let opcode = rest.split_whitespace().next().unwrap_or("");
+
+        // `store` has no SSA result, so it is not in the plan's `forms` map;
+        // it is native exactly when its stored value is (the same rule the
+        // planner applied).
+        if opcode == "store" {
+            return self.try_native_vector_store(rest, lineno, f);
+        }
+
+        let Some(name) = result else {
+            return Ok(false);
+        };
+        let Some(form) = f.native_plan.form(name).cloned() else {
+            return Ok(false);
+        };
+
+        let tail = strip_native_vector_flags(rest, opcode);
+        match form {
+            NativeForm::Load => self.emit_native_vector_load(name, tail, lineno, f)?,
+            NativeForm::BinOp => self.emit_native_vector_binop(opcode, name, tail, lineno, f)?,
+            NativeForm::Phi => {
+                let (ty_str, _) = split_ty_operand(tail)?;
+                let shape = self.require_native_shape(&ty_str)?;
+                self.parse_phi_with_ty(tail, Some(name.to_string()), lineno, f, shape.vector_ty())?;
+            }
+            NativeForm::ExtractElement => {
+                self.emit_native_extract_element(name, tail, lineno, f)?
+            }
+            NativeForm::InsertElement => self.emit_native_insert_element(name, tail, lineno, f)?,
+            NativeForm::SplatLane0 { splat_token } => {
+                self.emit_native_splat(name, tail, &splat_token, lineno, f)?
+            }
+            NativeForm::Store => return Ok(false),
+        }
+
+        // BOUNDARY (native -> lanes). Some consumer of this value is
+        // scalarized, so materialize its lanes right here at the definition:
+        // `%name#vi = extractelement <S> %name, i64 i`. Emitting at the
+        // definition (not at each use) is what makes the lane values dominate
+        // every use the native value dominated.
+        if let Some(shape) = f.native_plan.lanes_needed(name) {
+            self.emit_native_lane_explosion(name, shape, f)?;
+        }
+        Ok(true)
+    }
+
+    /// The plan says this `store` is native: one `STR Q` of a 128-bit value.
+    fn try_native_vector_store(
+        &mut self,
+        rest: &str,
+        lineno: usize,
+        f: &mut FuncScratch,
+    ) -> Result<bool> {
+        let tail = rest.trim_start_matches("store").trim();
+        if tail.starts_with("volatile ") || tail.starts_with("atomic ") {
+            return Ok(false);
+        }
+        let Some((val_part, rest2)) = split_comma(tail) else {
+            return Ok(false);
+        };
+        let Ok((ty_str, val_tok)) = split_ty_operand(&val_part) else {
+            return Ok(false);
+        };
+        let Some(shape) = crate::native_vector::native_shape(&ty_str) else {
+            return Ok(false);
+        };
+        // Native exactly when the stored value is itself native (or a vector
+        // constant, which materializes directly into a register).
+        if let Some(name) = val_tok.trim().strip_prefix('%')
+            && !f.native_plan.is_native(name)
+        {
+            return Ok(false);
+        }
+        let ty = shape.vector_ty();
+        let value = self.lookup_operand(&val_tok, &ty, f)?;
+        let ptr_part = split_comma(&rest2)
+            .map(|(head, _)| head)
+            .unwrap_or_else(|| rest2.trim().to_string());
+        let (_, ptr_tok) = split_ty_operand(&ptr_part)?;
+        let ptr = self.lookup_operand(&ptr_tok, &Ty::Ptr, f)?;
+        let _ = lineno;
+        f.push_inst(InstrNode::new(Inst::Store {
+            ty,
+            ptr,
+            value,
+            volatile: false,
+            align: None,
+        }));
+        Ok(true)
+    }
+
+    fn require_native_shape(&self, ty_str: &str) -> Result<Shape> {
+        crate::native_vector::native_shape(ty_str).ok_or_else(|| {
+            self.err_unsupported(&format!(
+                "native vector lowering reached non-contracted shape `{ty_str}`"
+            ))
+        })
+    }
+
+    fn emit_native_vector_load(
+        &mut self,
+        name: &str,
+        tail: &str,
+        lineno: usize,
+        f: &mut FuncScratch,
+    ) -> Result<()> {
+        let (ty_str, rest2) = split_comma(tail)
+            .ok_or_else(|| self.err_parse(lineno, "load: expected `<ty>, ptr`"))?;
+        let shape = self.require_native_shape(&ty_str)?;
+        let ptr_part = split_comma(&rest2)
+            .map(|(head, _)| head)
+            .unwrap_or_else(|| rest2.trim().to_string());
+        let (_, ptr_tok) = split_ty_operand(&ptr_part)?;
+        let ptr = self.lookup_operand(&ptr_tok, &Ty::Ptr, f)?;
+        let dest = f.intern_value(name);
+        f.push_inst(
+            InstrNode::new(Inst::Load {
+                ty: shape.vector_ty(),
+                ptr,
+                volatile: false,
+                align: None,
+            })
+            .with_result(dest),
+        );
+        Ok(())
+    }
+
+    fn emit_native_vector_binop(
+        &mut self,
+        opcode: &str,
+        name: &str,
+        tail: &str,
+        lineno: usize,
+        f: &mut FuncScratch,
+    ) -> Result<()> {
+        // Only the lane-wise operations the AArch64 ISel lowers for the
+        // contracted shapes reach here — six integer ops on the integer
+        // shapes, four FP ops on `<4 x float>`/`<2 x double>` (the planner
+        // admits no other opcode, and refuses the integer/FP cross product).
+        // Anything else is a planner/emitter disagreement and fails closed
+        // rather than picking a default.
+        let op = match opcode {
+            "add" => BinOp::Add,
+            "sub" => BinOp::Sub,
+            "mul" => BinOp::Mul,
+            "and" => BinOp::And,
+            "or" => BinOp::Or,
+            "xor" => BinOp::Xor,
+            "fadd" => BinOp::FAdd,
+            "fsub" => BinOp::FSub,
+            "fmul" => BinOp::FMul,
+            "fdiv" => BinOp::FDiv,
+            _ => {
+                return Err(self.err_unsupported(&format!(
+                    "native vector lowering reached unmodelled opcode `{opcode}`"
+                )));
+            }
+        };
+        let (ty_str, operands) = split_ty_operand(tail)?;
+        let shape = self.require_native_shape(&ty_str)?;
+        // Re-check the integer/FP split at the emission site. The planner is
+        // the authority on what goes native, but this function is reachable
+        // from a single `NativeForm::BinOp` tag that does not itself record
+        // which family the opcode came from, so a future planner edit that
+        // widened one set without the other would otherwise emit `ADD .2d` for
+        // a `<2 x double>`. Cheap, local, and fails closed.
+        let op_is_fp = matches!(op, BinOp::FAdd | BinOp::FSub | BinOp::FMul | BinOp::FDiv);
+        if op_is_fp != shape.elem.is_float() {
+            return Err(self.err_unsupported(&format!(
+                "native vector lowering: opcode `{opcode}` does not match element type of `{ty_str}`"
+            )));
+        }
+        let ty = shape.vector_ty();
+        let (lhs_str, rhs_str) = split_comma(&operands)
+            .ok_or_else(|| self.err_parse(lineno, "vector binop: expected `%a, %b`"))?;
+        let lhs = self.lookup_operand(&lhs_str, &ty, f)?;
+        let rhs = self.lookup_operand(&rhs_str, &ty, f)?;
+        let dest = f.intern_value(name);
+        f.push_inst(InstrNode::new(Inst::BinOp { op, ty, lhs, rhs }).with_result(dest));
+        Ok(())
+    }
+
+    fn emit_native_extract_element(
+        &mut self,
+        name: &str,
+        tail: &str,
+        lineno: usize,
+        f: &mut FuncScratch,
+    ) -> Result<()> {
+        let parts = split_aggregate_elems(tail);
+        if parts.len() != 2 {
+            return Err(self.err_parse(lineno, "extractelement: expected `<vec>, <idx>`"));
+        }
+        let (vec_ty, vec_val) = split_ty_operand(&parts[0])?;
+        let shape = self.require_native_shape(&vec_ty)?;
+        let array = self.lookup_operand(&vec_val, &shape.vector_ty(), f)?;
+        let index = self.native_lane_index(&parts[1], shape, lineno, f)?;
+        let dest = f.intern_value(name);
+        f.push_inst(
+            InstrNode::new(Inst::ExtractElement {
+                ty: shape.elem.ty(),
+                array,
+                index,
+            })
+            .with_result(dest),
+        );
+        Ok(())
+    }
+
+    fn emit_native_insert_element(
+        &mut self,
+        name: &str,
+        tail: &str,
+        lineno: usize,
+        f: &mut FuncScratch,
+    ) -> Result<()> {
+        let parts = split_aggregate_elems(tail);
+        if parts.len() != 3 {
+            return Err(self.err_parse(lineno, "insertelement: expected `<vec>, <elem>, <idx>`"));
+        }
+        let (vec_ty, vec_val) = split_ty_operand(&parts[0])?;
+        let shape = self.require_native_shape(&vec_ty)?;
+        let ty = shape.vector_ty();
+        let array = self.lookup_operand(&vec_val, &ty, f)?;
+        let (_, ins_val) = split_ty_operand(&parts[1])?;
+        let value = self.lookup_operand(&ins_val, &shape.elem.ty(), f)?;
+        let index = self.native_lane_index(&parts[2], shape, lineno, f)?;
+        let dest = f.intern_value(name);
+        f.push_inst(
+            InstrNode::new(Inst::InsertElement {
+                ty,
+                array,
+                index,
+                value,
+            })
+            .with_result(dest),
+        );
+        Ok(())
+    }
+
+    /// The lane-0 broadcast idiom, which is exactly NEON `DUP`:
+    ///
+    /// ```text
+    /// %a = insertelement <S> poison, T %x, i64 0
+    /// %b = shufflevector <S> %a, <S> poison, <N x i32> zeroinitializer
+    /// ```
+    ///
+    /// The planner has already proven that the source of this shuffle is that
+    /// `insertelement`, so lane 0 IS `%x` and the pair collapses to a single
+    /// `vector.pack_lanes` of one repeated scalar. No other shuffle reaches
+    /// here — everything else scalarizes.
+    fn emit_native_splat(
+        &mut self,
+        name: &str,
+        tail: &str,
+        splat_token: &str,
+        lineno: usize,
+        f: &mut FuncScratch,
+    ) -> Result<()> {
+        let parts = split_aggregate_elems(tail);
+        if parts.len() != 3 {
+            return Err(self.err_parse(lineno, "shufflevector: expected three operands"));
+        }
+        let (vec_ty, _) = split_ty_operand(&parts[0])?;
+        let shape = self.require_native_shape(&vec_ty)?;
+        let lane0 = self.lookup_operand(splat_token, &shape.elem.ty(), f)?;
+        let dest = f.intern_value(name);
+        let op = trust_ir::dialect::vector::pack_lanes_repeated(shape.vector_ty(), lane0)
+            .map_err(|e| self.err_unsupported(&format!("vector splat: {e}")))?;
+        f.push_inst(InstrNode::new(Inst::DialectOp(Box::new(op))).with_result(dest));
+        Ok(())
+    }
+
+    /// Materialize the constant lane index of an `insertelement` /
+    /// `extractelement` as the `i64` constant `trust_ir` requires.
+    fn native_lane_index(
+        &mut self,
+        clause: &str,
+        shape: Shape,
+        lineno: usize,
+        f: &mut FuncScratch,
+    ) -> Result<ValueId> {
+        let (_, val) = split_ty_operand(clause)?;
+        let idx = parse_int_literal(&val)
+            .ok_or_else(|| self.err_parse(lineno, "vector lane index is not a constant"))?;
+        if idx < 0 || idx >= i128::from(shape.lanes) {
+            return Err(self.err_parse(lineno, "vector lane index out of range"));
+        }
+        Ok(self.emit_i64_const(idx, f))
+    }
+
+    /// BOUNDARY (native -> lanes): bind `%name#v0 … %name#v{n-1}` to the lanes
+    /// of the native value `%name`, so a scalarized consumer finds exactly the
+    /// lane names [`crate::vector`] would have produced.
+    fn emit_native_lane_explosion(
+        &mut self,
+        name: &str,
+        shape: Shape,
+        f: &mut FuncScratch,
+    ) -> Result<()> {
+        let array = f.intern_value(name);
+        let elem_ty = shape.elem.ty();
+        for i in 0..shape.lanes {
+            let index = self.emit_i64_const(i128::from(i), f);
+            let lane = f.intern_value(&format!("{name}#v{i}"));
+            f.push_inst(
+                InstrNode::new(Inst::ExtractElement {
+                    ty: elem_ty.clone(),
+                    array,
+                    index,
+                })
+                .with_result(lane),
+            );
+        }
+        Ok(())
+    }
+
+    /// BOUNDARY (lanes -> native): bind `%name` to a single 128-bit value built
+    /// from the lanes `%name#v0 … %name#v{n-1}` a scalarized definition just
+    /// produced.
+    ///
+    /// A lane may be an ALIAS (`extractelement`/`shufflevector` are pure
+    /// renamings in the scalarizer) or even a literal, so each lane goes
+    /// through the ordinary operand resolution rather than being assumed to be
+    /// an SSA name.
+    fn emit_pack_lanes(&mut self, name: &str, shape: Shape, f: &mut FuncScratch) -> Result<()> {
+        let elem_ty = shape.elem.ty();
+        let mut lanes = Vec::with_capacity(shape.lanes as usize);
+        for i in 0..shape.lanes {
+            let tok = format!("%{name}#v{i}");
+            lanes.push(self.lookup_operand(&tok, &elem_ty, f)?);
+        }
+        let dest = f.intern_value(name);
+        let op = trust_ir::dialect::vector::pack_lanes(shape.vector_ty(), lanes);
+        f.push_inst(InstrNode::new(Inst::DialectOp(Box::new(op))).with_result(dest));
+        Ok(())
+    }
+
+    /// Dispatch a SCALAR instruction on its leading opcode keyword. Reached
+    /// both directly and, one lane at a time, from the vector expander.
+    fn dispatch_body_inst(
+        &mut self,
+        result_name: Option<String>,
+        rest: &str,
+        lineno: usize,
+        f: &mut FuncScratch,
+    ) -> Result<()> {
         let opcode = rest.split_whitespace().next().unwrap_or("");
         match opcode {
             "ret" => self.parse_ret(rest, lineno, f),
@@ -2342,11 +2903,15 @@ impl Parser {
             let rest2 = parts
                 .next()
                 .ok_or_else(|| self.err_parse(lineno, "br: missing labels"))?;
-            let cond_name = cond_part
-                .trim_start_matches("i1")
-                .trim()
-                .trim_start_matches('%');
-            let cond = f.intern_value(cond_name);
+            // Route the condition through `lookup_operand` rather than
+            // interning the bare name. Two things fall out: the vector
+            // lane-alias chain is resolved (an `extractelement <N x i1> %m,
+            // i32 k` condition is a pure renaming, so `%c` may stand for
+            // `%m#vk`), and a LITERAL condition — `br i1 true, …` — becomes a
+            // materialized Bool constant instead of an SSA name `true` with no
+            // definition anywhere in the function.
+            let cond_tok = cond_part.trim_start_matches("i1").trim();
+            let cond = self.lookup_operand(cond_tok, &Ty::Bool, f)?;
             let (tlabel, flabel) = split_two_labels(rest2)
                 .ok_or_else(|| self.err_parse(lineno, "br: malformed label pair"))?;
             let then_id = f.intern_block(&tlabel);
@@ -4372,15 +4937,35 @@ impl Parser {
         lineno: usize,
         f: &mut FuncScratch,
     ) -> Result<()> {
+        let tail = strip_fmath_flags(rest, "phi");
+        let (ty_str, _) = split_ty_operand(tail)?;
+        let ty = parse_ty(&ty_str)?;
+        self.parse_phi_with_ty(tail, result, lineno, f, ty)
+    }
+
+    /// The body of [`Self::parse_phi`], with the block-parameter type supplied
+    /// by the caller.
+    ///
+    /// `tail` is the phi text with the opcode and any fast-math flags already
+    /// stripped. The native vector path calls this directly with a
+    /// `Ty::Vector(..)` so the phi becomes ONE V128 block parameter instead of
+    /// `lanes` scalar ones; every other caller passes `parse_ty`'s result and
+    /// the behaviour is unchanged.
+    fn parse_phi_with_ty(
+        &mut self,
+        tail: &str,
+        result: Option<String>,
+        lineno: usize,
+        f: &mut FuncScratch,
+        ty: Ty,
+    ) -> Result<()> {
         let name = result.ok_or_else(|| self.err_parse(lineno, "phi without result"))?;
         let target = f
             .current
             .ok_or_else(|| self.err_parse(lineno, "phi outside block"))?;
         let target = BlockId::new(target as u32);
 
-        let tail = strip_fmath_flags(rest, "phi");
-        let (ty_str, incoming_str) = split_ty_operand(tail)?;
-        let ty = parse_ty(&ty_str)?;
+        let (_, incoming_str) = split_ty_operand(tail)?;
         let dest = f.intern_value(&name);
         f.blocks[target.as_usize()].params.push((dest, ty.clone()));
 
@@ -4585,7 +5170,8 @@ impl Parser {
         lineno: usize,
         f: &mut FuncScratch,
     ) -> Result<ValueId> {
-        let tok = tok.trim();
+        let resolved = f.resolve_token_alias(tok);
+        let tok = resolved.as_str();
         if let Some(rest) = tok.strip_prefix('%') {
             return Ok(f.intern_value(rest));
         }
@@ -4613,6 +5199,40 @@ impl Parser {
             return Ok(v);
         }
 
+        // `phi ptr [ getelementptr inbounds (i8, ptr @g, i64 K), %pred ], ...`
+        //
+        // The address of a global at a CONSTANT byte offset, as a phi incoming.
+        // This is the canonical shape of a POINTER-INDUCTION-VARIABLE loop whose
+        // walk starts inside a global array (`p = &g[k]`), so clang emits it for
+        // exactly the loops we most want to import well. Without this arm the
+        // token fell through to `parse_constant_operand`, which has no
+        // const-expr evaluator, and the whole module failed to import.
+        //
+        // Same treatment as the `@g` arm directly above, which is this case with
+        // K = 0: fold the offset into the address stub and materialize ONE
+        // constant in the PREDECESSOR block, so the value dominates the phi
+        // edge. `global_addr_stub` already takes the byte offset and range-checks
+        // it, and `parse_constexpr_global_gep` is the same parser the operand
+        // path uses -- both fail closed, so an offset or shape either of them
+        // rejects still refuses the module rather than mis-importing it.
+        if constant_expr_operand_kind(tok) == Some("getelementptr")
+            && matches!(ty, Ty::Ptr)
+            && let Ok((global_name, offset)) = self.parse_constexpr_global_gep(tok)
+        {
+            let addr = self.global_addr_stub(&global_name, offset)?;
+            let v = f.fresh_value();
+            f.insert_before_terminator(
+                pred,
+                InstrNode::new(Inst::Const {
+                    ty: Ty::Ptr,
+                    value: Constant::Int(addr),
+                })
+                .with_result(v),
+                lineno,
+            )?;
+            return Ok(v);
+        }
+
         let constant = self.parse_constant_operand(tok, ty)?;
         let v = f.fresh_value();
         f.insert_before_terminator(
@@ -4627,7 +5247,61 @@ impl Parser {
         Ok(v)
     }
 
+    /// Decode a whole-vector constant operand into `Constant::Vector`.
+    ///
+    /// Handles every spelling clang emits for a vector constant. Each lane is
+    /// decoded by the SAME `parse_constant_operand` that decodes a scalar of
+    /// the element type, so a lane literal can never be read differently here
+    /// than it would be on the scalarizing path. Anything else fails closed.
+    fn parse_vector_constant(&self, tok: &str, elem: &Ty, lanes: u32) -> Result<Constant> {
+        let tok = tok.trim();
+        let n = lanes as usize;
+        if tok == "zeroinitializer" || tok == "undef" || tok == "poison" {
+            let zero = self.parse_constant_operand("undef", elem)?;
+            return Ok(Constant::Vector(vec![zero; n]));
+        }
+        if let Some(inner) = tok
+            .strip_prefix("splat (")
+            .and_then(|s| s.strip_suffix(')'))
+        {
+            let (ty_str, val) = split_ty_operand(inner)?;
+            let lane_ty = parse_ty(&ty_str)?;
+            if lane_ty != *elem {
+                return Err(self.err_unsupported(&format!(
+                    "vector splat element type `{ty_str}` does not match `{elem:?}`"
+                )));
+            }
+            let lane = self.parse_constant_operand(&val, elem)?;
+            return Ok(Constant::Vector(vec![lane; n]));
+        }
+        if let Some(inner) = tok.strip_prefix('<').and_then(|s| s.strip_suffix('>')) {
+            let elems = split_aggregate_elems(inner);
+            if elems.len() != n {
+                return Err(self.err_unsupported(&format!(
+                    "vector constant `{tok}` has {} elements, expected {n}",
+                    elems.len()
+                )));
+            }
+            let mut out = Vec::with_capacity(n);
+            for e in elems {
+                let (ty_str, val) = split_ty_operand(&e)?;
+                let lane_ty = parse_ty(&ty_str)?;
+                if lane_ty != *elem {
+                    return Err(self.err_unsupported(&format!(
+                        "vector constant element type `{ty_str}` does not match `{elem:?}`"
+                    )));
+                }
+                out.push(self.parse_constant_operand(&val, elem)?);
+            }
+            return Ok(Constant::Vector(out));
+        }
+        Err(self.err_unsupported(&format!("vector constant operand `{tok}`")))
+    }
+
     fn parse_constant_operand(&self, tok: &str, ty: &Ty) -> Result<Constant> {
+        if let Ty::Vector(elem, lanes) = ty {
+            return self.parse_vector_constant(tok, elem, *lanes);
+        }
         if tok == "true" {
             Ok(Constant::Bool(true))
         } else if tok == "false" {
@@ -4662,7 +5336,29 @@ impl Parser {
     // --- Operand resolution -----------------------------------------------
 
     fn lookup_operand(&self, tok: &str, ty: &Ty, f: &mut FuncScratch) -> Result<ValueId> {
-        let tok = tok.trim();
+        // Vector lane aliases first: `%r` may stand for `%a#v2` or for a bare
+        // literal after an `extractelement` / `shufflevector` renaming.
+        let resolved = f.resolve_token_alias(tok);
+        let tok = resolved.as_str();
+        // A whole-vector CONSTANT operand of a natively-lowered instruction:
+        // `zeroinitializer`, an element list, `splat (T v)`, `undef`/`poison`.
+        // Only reached with a `Ty::Vector` annotation, which only the native
+        // path produces — the scalarizer splits constants lane by lane before
+        // any operand resolution happens.
+        if let Ty::Vector(elem, lanes) = ty
+            && !tok.starts_with('%')
+        {
+            let constant = self.parse_vector_constant(tok, elem, *lanes)?;
+            let v = f.fresh_value();
+            f.push_inst(
+                InstrNode::new(Inst::Const {
+                    ty: ty.clone(),
+                    value: constant,
+                })
+                .with_result(v),
+            );
+            return Ok(v);
+        }
         if let Some(kind) = constant_expr_operand_kind(tok) {
             // A `getelementptr (...)` const-expr addressing a global folds to the
             // global's base address plus a constant byte offset — the one const-
@@ -5226,7 +5922,11 @@ fn parse_function_signature(
     // a predictable shape: the type is always the token immediately before
     // `@name`.
     // Tokenise pre_at; the last token with a leading type char is the type.
-    let mut tokens: Vec<&str> = pre_at.split_whitespace().collect();
+    // Bracket-aware, so `declare <4 x double> @llvm.fmuladd.v4f64(...)` sees
+    // ONE return-type token instead of the three fragments `<4` / `x` /
+    // `double>` — none of which `is_type_token` recognises, so the vector
+    // return silently became `void`.
+    let mut tokens: Vec<&str> = split_top_level_ws(pre_at);
     let mut ret_ty: Option<Ty> = None;
     while let Some(t) = tokens.pop() {
         if t == "void" {
@@ -5252,8 +5952,13 @@ fn parse_function_signature(
                 is_vararg = true;
                 continue;
             }
-            // Each param is `<ty> [attrs...] [%name]`.
-            let toks: Vec<&str> = p.split_whitespace().collect();
+            // Each param is `<ty> [attrs...] [%name]`. Tokenize at bracket
+            // depth 0 so a bracketed type — `<4 x double>`, `[8 x i32]`,
+            // `{ i32, i32 }` — stays ONE token. Splitting on plain whitespace
+            // cut `<4 x double>` into `<4` / `x` / `double>` and handed the
+            // fragment `<4` to `parse_ty`, which reported the nonsense
+            // diagnostic "aggregate / vector type `<4`".
+            let toks: Vec<&str> = split_top_level_ws(p);
             if toks.is_empty() {
                 continue;
             }
@@ -5342,7 +6047,7 @@ fn split_eq_not_icmp(s: &str) -> Option<(&str, &str)> {
     None
 }
 
-fn split_comma(s: &str) -> Option<(String, String)> {
+pub(crate) fn split_comma(s: &str) -> Option<(String, String)> {
     // Respect balanced brackets of every kind — `[` `(` `{` `<` — and `c"..."`
     // string literals, so a comma inside a struct initializer `{ i32 1, i32 2 }`
     // or a string does not split the operand.
@@ -5409,6 +6114,75 @@ fn split_two_labels(s: &str) -> Option<(String, String)> {
         .trim_start_matches('%')
         .to_string();
     Some((a, b))
+}
+
+/// Strip the opcode word and any poison-refinement / fast-math flag tokens that
+/// may follow it, leaving the operand text. Used by the native vector emitter,
+/// which must see exactly the operand text the planner classified.
+fn strip_native_vector_flags<'a>(rest: &'a str, opcode: &str) -> &'a str {
+    let mut s = rest.trim_start_matches(opcode).trim_start();
+    loop {
+        let next = s.split_whitespace().next().unwrap_or("");
+        let is_flag = matches!(
+            next,
+            "nsw"
+                | "nuw"
+                | "exact"
+                | "disjoint"
+                | "samesign"
+                | "nneg"
+                | "fast"
+                | "nnan"
+                | "ninf"
+                | "nsz"
+                | "arcp"
+                | "contract"
+                | "afn"
+                | "reassoc"
+        );
+        if next.is_empty() || !is_flag {
+            return s;
+        }
+        s = s[next.len()..].trim_start();
+    }
+}
+
+/// Reduce a raw function body to the `(result_name, instruction_text)` pairs
+/// [`crate::native_vector::plan_function`] expects.
+///
+/// This must apply the SAME normalization the emitter applies — the `=` split
+/// and the tail-call marker strip — or the planner would key its decisions on
+/// text the emitter never sees. Lines that are not instructions (labels,
+/// braces, blank lines) map to an empty entry so nothing is misread as one.
+fn native_vector_plan_input(body: &[(usize, String)]) -> Vec<(Option<String>, String)> {
+    let mut out = Vec::with_capacity(body.len());
+    for (_, raw) in body {
+        let line = raw.trim();
+        if line.is_empty() || line == "{" || line == "}" || parse_block_label(line).is_some() {
+            out.push((None, String::new()));
+            continue;
+        }
+        let (result, rest) = match split_eq_not_icmp(line) {
+            Some((lhs, rhs)) => {
+                let lhs = lhs.trim();
+                if !lhs.starts_with('%') {
+                    out.push((None, String::new()));
+                    continue;
+                }
+                (Some(lhs.trim_start_matches('%').to_string()), rhs.trim())
+            }
+            None => (None, line),
+        };
+        let mut rest = rest;
+        for prefix in ["tail ", "musttail ", "notail "] {
+            if let Some(t) = rest.strip_prefix(prefix) {
+                rest = t.trim_start();
+                break;
+            }
+        }
+        out.push((result, rest.to_string()));
+    }
+    out
 }
 
 fn strip_binop_flags<'a>(rest: &'a str, opcode: &str) -> &'a str {
@@ -5615,7 +6389,7 @@ fn libm_intrinsic_symbol(name: &str) -> Option<&'static str> {
 /// aggregate types: `[N x T]`, `{ ... }`, `<N x T>` return the whole bracketed
 /// type; `%name` and scalars (`i32`, `double`, `ptr`) run to the next
 /// whitespace. Returns `(type, value)` or `None` if either is empty.
-fn split_leading_type(s: &str) -> Option<(&str, &str)> {
+pub(crate) fn split_leading_type(s: &str) -> Option<(&str, &str)> {
     let s = s.trim_start();
     let first = s.chars().next()?;
     let end = if matches!(first, '[' | '{' | '<') {
@@ -5649,7 +6423,7 @@ fn split_leading_type(s: &str) -> Option<(&str, &str)> {
 /// Split an aggregate-initializer body (the inside of `{...}` or `[...]`) into
 /// its top-level comma-separated elements, respecting nested brackets of every
 /// kind AND `c"..."` string literals (whose bytes may contain commas/brackets).
-fn split_aggregate_elems(s: &str) -> Vec<String> {
+pub(crate) fn split_aggregate_elems(s: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut depth = 0i32;
     let mut in_string = false;
@@ -5876,6 +6650,16 @@ fn parse_ty(s: &str) -> Result<Ty> {
     }
 }
 
+/// Kill switch for lane-scalarizing vector import (`TCG_NO_VECTOR_IMPORT=1`).
+///
+/// With it set, `parse_body_line` never consults [`crate::vector`], so every
+/// vector construct falls back to the historical `parse_ty` rejection and the
+/// importer produces byte-identical objects for every program that imported
+/// before the expander existed.
+fn vector_import_disabled() -> bool {
+    std::env::var_os("TCG_NO_VECTOR_IMPORT").is_some_and(|v| v != "0")
+}
+
 fn align_up(value: u64, align: u64) -> u64 {
     if align <= 1 {
         value
@@ -6031,6 +6815,42 @@ fn is_type_token(s: &str) -> bool {
             | "float"
             | "double"
     ) || s.ends_with('*')
+        // A `<...>` return type is a VECTOR (or a packed struct). Recognising
+        // it routes the token into `parse_ty`, which fails closed. Without
+        // this arm the token matched nothing and the return type silently
+        // defaulted to `void`.
+        || (s.starts_with('<') && s.ends_with('>'))
+}
+
+/// Split `s` on whitespace at BRACKET DEPTH ZERO, so a bracketed LLVM type
+/// (`<4 x double>`, `[8 x i32]`, `{ i32, i32 }`, `range(i32 0, 65536)`) stays
+/// a single token.
+fn split_top_level_ws(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut start: Option<usize> = None;
+    for (i, c) in s.char_indices() {
+        match c {
+            '[' | '(' | '{' | '<' => depth += 1,
+            ']' | ')' | '}' | '>' => depth -= 1,
+            _ => {}
+        }
+        if depth == 0 && c.is_whitespace() {
+            if let Some(st) = start.take() {
+                out.push(s[st..i].trim());
+            }
+        } else if start.is_none() {
+            start = Some(i);
+        }
+    }
+    if let Some(st) = start {
+        let tok = s[st..].trim();
+        if !tok.is_empty() {
+            out.push(tok);
+        }
+    }
+    out.retain(|t| !t.is_empty());
+    out
 }
 
 /// Find the byte offset of the first `@` at nesting depth 0, i.e. not
@@ -6183,7 +7003,7 @@ fn decode_ll_string(s: &str) -> Vec<u8> {
     out
 }
 
-fn parse_int_literal(s: &str) -> Option<i128> {
+pub(crate) fn parse_int_literal(s: &str) -> Option<i128> {
     let s = s.trim();
     if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
         return i128::from_str_radix(hex, 16).ok();
@@ -9917,6 +10737,66 @@ entry:
             }
             other => panic!("expected aggregate, got {other:?}"),
         }
+    }
+
+    /// A pointer-INDUCTION-VARIABLE loop starting inside a global array
+    /// (`p = &g[k]; while (...) { ... p++; }`) makes clang emit the initial
+    /// pointer as a CONST-EXPR GEP in the loop-header phi:
+    ///
+    ///   %p = phi ptr [ %next, %body ], [ getelementptr inbounds nuw (i8, ptr @g, i64 K), %entry ]
+    ///
+    /// `lookup_phi_operand` handled `%local` and bare `@g` but fell through to
+    /// `parse_constant_operand` for this, which has no const-expr evaluator, so
+    /// the WHOLE MODULE failed to import with "unknown operand token". Found on
+    /// Stanford/Puzzle rewritten to pointer-IV form (2026-08-15).
+    #[test]
+    fn phi_incoming_may_be_a_constexpr_gep_on_a_global() {
+        let src = r#"
+@g = internal global [512 x i32] zeroinitializer, align 4
+
+define i32 @f(i32 %n) {
+entry:
+  br label %loop
+
+loop:
+  %p = phi ptr [ %next, %loop ], [ getelementptr inbounds nuw (i8, ptr @g, i64 292), %entry ]
+  %i = phi i32 [ %i1, %loop ], [ 0, %entry ]
+  %v = load i32, ptr %p, align 4
+  %next = getelementptr inbounds nuw i8, ptr %p, i64 4
+  %i1 = add i32 %i, 1
+  %c = icmp slt i32 %i1, %n
+  br i1 %c, label %loop, label %out
+
+out:
+  ret i32 %v
+}
+"#;
+        let m = import_text(src, "t").expect("const-expr GEP phi incoming must import");
+        assert!(
+            m.functions.iter().any(|f| f.name == "f"),
+            "function f must be present"
+        );
+    }
+
+    /// The same shape with a byte offset that is NOT a valid stub offset must
+    /// still FAIL CLOSED rather than silently import a wrong address.
+    #[test]
+    fn phi_constexpr_gep_on_undeclared_global_fails_closed() {
+        let src = r#"
+define i32 @f() {
+entry:
+  br label %loop
+
+loop:
+  %p = phi ptr [ %p, %loop ], [ getelementptr inbounds nuw (i8, ptr @nope, i64 8), %entry ]
+  %v = load i32, ptr %p, align 4
+  br label %loop
+}
+"#;
+        assert!(
+            import_text(src, "t").is_err(),
+            "const-expr GEP on an undeclared global must fail closed"
+        );
     }
 
     #[test]

@@ -309,8 +309,9 @@ fn hoist_loop_invariants(
     // a chain to a strictly-less-frequent region that is STILL inside a loop —
     // it never performs the final "pull out of the OUTERMOST loop" step. That
     // last move shrinks a single hot loop's body and, on the measured target,
-    // retunes its fetch alignment enough to regress tight FP kernels
-    // (flops-1/flops-7) for no critical-path benefit. Deeply-nested kernels
+    // regresses tight FP kernels (flops-1/flops-7) for no critical-path benefit.
+    // (This comment used to attribute that to "fetch alignment"; see the R3
+    // control below — the regression is alignment-independent.) Deeply-nested kernels
     // (perlin's fade/lerp coefficients, live in the depth-3/4 inner loops) still
     // lift across every inner level and out of the hottest loops — only the
     // outermost-loop hoist they never needed is skipped. `depth` is 1-based
@@ -319,17 +320,49 @@ fn hoist_loop_invariants(
     // chains, gated behind `TCG_LICM_DEPTH1_MULTI`.
     //
     // The blanket depth-1 hoist was tried and reverted (475d949b): it regressed
-    // flops-1 by 8% and flops-7 by 2.3% via fetch-alignment effects when a single
-    // hot loop's body shrinks. Those regressions came from lifting SINGLE
-    // instructions, where the win is one instruction and the layout perturbation
-    // can exceed it.
+    // flops-1 by 8% and flops-7 by 2.3%. That revert note attributed the loss to
+    // "fetch-alignment effects when a single hot loop's body shrinks", and this
+    // comment used to claim that requiring `chain.len() >= 2` "keeps the reverted
+    // single-instruction case excluded while admitting the shape where the win is
+    // large."
+    //
+    // ★ BOTH HALVES OF THAT CLAIM ARE FALSE — measured 2026-08-15, whole corpus,
+    // tcg-vs-tcg (same .ll, same driver object, interleaved, min of 13, with a
+    // byte-identical null arm on every row):
+    //
+    //   * The guard does NOT exclude the reverted regressions. flops-1 still loses
+    //     8.15% and flops-7 1.73% WITH `chain.len() >= 2` in force — flops-1
+    //     reproducing the cited 8% almost exactly. The chain it hoists there is a
+    //     2-instruction `mov`+`movk` of the loop bound 0x12a05f20, admitted by
+    //     precisely this guard.
+    //   * It is NOT a fetch-alignment effect. Re-run under
+    //     TCG_NO_LOOP_HEAD_ALIGN=1 the numbers are unchanged (flops-1 1.0815 vs
+    //     1.0810, flops-3 0.7969 vs 0.7987, misr 1.0187 vs 1.0188), so R3 clears
+    //     alignment as the cause. (Independently: 32-byte head alignment was
+    //     priced at ZERO benefit on this target — see loop_align.rs.)
+    //
+    // What the arm actually does is PERTURB DOWNSTREAM PASSES. On flops-3 the
+    // hoist suppresses a 4x unroll (`add x1,#4` -> `add x0,#1`), and the
+    // un-unrolled form is 20% FASTER (0.7980/0.7997). Both flops programs run a
+    // fixed 312.5M iterations (this llvm-test-suite copy is truncated to Module 1
+    // with its outputs stabilized to `0 * 1e-30`, so `loops` never recalibrates),
+    // giving exact per-iteration deltas: flops-1 -2 insts/iter for +8% cycles,
+    // flops-3 +4 insts/iter for -20% cycles. Instruction count does not predict
+    // the sign, let alone the size.
+    //
+    // ⇒ The tier is a SHAPE LOTTERY at depth 1, not a cost/benefit the guard can
+    // be tuned to capture. Corpus verdict over the 40 programs it changes:
+    // geomean 1.0014 min / 1.0022 tmed against a null arm of 1.0002 / 1.0017 —
+    // inside the instrument's own envelope, i.e. nothing. It is kept OPT-IN
+    // (`TCG_LICM_DEPTH1_MULTI`) for that reason, NOT because the guard is safe.
+    // The p4_matmul motivation below is real but was never worth the variance.
     //
     // A movz+movk... chain is a different trade: 2-4 instructions per iteration,
     // and on p4_matmul's initialization loop a 4-instruction 64-bit magic
     // constant is rebuilt every iteration inside a ~10-instruction body
     // (measured: 12 movz/movk in `main` against LLVM's 6, LLVM hoisting the same
-    // constant). Requiring `chain.len() >= 2` keeps the reverted single-instruction
-    // case excluded while admitting the shape where the win is large.
+    // constant). Real wins do exist in the set — almabench 0.9945/0.9964 in both
+    // alignment regimes — but they are outnumbered by same-size losses.
     let depth1_multi = lp.depth == 1 && crate::env_lock::var_os("TCG_LICM_DEPTH1_MULTI").is_some();
     if const_chain_hoist_enabled() && (lp.depth >= 2 || depth1_multi) {
         for (carrier, chain) in find_hoistable_constant_chains(func, &lp.body, &def_counts) {

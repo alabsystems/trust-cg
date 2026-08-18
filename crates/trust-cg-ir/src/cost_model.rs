@@ -255,6 +255,11 @@ impl AppleSiliconCostModel {
             StrbRI => (1, 2.0),
             StrhRI => (1, 2.0),
             StrRO => (1, 2.0),
+            // Narrow register-offset stores: same store-pipe cost as `StrRO`
+            // (the address-generation work is identical; the access width does
+            // not change the store latency/throughput on this model).
+            StrbRO => (1, 2.0),
+            StrhRO => (1, 2.0),
             StpRI => (1, 2.0),
             StpPreIndex => (1, 2.0),
             STRWui => (1, 2.0),

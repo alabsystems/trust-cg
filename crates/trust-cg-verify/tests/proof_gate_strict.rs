@@ -7,7 +7,8 @@
 // no solver is present, when a solver finds a counterexample or errors, or if
 // any result falls back to statistical evaluation. Timeout/unknown results are
 // explicit solver-capacity PENDING entries: they are reported but are neither
-// proofs nor soundness failures.
+// proofs nor soundness failures. Only the narrow audited allowlist below may
+// remain pending; a new timeout/unknown fails the full-database floor closed.
 //
 // The always-on tests assert the gate contract without requiring a solver.
 // `representative_arithmetic_is_formally_verified` is a six-obligation smoke.
@@ -65,6 +66,78 @@ fn on_large_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
 }
 
 const FORMAL_PROOF_TEST_ENV: &str = "TRUST_CG_RUN_FORMAL_PROOF_TESTS";
+
+/// Audited full-database obligations that may remain formally PENDING because
+/// their bit-blasts exceed the strict gate's current solver budget. This is an
+/// upper bound, not a claim that they must time out: an entry that AY proves is
+/// credited as `Verified`, while any pending name outside this list fails the
+/// gate. Keep exact registered names so a rename cannot silently inherit debt.
+const SOLVER_CAPACITY_PENDING_ALLOWLIST: &[&str] = &[
+    "x86_64: Sdiv_I32 -> IDIV r32 (quotient)",
+    "x86_64: Sdiv_I64 -> IDIV r64 (quotient)",
+    "x86_64: Srem_I32 -> IDIV r32 (remainder)",
+    "x86_64: Srem_I64 -> IDIV r64 (remainder)",
+    "x86_64: V2I64 even-dword widening Umul -> PMULUDQ xmm,xmm",
+];
+
+/// Exact static corpus cardinality after removing duplicate registrations.
+/// A change requires auditing both the capacity allowlist and the documented
+/// full-gate scope; silently shrinking the database is not a green gate.
+const EXPECTED_STATIC_PROOF_OBLIGATION_COUNT: usize = 1_869;
+
+#[test]
+fn solver_capacity_pending_allowlist_is_narrow_unique_and_live() {
+    on_large_stack(|| {
+        use std::collections::HashSet;
+
+        assert_eq!(
+            SOLVER_CAPACITY_PENDING_ALLOWLIST.len(),
+            5,
+            "capacity debt may change only through an explicit audit"
+        );
+        let unique: HashSet<&str> = SOLVER_CAPACITY_PENDING_ALLOWLIST.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            SOLVER_CAPACITY_PENDING_ALLOWLIST.len(),
+            "capacity-pending allowlist contains duplicate names"
+        );
+
+        let db = ProofDatabase::new();
+        assert_eq!(
+            db.len(),
+            EXPECTED_STATIC_PROOF_OBLIGATION_COUNT,
+            "static proof corpus changed; audit the strict-gate scope and capacity allowlist"
+        );
+        let registered: HashSet<&str> = db
+            .all()
+            .iter()
+            .map(|proof| proof.obligation.name.as_str())
+            .collect();
+        assert_eq!(
+            registered.len(),
+            db.len(),
+            "registered static proof names must be globally unique because capacity authority is name-bound"
+        );
+        let ambiguous_or_dead: Vec<(&str, usize)> = SOLVER_CAPACITY_PENDING_ALLOWLIST
+            .iter()
+            .copied()
+            .map(|name| {
+                let registrations = db
+                    .all()
+                    .iter()
+                    .filter(|proof| proof.obligation.name == name)
+                    .count();
+                (name, registrations)
+            })
+            .filter(|(_, registrations)| *registrations != 1)
+            .collect();
+        assert!(
+            ambiguous_or_dead.is_empty(),
+            "each name-bound capacity exception must identify exactly one registered proof: \
+             {ambiguous_or_dead:?}"
+        );
+    });
+}
 
 /// Keep external-solver proof campaigns out of the ordinary hermetic test lane
 /// without hiding them from libtest. The opt-in must be the exact value `1`;
@@ -260,16 +333,28 @@ fn full_database_is_formally_verified() {
     // No obligation passed via anything but a formal `Verified`.
     assert_no_statistical_fallback(&report);
 
-    // Solver-capacity PENDING (Timeout/Unknown) is REPORTED, never a pass and
-    // never a hard fail. A timeout is NEVER evidence of a miscompile (only a
-    // counterexample is), and which obligations time out is NON-DETERMINISTIC
-    // (it depends on machine load and the per-obligation budget) — so failing on
-    // a fixed pending set makes the gate flaky, not stronger. The soundness
-    // guarantee above is unaffected by how many obligations are pending. Pending
-    // obligations are additionally backstopped by the exhaustive/statistical mock
-    // evaluator in the non-strict lanes. Known capacity-bound example:
-    // `MUL Xd,Xn,#-1 ≡ NEG` (a true 64-bit identity z3 bit-blasts).
+    // Solver-capacity PENDING (Timeout/Unknown) is REPORTED, never a pass. The
+    // five audited wide x86 bit-vector rows may remain pending; any NEW pending
+    // row is a gate failure. A known row may graduate to `Verified`, so the
+    // observed pending set may be a subset of the allowlist, never a superset.
+    // This preserves load tolerance without letting solver/checker regressions
+    // silently widen the formal floor.
     let pending = report.failures_in_class(FailureClass::SolverCapacity);
+    let unexpected: Vec<_> = pending
+        .iter()
+        .copied()
+        .filter(|result| !SOLVER_CAPACITY_PENDING_ALLOWLIST.contains(&result.name.as_str()))
+        .collect();
+    assert!(
+        unexpected.is_empty(),
+        "STRICT GATE FAILED (UNALLOWLISTED PENDING): {} new timeout/unknown obligation(s):\n{}",
+        unexpected.len(),
+        unexpected
+            .iter()
+            .map(|r| format!("  [{:?}] {} -- {}", r.category, r.name, r.detail()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
     if pending.is_empty() {
         assert_eq!(report.verified(), report.total());
         println!(
@@ -280,7 +365,7 @@ fn full_database_is_formally_verified() {
         println!(
             "STRICT GATE OK: {}/{} formally Verified, 0 soundness failures; \
              {} solver-capacity PENDING (timeouts/unknown — reported, not a pass; \
-             non-deterministic under load):\n{}",
+             audited allowlist only):\n{}",
             report.verified(),
             report.total(),
             pending.len(),

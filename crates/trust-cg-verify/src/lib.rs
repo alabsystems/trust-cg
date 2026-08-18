@@ -149,6 +149,8 @@ pub mod elf_data_reloc_proofs;
 pub mod ext_trunc_proofs;
 pub mod failed_proof_reducer;
 pub mod field_copy_faithfulness;
+#[cfg(test)]
+mod formal_gap;
 pub mod fp_bitmodel;
 pub mod fp_convert_proofs;
 pub mod frame_proofs;

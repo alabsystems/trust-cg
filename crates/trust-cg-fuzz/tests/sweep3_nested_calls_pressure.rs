@@ -616,6 +616,34 @@ fn build_mutual(name: &str, ping_state: u32, pong_state: u32, depth_mask: i64) -
 // Tests
 // ===========================================================================
 
+/// Minimal pin for the O3 mutual-recursion miscompile found by the full sweep.
+/// Both register allocators produced the same wrong value, while O0/O1/O2 and
+/// the interpreter agreed, so this keeps the optimizer boundary independently
+/// reproducible without rerunning the 12-module campaign.
+#[test]
+fn mutual_recursion_o3_preserves_cross_call_state_regression() {
+    let module = build_mutual("mut_o3_cross_call_regression", 7, 11, 3);
+    let row = [1, 2, 3, 4];
+    let oracle = run_oracle_one(&module, &row).expect("regression oracle must be defined");
+    assert_eq!(oracle, 12_160_686, "regression oracle drifted");
+
+    for jit_fast in [true, false] {
+        for opt in OPTS {
+            let got = match jit_run(&module, opt, jit_fast, &row) {
+                Run::Value(value) => value,
+                Run::CompileErr => panic!("regression compile failed at {opt:?}, fast={jit_fast}"),
+                Run::SymbolMissing => {
+                    panic!("regression entry symbol missing at {opt:?}, fast={jit_fast}")
+                }
+            };
+            assert_eq!(
+                got, oracle,
+                "mutual-recursion cross-call state was miscompiled at {opt:?}, fast={jit_fast}"
+            );
+        }
+    }
+}
+
 #[test]
 fn nested_chain_mixed_arity() {
     let mut defects = Vec::new();

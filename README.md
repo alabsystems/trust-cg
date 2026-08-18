@@ -214,7 +214,7 @@ optimization does not fire or, on proof-required paths, a compilation error—it
 must never be presented as stronger evidence than it is.
 
 The v0.1.0 opcode evidence inventory pins accepted/deferred classifications for
-every inventoried backend: AArch64 155/246 accepted (91 explicit RED rows),
+every inventoried backend: AArch64 155/248 accepted (93 explicit RED rows),
 x86-64 163/192 (29 RED), RISC-V 14/17 (3 RED), and WebAssembly 109/111
 (2 RED). These ratios measure accepted obligation coverage over emitted
 value/effect inventories, not compiler correctness or formal-proof coverage. In

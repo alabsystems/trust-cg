@@ -82,7 +82,9 @@ pub fn opcode_effect(opcode: AArch64Opcode) -> MemoryEffect {
 
         // -- Stores: write memory --
         StrRI | StrPreIndex | StrPostIndex | StrbRI | StrhRI | StpRI | StpPreIndex | StrRO
-        | STRWui | STRXui | STRSui | STRDui | NeonSt1Post | NeonStpQPost => MemoryEffect::Store,
+        | StrbRO | StrhRO | STRWui | STRXui | STRSui | STRDui | NeonSt1Post | NeonStpQPost => {
+            MemoryEffect::Store
+        }
 
         // -- Volatile memory: full barrier --
         // A volatile access (MMIO / signal visibility) must never be elided,

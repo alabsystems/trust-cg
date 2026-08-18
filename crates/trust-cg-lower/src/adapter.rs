@@ -1343,14 +1343,14 @@ pub(crate) fn packed_struct_layout_inner(
 /// layout the producer did not specify is the defect class
 /// [`crate::declared_layout`] exists to prevent, one type-former over.
 ///
-/// Only [`EnumTagEncoding::Direct`] can agree. A `Niche` encoding recovers its
-/// discriminant by range-testing a payload field instead of reading a tag lane,
-/// which `Type::Enum` cannot express, so "agreement" is not even definable for
-/// it — it is reported as a difference, not silently accepted. (The niche arm
-/// is unreachable from the translation today: [`niche_enum_carrier`] answers
-/// that encoding earlier, against the payload carrier rather than the canonical
-/// shape. It stays because this predicate is about `Type::Enum` and the answer
-/// for a niche encoding is genuinely "no", however the caller got here.)
+/// Only [`EnumTagEncoding::Direct`] can agree. `Niche` and `Untagged` both omit
+/// the tag lane that `Type::Enum` necessarily emits, so "agreement" is not even
+/// definable for either encoding — they are reported as differences, never
+/// silently accepted. (The niche arm is unreachable from the translation
+/// today: [`niche_enum_carrier`] answers that encoding earlier, against the
+/// payload carrier rather than the canonical shape. It stays because this
+/// predicate is about `Type::Enum` and the answer is genuinely "no", however
+/// the caller got here.)
 fn enum_layout_matches_canonical(
     layout: &trust_ir::ty::EnumLayoutDescriptor,
     lowered: &Type,
@@ -1361,6 +1361,11 @@ fn enum_layout_matches_canonical(
         EnumTagEncoding::Direct { tag_offset } => tag_offset,
         EnumTagEncoding::Niche { .. } => {
             return Err("niche tag encoding; the LIR enum has no niche representation".to_string());
+        }
+        EnumTagEncoding::Untagged => {
+            return Err(
+                "untagged encoding; the LIR enum has no tag-free representation".to_string(),
+            );
         }
     };
     // The canonical shape puts the tag at offset 0, by construction.
@@ -3681,14 +3686,19 @@ impl<'a> TrustIrAdapter<'a> {
         &mut self,
         node: &InstrNode,
         bound: u64,
+        base: Value,
+        index: Value,
     ) -> Option<LatticeBoundsCapability> {
         let index_vid = Self::exact_in_bounds_index_vid(node)?;
         let pred = self.refinement_pred_of(index_vid)?;
         let module = self.module?;
+        let function = &self.trust_ir_func?.name;
         // Build the env lazily from the module rather than from `proof_ctx.refinement_env`:
         // that field is populated at the END of `translate`, and this runs mid-translation.
         let env = RefinementEnv::from_module(module);
-        let capability = lattice_guard::certify_bounds_guard(&env, pred, bound)?;
+        let capability = lattice_guard::certify_bounds_guard_for_source_carrier(
+            &env, pred, bound, function, base, index,
+        )?;
         // Belt and braces: a capability that does not replay against the very env it was minted
         // from is a bug in the minter, not an authorization. Refuse it.
         if !capability.replay(&env) {
@@ -3714,14 +3724,15 @@ impl<'a> TrustIrAdapter<'a> {
                 // index's declared refinement predicate entails `[0, bound-1]`, bind the carrier
                 // to the lattice obligation instead: that id names the discharging predicate's
                 // content, and the pipeline can hand the kernel matching evidence for it.
-                let obligation = match self.certify_bounds_guard_from_refinement(node, bound) {
-                    Some(capability) => {
-                        let id = capability.obligation_id();
-                        self.proof_ctx.lattice_bounds_capabilities.push(capability);
-                        Some(id)
-                    }
-                    None => label_obligation,
-                };
+                let obligation =
+                    match self.certify_bounds_guard_from_refinement(node, bound, base, index) {
+                        Some(capability) => {
+                            let id = capability.obligation_id();
+                            self.proof_ctx.lattice_bounds_capabilities.push(capability);
+                            Some(id)
+                        }
+                        None => label_obligation,
+                    };
                 instrs.push(Instruction {
                     opcode: Opcode::GuardBoundsCheck { bound, obligation },
                     args: vec![base, index],
@@ -6023,6 +6034,11 @@ impl<'a> TrustIrAdapter<'a> {
             BinOp::And | BinOp::Or | BinOp::Xor => {
                 matches!(ty, Ty::Bool) || Self::is_integer_scalar_ty(ty)
             }
+            // Trust: the BOOLEAN connectives (trust-ir 4b06918). STRICTER than the
+            // overloaded And/Or/Xor above, matching trust-ir's own validator, which
+            // admits BAnd/BOr/BXor on Bool only -- an integer operand means the
+            // frontend picked the wrong opcode.
+            BinOp::BAnd | BinOp::BOr | BinOp::BXor => matches!(ty, Ty::Bool),
             // FRem is handled entirely by its dedicated lowering arm above
             // (which returns before this shape gate): f32/f64 call fmod/fmodf,
             // and f16 promotes to f32, calls fmodf, and demotes (fmod is exact).
@@ -6690,6 +6706,16 @@ impl<'a> TrustIrAdapter<'a> {
                     BinOp::And => Opcode::Band,
                     BinOp::Or => Opcode::Bor,
                     BinOp::Xor => Opcode::Bxor,
+                    // Trust: the BOOLEAN connectives lower to the SAME machine
+                    // opcodes. That is exact, not an approximation: the shape gate
+                    // above admits them on `Ty::Bool` only, whose carrier is 0/1, and
+                    // on 0/1 the bitwise instruction computes the logical result. The
+                    // distinction these opcodes carry is a VERIFICATION one -- it buys
+                    // a reducing denotation instead of an opaque one -- and has no
+                    // machine-level consequence here.
+                    BinOp::BAnd => Opcode::Band,
+                    BinOp::BOr => Opcode::Bor,
+                    BinOp::BXor => Opcode::Bxor,
                     BinOp::Shl => Opcode::Ishl,
                     BinOp::LShr => Opcode::Ushr,
                     BinOp::AShr => Opcode::Sshr,
@@ -17865,6 +17891,12 @@ fn translate_trust_ir_proof(p: &ProofAnnotation) -> Option<Proof> {
         ProofAnnotation::Aligned(_) => None,
         ProofAnnotation::NoPanic => None,
         ProofAnnotation::NoUndef => None,
+        // A public, forgeable marker on an `Undef` saying that the producer
+        // intends a fresh unconstrained symbolic value. It proves and narrows
+        // nothing, and the machine-code adapter already lowers `Undef` without
+        // consulting annotations. Keep it inert here: mapping it to any CPU
+        // `Proof` would accidentally turn producer metadata into authority.
+        ProofAnnotation::FreshSymbolicHavoc => None,
         // trust_ir#30 additions: GPU memory-role hints, parallel/bounded-loop
         // annotations, and divergence classification. These are consumed by
         // the heterogeneous compute planner (`target_analysis.rs` /
@@ -26136,6 +26168,23 @@ mod tests {
                 .facts
                 .contains(&ProofFact::DivergenceClass(ProofDivergence::Uniform))
         );
+    }
+
+    #[test]
+    fn fresh_symbolic_havoc_is_inert_at_the_codegen_boundary() {
+        let node = InstrNode {
+            inst: Inst::Undef { ty: Ty::I32 },
+            results: vec![ValueId::new(0)],
+            proofs: vec![ProofAnnotation::FreshSymbolicHavoc],
+            span: None,
+            proof_context: None,
+            scope: None,
+        };
+
+        let metadata = extract_proof_metadata(&node);
+        assert!(metadata.proofs.is_empty());
+        assert!(metadata.facts.is_empty());
+        assert!(metadata.diagnostics.is_empty());
     }
 
     #[test]

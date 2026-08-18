@@ -2294,7 +2294,7 @@ fn produces_def(op: AArch64Opcode) -> bool {
         op,
         CmpRR | CmpRI | BCond | B
         // stores write MEMORY, not operand 0's register.
-        | StrRI | StrbRI | StrhRI | StrRO | StpRI | StrPreIndex | StrPostIndex
+        | StrRI | StrbRI | StrhRI | StrRO | StrbRO | StrhRO | StpRI | StrPreIndex | StrPostIndex
         | STRWui | STRXui | STRSui | STRDui | NeonSt1Post | NeonStpQPost
     )
 }

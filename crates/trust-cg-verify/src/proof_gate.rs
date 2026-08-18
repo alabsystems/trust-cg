@@ -135,6 +135,8 @@ pub enum GateFailureKind {
     /// The solver ran but timed out before deciding. A timeout is NOT a pass.
     Timeout,
     /// The solver returned `unknown` (incomplete theory, resource limit, etc.).
+    /// [`GateObligationResult::failure_class`] promotes proof-authority rejection
+    /// and internal-error reasons to a hard soundness failure.
     Unknown,
     /// The solver errored (parse failure, missing binary at call time, etc.).
     Error,
@@ -183,9 +185,10 @@ pub enum FailureClass {
     /// The solver disproved the obligation (counterexample) or could not run the
     /// check (error). A bug or a broken environment — must be fixed.
     Soundness,
-    /// The solver ran but did not decide within budget (timeout) or returned
-    /// `unknown`. The obligation is semantically expected to be correct but is
-    /// capacity-bound; it is reported as formally PENDING, never as passed.
+    /// The solver ran but did not decide within budget (timeout) or returned an
+    /// ordinary incompleteness/resource `unknown`. Proof-authority rejection and
+    /// internal-error unknown reasons are promoted to [`Self::Soundness`]. A
+    /// capacity-bound obligation is reported as formally PENDING, never passed.
     SolverCapacity,
 }
 
@@ -238,8 +241,17 @@ impl GateObligationResult {
     /// A [`FailureClass::SolverCapacity`] result is formally PENDING, not a pass:
     /// it still fails the gate (`is_formally_valid()` is false), but the report
     /// can list it separately from a genuine [`FailureClass::Soundness`] failure.
+    /// AY's stable `self-check-rejected`, legacy `proof-trusted`, and
+    /// `internal-error` unknown reasons are not capacity failures: they mean the
+    /// proof authority rejected a computed verdict or the solver malfunctioned,
+    /// so this method promotes them to `Soundness` fail-closed.
     pub fn failure_class(&self) -> Option<FailureClass> {
-        self.failure_kind().map(|k| k.class())
+        match &self.ay_result {
+            AYResult::Unknown(reason) if unknown_is_hard_failure(reason) => {
+                Some(FailureClass::Soundness)
+            }
+            _ => self.failure_kind().map(|kind| kind.class()),
+        }
     }
 
     /// Human-readable failure detail (counterexample assignment, reason text).
@@ -261,6 +273,17 @@ impl GateObligationResult {
             AYResult::Error(msg) => format!("ERROR: {}", msg),
         }
     }
+}
+
+/// AY reason-unknown markers that describe a broken/rejected authority path,
+/// not search incompleteness or resource exhaustion. AY deliberately exposes
+/// `self-check-rejected` as a greppable soundness-gate result; treating it as
+/// solver capacity would allow a caught wrong answer to enter a PENDING ledger.
+fn unknown_is_hard_failure(reason: &str) -> bool {
+    let reason = reason.to_ascii_lowercase();
+    reason.contains("self-check-rejected")
+        || reason.contains("proof-trusted")
+        || reason.contains("internal-error")
 }
 
 // ---------------------------------------------------------------------------
@@ -939,6 +962,15 @@ mod tests {
         }
     }
 
+    fn authority_rejected_unknown(name: &str, reason: &str) -> GateObligationResult {
+        GateObligationResult {
+            name: name.to_string(),
+            category: ProofCategory::Division,
+            ay_result: AYResult::Unknown(reason.to_string()),
+            duration: Duration::from_millis(1),
+        }
+    }
+
     fn error(name: &str) -> GateObligationResult {
         GateObligationResult {
             name: name.to_string(),
@@ -966,7 +998,7 @@ mod tests {
 
     #[test]
     fn failure_class_splits_capacity_from_soundness() {
-        // Timeout and Unknown are capacity-bound -> formally PENDING.
+        // Timeout and ordinary incomplete Unknown are capacity-bound -> PENDING.
         assert_eq!(
             timeout("t").failure_class(),
             Some(FailureClass::SolverCapacity)
@@ -975,7 +1007,26 @@ mod tests {
             unknown("u").failure_class(),
             Some(FailureClass::SolverCapacity)
         );
-        // Counterexample and Error are hard soundness failures.
+        // A proof-authority rejection is a caught wrong answer, not capacity.
+        for reason in [
+            "(:reason-unknown (incomplete self-check-rejected))",
+            "(:reason-unknown (incomplete proof-trusted))",
+            "(:reason-unknown internal-error)",
+        ] {
+            let rejected = authority_rejected_unknown("rejected", reason);
+            assert_eq!(
+                rejected.failure_kind(),
+                Some(GateFailureKind::Unknown),
+                "the raw solver outcome remains Unknown"
+            );
+            assert_eq!(
+                rejected.failure_class(),
+                Some(FailureClass::Soundness),
+                "authority/internal unknown must fail hard: {reason}"
+            );
+            assert_eq!(report(vec![rejected]).soundness_failures().len(), 1);
+        }
+        // Counterexample and Error are also hard soundness failures.
         assert_eq!(cex("c").failure_class(), Some(FailureClass::Soundness));
         assert_eq!(error("e").failure_class(), Some(FailureClass::Soundness));
         // A verified obligation has no failure class.

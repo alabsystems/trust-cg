@@ -423,6 +423,10 @@ pub struct ProofOptimization {
     /// end of `run_impl` (after deletion-by-retain; `func.insts` retains the inst data), so the
     /// re-check's fingerprint comparison is non-vacuous. See `recheck_kernel_eliminations`.
     kernel_observed_operands: Vec<Vec<GuardOperandRef>>,
+    /// Opaque decidable-lattice authority, reconstructed from replayed capabilities and exact live
+    /// carrier bindings.  This is separate from the public raw evidence/map compatibility API so
+    /// merely enabling the lattice Cargo feature can never bless caller-constructed inputs.
+    lattice_authority: Option<trust_cg_lower::lattice_guard::LatticeGuardReplayAuthority>,
 }
 
 impl ProofOptimization {
@@ -442,6 +446,7 @@ impl ProofOptimization {
             kernel_obligations: HashMap::new(),
             kernel_eliminations: Vec::new(),
             kernel_observed_operands: Vec::new(),
+            lattice_authority: None,
         }
     }
 
@@ -454,8 +459,8 @@ impl ProofOptimization {
         obligations: HashMap<InstId, (u128, Option<u128>)>,
     ) {
         self.kernel_gate = true;
+        self.lattice_authority = None;
         if trust_cg_lower::guard_evidence::validator_guard_replay_authority_available()
-            || trust_cg_lower::lattice_guard::lattice_guard_replay_authority_available()
             || cfg!(test)
         {
             // Structural kernel-model tests exercise the future authorization path. Production can
@@ -468,6 +473,22 @@ impl ProofOptimization {
             self.kernel_evidence = DischargedEvidenceTable::new();
             self.kernel_obligations.clear();
         }
+    }
+
+    /// Enable the decidable-lattice lane with an opaque authority object produced by exact replay
+    /// and live-carrier binding.
+    ///
+    /// Unlike [`ProofOptimization::enable_kernel_gate`], this API accepts no public evidence table
+    /// or obligation map.  The lattice feature enables the replay algorithm, while possession of
+    /// this reconstructed object carries the per-use authority.
+    pub fn enable_lattice_kernel_gate(
+        &mut self,
+        authority: trust_cg_lower::lattice_guard::LatticeGuardReplayAuthority,
+    ) {
+        self.kernel_gate = true;
+        self.kernel_evidence = DischargedEvidenceTable::new();
+        self.kernel_obligations.clear();
+        self.lattice_authority = Some(authority);
     }
 
     /// The kernel eliminations authorized during the last run (for the independent re-checker):
@@ -484,6 +505,13 @@ impl ProofOptimization {
         func: &MachFunction,
         inst_id: InstId,
     ) -> Option<EliminationCertificate> {
+        if let Some(authority) = &self.lattice_authority {
+            let certificate = authority.authorize(func, inst_id)?;
+            self.kernel_eliminations
+                .push((inst_id, certificate.clone()));
+            return Some(certificate);
+        }
+
         let target = AArch64GuardTarget;
         let inst = func.inst(inst_id);
         let kind = target.classify_carrier(inst)?;
@@ -527,7 +555,11 @@ impl ProofOptimization {
                 // No independent snapshot for this elimination => fail closed.
                 None => &[],
             };
-            match recheck_elimination(certificate, observed, &self.kernel_evidence) {
+            let outcome = match &self.lattice_authority {
+                Some(authority) => authority.recheck(certificate, observed),
+                None => recheck_elimination(certificate, observed, &self.kernel_evidence),
+            };
+            match outcome {
                 RecheckOutcome::Valid => {}
                 RecheckOutcome::Rejected { reason } => {
                     return Err(format!(
@@ -552,7 +584,11 @@ impl ProofOptimization {
         let target = AArch64GuardTarget;
         for (inst_id, certificate) in &self.kernel_eliminations {
             let observed = target.operand_identity(func.inst(*inst_id)).operands;
-            match recheck_elimination(certificate, &observed, &self.kernel_evidence) {
+            let outcome = match &self.lattice_authority {
+                Some(authority) => authority.recheck(certificate, &observed),
+                None => recheck_elimination(certificate, &observed, &self.kernel_evidence),
+            };
+            match outcome {
                 RecheckOutcome::Valid => {}
                 RecheckOutcome::Rejected { reason } => {
                     return Err(format!(
@@ -715,8 +751,10 @@ impl ProofOptimization {
         // that still have no exact evidence behind them stay exactly as inert as they are today.
         let full_authority =
             trust_cg_lower::guard_evidence::validator_guard_replay_authority_available();
-        let lattice_authority =
-            trust_cg_lower::lattice_guard::lattice_guard_replay_authority_available();
+        let lattice_authority = self
+            .lattice_authority
+            .as_ref()
+            .is_some_and(trust_cg_lower::lattice_guard::LatticeGuardReplayAuthority::is_enabled);
         if !full_authority && !lattice_authority && !cfg!(test) {
             return false;
         }

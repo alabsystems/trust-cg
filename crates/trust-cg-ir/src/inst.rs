@@ -306,6 +306,19 @@ pub enum AArch64Opcode {
     /// taken from the OPCODE. S=1 shifts the index by log2(2)=1.
     /// Operands: [Wt, Xn, Xm, Imm((option<<1)|S)].
     LdrhRO,
+    /// STRB Wt, [Xn, Xm{, extend}] — store the low BYTE of a W register, base +
+    /// register offset. Narrow store sibling of `StrRO`, and the exact store
+    /// mirror of `LdrbRO`: the access width is 1 byte, taken from the OPCODE and
+    /// never from the transfer class (which is `Gpr32`/`Gpr64` depending on what
+    /// isel produced — a `strb` ignores the upper bits either way). Byte
+    /// accesses use no shift (S=0) since log2(1)=0.
+    /// Operands: [Wt, Xn, Xm, Imm((option<<1)|S)].
+    StrbRO,
+    /// STRH Wt, [Xn, Xm{, extend}] — store the low HALFWORD of a W register,
+    /// base + register offset. Store mirror of `LdrhRO`; the access width is
+    /// 2 bytes, taken from the OPCODE. S=1 shifts the index by log2(2)=1.
+    /// Operands: [Wt, Xn, Xm, Imm((option<<1)|S)].
+    StrhRO,
 
     // -- Memory (GOT / TLV) --
     /// LDR Xd, [Xn, #got_pageoff] — load from GOT slot.
@@ -1322,7 +1335,7 @@ impl AArch64Opcode {
             }
 
             // Memory stores
-            StrRI | StrbRI | StrhRI | StrRO => {
+            StrRI | StrbRI | StrhRI | StrRO | StrbRO | StrhRO => {
                 InstFlags::WRITES_MEMORY.union(InstFlags::HAS_SIDE_EFFECTS)
             }
             StrPreIndex | StrPostIndex => {
@@ -1574,7 +1587,9 @@ impl AArch64Opcode {
             CmpRR | CmpRI | Tst | Fcmp | CMPWrr | CMPXrr | CMPWri | CMPXri => false,
             // Stores: write to memory, no register def
             StrRI | StrbRI | StrhRI | StrPreIndex | StrPostIndex | StpRI | StpPreIndex | StrRO
-            | STRWui | STRXui | STRSui | STRDui | NeonSt1Post | NeonStpQPost => false,
+            | StrbRO | StrhRO | STRWui | STRXui | STRSui | STRDui | NeonSt1Post | NeonStpQPost => {
+                false
+            }
             // Volatile stores produce no value (mirror the plain stores above);
             // the `_ => true` default would otherwise mark the stored-value
             // operand as a dead def and let a pass eliminate the store.

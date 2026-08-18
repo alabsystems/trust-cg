@@ -140,8 +140,8 @@ pub fn opcode_latency(opcode: AArch64Opcode) -> (u32, ExecutionPort) {
         VolatileStrRI | VolatileStrbRI | VolatileStrhRI => (1, ExecutionPort::LoadStore),
 
         // Stores: 1 cycle (non-blocking dispatch)
-        StrRI | StrPreIndex | StrPostIndex | StrbRI | StrhRI | StrRO | StpRI | StpPreIndex
-        | STRWui | STRXui | STRSui | STRDui => (1, ExecutionPort::LoadStore),
+        StrRI | StrPreIndex | StrPostIndex | StrbRI | StrhRI | StrRO | StrbRO | StrhRO | StpRI
+        | StpPreIndex | STRWui | STRXui | STRSui | STRDui => (1, ExecutionPort::LoadStore),
 
         // Stack allocation pseudo
         StackAlloc => (1, ExecutionPort::IntAlu),

@@ -212,3 +212,48 @@ fn no_loops_is_noop() {
     let mut pass = AliasVersionedLoadHoist;
     assert!(!pass.run(&mut func));
 }
+
+/// The clobber/read range of a 128-bit access must be 16 bytes.
+///
+/// This number is the ONLY thing standing between the runtime disjointness
+/// check and an unsound hoist: it is used both as a load range's width and as
+/// the SCALE of an indexed store's range (`[base, base + bound*scale)`), so an
+/// under-estimate shrinks the region the check proves disjoint while the
+/// hardware still writes the full width. The pass previously reached `Fpr128`
+/// through a `_ => 8` catch-all and credited a 16-byte `STR Q` / `LDR Q` with 8
+/// bytes — half of every vector access invisible to the check.
+///
+/// Errors in the other direction are safe (a too-wide range can only fail the
+/// check and take the untouched slow loop), which is why the narrow classes may
+/// keep the conservative 8; only "never smaller than the true width" is
+/// asserted here.
+#[test]
+fn class_byte_ranges_never_understate_the_access_width() {
+    let true_width = |c: RegClass| -> i64 {
+        match c {
+            RegClass::Fpr128 => 16,
+            RegClass::Gpr64 | RegClass::Fpr64 | RegClass::System => 8,
+            RegClass::Gpr32 | RegClass::Fpr32 => 4,
+            RegClass::Fpr16 => 2,
+            RegClass::Fpr8 => 1,
+        }
+    };
+    for c in [
+        RegClass::Fpr128,
+        RegClass::Gpr64,
+        RegClass::Fpr64,
+        RegClass::System,
+        RegClass::Gpr32,
+        RegClass::Fpr32,
+        RegClass::Fpr16,
+        RegClass::Fpr8,
+    ] {
+        assert!(
+            class_bytes(c) >= true_width(c),
+            "{c:?}: range {} understates a {}-byte access",
+            class_bytes(c),
+            true_width(c)
+        );
+    }
+    assert_eq!(class_bytes(RegClass::Fpr128), 16, "Q access is 16 bytes");
+}

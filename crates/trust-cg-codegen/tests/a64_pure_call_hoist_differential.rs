@@ -29,7 +29,7 @@ use trust_cg_codegen::compiler::{Compiler, CompilerConfig};
 use trust_cg_codegen::env_lock;
 use trust_cg_codegen::interpreter::{InterpreterValue, interpret};
 use trust_cg_codegen::pipeline::OptLevel;
-use trust_cg_codegen::target::Target;
+use trust_cg_codegen::target::{Target, TargetSpec};
 use trust_ir::{
     BinOp, BlockId, Constant, FuncId, FuncTy, ICmpOp, Inst, InstrNode, Module as M, Ty, ValueId,
 };
@@ -176,14 +176,20 @@ fn build_pure_call_loop(bound: i128, arg_val: u32) -> M {
 }
 
 fn compile_a64(m: &M, opt: OptLevel) -> Vec<u8> {
-    let c = Compiler::new(CompilerConfig {
-        opt_level: opt,
-        target: Target::Aarch64,
-        // This two-function module must consume the thread-local pass override
-        // on the calling thread instead of dispatching it to rayon workers.
-        parallel: false,
-        ..CompilerConfig::default()
-    });
+    // Explicit Darwin spec: the a64 interp harness parses Mach-O, and the
+    // default target spec is host-OS-aware (ELF on a Linux host).
+    // Cross-emission only; same pattern as a64_abi_probe.
+    let c = Compiler::new_for_target_spec(
+        CompilerConfig {
+            opt_level: opt,
+            target: Target::Aarch64,
+            // This two-function module must consume the thread-local pass override
+            // on the calling thread instead of dispatching it to rayon workers.
+            parallel: false,
+            ..CompilerConfig::default()
+        },
+        TargetSpec::parse("aarch64-apple-darwin").expect("parse aarch64-apple-darwin target spec"),
+    );
     c.compile(m).expect("aarch64 compile").object_code
 }
 

@@ -902,6 +902,11 @@ fn binop_to_op_name(op: &BinOp) -> &'static str {
         BinOp::SRem => "SDIV", // closest equivalent
         BinOp::URem => "UDIV", // closest equivalent
         BinOp::And => "AND",
+        // Trust: the boolean connectives cost the same as their bitwise twins --
+        // they lower to the identical machine opcodes (see `adapter.rs`).
+        BinOp::BAnd => "AND",
+        BinOp::BOr => "ORR",
+        BinOp::BXor => "EOR",
         BinOp::Or => "ORR",
         BinOp::Xor => "EOR",
         BinOp::Shl => "SHL",

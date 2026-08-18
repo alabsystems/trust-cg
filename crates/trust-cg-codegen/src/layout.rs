@@ -260,7 +260,7 @@ fn pick_loop_aware_successor(
     for lp in &encl {
         let cands = in_loop_unplaced_succs(func, block, lp, placed);
         if !cands.is_empty() {
-            return Some(select_in_loop(func, block, &cands, order_index));
+            return Some(select_in_loop(func, loops, block, &cands, order_index));
         }
     }
     // Cannot extend directly; if any enclosing loop is unfinished, force a
@@ -295,12 +295,19 @@ fn in_loop_unplaced_succs(
 /// Choose which in-loop successor to place next.
 ///
 /// One candidate: take it. Two-or-more (an in-loop conditional whose arms both
-/// stay in the loop): prefer the branch-taken (conditional) target when the
-/// terminator can be inverted, so the hot in-loop arm becomes the fall-through
-/// after [`orient_loop_conditionals`]; otherwise the natural fall-through
-/// successor. Final tie-break: lowest current-order index (minimal perturbation).
+/// stay in the enclosing repair target) is decided in three tiers:
+///
+/// 1. INNERMOST-LOOP PREFERENCE ([`inner_loop_only_candidate`]) — keep the
+///    innermost loop contiguous;
+/// 2. BRANCH-TAKEN PREFERENCE — place the conditional target so it becomes the
+///    fall-through after [`orient_loop_conditionals`], EXCEPT at the two-armed
+///    tail-duplicated header shape a later tier lays out better
+///    ([`ccpref_defers_to_latch_pull`]);
+/// 3. the natural fall-through successor, then lowest current-order index
+///    (minimal perturbation).
 fn select_in_loop(
     func: &MachFunction,
+    loops: &LoopAnalysis,
     block: BlockId,
     cands: &[BlockId],
     order_index: &[usize],
@@ -308,10 +315,14 @@ fn select_in_loop(
     if cands.len() == 1 {
         return cands[0];
     }
+    if let Some(inner) = inner_loop_only_candidate(func, loops, block, cands) {
+        return inner;
+    }
     if bp_ccpref_enabled()
         && let Some(cp) = classify_cond_pair(func, block)
         && cands.contains(&cp.cc_target)
         && cond_pair_invertible(func, &cp)
+        && !ccpref_defers_to_latch_pull(func, loops, block, cands)
     {
         return cp.cc_target;
     }
@@ -326,9 +337,176 @@ fn select_in_loop(
         .unwrap()
 }
 
+/// The candidate that keeps the chain inside `block`'s INNERMOST loop, when
+/// exactly one candidate does and at least one does not.
+///
+/// WHY THIS TIER EXISTS. `pick_loop_aware_successor` builds its candidate set
+/// from the enclosing SCATTERED repair target — which, when the conditional sits
+/// in a NESTED loop the size gates excluded (`>= 8` body blocks, `>= 4`
+/// conditionals), is an OUTER loop. Its body legitimately contains the inner
+/// loop's exit continuation, so `in_loop_unplaced_succs` offers "leave the inner
+/// loop" and "stay in the inner loop" as equal candidates and the branch-taken
+/// preference below picks between them on POLARITY. Polarity is not a cost
+/// model; loop nesting is: a block placed next to its inner-loop siblings costs
+/// the loop one taken branch per iteration, a block placed outside strands the
+/// inner loop's continue edge at two.
+///
+/// This tier is what the measured wins were actually made of, which is why it
+/// runs FIRST. Instrumented at every firing site in the corpus (`TCG_BP_DEBUG`):
+///   * Shootout/heapsort `benchmark_heapsort` B13 and `main` B21, and
+///     Stanford/Quicksort `Quicksort` B6 and B12 — exactly one candidate is in
+///     the inner loop, and it is ALSO the branch-taken arm, so this tier
+///     reproduces the historical choice and both programs' wins are preserved
+///     bit-for-bit (heapsort 0.905 min / 0.920 med vs the preference disabled;
+///     Quicksort 0.762 / 0.673);
+///   * Stanford/Bubblesort `Bubble` B17 — exactly one candidate is in the inner
+///     loop and it is the FALL-THROUGH arm, the branch-taken arm being the
+///     outer loop's exit continuation. The historical preference took the outer
+///     arm and left the inner loop's continue edge stranded at two taken
+///     branches per iteration.
+/// Everywhere else in the corpus BOTH candidates are in the innermost loop, so
+/// this tier abstains and the decision is unchanged.
+///
+/// Kill switch: `TCG_BP_NO_INNER_LOOP_PREF=1`.
+fn inner_loop_only_candidate(
+    func: &MachFunction,
+    loops: &LoopAnalysis,
+    block: BlockId,
+    cands: &[BlockId],
+) -> Option<BlockId> {
+    if !bp_inner_loop_pref_enabled() {
+        return None;
+    }
+    let inner = loops.containing_loop(block)?;
+    // Multi-block inner loop only: a single-block (self) loop has no in-loop
+    // successor to keep the chain in, and `block` must be one of its members.
+    if inner.body.len() < 2 || !inner.body.contains(&block) {
+        return None;
+    }
+    let mut inside: Option<BlockId> = None;
+    let mut outside = false;
+    for &c in cands {
+        if inner.body.contains(&c) {
+            if inside.is_some() {
+                return None; // more than one stays: no discrimination
+            }
+            inside = Some(c);
+        } else {
+            outside = true;
+        }
+    }
+    let inside = inside?;
+    if !outside {
+        return None;
+    }
+    if std::env::var("TCG_BP_DEBUG").as_deref() == Ok("1") {
+        eprintln!(
+            "BP_INNERPREF fn={} B{} inner=B{} cands={:?} -> B{}",
+            func.name,
+            block.0,
+            inner.header.0,
+            cands.iter().map(|b| b.0).collect::<Vec<_>>(),
+            inside.0
+        );
+    }
+    Some(inside)
+}
+
 /// True if any block of `lp` is still unplaced.
 fn loop_has_unplaced(lp: &NaturalLoop, placed: &[bool]) -> bool {
     lp.body.iter().any(|b| !placed[b.0 as usize])
+}
+
+/// The applicability limit on the branch-taken preference in [`select_in_loop`].
+///
+/// THE HEURISTIC'S PREMISE. Once [`inner_loop_only_candidate`] has abstained,
+/// both candidates are in the same innermost loop, so loop nesting — this
+/// pass's entire static hotness signal — says nothing about which arm is hot.
+/// What the branch-taken preference buys there is a *layout*, not a prediction:
+/// it makes the chain commit to one arm as the fall-through line.
+///
+/// WHERE THAT COMMITMENT IS WRONG. When `block` is the header of a TWO-ARMED
+/// TAIL-DUPLICATED loop — a header whose conditional splits into arms that each
+/// carry their own copy of the latch, i.e. two or more in-body blocks ending in
+/// `B block`, at least one of them also carrying a cloned conditional loop exit
+/// — a strictly better layout exists and a later tier already knows how to
+/// build it: [`pull_duplicated_latch_before_header`] (step 3.5) lays the
+/// duplicated arm immediately BEFORE the header, so step 4 turns its back edge
+/// into the header's fall-through seam and BOTH arms cost exactly ONE taken
+/// branch per iteration. That pull only fires on a dup the chain left
+/// OUT-OF-LINE (outside the span of the rest of the body); placing the dup right
+/// after the header puts it INSIDE the span and silently pre-empts the pull,
+/// leaving the non-selected arm at TWO taken branches per iteration.
+///
+/// MEASURED (Stanford/Bubblesort, clang -O3 IR, PMC cycles vs clang -O3 from
+/// source). `Bubble`'s inner `sortlist[i] > sortlist[i+1]` loop is exactly this
+/// shape, nested inside the `while (top>1)` loop, which IS the repair target.
+/// Ablating the PULL instead of the preference (`TCG_BP_NO_BEPULL=1`)
+/// reproduces the bad number with byte-identical instruction counts — 1.503 min
+/// / 1.479 trimmed-median against the preference's own 1.427 / 1.429 — which is
+/// the causal proof that the pull, not the arm choice as such, is what this
+/// preference was destroying. With both this deference and the innermost-loop
+/// preference in place the loop reaches 0.98 / 1.01 at 5.0% fewer retired
+/// instructions, because the rotation also removes the extra unconditional back
+/// branch the stranded arm needed.
+///
+/// The gate is deliberately narrow: it fires only at a LOOP HEADER of the
+/// duplicated-latch shape, so the loops the preference was landed for
+/// (heapsort's sift-down, Quicksort's partition scan) are untouched.
+/// Kill switch: `TCG_BP_NO_CCPREF_LATCH_DEFER=1`.
+fn ccpref_defers_to_latch_pull(
+    func: &MachFunction,
+    loops: &LoopAnalysis,
+    block: BlockId,
+    cands: &[BlockId],
+) -> bool {
+    if !bp_ccpref_latch_defer_enabled() {
+        return false;
+    }
+    // `block` must itself be a loop header; `get_loop` is keyed by header.
+    let Some(lp) = loops.get_loop(block) else {
+        return false;
+    };
+    // Mirrors `pull_duplicated_latch_before_header`'s own preconditions.
+    if lp.body.len() < 3 {
+        return false;
+    }
+    // Two or more in-body blocks ending in `B block` = the duplicated-latch
+    // signature (the original latch plus at least one tail-duplicated clone).
+    let backedge_sources: Vec<BlockId> = lp
+        .body
+        .iter()
+        .copied()
+        .filter(|&b| {
+            b != block
+                && last_real_inst(func, b).is_some_and(|id| {
+                    let inst = func.inst(id);
+                    inst.opcode == AArch64Opcode::B && single_block_operand(inst) == Some(block)
+                })
+        })
+        .collect();
+    if backedge_sources.len() < 2 {
+        return false;
+    }
+    // ...and one of the candidates IS such a duplicated latch, carrying its own
+    // cloned conditional loop exit (the `dup` the pull would move).
+    let defers = cands.iter().any(|c| {
+        backedge_sources.contains(c)
+            && func.block(*c).insts.iter().any(|&id| {
+                let inst = func.inst(id);
+                inst.is_conditional_branch()
+                    && single_block_operand(inst).is_some_and(|t| !lp.body.contains(&t))
+            })
+    });
+    if defers && std::env::var("TCG_BP_DEBUG").as_deref() == Ok("1") {
+        eprintln!(
+            "BP_LATCHDEFER fn={} header=B{} cands={:?}",
+            func.name,
+            block.0,
+            cands.iter().map(|b| b.0).collect::<Vec<_>>()
+        );
+    }
+    defers
 }
 
 /// Re-seed the chain within the innermost unfinished enclosing loop of `block`:
@@ -2149,6 +2327,29 @@ fn bp_ccpref_enabled() -> bool {
     static F: OnceLock<bool> = OnceLock::new();
     *F.get_or_init(|| !matches!(std::env::var("TCG_BP_NO_CCPREF").as_deref(), Ok("1")))
 }
+/// Innermost-loop preference in [`select_in_loop`] (default ON). Kill switch:
+/// `TCG_BP_NO_INNER_LOOP_PREF=1`. See [`inner_loop_only_candidate`].
+fn bp_inner_loop_pref_enabled() -> bool {
+    static F: OnceLock<bool> = OnceLock::new();
+    *F.get_or_init(|| {
+        !matches!(
+            std::env::var("TCG_BP_NO_INNER_LOOP_PREF").as_deref(),
+            Ok("1")
+        )
+    })
+}
+/// Applicability limit on the branch-taken preference (default ON). Kill switch:
+/// `TCG_BP_NO_CCPREF_LATCH_DEFER=1` restores the unconditional preference.
+/// See [`ccpref_defers_to_latch_pull`].
+fn bp_ccpref_latch_defer_enabled() -> bool {
+    static F: OnceLock<bool> = OnceLock::new();
+    *F.get_or_init(|| {
+        !matches!(
+            std::env::var("TCG_BP_NO_CCPREF_LATCH_DEFER").as_deref(),
+            Ok("1")
+        )
+    })
+}
 /// Small-loop in-place orientation (default ON). Kill switch:
 /// `TCG_BP_NO_SMALL_ORIENT=1`. Enables per-loop (not per-function) protection of
 /// already-rotated loops so small, contiguous, MIS-ORIENTED top-tested hot loops
@@ -3874,6 +4075,195 @@ mod tests {
                 .collect();
             assert_eq!(oa, ob, "block {ba:?} instruction stream must match");
         }
+    }
+
+    /// Helper: the Stanford/Bubblesort `Bubble` NEST — a qualifying outer
+    /// repair target (9 body blocks, 7 conditional blocks, call-free, laid out
+    /// scattered) containing a SUB-THRESHOLD two-armed tail-duplicated inner
+    /// loop. This is the shape that made the branch-taken preference reach a
+    /// conditional in a loop the size gates deliberately excluded.
+    ///
+    /// ```text
+    ///   0 entry : B 1
+    ///   1 OH    : cmp; bcond 2 ; B 4          (outer header)
+    ///   2 A     : cmp; bcond 3 ; B 4
+    ///   4 B     : cmp; bcond 3 ; B 8
+    ///   3 IH    : ldr; cmp; bcond 5 ; B 6     (INNER header)
+    ///   5 SWAP  : str; cmp; bcond 8 ; B 3     (dup latch: cloned exit + backedge)
+    ///   6 NOSWP : add; B 7
+    ///   7 ITEST : cmp; bcond 8 ; B 10
+    ///   10 ILATCH: add; B 3                   (the other backedge source)
+    ///   8 OLATCH: cmp; bcond 9 ; B 1          (outer back edge)
+    ///   9 EXIT  : ret
+    /// ```
+    /// Returns (func, [entry, oh, a, ih, bblk, swap, noswap, itest, olatch,
+    /// exit, ilatch]).
+    #[allow(clippy::type_complexity)]
+    fn make_bubble_nest() -> (MachFunction, [BlockId; 11]) {
+        let mut func = make_func("bubble_nest", 11);
+        let entry = BlockId(0);
+        let oh = BlockId(1);
+        let a = BlockId(2);
+        let ih = BlockId(3);
+        let bblk = BlockId(4);
+        let swap = BlockId(5);
+        let noswap = BlockId(6);
+        let itest = BlockId(7);
+        let olatch = BlockId(8);
+        let exit = BlockId(9);
+        let ilatch = BlockId(10);
+
+        let alu = || MachInst::new(AArch64Opcode::AddRI, vec![]);
+        let cmp = || MachInst::new(AArch64Opcode::CmpRR, vec![]);
+
+        add_inst(&mut func, entry, b(oh));
+        func.add_edge(entry, oh);
+
+        for (blk, cc, taken, fall) in [
+            (oh, AArch64CC::GT, a, bblk),
+            (a, AArch64CC::GT, ih, bblk),
+            (bblk, AArch64CC::GT, ih, olatch),
+            (swap, AArch64CC::EQ, olatch, ih),
+            (itest, AArch64CC::EQ, olatch, ilatch),
+            (olatch, AArch64CC::EQ, exit, oh),
+        ] {
+            if blk == swap {
+                add_inst(&mut func, blk, MachInst::new(AArch64Opcode::StrRI, vec![]));
+            }
+            add_inst(&mut func, blk, cmp());
+            add_inst(&mut func, blk, bcond(cc, taken));
+            add_inst(&mut func, blk, b(fall));
+            func.add_edge(blk, taken);
+            func.add_edge(blk, fall);
+        }
+
+        add_inst(&mut func, ih, MachInst::new(AArch64Opcode::LdrRI, vec![]));
+        add_inst(&mut func, ih, cmp());
+        add_inst(&mut func, ih, bcond(AArch64CC::GT, swap));
+        add_inst(&mut func, ih, b(noswap));
+        func.add_edge(ih, swap);
+        func.add_edge(ih, noswap);
+
+        add_inst(&mut func, noswap, alu());
+        add_inst(&mut func, noswap, b(itest));
+        func.add_edge(noswap, itest);
+
+        add_inst(&mut func, ilatch, alu());
+        add_inst(&mut func, ilatch, b(ih));
+        func.add_edge(ilatch, ih);
+
+        add_inst(&mut func, exit, MachInst::new(AArch64Opcode::Ret, vec![]));
+
+        // Scattered input order: `exit` sits inside the outer body's span, and
+        // the two backedge sources are at the far end (what the greedy chainer
+        // produced in the real program).
+        func.block_order = vec![
+            entry, oh, a, bblk, ih, noswap, itest, exit, olatch, swap, ilatch,
+        ];
+        (
+            func,
+            [
+                entry, oh, a, ih, bblk, swap, noswap, itest, olatch, exit, ilatch,
+            ],
+        )
+    }
+
+    fn loops_of(func: &MachFunction) -> LoopAnalysis {
+        let dom = DomTree::compute(func);
+        LoopAnalysis::compute(func, &dom)
+    }
+
+    /// The two-armed tail-duplicated INNER header declines the branch-taken
+    /// preference so step 3.5's duplicated-latch pull can rotate the swap arm
+    /// in front of the header (both arms then cost one taken branch/iteration).
+    #[test]
+    fn ccpref_defers_the_two_armed_dup_latch_header_to_the_pull() {
+        let (func, [_, _, _, ih, _, swap, noswap, _, _, _, _]) = make_bubble_nest();
+        let loops = loops_of(&func);
+        assert!(
+            ccpref_defers_to_latch_pull(&func, &loops, ih, &[swap, noswap]),
+            "the inner header of a two-armed tail-duplicated loop must defer"
+        );
+        // ...and it is the SHAPE, not the block, that decides: with the dup arm
+        // absent from the candidate set there is nothing for the pull to own.
+        assert!(
+            !ccpref_defers_to_latch_pull(&func, &loops, ih, &[noswap]),
+            "no duplicated latch among the candidates -> no deference"
+        );
+    }
+
+    /// A block that is not a loop header never defers (the pull only ever moves
+    /// a dup in front of ITS OWN header).
+    #[test]
+    fn ccpref_deference_is_confined_to_loop_headers() {
+        let (func, [_, _, _, _, _, swap, noswap, itest, olatch, _, ilatch]) = make_bubble_nest();
+        let loops = loops_of(&func);
+        assert!(!ccpref_defers_to_latch_pull(
+            &func,
+            &loops,
+            itest,
+            &[olatch, ilatch]
+        ));
+        assert!(!ccpref_defers_to_latch_pull(
+            &func,
+            &loops,
+            noswap,
+            &[swap, ilatch]
+        ));
+    }
+
+    /// The innermost-loop preference takes the candidate that KEEPS the chain
+    /// in the inner loop, and abstains when both candidates are in it.
+    #[test]
+    fn inner_loop_preference_keeps_the_inner_loop_contiguous() {
+        let (func, [_, _, _, ih, _, swap, noswap, itest, olatch, _, ilatch]) = make_bubble_nest();
+        let loops = loops_of(&func);
+        // `itest` splits into the OUTER latch (branch-taken) and the INNER
+        // latch (fall-through). The inner one wins regardless of polarity.
+        assert_eq!(
+            inner_loop_only_candidate(&func, &loops, itest, &[olatch, ilatch]),
+            Some(ilatch),
+            "the candidate inside the innermost loop must be preferred"
+        );
+        // Both arms of the inner header stay in the inner loop: abstain, and
+        // let the branch-taken tier (and its deference) decide.
+        assert_eq!(
+            inner_loop_only_candidate(&func, &loops, ih, &[swap, noswap]),
+            None,
+            "no discrimination when every candidate stays in the inner loop"
+        );
+    }
+
+    /// END TO END: with both tiers the inner loop is laid out so that the swap
+    /// arm sits immediately BEFORE the inner header (its back edge becomes the
+    /// fall-through seam) and the inner latch immediately follows its test —
+    /// i.e. neither arm is stranded behind two taken branches.
+    #[test]
+    fn bubble_nest_lays_out_both_inner_arms_at_one_taken_branch() {
+        let (mut func, [_, _, _, ih, _, swap, _, itest, _, _, ilatch]) = make_bubble_nest();
+        assert!(aarch64_layout_fallthrough_and_elide(&mut func, false));
+
+        let pos = |b: BlockId| func.block_order.iter().position(|&x| x == b).unwrap();
+        assert_eq!(
+            pos(swap) + 1,
+            pos(ih),
+            "the duplicated swap latch must be pulled immediately before the \
+             inner header (block_order = {:?})",
+            func.block_order
+        );
+        assert_eq!(
+            pos(itest) + 1,
+            pos(ilatch),
+            "the inner latch must follow its test, not be stranded behind the \
+             outer latch (block_order = {:?})",
+            func.block_order
+        );
+        // The pulled arm's `B header` is gone: it falls through.
+        assert_ne!(
+            last_opcode(&func, swap),
+            AArch64Opcode::B,
+            "the pulled arm's back edge must be elided into a fall-through"
+        );
     }
 
     /// Helper: Bubblesort's post-taildup shape. Returns (func, blocks) where

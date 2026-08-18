@@ -91,7 +91,7 @@ use trust_cg_codegen::compiler::{Compiler, CompilerConfig};
 use trust_cg_codegen::env_lock;
 use trust_cg_codegen::interpreter::{InterpreterValue, interpret};
 use trust_cg_codegen::pipeline::OptLevel;
-use trust_cg_codegen::target::Target;
+use trust_cg_codegen::target::{Target, TargetSpec};
 
 use trust_cg_lift::disasm::aarch64::decode;
 use trust_ir::{
@@ -112,14 +112,20 @@ static AY_DIFFERENTIAL_TEST_LOCK: Mutex<()> = Mutex::new(());
 /// Callers run inside an `env_lock::with_env_edits` scope that establishes the
 /// thread-local AY env overrides and restores them on exit.
 fn compile_raw(m: &M, opt: OptLevel) -> Vec<u8> {
-    let c = Compiler::new(CompilerConfig {
-        opt_level: opt,
-        target: Target::Aarch64,
-        // Thread-local allocator overrides are intentionally consumed on this
-        // test thread rather than propagated into a rayon pool.
-        parallel: false,
-        ..CompilerConfig::default()
-    });
+    // Explicit Darwin spec: the a64 interp harness parses Mach-O, and the
+    // default target spec is host-OS-aware (ELF on a Linux host).
+    // Cross-emission only; same pattern as a64_abi_probe.
+    let c = Compiler::new_for_target_spec(
+        CompilerConfig {
+            opt_level: opt,
+            target: Target::Aarch64,
+            // Thread-local allocator overrides are intentionally consumed on this
+            // test thread rather than propagated into a rayon pool.
+            parallel: false,
+            ..CompilerConfig::default()
+        },
+        TargetSpec::parse("aarch64-apple-darwin").expect("parse aarch64-apple-darwin target spec"),
+    );
     c.compile(m).expect("aarch64 compile").object_code
 }
 

@@ -38,8 +38,8 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "ay-arrays"
-version = "0.9.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=882800fa351d5045e6f8ca67c756b4081ffbf2cf#882800fa351d5045e6f8ca67c756b4081ffbf2cf"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-core",
  "num-bigint",
@@ -48,8 +48,8 @@ dependencies = [
 
 [[package]]
 name = "ay-bv"
-version = "0.9.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=882800fa351d5045e6f8ca67c756b4081ffbf2cf#882800fa351d5045e6f8ca67c756b4081ffbf2cf"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-core",
  "ay-sys",
@@ -60,8 +60,8 @@ dependencies = [
 
 [[package]]
 name = "ay-core"
-version = "0.9.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=882800fa351d5045e6f8ca67c756b4081ffbf2cf#882800fa351d5045e6f8ca67c756b4081ffbf2cf"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-sys",
  "foldhash 0.1.5",
@@ -77,8 +77,8 @@ dependencies = [
 
 [[package]]
 name = "ay-diff-logic"
-version = "0.9.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=882800fa351d5045e6f8ca67c756b4081ffbf2cf#882800fa351d5045e6f8ca67c756b4081ffbf2cf"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "num-bigint",
  "num-rational",
@@ -87,8 +87,8 @@ dependencies = [
 
 [[package]]
 name = "ay-dpll"
-version = "0.9.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=882800fa351d5045e6f8ca67c756b4081ffbf2cf#882800fa351d5045e6f8ca67c756b4081ffbf2cf"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-arrays",
  "ay-bv",
@@ -127,8 +127,8 @@ dependencies = [
 
 [[package]]
 name = "ay-drat-check"
-version = "0.9.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=882800fa351d5045e6f8ca67c756b4081ffbf2cf#882800fa351d5045e6f8ca67c756b4081ffbf2cf"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-proof-common",
  "ay-sys",
@@ -138,8 +138,8 @@ dependencies = [
 
 [[package]]
 name = "ay-dt"
-version = "0.9.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=882800fa351d5045e6f8ca67c756b4081ffbf2cf#882800fa351d5045e6f8ca67c756b4081ffbf2cf"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-core",
  "ay-euf",
@@ -148,8 +148,8 @@ dependencies = [
 
 [[package]]
 name = "ay-euf"
-version = "0.9.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=882800fa351d5045e6f8ca67c756b4081ffbf2cf#882800fa351d5045e6f8ca67c756b4081ffbf2cf"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-core",
  "hashbrown 0.15.5",
@@ -159,8 +159,8 @@ dependencies = [
 
 [[package]]
 name = "ay-fp"
-version = "0.9.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=882800fa351d5045e6f8ca67c756b4081ffbf2cf#882800fa351d5045e6f8ca67c756b4081ffbf2cf"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-core",
  "num-bigint",
@@ -171,8 +171,8 @@ dependencies = [
 
 [[package]]
 name = "ay-frontend"
-version = "0.9.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=882800fa351d5045e6f8ca67c756b4081ffbf2cf#882800fa351d5045e6f8ca67c756b4081ffbf2cf"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-core",
  "logos",
@@ -185,8 +185,8 @@ dependencies = [
 
 [[package]]
 name = "ay-intsat"
-version = "0.9.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=882800fa351d5045e6f8ca67c756b4081ffbf2cf#882800fa351d5045e6f8ca67c756b4081ffbf2cf"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-core",
  "num-bigint",
@@ -196,8 +196,8 @@ dependencies = [
 
 [[package]]
 name = "ay-jit"
-version = "0.9.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=882800fa351d5045e6f8ca67c756b4081ffbf2cf#882800fa351d5045e6f8ca67c756b4081ffbf2cf"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-core",
  "serde",
@@ -206,8 +206,8 @@ dependencies = [
 
 [[package]]
 name = "ay-lia"
-version = "0.9.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=882800fa351d5045e6f8ca67c756b4081ffbf2cf#882800fa351d5045e6f8ca67c756b4081ffbf2cf"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-core",
  "ay-intsat",
@@ -221,8 +221,8 @@ dependencies = [
 
 [[package]]
 name = "ay-lra"
-version = "0.9.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=882800fa351d5045e6f8ca67c756b4081ffbf2cf#882800fa351d5045e6f8ca67c756b4081ffbf2cf"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-core",
  "ay-jit",
@@ -237,16 +237,16 @@ dependencies = [
 
 [[package]]
 name = "ay-map"
-version = "0.9.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=882800fa351d5045e6f8ca67c756b4081ffbf2cf#882800fa351d5045e6f8ca67c756b4081ffbf2cf"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-core",
 ]
 
 [[package]]
 name = "ay-milp"
-version = "0.9.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=882800fa351d5045e6f8ca67c756b4081ffbf2cf#882800fa351d5045e6f8ca67c756b4081ffbf2cf"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-dpll",
  "ay-lra",
@@ -266,8 +266,8 @@ dependencies = [
 
 [[package]]
 name = "ay-model-check"
-version = "0.9.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=882800fa351d5045e6f8ca67c756b4081ffbf2cf#882800fa351d5045e6f8ca67c756b4081ffbf2cf"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-core",
  "num-bigint",
@@ -278,16 +278,16 @@ dependencies = [
 
 [[package]]
 name = "ay-multiset"
-version = "0.9.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=882800fa351d5045e6f8ca67c756b4081ffbf2cf#882800fa351d5045e6f8ca67c756b4081ffbf2cf"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-core",
 ]
 
 [[package]]
 name = "ay-nia"
-version = "0.9.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=882800fa351d5045e6f8ca67c756b4081ffbf2cf#882800fa351d5045e6f8ca67c756b4081ffbf2cf"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-core",
  "ay-lia",
@@ -304,8 +304,8 @@ dependencies = [
 
 [[package]]
 name = "ay-nonlinear-common"
-version = "0.9.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=882800fa351d5045e6f8ca67c756b4081ffbf2cf#882800fa351d5045e6f8ca67c756b4081ffbf2cf"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "num-rational",
  "num-traits",
@@ -313,8 +313,8 @@ dependencies = [
 
 [[package]]
 name = "ay-nra"
-version = "0.9.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=882800fa351d5045e6f8ca67c756b4081ffbf2cf#882800fa351d5045e6f8ca67c756b4081ffbf2cf"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-core",
  "ay-lra",
@@ -330,8 +330,8 @@ dependencies = [
 
 [[package]]
 name = "ay-pb"
-version = "0.9.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=882800fa351d5045e6f8ca67c756b4081ffbf2cf#882800fa351d5045e6f8ca67c756b4081ffbf2cf"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-core",
  "ay-milp",
@@ -352,8 +352,8 @@ dependencies = [
 
 [[package]]
 name = "ay-pb-core"
-version = "0.9.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=882800fa351d5045e6f8ca67c756b4081ffbf2cf#882800fa351d5045e6f8ca67c756b4081ffbf2cf"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-core",
  "ay-sat",
@@ -372,13 +372,13 @@ dependencies = [
 
 [[package]]
 name = "ay-prefetch"
-version = "0.9.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=882800fa351d5045e6f8ca67c756b4081ffbf2cf#882800fa351d5045e6f8ca67c756b4081ffbf2cf"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 
 [[package]]
 name = "ay-proof"
-version = "0.9.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=882800fa351d5045e6f8ca67c756b4081ffbf2cf#882800fa351d5045e6f8ca67c756b4081ffbf2cf"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-core",
  "ay-sat",
@@ -391,16 +391,16 @@ dependencies = [
 
 [[package]]
 name = "ay-proof-common"
-version = "0.9.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=882800fa351d5045e6f8ca67c756b4081ffbf2cf#882800fa351d5045e6f8ca67c756b4081ffbf2cf"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "ay-sat"
-version = "0.9.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=882800fa351d5045e6f8ca67c756b4081ffbf2cf#882800fa351d5045e6f8ca67c756b4081ffbf2cf"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-core",
  "ay-drat-check",
@@ -423,13 +423,13 @@ dependencies = [
 
 [[package]]
 name = "ay-sat-congruence-core"
-version = "0.9.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=882800fa351d5045e6f8ca67c756b4081ffbf2cf#882800fa351d5045e6f8ca67c756b4081ffbf2cf"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 
 [[package]]
 name = "ay-seq"
-version = "0.9.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=882800fa351d5045e6f8ca67c756b4081ffbf2cf#882800fa351d5045e6f8ca67c756b4081ffbf2cf"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-core",
  "num-bigint",
@@ -437,16 +437,16 @@ dependencies = [
 
 [[package]]
 name = "ay-set"
-version = "0.9.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=882800fa351d5045e6f8ca67c756b4081ffbf2cf#882800fa351d5045e6f8ca67c756b4081ffbf2cf"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-core",
 ]
 
 [[package]]
 name = "ay-strings"
-version = "0.9.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=882800fa351d5045e6f8ca67c756b4081ffbf2cf#882800fa351d5045e6f8ca67c756b4081ffbf2cf"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-core",
  "num-bigint",
@@ -455,8 +455,8 @@ dependencies = [
 
 [[package]]
 name = "ay-sys"
-version = "0.9.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=882800fa351d5045e6f8ca67c756b4081ffbf2cf#882800fa351d5045e6f8ca67c756b4081ffbf2cf"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "libc",
  "windows-sys",
@@ -561,8 +561,8 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
 name = "clean-kernel"
-version = "1.5.0"
-source = "git+https://github.com/alabsystems/clean.git?rev=537aa6b4b3c75457260f58132ae62cfce11cca84#537aa6b4b3c75457260f58132ae62cfce11cca84"
+version = "1.6.0"
+source = "git+https://github.com/alabsystems/clean.git?rev=bc2923ca9a1d0b7ec060803dc922b5e621309378#bc2923ca9a1d0b7ec060803dc922b5e621309378"
 dependencies = [
  "ahash",
  "bincode 2.0.1",
@@ -1262,7 +1262,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys",
@@ -1321,7 +1321,7 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-codegen"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rayon",
  "serde",
@@ -1341,21 +1341,21 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-dialect"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "trust-cg-ir",
 ]
 
 [[package]]
 name = "trust-cg-drat-trim"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "trust-cg-ir"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1363,7 +1363,7 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-lower"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "thiserror",
@@ -1374,7 +1374,7 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-opt"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1386,11 +1386,11 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-process-env"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "trust-cg-regalloc"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ay-pb",
  "ay-sat",
@@ -1401,7 +1401,7 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-verify"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rayon",
  "rmp-serde",
@@ -1420,8 +1420,8 @@ dependencies = [
 
 [[package]]
 name = "trust-ir"
-version = "0.4.0"
-source = "git+https://github.com/alabsystems/trust-ir.git?rev=f497428646b05c2f20ff0017f6b01d4924935d12#f497428646b05c2f20ff0017f6b01d4924935d12"
+version = "0.5.0"
+source = "git+https://github.com/alabsystems/trust-ir.git?rev=32a2c54b555c884a40020093f5910cbb5e2050ab#32a2c54b555c884a40020093f5910cbb5e2050ab"
 dependencies = [
  "bincode 1.3.3",
  "clean-kernel",
@@ -1431,8 +1431,8 @@ dependencies = [
 
 [[package]]
 name = "trust-ir-build"
-version = "0.4.0"
-source = "git+https://github.com/alabsystems/trust-ir.git?rev=f497428646b05c2f20ff0017f6b01d4924935d12#f497428646b05c2f20ff0017f6b01d4924935d12"
+version = "0.5.0"
+source = "git+https://github.com/alabsystems/trust-ir.git?rev=32a2c54b555c884a40020093f5910cbb5e2050ab#32a2c54b555c884a40020093f5910cbb5e2050ab"
 dependencies = [
  "clean-kernel",
  "rayon",
@@ -1442,8 +1442,8 @@ dependencies = [
 
 [[package]]
 name = "trust-ir-giveback"
-version = "0.4.0"
-source = "git+https://github.com/alabsystems/trust-ir.git?rev=f497428646b05c2f20ff0017f6b01d4924935d12#f497428646b05c2f20ff0017f6b01d4924935d12"
+version = "0.5.0"
+source = "git+https://github.com/alabsystems/trust-ir.git?rev=32a2c54b555c884a40020093f5910cbb5e2050ab#32a2c54b555c884a40020093f5910cbb5e2050ab"
 dependencies = [
  "trust-ir",
 ]

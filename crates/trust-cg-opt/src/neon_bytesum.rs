@@ -3450,6 +3450,8 @@ fn produces_def(op: AArch64Opcode) -> bool {
             | StrbRI
             | StrhRI
             | StrRO
+            | StrbRO
+            | StrhRO
             | StpRI
             // Pre/post-index stores also list the stored value first (their
             // base-pointer writeback is an in-place tie, not an operand-0 def).

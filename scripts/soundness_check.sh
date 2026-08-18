@@ -17,8 +17,8 @@
 #   trust-cg (cargo test -p trust-cg-verify --test <target>):
 #     - soundness_manifest      (THE meta-gate: every invariant has a live
 #                                fail-closed test; every B-* id present)
-#     - coverage_gate_tests     (accepted/deferred inventory: AArch64 155/246
-#                                with 91 named RED rows; x86-64 163/192 with 29,
+#     - coverage_gate_tests     (accepted/deferred inventory: AArch64 155/248
+#                                with 93 named RED rows; x86-64 163/192 with 29,
 #                                RISC-V 14/17 with 3, WebAssembly 109/111 with 2.
 #                                Exact classifications are pinned; unknown drift
 #                                fails. Ratios are evidence coverage, not

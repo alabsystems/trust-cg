@@ -156,7 +156,7 @@ pub fn detect_smulh_idioms(
         let wide_val = shifted_inst.args[0];
         let shift_val = shifted_inst.args[1];
         let Some(extra_skip_idx) =
-            match_shift_amount(&def_site, &use_count, instructions, shift_val)
+            match_shift_amount(&def_site, use_count, instructions, shift_val)
         else {
             continue;
         };

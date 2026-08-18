@@ -302,10 +302,12 @@ fn stats_enabled() -> bool {
     crate::env_lock::var_os("TCG_AY_REGALLOC_STATS").is_some()
 }
 
-/// Whether the greedy-incumbent PHASE seeding (warm-start form (b)) is active.
+/// Whether PHASE seeding is active.
 /// On by default whenever the AY path runs; `TCG_AY_REGALLOC_NO_SEED` opts out
-/// (the A/B measurement lever). Purely a solver-search bias — disabling it can
-/// change which strictly-better allocation is found, never correctness.
+/// (the A/B measurement lever). With a greedy incumbent this is warm-start form
+/// (b); the explicit FORCE_KEEP lane instead seeds the guaranteed-feasible
+/// all-spill corner. Purely a solver-search bias — disabling it can change which
+/// allocation is found, never correctness.
 fn seed_enabled() -> bool {
     crate::env_lock::var_os("TCG_AY_REGALLOC_NO_SEED").is_none()
 }
@@ -373,6 +375,27 @@ fn greedy_phase_seeds(
     seeds
 }
 
+/// A guaranteed-feasible phase corner for the unbounded base formula.
+///
+/// Every vreg spills, so all `x` variables are false, every `s` variable is
+/// true, and every move `diff` is false (both endpoints share the spilled
+/// location). This satisfies exactly-one, interference, and move rows by
+/// construction. It is used only when no greedy incumbent bound is present,
+/// notably the explicit FORCE_KEEP execution-evidence lane, so phase
+/// completion can establish a validated incumbent deterministically instead of
+/// racing a wall-clock deadline from the all-registers corner.
+fn all_spill_phase_seeds(x_var: &[Vec<u32>], s_var: &[u32], diff_var: &[u32]) -> Vec<(u32, bool)> {
+    let mut seeds = Vec::with_capacity(
+        x_var.iter().map(Vec::len).sum::<usize>() + s_var.len() + diff_var.len(),
+    );
+    for (row, &spill) in x_var.iter().zip(s_var) {
+        seeds.extend(row.iter().map(|&var| (var, false)));
+        seeds.push((spill, true));
+    }
+    seeds.extend(diff_var.iter().map(|&var| (var, false)));
+    seeds
+}
+
 /// Solve the WHOLE-VREG AY-PBO assignment for `intervals` (one preg per vreg for
 /// its whole live range) and return `Some((allocation, spilled))` — the decoded,
 /// self-checked assignment map plus the spilled vregs — or `None` to signal
@@ -391,8 +414,10 @@ fn greedy_phase_seeds(
 /// `Unsatisfiable` (greedy optimal over the whole-vreg closure) and `Unknown`
 /// (time-starved) are clean declines. When `G == 0` greedy is unbeatable and we
 /// decline without solving. `None` (or a fall-back-worthy record mismatch)
-/// simply drops the bound — the run-both-keep-better criterion in `allocate`
-/// still gates the result either way.
+/// simply drops the bound. Normal production still applies the
+/// run-both-keep-better criterion in `allocate`; the explicit FORCE_KEEP
+/// execution-evidence lane may retain a worse result, but only after the same
+/// self-check and translation validator accept it.
 pub(crate) fn solve_whole_vreg(
     func: &RegAllocFunction,
     intervals: &[LiveInterval],
@@ -592,27 +617,35 @@ pub(crate) fn solve_whole_vreg(
     // the best feasible incumbent found so far when the deadline trips. Both an
     // `Optimal` (proven minimum) and a `Feasible` (best-so-far) result are a
     // *valid* satisfying assignment of the hard constraints — the caller compares
-    // its spill count against greedy and keeps whichever is smaller, so a merely-
-    // feasible incumbent can never make the result worse than greedy.
+    // its recomputed traffic against greedy and keeps whichever is better. The
+    // explicit FORCE_KEEP execution-evidence lane may retain a merely-feasible,
+    // worse result so the AY stream is exercised, but never without the same
+    // model self-check and always-on translation validator.
     let deadline = Instant::now() + time_cap();
     let mut solver = PbCdclSolver::new_interruptible(&instance, || Instant::now() >= deadline);
 
-    // Warm-start form (b): seed the decision phases at greedy's (collapsed)
-    // solution so the anytime search improves a known-good point instead of
-    // repairing the all-in-registers start. See [`greedy_phase_seeds`] for the
-    // soundness argument (pure polarity bias; every hard gate unchanged).
-    if seed_enabled()
-        && let Some(rec) = incumbent
-    {
-        let seeds = greedy_phase_seeds(
-            rec,
-            &vregs,
-            &candidates,
-            &x_var,
-            &s_var,
-            &move_pairs,
-            &diff_var,
-        );
+    // Seed the decision phases at greedy's collapsed solution when the strict
+    // incumbent bound is present. The explicit FORCE_KEEP lane has no bound, so
+    // seed its guaranteed-feasible all-spill corner and obtain an incumbent
+    // independent of wall-clock scheduling. Other unbounded internal/unit
+    // callers retain AY's objective-directed phases. Every case is a pure
+    // polarity bias; all hard gates are unchanged.
+    if seed_enabled() {
+        let seeds = if let Some(rec) = incumbent {
+            greedy_phase_seeds(
+                rec,
+                &vregs,
+                &candidates,
+                &x_var,
+                &s_var,
+                &move_pairs,
+                &diff_var,
+            )
+        } else if crate::env_lock::var_os("TCG_AY_REGALLOC_FORCE_KEEP").is_some() {
+            all_spill_phase_seeds(&x_var, &s_var, &diff_var)
+        } else {
+            Vec::new()
+        };
         if !seeds.is_empty() {
             solver.seed_phases(&seeds);
         }
@@ -2145,6 +2178,29 @@ mod traffic_tests {
                 // move (v0, v1): Some(20) vs None differ -> diff true.
                 (11, true),
                 // move (v0, v3): v3 unrecorded -> no diff seed for var 12.
+            ]
+        );
+    }
+
+    /// Without an incumbent bound, seed a complete, satisfying all-spill model:
+    /// every register-choice variable false, every spill variable true, and
+    /// every copy-difference variable false.
+    #[test]
+    fn all_spill_phase_seeds_are_complete_and_deterministic() {
+        let x_var = vec![vec![1, 2], vec![4], Vec::new()];
+        let s_var = vec![3, 5, 6];
+        let diff_var = vec![7, 8];
+        assert_eq!(
+            all_spill_phase_seeds(&x_var, &s_var, &diff_var),
+            vec![
+                (1, false),
+                (2, false),
+                (3, true),
+                (4, false),
+                (5, true),
+                (6, true),
+                (7, false),
+                (8, false),
             ]
         );
     }

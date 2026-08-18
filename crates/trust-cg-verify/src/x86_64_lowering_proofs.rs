@@ -1078,8 +1078,15 @@ pub fn proof_x86_srem_i64() -> ProofObligation {
 
 /// Build the branchless-guarded SDiv x86 expression for the given width.
 ///
-/// Models `select_div`'s emitted sequence:
-///   `ite(rhs == -1, bvneg(lhs), idiv_quotient(lhs, (rhs == -1) ? 1 : rhs))`.
+/// Models `select_div`'s emitted sequence, path-normalized at its observable
+/// result:
+///   `ite(rhs == -1, bvneg(lhs), idiv_quotient(lhs, rhs))`.
+///
+/// The emitted IDIV actually receives `(rhs == -1) ? 1 : rhs`. On the outer
+/// true path its quotient is discarded in favor of `-lhs`; on the false path
+/// that safe divisor is exactly `rhs`. Removing the dead true-path quotient
+/// preserves the emitted result exactly while avoiding a solver-hostile nested
+/// ITE under signed division.
 fn guarded_sdiv_expr(
     size: crate::x86_64_semantics::X86OperandSize,
     lhs: &SmtExpr,
@@ -1088,21 +1095,23 @@ fn guarded_sdiv_expr(
 ) -> SmtExpr {
     use crate::x86_64_semantics::encode_idiv_quotient;
     let minus_one = SmtExpr::bv_const(crate::smt::mask(u64::MAX, width), width);
-    let one = SmtExpr::bv_const(1, width);
     let is_minus_one = rhs.clone().eq_expr(minus_one);
-    let safe_rhs = SmtExpr::ite(is_minus_one.clone(), one, rhs.clone());
     SmtExpr::ite(
         is_minus_one,
         lhs.clone().bvneg(),
-        encode_idiv_quotient(size, lhs.clone(), safe_rhs),
+        encode_idiv_quotient(size, lhs.clone(), rhs.clone()),
     )
 }
 
 /// Build the branchless-guarded SRem x86 expression for the given width.
 ///
-/// Models `select_div`'s emitted sequence: `idiv_remainder(lhs, (rhs == -1) ? 1 : rhs)`.
-/// No result patch is needed: when `rhs == -1`, `safe_rhs == 1` so the remainder
-/// is `lhs % 1 == 0`, exactly the wrapping_rem result.
+/// Models `select_div`'s emitted sequence, path-normalized at its observable
+/// result: `ite(rhs == -1, 0, idiv_remainder(lhs, rhs))`.
+///
+/// The emitted IDIV receives `(rhs == -1) ? 1 : rhs`; on the true path its
+/// remainder is necessarily `lhs % 1 == 0`, and on the false path its divisor
+/// is exactly `rhs`. Spelling those two exact output paths explicitly avoids a
+/// nested ITE under signed remainder without weakening the theorem.
 fn guarded_srem_expr(
     size: crate::x86_64_semantics::X86OperandSize,
     lhs: &SmtExpr,
@@ -1111,10 +1120,12 @@ fn guarded_srem_expr(
 ) -> SmtExpr {
     use crate::x86_64_semantics::encode_idiv_remainder;
     let minus_one = SmtExpr::bv_const(crate::smt::mask(u64::MAX, width), width);
-    let one = SmtExpr::bv_const(1, width);
     let is_minus_one = rhs.clone().eq_expr(minus_one);
-    let safe_rhs = SmtExpr::ite(is_minus_one, one, rhs.clone());
-    encode_idiv_remainder(size, lhs.clone(), safe_rhs)
+    SmtExpr::ite(
+        is_minus_one,
+        SmtExpr::bv_const(0, width),
+        encode_idiv_remainder(size, lhs.clone(), rhs.clone()),
+    )
 }
 
 /// Proof: `trust_ir::Sdiv(I32, a, b) -> x86-64 branchless-guarded IDIV r32`.
@@ -9962,6 +9973,9 @@ mod tests {
     #[test]
     fn test_x86_64_guarded_sdiv_srem_int_min_corner() {
         use crate::smt::EvalResult;
+        use crate::x86_64_semantics::{
+            X86OperandSize, encode_idiv_quotient, encode_idiv_remainder,
+        };
         use std::collections::HashMap;
 
         // (width, INT_MIN, -1)
@@ -9997,6 +10011,41 @@ mod tests {
                 assert!(
                     spec_r.semantically_equal(&emit_r),
                     "guarded SRem mismatch at width={width} a={av:#x} b={bv:#x}: spec={spec_r:?} emitted={emit_r:?}"
+                );
+
+                // Independently spell the literal emitted safe-divisor sequence and pin the
+                // path-normalized proof model to it at every adversarial point above. The
+                // universal AY obligations prove the normalized model against the source spec;
+                // these checks keep its machine-side derivation live and catch a wrong branch,
+                // patch value, or safe divisor.
+                let lhs = SmtExpr::var("a", width);
+                let rhs = SmtExpr::var("b", width);
+                let minus_one_expr = SmtExpr::bv_const(crate::smt::mask(u64::MAX, width), width);
+                let is_minus_one = rhs.clone().eq_expr(minus_one_expr);
+                let safe_rhs = SmtExpr::ite(
+                    is_minus_one.clone(),
+                    SmtExpr::bv_const(1, width),
+                    rhs.clone(),
+                );
+                let size = if width == 32 {
+                    X86OperandSize::S32
+                } else {
+                    X86OperandSize::S64
+                };
+                let literal_q = SmtExpr::ite(
+                    is_minus_one,
+                    lhs.clone().bvneg(),
+                    encode_idiv_quotient(size, lhs.clone(), safe_rhs.clone()),
+                )
+                .eval(&env);
+                let literal_r = encode_idiv_remainder(size, lhs, safe_rhs).eval(&env);
+                assert_eq!(
+                    emit_q, literal_q,
+                    "path-normalized SDiv model drifted from the literal emitted sequence"
+                );
+                assert_eq!(
+                    emit_r, literal_r,
+                    "path-normalized SRem model drifted from the literal emitted sequence"
                 );
 
                 // Sanity-pin the overflow corner to the wrapping spec values.

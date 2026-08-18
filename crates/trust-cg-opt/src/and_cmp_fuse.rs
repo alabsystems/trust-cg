@@ -107,6 +107,55 @@ fn and_cmp_fuse_enabled() -> bool {
     crate::env_lock::var_os("TCG_NO_AND_CMP_FUSE").is_none()
 }
 
+/// The REGISTER-operand arm (`AND Rd,Rn,Rm` + `CMP Rd,#0` -> `TST Rn,Rm`) is
+/// **OPT-IN**: set `TCG_AND_CMP_FUSE_RR=1` to enable it. Default OFF, so the
+/// shipped compiler is byte-identical to the immediate-only pass.
+///
+/// # Why it is off, when it is provably correct and removes real instructions
+///
+/// It works exactly as designed. On CoyoteBench/huffbench's encode inner loop
+/// (1.5e9 iterations, measured, not estimated) it collapses
+/// `and x1,x0,x6` + `cmp x1,#0` into `tst x0,x6`, removing **exactly
+/// 1.50e9 dynamic instructions** -- 1 per iteration, as predicted to 3 digits
+/// -- and shortening the chain into the dependent `cset`. stdout is bit-exact
+/// against clang -O3 in all four arms tested.
+///
+/// **It buys nothing.** Corpus measurement (tcg-vs-tcg, same `.ll`, same driver
+/// object, interleaved, min of 13, byte-identical null arm on every row; the
+/// arm changes 6 of 65 SingleSource programs):
+///
+/// | program | enabled vs disabled (min/tmed) | dyn insts |
+/// |---|---|---|
+/// | huffbench | 1.0016 / 1.0013 (null 0.9991) | **-1.63%** |
+/// | ReedSolomon | 1.0054 / 1.0064 | -0.01% |
+/// | nsieve-bits | 1.0109 / 1.0069 | **+2.48%** |
+/// | geomean (6) | 1.0030 / 1.0152 (null 1.0024 / 1.0104) | |
+///
+/// So it REMOVES 1.6% of huffbench's instructions for zero cycles, and COSTS
+/// nsieve-bits 1.1% while ADDING 2.5% of its instructions -- the extra work is a
+/// downstream reshuffle the peephole triggers, not anything it emits.
+///
+/// R3: huffbench's two alignment regimes DISAGREE IN SIGN (default 1.0015 min /
+/// 1.0016 tmed against no-align 0.9771 / 0.9759), which is the loop_align
+/// lottery signature. A lever whose sign flips with padding is not a lever.
+///
+/// This is the same lesson as `loop_align.rs` and the LICM depth-1 tier: on this
+/// target, removing instructions that are not on a real resource bottleneck buys
+/// nothing, and the layout perturbation dominates whatever it saves. Enable it
+/// only with a per-program measurement in hand.
+///
+/// # It is parked for being useless, NOT for being unsafe
+///
+/// `torture_ship` was run a second time with `TCG_AND_CMP_FUSE_RR=1` and lands
+/// **exactly on pin** -- 1114 PASS / 337 IMPORT_FAIL / **0 MISCOMPILE** / 0
+/// LINKFAIL / 0 TIMEOUT / 1 TCG_PASSES_ORACLE_FAILS / 2 BOTH_FAIL_DIFF, the same
+/// tuple as the default build. So the C-flag guard and the two-source
+/// redefinition guard hold across 1114 programs with the arm live. Turning it on
+/// costs correctness nothing; it simply does not pay.
+fn and_cmp_fuse_rr_enabled() -> bool {
+    crate::env_lock::var_os("TCG_AND_CMP_FUSE_RR").is_some()
+}
+
 /// Condition codes that observe the C flag: HS(0b0010), LO(0b0011),
 /// HI(0b1000), LS(0b1001). See the module docs -- this is the whole reason the
 /// pass needs a guard.
@@ -124,7 +173,13 @@ fn cond_operand_index(opcode: AArch64Opcode) -> Option<usize> {
     match opcode {
         BCond | Bcc => Some(0),
         CSet => Some(1),
-        Csel | Csinc | Csinv | Csneg => Some(3),
+        // FcselRR is the scalar-FP conditional select. `effects::reads_flags`
+        // already classifies it as an NZCV reader, so omitting it here did not
+        // make the pass unsound — it made it INERT: `flags_safe_after` treats an
+        // unlocatable condition as unsafe and bails. Its condition operand sits
+        // at index 3, exactly like the integer CSEL family (see the FcselRR arm
+        // of the encoder, which reads `imm_val(inst, 3)`).
+        Csel | Csinc | Csinv | Csneg | FcselRR => Some(3),
         _ => None,
     }
 }
@@ -269,6 +324,26 @@ fn run_and_cmp_fuse(func: &mut MachFunction, mut provenance: Option<&mut Provena
     let read_counts = count_vreg_reads(func);
 
     let mut changed = false;
+    if crate::env_lock::var_os("TCG_DUMP_ANDCMP").is_some() {
+        let mut census: HashMap<String, usize> = HashMap::new();
+        for &b in &func.block_order {
+            for &i in &func.block(b).insts {
+                let inst = func.inst(i);
+                let k = format!("{:?}", inst.opcode);
+                if k.starts_with("Cmp") || k.starts_with("CMP") || k.starts_with("And") {
+                    let zero = matches!(inst.operands.get(1), Some(MachOperand::Imm(0)));
+                    *census
+                        .entry(format!("{k}{}", if zero { " #0" } else { "" }))
+                        .or_default() += 1;
+                }
+            }
+        }
+        let mut v: Vec<_> = census.into_iter().collect();
+        v.sort();
+        for (k, n) in v {
+            eprintln!("TCG_ANDCMP census {k} = {n}");
+        }
+    }
     for block_id in func.block_order.clone() {
         // AndRI defs seen so far in this block, invalidated on redefinition so a
         // hit is the true reaching definition.
@@ -312,7 +387,9 @@ fn run_and_cmp_fuse(func: &mut MachFunction, mut provenance: Option<&mut Provena
                     return;
                 };
                 last_def_pos.insert(*v, pos);
-                if opcode == AArch64Opcode::AndRI && i == 0 {
+                let fusable_and = opcode == AArch64Opcode::AndRI
+                    || (opcode == AArch64Opcode::AndRR && and_cmp_fuse_rr_enabled());
+                if fusable_and && i == 0 {
                     and_defs.insert(*v, (inst_id, pos));
                 } else {
                     and_defs.remove(v);
@@ -349,54 +426,104 @@ fn try_fuse(
         return None;
     };
 
-    // (1) single-use function-wide: this CMP is the only reader
-    if read_counts.get(t).copied().unwrap_or(0) != 1 {
-        return None;
+    // DIAGNOSTIC (default off, TCG_DUMP_ANDCMP=1): why a CmpRI #0 whose operand
+    // has a reaching AND was declined. Only such candidates are reported.
+    let dump = crate::env_lock::var_os("TCG_DUMP_ANDCMP").is_some();
+    macro_rules! decline {
+        ($why:expr) => {{
+            if dump {
+                eprintln!(
+                    "TCG_ANDCMP decline v{} and={:?} why={}",
+                    t.id,
+                    and_defs.get(t).map(|&(id, _)| func.inst(id).opcode),
+                    $why
+                );
+            }
+            return None;
+        }};
     }
 
-    // (2) reaching AND def in this block
+    // (1) single-use function-wide: this CMP is the only reader
+    if read_counts.get(t).copied().unwrap_or(0) != 1 {
+        decline!(format!(
+            "not single-use: {} reads",
+            read_counts.get(t).copied().unwrap_or(0)
+        ));
+    }
+
+    // (2) reaching AND def in this block. Two admissible shapes:
+    //   AndRI Rd, Rn, #imm  ->  TST Rn, #imm
+    //   AndRR Rd, Rn, Rm    ->  TST Rn, Rm      (register arm)
+    // `Tst` already encodes BOTH forms, so the register arm needs no new opcode.
     let (and_id, and_pos) = *and_defs.get(t)?;
     let and_inst = func.inst(and_id);
-    if and_inst.opcode != AArch64Opcode::AndRI || and_inst.operands.len() != 3 {
-        return None;
+    let is_rr = match and_inst.opcode {
+        AArch64Opcode::AndRI => false,
+        AArch64Opcode::AndRR if and_cmp_fuse_rr_enabled() => true,
+        _ => decline!(format!(
+            "reaching def not a fusable AND: {:?}",
+            and_inst.opcode
+        )),
+    };
+    if and_inst.operands.len() != 3 {
+        decline!("AND arity != 3");
     }
 
     let MachOperand::VReg(src) = and_inst.operands.get(1)? else {
         return None;
     };
-    let MachOperand::Imm(mask) = and_inst.operands.get(2)? else {
-        return None;
+
+    // The second operand, and the full set of source registers whose reads this
+    // rewrite moves DOWN to the CMP's position.
+    let (second, srcs): (MachOperand, Vec<VReg>) = if is_rr {
+        let MachOperand::VReg(src2) = and_inst.operands.get(2)? else {
+            return None;
+        };
+        (MachOperand::VReg(*src2), vec![*src, *src2])
+    } else {
+        let MachOperand::Imm(mask) = and_inst.operands.get(2)? else {
+            return None;
+        };
+        // (5a) immediate arm only: the mask must be encodable at exactly this
+        // width. The encoder also fails closed, but rewriting into something
+        // unencodable is not this pass's business.
+        if t.class != src.class {
+            decline!("imm arm: class mismatch");
+        }
+        if !is_logical_immediate(*mask, reg_width(*t)?) {
+            decline!("imm arm: mask not a logical immediate");
+        }
+        (MachOperand::Imm(*mask), vec![*src])
     };
 
-    // (3) source must not be redefined between the AND and the CMP
-    if let Some(&d) = last_def_pos.get(src) {
-        if d > and_pos {
-            return None;
+    // (3) NO source may be redefined between the AND and the CMP. The register
+    // arm has TWO reads to move, not one -- missing either would let the TST
+    // read a value written after the AND.
+    for s in &srcs {
+        if let Some(&d) = last_def_pos.get(s)
+            && d > and_pos
+        {
+            decline!(format!("source v{} redefined after the AND", s.id));
         }
     }
 
-    // (5) Both operations must use the same scalar GPR width, and the mask
-    // must be encodable at exactly that width. A malformed cross-width pair is
-    // not something this local rewrite may reinterpret.
-    if t.class != src.class {
-        return None;
+    // (5b) All operands must share one scalar GPR width. A malformed
+    // cross-width triple is not something this local rewrite may reinterpret.
+    if srcs.iter().any(|s| s.class != t.class) {
+        decline!("cross-width operands");
     }
-    let width = reg_width(*t)?;
-    if !is_logical_immediate(*mask, width) {
-        return None;
-    }
+    reg_width(*t)?;
 
-    // (6) THE C-FLAG GUARD
+    // (6) THE C-FLAG GUARD -- unchanged, and it is the whole reason this pass
+    // has a guard at all. `TST` is `ANDS XZR,..` and CLEARS C; `CMP Rd,#0` is
+    // `SUBS XZR,Rd,#0` and SETS it. Identical for the register arm.
     if !flags_safe_after(func, block_id, pos) {
-        return None;
+        decline!("C-FLAG GUARD: a consumer reads C");
     }
 
     Some((
         and_id,
-        MachInst::new(
-            AArch64Opcode::Tst,
-            vec![MachOperand::VReg(*src), MachOperand::Imm(*mask)],
-        ),
+        MachInst::new(AArch64Opcode::Tst, vec![MachOperand::VReg(*src), second]),
     ))
 }
 

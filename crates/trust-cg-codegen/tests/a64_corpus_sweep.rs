@@ -63,7 +63,7 @@ use common::x86_64_corpus as corpus;
 use trust_cg_codegen::compiler::{Compiler, CompilerConfig};
 use trust_cg_codegen::interpreter::{InterpreterValue, interpret};
 use trust_cg_codegen::pipeline::OptLevel;
-use trust_cg_codegen::target::Target;
+use trust_cg_codegen::target::{Target, TargetSpec};
 
 use trust_ir::{
     BinOp, Block as B, CastOp, Constant, FuncTy, Function as F, ICmpOp, Inst, InstrNode,
@@ -74,11 +74,17 @@ use trust_ir::{BlockId, FuncId, ValueId};
 const OPTS: [OptLevel; 3] = [OptLevel::O0, OptLevel::O2, OptLevel::O3];
 
 fn compile(m: &M, opt: OptLevel) -> Vec<u8> {
-    let c = Compiler::new(CompilerConfig {
-        opt_level: opt,
-        target: Target::Aarch64,
-        ..CompilerConfig::default()
-    });
+    // Explicit Darwin spec: the a64 interp harness parses Mach-O, and the
+    // default target spec is host-OS-aware (ELF on a Linux host).
+    // Cross-emission only; same pattern as a64_abi_probe.
+    let c = Compiler::new_for_target_spec(
+        CompilerConfig {
+            opt_level: opt,
+            target: Target::Aarch64,
+            ..CompilerConfig::default()
+        },
+        TargetSpec::parse("aarch64-apple-darwin").expect("parse aarch64-apple-darwin target spec"),
+    );
     c.compile(m).expect("aarch64 compile").object_code
 }
 

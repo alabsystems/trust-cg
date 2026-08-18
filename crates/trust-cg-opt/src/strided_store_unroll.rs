@@ -964,6 +964,8 @@ fn produces_def(op: AArch64Opcode) -> bool {
             | StrhRI
             | StrRI
             | StrRO
+            | StrbRO
+            | StrhRO
             | TrapBoundsCheckExact
             | TrapBoundsCheck
             | TrapOverflow

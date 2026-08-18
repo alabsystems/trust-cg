@@ -421,6 +421,31 @@ impl A64Interp {
                 let v = self.load_bytes(addr, nbytes);
                 self.write_x(rt, 64, v);
             }
+            // PRFM / PRFUM — (V=0, size=0b11, opc=0b10) is PREFETCH, not a load.
+            //
+            // This arm must precede the sign-extending one. `opc=0b10` means
+            // "sign-extend to 64" in every OTHER size row, but at `size=0b11`
+            // the triple is the prefetch encoding, and there `Rt` is not a
+            // register at all — it is the prefetch operation `<prfop>`
+            // (type:target:policy). The instruction reads no data and writes no
+            // register.
+            //
+            // Executing it as a load did BOTH of the things it must not: an
+            // 8-byte memory read at the computed address (fault-capable, and
+            // able to diverge from hardware on an unmapped page), and a write to
+            // X<prfop> — clobbering whichever register the prfop bits happen to
+            // name. The decoder ACCEPTS these words on purpose
+            // (`still_accepts_real_prfm`, `still_accepts_prefetch_without_writeback`
+            // in trust-cg-lift/tests/aarch64_allocation.rs: "must still decode,
+            // in every form"), so the fidelity gap was here, in the consumer,
+            // not in the acceptance set.
+            //
+            // A prefetch is architecturally a hint: no observable state change.
+            // Falling through leaves the base-register writeback below intact —
+            // it is `None` for these words in any case, because PRFM has no
+            // base-writeback form and `validate_scalar_load_store` refuses that
+            // row.
+            0b10 if size == 0b11 => {}
             0b10 => {
                 // Sign-extend to 64.
                 let raw = self.load_bytes(addr, nbytes);

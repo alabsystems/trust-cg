@@ -246,6 +246,33 @@ const ELEM_BYTES_I64: i64 = 8;
 /// loop iterations). `UNROLL * VF` i32 lanes are processed per iteration (16).
 const UNROLL: usize = 4;
 
+/// DIAGNOSTIC (`TCG_NEONMAP_TRACE`): report the exact structural gate a
+/// candidate loop dies on. Recognition is a long chain of `return None`s, and
+/// attributing a decline by reading the disassembly has been wrong every time it
+/// was tried in this campaign — this prints the predicate instead.
+#[inline]
+fn nm_trace(args: std::fmt::Arguments<'_>) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("TCG_NEONMAP_TRACE").is_some()) {
+        eprintln!("[neon-map] {args}");
+    }
+}
+
+/// Kill switch for the shared-preheader relaxation below: set
+/// `TCG_NO_NEONMAP_SHARED_PREHEADER=1` to restore the old `gpreds.len() == 1`
+/// gate on every shape.
+fn legacy_shared_preheader_gate() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var_os("TCG_NO_NEONMAP_SHARED_PREHEADER").is_some())
+}
+
+macro_rules! nm_bail {
+    ($($t:tt)*) => {{
+        nm_trace(format_args!($($t)*));
+        return None;
+    }};
+}
+
 /// The `neon-map` machine pass.
 #[derive(Default)]
 pub struct NeonMapPass {
@@ -311,7 +338,27 @@ impl NeonMapPass {
         // so recognized data for other loops stays valid.
         let mut plans = Vec::new();
         for lp in loops.all_loops() {
+            nm_trace(format_args!(
+                "fn={} consider header=b{} latch=b{} body={:?} hpreds={:?}",
+                func.name,
+                lp.header.0,
+                lp.latch.0,
+                {
+                    let mut v: Vec<u32> = lp.body.iter().map(|b| b.0).collect();
+                    v.sort_unstable();
+                    v
+                },
+                func.block(lp.header)
+                    .preds
+                    .iter()
+                    .map(|b| b.0)
+                    .collect::<Vec<_>>()
+            ));
             if let Some(rec) = Recognized::recognize(func, dom, lp.header, lp.latch, &lp.body) {
+                nm_trace(format_args!(
+                    "fn={} header=b{} RECOGNIZED",
+                    func.name, lp.header.0
+                ));
                 plans.push(rec);
             }
         }
@@ -1411,7 +1458,11 @@ impl Recognized {
         for &b in body {
             for &id in &func.block(b).insts {
                 if !allowed_loop_op(func.inst(id).opcode) {
-                    return None;
+                    nm_bail!(
+                        "G1 opcode not allowed in body: b{} {:?}",
+                        b.0,
+                        func.inst(id).opcode
+                    );
                 }
                 loop_insts.insert(id);
             }
@@ -1429,6 +1480,10 @@ impl Recognized {
         {
             return Some(rec);
         }
+        nm_trace(format_args!(
+            "G2 two-block path declined (body.len={}), trying forward-chain",
+            body.len()
+        ));
         Self::recognize_forward_chain(func, dom, header, latch, body, &loop_insts)
     }
 
@@ -1449,28 +1504,70 @@ impl Recognized {
         // (R6) header preds are exactly {latch, guard}; guard has one pred.
         let hpreds = &func.block(header).preds;
         if hpreds.len() != 2 || !hpreds.contains(&latch) {
-            return None;
+            nm_bail!(
+                "G3 header preds not {{latch,guard}}: preds={:?} latch=b{}",
+                hpreds.iter().map(|b| b.0).collect::<Vec<_>>(),
+                latch.0
+            );
         }
         let guard = *hpreds.iter().find(|&&b| b != latch)?;
         let gpreds = &func.block(guard).preds;
-        if gpreds.len() != 1 {
-            return None;
+        // SHAPE-FRAGILITY FIX (`TCG_NO_NEONMAP_SHARED_PREHEADER` restores the old
+        // behaviour). The single-entry `guard` is a requirement of the NATIVE shape
+        // ONLY, which splices its vector preamble into the block BEFORE the guard
+        // (`preheader`) because the guard itself must survive as the scalar loop's
+        // top test. The two ROTATED shapes RE-ROOT onto the guard and overwrite
+        // `preheader`/`preheader_term` unread, so for them `gpreds.len() == 1` was
+        // never load-bearing — it just happened to hold for the block shape clang
+        // -O1/-O2 emits.
+        //
+        // It stops holding the moment the producer is any good: when clang hoists a
+        // loop-invariant entry guard out of an enclosing loop (`-O3` on a nest like
+        // `for k { for i { y[i] += x[i] } }`), the inner loop's entry block IS the
+        // outer loop's header, which has two predecessors (outer preheader + outer
+        // latch) — and a perfectly ordinary `y[i]+=x[i]` stopped vectorizing purely
+        // because of that. What the rotated path actually needs is that the guard
+        // reach the header on a single edge it may retarget, which `apply` gets from
+        // `reroot_term` and the dominance checks in `recognize_tail` — none of which
+        // care how many ways control arrives AT the guard. Splicing into a
+        // multi-entry guard re-runs the preamble once per entry to the loop, which is
+        // exactly the contract the preamble already has.
+        if gpreds.len() != 1 && legacy_shared_preheader_gate() {
+            nm_bail!(
+                "G4 guard b{} has {} preds ({:?}), want exactly 1 [legacy]",
+                guard.0,
+                gpreds.len(),
+                gpreds.iter().map(|b| b.0).collect::<Vec<_>>()
+            );
         }
-        let preheader = gpreds[0];
-        let preheader_term = *func
-            .block(preheader)
-            .insts
-            .iter()
-            .rev()
-            .find(|&&id| branch_targets(func.inst(id)).contains(&guard))?;
+        // `Some` exactly when the classic dedicated-guard shape holds. The NATIVE arm
+        // below requires it; the rotated arms never read it.
+        let native_entry: Option<(BlockId, InstId)> = if gpreds.len() == 1 {
+            let preheader = gpreds[0];
+            func.block(preheader)
+                .insts
+                .iter()
+                .rev()
+                .find(|&&id| branch_targets(func.inst(id)).contains(&guard))
+                .map(|&t| (preheader, t))
+        } else {
+            None
+        };
         // Mutable copies: the ROTATED FORWARD shape RE-ROOTS the vectorizer's block
         // model onto the GUARD (clang inits iv AND computes the bound there, then
         // unconditionally branches to the header). Making the GUARD the vectorizer's
         // preheader lets `apply` splice the vector loop AFTER iv-init and route the
         // vector exit into the HEADER (do-while scalar tail) — with a tail guard for
         // the remainder-0 case. See neon_array for the full rationale.
-        let (mut vec_preheader, mut vec_guard, mut vec_preheader_term) =
-            (preheader, guard, preheader_term);
+        //
+        // Each of the three shape arms below (native / rotated-forward /
+        // rotated-reverse) assigns all three or bails, so there is no default: the
+        // NATIVE arm takes them from `native_entry`, the rotated arms re-root onto
+        // the guard. (Leaving them uninitialized is what lets the compiler check
+        // that claim — it was previously masked by a dead initializer.)
+        let vec_preheader: BlockId;
+        let vec_guard: BlockId;
+        let vec_preheader_term: Option<InstId>;
         // ROTATED FORWARD only: the loop's true exit block (set in the rotated branch).
         let mut rotated_exit: Option<BlockId> = None;
         // ROTATED REVERSE (clang -O1) only: the array-index register `iv-1` and the
@@ -1506,7 +1603,19 @@ impl Recognized {
             .find(|i| i.opcode == AArch64Opcode::BCond && branch_targets(i).contains(&header));
 
         let (iv, bound, descending) = if let Some(bcond) = latch_exit_bcond {
-            // NATIVE shape.
+            // NATIVE shape: the guard survives as the scalar loop's top test, so the
+            // vector preamble goes in the block BEFORE it — which must therefore be
+            // the guard's SOLE predecessor.
+            let Some((preheader, preheader_term)) = native_entry else {
+                nm_bail!(
+                    "G4 native shape needs a dedicated single-entry guard; b{} has {} preds",
+                    guard.0,
+                    gpreds.len()
+                );
+            };
+            vec_preheader = preheader;
+            vec_guard = guard;
+            vec_preheader_term = Some(preheader_term);
             let descending = match imm_of(&bcond.operands[0])? {
                 CC_LT => false,
                 CC_GE => true,
@@ -1574,7 +1683,7 @@ impl Recognized {
                 rotated_exit = Some(exit);
                 vec_preheader = guard;
                 vec_guard = header;
-                vec_preheader_term = reroot_term;
+                vec_preheader_term = Some(reroot_term);
                 (wb_dst, bound, false)
             } else if is_decrement_by_one(func, &def, iv_src, wb_dst) {
                 // ROTATED REVERSE `for(i=n-1;i>=0;i--)`. clang lowers this to a phi
@@ -1602,7 +1711,7 @@ impl Recognized {
                 rotated_exit = Some(exit);
                 vec_preheader = guard;
                 vec_guard = header;
-                vec_preheader_term = reroot_term;
+                vec_preheader_term = Some(reroot_term);
                 rev_index = Some(iv_src);
                 rev_count = Some(init_iv);
                 (wb_dst, wb_dst, true) // bound is a placeholder on the descending path
@@ -1629,7 +1738,7 @@ impl Recognized {
             guard: vec_guard,
             rotated_exit,
             preheader: vec_preheader,
-            preheader_term: vec_preheader_term,
+            preheader_term: vec_preheader_term?,
             iv,
             bound,
             bound_imm: None,
@@ -3764,7 +3873,7 @@ mod tests {
     ///
     /// Register map: v0=base_y (store + in-place input), v2=base_x (distinct
     /// input), v6=count (i64), v40=4 (es), v7=-1 (Movn), iv=v5.
-    fn build_map_loop_rotated_reverse(kind: u8) -> MachFunction {
+    fn build_map_loop_rotated_reverse(kind: u8, nested: bool) -> MachFunction {
         let mut func = MachFunction::new("k".to_string(), Signature::new(vec![], vec![]));
         let bb0 = func.entry;
         let guard = func.create_block();
@@ -3820,12 +3929,32 @@ mod tests {
         // Latch: iv = idx (= iv-1); B -> header.
         push(&mut func, latch, MovR, vec![v64(5), v64(8)]);
         push(&mut func, latch, B, vec![b(header)]);
-        push(&mut func, exit, Ret, vec![]);
         func.add_edge(bb0, guard);
         func.add_edge(guard, header);
         func.add_edge(header, latch);
         func.add_edge(header, exit);
         func.add_edge(latch, header);
+        if nested {
+            // The clang -O3 NEST: `for k in 0..K { for i=n-1;i>=0;i-- { ... } }`
+            // with the `n > 0` entry test hoisted out of the whole nest. The inner
+            // loop's entry block is then the OUTER loop's header, i.e. `guard` has
+            // TWO predecessors (outer preheader `bb0` + outer latch). Everything
+            // about the inner loop is unchanged — this is exactly the difference
+            // that used to turn the vectorizer off.
+            let olatch = func.create_block();
+            let done = func.create_block();
+            push(&mut func, exit, B, vec![b(olatch)]);
+            push(&mut func, olatch, AddRI, vec![v(60), v(60), i(1)]);
+            push(&mut func, olatch, CmpRI, vec![v(60), i(1000)]);
+            push(&mut func, olatch, BCond, vec![i(CC_LT), b(guard)]);
+            push(&mut func, olatch, B, vec![b(done)]);
+            push(&mut func, done, Ret, vec![]);
+            func.add_edge(exit, olatch);
+            func.add_edge(olatch, guard);
+            func.add_edge(olatch, done);
+        } else {
+            push(&mut func, exit, Ret, vec![]);
+        }
         func.next_vreg = 512;
         func
     }
@@ -3837,7 +3966,7 @@ mod tests {
         // RUNTIME versioning fires with the recovered count and descending block
         // addressing. Vectorizes: 2 arrays (in-place y + distinct x) * 2 pairs = 4
         // LDP q,q, 2 paired STP, and one distinct-input range check (2 LS guards).
-        let mut func = build_map_loop_rotated_reverse(0);
+        let mut func = build_map_loop_rotated_reverse(0, false);
         assert!(func.noalias_params.is_empty());
         let mut pass = NeonMapPass::new();
         assert!(
@@ -3870,7 +3999,7 @@ mod tests {
     fn vectorizes_rotated_reverse_in_place_double() {
         // Pure single-array in-place rotated reverse `y[i]+=y[i]` (regime A — the
         // only pointer touched is the store base). No noalias, no runtime guard.
-        let mut func = build_map_loop_rotated_reverse(3);
+        let mut func = build_map_loop_rotated_reverse(3, false);
         assert!(func.noalias_params.is_empty());
         let mut pass = NeonMapPass::new();
         assert!(
@@ -3889,11 +4018,81 @@ mod tests {
     }
 
     #[test]
+    fn vectorizes_rotated_reverse_with_multi_entry_guard() {
+        // SHAPE FRAGILITY (the ary3 -O3 witness). Same inner loop as
+        // `versions_rotated_reverse_accumulate_without_noalias`, but the loop sits
+        // inside an enclosing loop whose entry test has been hoisted out of the
+        // nest, so the inner loop's entry block is the OUTER loop's header and has
+        // TWO predecessors. Nothing about the inner loop changed, so it must still
+        // vectorize: the rotated path re-roots onto the guard and never reads the
+        // block before it.
+        let mut func = build_map_loop_rotated_reverse(0, true);
+        let header = (0..func.blocks.len() as u32)
+            .map(BlockId)
+            .find(|&b| func.block(b).preds.len() == 2 && func.block(b).succs.len() == 2)
+            .expect("inner header has 2 preds and 2 succs");
+        let guard = *func
+            .block(header)
+            .preds
+            .iter()
+            .find(|&&p| func.block(p).succs.len() == 1)
+            .expect("the guard is the header pred with a single successor");
+        assert_eq!(
+            func.block(guard).preds.len(),
+            2,
+            "precondition: the guard is multi-entry (outer preheader + outer latch)"
+        );
+        let mut pass = NeonMapPass::new();
+        assert!(
+            pass.run(&mut func),
+            "a multi-entry guard must NOT disable the rotated map vectorizer"
+        );
+        assert_eq!(pass.fired(), 1);
+        assert_eq!(
+            count(&func, AArch64Opcode::NeonLdpQPost),
+            UNROLL,
+            "4 LDP q,q"
+        );
+        assert_paired_stores(&func);
+        assert_eq!(count(&func, AArch64Opcode::StrRI), 1, "scalar tail kept");
+    }
+
+    #[test]
+    fn bails_native_shape_when_guard_is_multi_entry() {
+        // The NATIVE shape keeps its guard as the scalar loop's top test and puts
+        // the vector preamble in the block BEFORE it, so it still REQUIRES a
+        // dedicated single-entry guard. Fail-closed must be preserved there — the
+        // relaxation is rotated-only.
+        let mut func = build_map_loop(0);
+        func.noalias_params = vec![0, 2, 10];
+        // Give the native guard a second entry. `build_map_loop` creates blocks in
+        // the order entry, guard, header, latch, exit.
+        let guard = BlockId(func.entry.0 + 1);
+        assert_eq!(
+            func.block(guard).preds.len(),
+            1,
+            "guard starts single-entry"
+        );
+        assert_eq!(func.block(guard).succs.len(), 2, "guard is the top test");
+        let extra = func.create_block();
+        let id = func.push_inst(MachInst::new(AArch64Opcode::B, vec![b(guard)]));
+        func.append_inst(extra, id);
+        func.add_edge(extra, guard);
+        assert_eq!(func.block(guard).preds.len(), 2);
+        let mut pass = NeonMapPass::new();
+        assert!(
+            !pass.run(&mut func),
+            "native shape must still fail-closed on a multi-entry guard"
+        );
+        assert_eq!(count(&func, AArch64Opcode::NeonStpQPost), 0);
+    }
+
+    #[test]
     fn bails_rotated_reverse_when_compare_not_one() {
         // Fail-closed: if the header exit compares `iv` against a constant other
         // than 1, the covered index range is NOT `[0, n-1]` and the recovered count
         // would be wrong, so recognition must BAIL (no vector store emitted).
-        let mut func = build_map_loop_rotated_reverse(0);
+        let mut func = build_map_loop_rotated_reverse(0, false);
         // Rewrite the header `CmpRI(iv, 1)` to `CmpRI(iv, 2)`.
         let ids: Vec<InstId> = func.blocks.iter().flat_map(|b| b.insts.clone()).collect();
         for id in ids {

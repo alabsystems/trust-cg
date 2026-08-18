@@ -21,6 +21,7 @@ use common::a64_interp::{A64Interp, extract_text, symbol_addrs};
 
 use trust_cg_codegen::compiler::{Compiler, CompilerConfig};
 use trust_cg_codegen::pipeline::OptLevel;
+use trust_cg_codegen::target::TargetSpec;
 use trust_ir::{
     Block as B, CastOp, Constant, FuncTy, Function as F, ICmpOp, Inst, InstrNode, InterpretValue,
     Interpreter, Module as M, OverflowOp, Ty,
@@ -160,10 +161,16 @@ fn build_add_ovf(narrow: Ty) -> M {
 // ---------------------------------------------------------------------------
 
 fn compile(m: &M, opt: OptLevel) -> Vec<u8> {
-    let c = Compiler::new(CompilerConfig {
-        opt_level: opt,
-        ..CompilerConfig::default()
-    });
+    // Explicit Darwin spec: the a64 interp harness parses Mach-O, and the
+    // default target spec is host-OS-aware (ELF on a Linux host).
+    // Cross-emission only; same pattern as a64_abi_probe.
+    let c = Compiler::new_for_target_spec(
+        CompilerConfig {
+            opt_level: opt,
+            ..CompilerConfig::default()
+        },
+        TargetSpec::parse("aarch64-apple-darwin").expect("parse aarch64-apple-darwin target spec"),
+    );
     c.compile(m).expect("compile").object_code
 }
 

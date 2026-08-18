@@ -268,7 +268,7 @@ fn assert_inventory_matches_enum_source<T: std::fmt::Debug>(
 ///   model + the silicon-validated NEON-FP differential bridge. +5 covered
 ///   (+1 to the denominator: NeonFcmgtV is a NEW opcode).
 ///
-/// AArch64 accepted-obligation coverage is 155/246. The 91 RED rows are all
+/// AArch64 accepted-obligation coverage is 155/248. The 93 RED rows are all
 /// explicit `DeferredUnfaithfulModel` findings. This ratio inventories evidence
 /// acceptance for emitted value/effect opcodes; it is not a formal-correctness
 /// percentage.
@@ -485,7 +485,10 @@ fn aarch64_emittable_coverage_is_honest_under_strict() {
     // SMULL deliberately stays a named RED row: the signed sibling must not
     // inherit the unsigned zext proof. +1 covered, denominator unchanged;
     // 93 -> 92 named RED rows. The complete packed-NZCV TST W/X pair then
-    // removes one more RED row, yielding the current 155/246 with 91 RED rows.
+    // removes one more RED row, yielding 155/246 with 91 RED rows at that stage.
+    // StrbRO and StrhRO subsequently entered the audited universe as emitted
+    // register-offset stores. Both fail closed pending a faithful memory-effect
+    // model, so the current inventory is 155/248 with 93 named RED rows.
     //
     // PUBLICATION HONESTY: the emitted value/effect denominator includes the 94
     // forms previously hidden in the historical fail-closed/covered-elsewhere
@@ -496,7 +499,7 @@ fn aarch64_emittable_coverage_is_honest_under_strict() {
     // evidence coverage, not a formal-correctness percentage.
     assert_eq!(
         report.emittable_count(),
-        246,
+        248,
         "AArch64 emitted value/effect denominator changed; update the pin deliberately"
     );
     assert_eq!(
@@ -507,11 +510,11 @@ fn aarch64_emittable_coverage_is_honest_under_strict() {
         report.audit_log()
     );
     assert!(
-        (report.coverage_percent() - (155.0 / 246.0 * 100.0)).abs() < f64::EPSILON,
-        "AArch64 accepted-obligation ratio drifted from the honest 155/246"
+        (report.coverage_percent() - (155.0 / 248.0 * 100.0)).abs() < f64::EPSILON,
+        "AArch64 accepted-obligation ratio drifted from the honest 155/248"
     );
 
-    // All 91 uncovered rows must be explicitly named model debt. A generic
+    // All 93 uncovered rows must be explicitly named model debt. A generic
     // mapping/discharge failure is a new wiring regression, while moving a row
     // back to the exclusion bucket is denominator shrinkage.
     assert!(
@@ -521,8 +524,8 @@ fn aarch64_emittable_coverage_is_honest_under_strict() {
     let failures = report.failures();
     assert_eq!(
         failures.len(),
-        91,
-        "AArch64 must have exactly the 91 pinned deferred rows:\n{}",
+        93,
+        "AArch64 must have exactly the 93 pinned deferred rows:\n{}",
         report.failure_summary()
     );
     assert!(
@@ -984,7 +987,7 @@ fn aarch64_universe_has_no_duplicates_and_matches_pinned_count() {
     // comparison has forced the new opcode into the audit.
     assert_eq!(
         ALL_AARCH64_OPCODES.len(),
-        290,
+        292,
         "AArch64 opcode count changed — a variant was added/removed. Update the array AND this \
          pinned count, and classify the new opcode in classify_aarch64 (the build already forced \
          that). (261 = 232 + the UNIVERSE BACKFILL of 28 opcodes that existed in the enum but \
@@ -1076,7 +1079,11 @@ fn aarch64_universe_has_no_duplicates_and_matches_pinned_count() {
          the shifted-source EOR fusion forms; both are classified \
          EmittableNeedsProof and covered through operand reconstruction with \
          W/X and wrong-kind/wrong-amount real-solver refute controls. \
-         The accepted/emitted-value-effect headline is 155/246 with 91 explicit \
+         The +2 to 292 are StrbRO/StrhRO, narrow register-offset stores that \
+         were already classified EmittableNeedsProof but missing from the \
+         explicit audit universe; both remain honest DeferredUnfaithfulModel \
+         rows pending an independent faithful memory-effect model. \
+         The accepted/emitted-value-effect headline is 155/248 with 93 explicit \
          DeferredUnfaithfulModel RED rows; see \
          aarch64_emittable_coverage_is_honest_under_strict.)"
     );
@@ -1692,7 +1699,7 @@ fn gate_reports_failure_for_an_emittable_opcode_with_no_proof() {
 /// honest within-emittable coverage is NO LONGER 100%. Reconstruction credit
 /// still requires the machine side to be rebuilt from the real opcode and
 /// operands. The publication inventory pins:
-///   * AArch64: 155/246 accepted, with 91 named RED rows.
+///   * AArch64: 155/248 accepted, with 93 named RED rows.
 ///   * x86-64: 163/192 accepted, with 29 named RED rows.
 ///   * RISC-V: 14/17 accepted, with 3 named RED rows.
 ///   * WebAssembly: 109/111 accepted, with 2 named RED rows.
@@ -1818,10 +1825,12 @@ fn clean_tree_reports_honest_strict_emittable_coverage() {
     // two reconstructed shifted-source forms, giving 153/246. Umull then left
     // the deferred set via its faithful widening obligation, giving 154/246;
     // complete packed-NZCV TST authority removes another RED row. The combined
-    // current inventory is therefore 155/246 with 91 explicit RED rows.
+    // packed-NZCV TST authority yields 155/246 with 91 RED rows. Adding the
+    // previously omitted StrbRO/StrhRO audit rows produces the current
+    // 155/248 inventory with 93 explicit RED rows.
     assert_eq!(
         (aa_cov, aa_em),
-        (155, 246),
+        (155, 248),
         "AArch64 accepted-obligation inventory changed; update the pins deliberately \
          — do NOT re-admit X==X identities NOR fake-cover a non-reconstructable opcode"
     );

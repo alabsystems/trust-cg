@@ -273,18 +273,104 @@ fn opcode_strategy() -> impl Strategy<Value = AArch64Opcode> {
         Just(Smulh),
         Just(Madd),
     ];
+    let shifted_tls = prop_oneof![
+        Just(EorRRShift),
+        Just(EorRRLsl),
+        Just(EorRRLsr),
+        Just(AddRRShift),
+        Just(AddRRShiftLsr),
+        Just(SubRRShift),
+        Just(AddTprelHi12),
+        Just(AddTprelLo12),
+        Just(LdrGottprel),
+    ];
+    let fp_extended = prop_oneof![
+        Just(FcselRR),
+        Just(FmaddRR),
+        Just(FminnmRR),
+        Just(FmaxnmRR),
+        Just(FrintmRR),
+        Just(FrintpRR),
+        Just(FrintzRR),
+    ];
+    let mem_extended = prop_oneof![
+        Just(LdrbRO),
+        Just(LdrhRO),
+        Just(StrbRO),
+        Just(StrhRO),
+        Just(VolatileLdrRI),
+        Just(VolatileLdrbRI),
+        Just(VolatileLdrhRI),
+        Just(VolatileStrRI),
+        Just(VolatileStrbRI),
+        Just(VolatileStrhRI),
+    ];
+    let neon_extended_a = prop_oneof![
+        Just(NeonSmaxV),
+        Just(NeonSminV),
+        Just(NeonUmaxV),
+        Just(NeonUminV),
+        Just(NeonFcmgtV),
+        Just(NeonCmhiV),
+        Just(NeonCmhsV),
+        Just(NeonCntV),
+        Just(NeonUaddlpV),
+        Just(NeonSaddlpV),
+        Just(NeonAbsV),
+        Just(NeonBitV),
+        Just(NeonUdotV),
+        Just(NeonSmlalV),
+        Just(NeonSmlal2V),
+        Just(NeonUmlalV),
+        Just(NeonUmlal2V),
+    ];
+    let neon_extended_b = prop_oneof![
+        Just(NeonUaddwV),
+        Just(NeonUaddw2V),
+        Just(NeonSaddwV),
+        Just(NeonSaddw2V),
+        Just(NeonMlaV),
+        Just(NeonUadalpV),
+        Just(NeonFmlaV),
+        Just(NeonFmlsV),
+        Just(NeonUcvtfV),
+        Just(NeonScvtfV),
+        Just(NeonFcvtlV),
+        Just(NeonFcvtl2V),
+        Just(NeonDupScalarD),
+        Just(NeonShlVImm),
+        Just(NeonUshrVImm),
+        Just(NeonSshrVImm),
+        Just(NeonFmlaLaneV),
+    ];
+    let atomic_release = prop_oneof![
+        Just(Ldaddl),
+        Just(Ldclrl),
+        Just(Ldeorl),
+        Just(Ldsetl),
+        Just(Ldsmaxl),
+        Just(Ldsminl),
+        Just(Ldumaxl),
+        Just(Lduminl),
+        Just(Swpl),
+    ];
     let trap_rc_sysreg = prop_oneof![
         Just(Brk),
         Just(TrapOverflow),
+        Just(TrapOverflowExact),
         Just(TrapBoundsCheck),
         Just(TrapBoundsCheckExact),
         Just(TrapNull),
         Just(TrapNullIfZero),
         Just(TrapDivZero),
+        Just(TrapDivZeroIfZero),
         Just(TrapShiftRange),
+        Just(TrapShiftRangeIfOOB),
         Just(Retain),
         Just(Release),
         Just(Mrs),
+        Just(TailCall),
+        Just(AlignNop),
     ];
     let llvm_aliases = prop_oneof![
         Just(MOVWrr),
@@ -304,51 +390,6 @@ fn opcode_strategy() -> impl Strategy<Value = AArch64Opcode> {
         Just(Bcc),
     ];
     let pseudos = prop_oneof![Just(Phi), Just(StackAlloc), Just(Copy), Just(Nop),];
-    // Variants added to the enum after the original #450 sweep (shifted-operand
-    // ALU forms, FP scalar additions, register-offset narrow loads, LSE release
-    // forms, TLS/volatile/tail-call/alignment) — kept covered so the
-    // `opcode_strategy_covers_at_least_80_percent` ratchet tracks enum growth.
-    // Still uncovered: the newer NEON widening/lane batch
-    // (NeonSmaxV..NeonFmlaLaneV) — extend with an operand model when #450
-    // resumes.
-    let post_450_scalar = prop_oneof![
-        Just(EorRRShift),
-        Just(AddRRShift),
-        Just(SubRRShift),
-        Just(EorRRLsl),
-        Just(EorRRLsr),
-        Just(AddRRShiftLsr),
-        Just(FcselRR),
-        Just(LdrbRO),
-        Just(LdrhRO),
-        Just(FmaddRR),
-        Just(FminnmRR),
-        Just(FmaxnmRR),
-        Just(FrintmRR),
-        Just(FrintpRR),
-        Just(FrintzRR),
-        Just(Ldaddl),
-        Just(Ldclrl),
-        Just(Ldeorl),
-        Just(Ldsetl),
-        Just(Ldsmaxl),
-        Just(Ldsminl),
-        Just(Ldumaxl),
-        Just(Lduminl),
-        Just(Swpl),
-        Just(AddTprelHi12),
-        Just(AddTprelLo12),
-        Just(TailCall),
-        Just(LdrGottprel),
-        Just(VolatileLdrRI),
-        Just(VolatileLdrbRI),
-        Just(VolatileLdrhRI),
-        Just(VolatileStrRI),
-        Just(VolatileStrbRI),
-        Just(VolatileStrhRI),
-        Just(AlignNop),
-    ];
-
     prop_oneof![
         arith_logical,
         shifts_cmp_sel,
@@ -361,10 +402,15 @@ fn opcode_strategy() -> impl Strategy<Value = AArch64Opcode> {
         neon,
         atomic_lse,
         addr_checked,
+        shifted_tls,
+        fp_extended,
+        mem_extended,
+        neon_extended_a,
+        neon_extended_b,
+        atomic_release,
         trap_rc_sysreg,
         llvm_aliases,
         pseudos,
-        post_450_scalar,
     ]
 }
 
@@ -595,6 +641,39 @@ fn strat_shift_ri() -> impl Strategy<Value = OpPair> {
                     MachOperand::PReg(a),
                     MachOperand::PReg(b),
                     MachOperand::Imm(imm),
+                ],
+            )
+        })
+}
+
+fn strat_shifted_rr() -> impl Strategy<Value = OpPair> {
+    use AArch64Opcode::*;
+    // Shifted-register ALU forms: three GPRs plus a real in-register shift.
+    // Include every modeled shift kind so the well-shaped lane reaches each
+    // encoder arm, while the independent malformed lane covers zero, >=width,
+    // and non-immediate operands.
+    (
+        prop_oneof![
+            Just(EorRRShift),
+            Just(EorRRLsl),
+            Just(EorRRLsr),
+            Just(AddRRShift),
+            Just(AddRRShiftLsr),
+            Just(SubRRShift),
+        ],
+        gpr_strategy(),
+        gpr_strategy(),
+        gpr_strategy(),
+        1i64..=63i64,
+    )
+        .prop_map(|(op, rd, rn, rm, amount)| {
+            (
+                op,
+                vec![
+                    MachOperand::PReg(rd),
+                    MachOperand::PReg(rn),
+                    MachOperand::PReg(rm),
+                    MachOperand::Imm(amount),
                 ],
             )
         })
@@ -870,9 +949,19 @@ fn strat_mem_pair() -> impl Strategy<Value = OpPair> {
 
 fn strat_mem_reg_off() -> impl Strategy<Value = OpPair> {
     use AArch64Opcode::*;
-    // LDR/STR with register offset: [Rt, Rn, Rm].
+    // LDR/STR with register offset: [Rt, Rn, Rm]. Narrow byte/halfword
+    // transfers share the same operand shape; their access width is fixed by
+    // the opcode and the encoder consumes only the low transfer-register bits.
     (
-        prop_oneof![Just(LdrRO), Just(StrRO), Just(LdrswRO)],
+        prop_oneof![
+            Just(LdrRO),
+            Just(StrRO),
+            Just(LdrswRO),
+            Just(LdrbRO),
+            Just(LdrhRO),
+            Just(StrbRO),
+            Just(StrhRO),
+        ],
         gpr_strategy(),
         gpr_strategy(),
         gpr_strategy(),
@@ -1536,6 +1625,7 @@ fn valid_machinst_strategy() -> impl Strategy<Value = MachInst> {
         strat_arith_ri().boxed(),
         strat_arith_rrr_madd().boxed(),
         strat_shift_ri().boxed(),
+        strat_shifted_rr().boxed(),
         strat_bitfield().boxed(),
         strat_extend().boxed(),
         strat_cmp_rr().boxed(),
@@ -1659,36 +1749,116 @@ proptest! {
 // Static coverage sanity check (#450 acceptance criterion)
 // ---------------------------------------------------------------------------
 //
-// Guardrail test: if a future refactor narrows `opcode_strategy()` below
-// 80% of the dense `AArch64Opcode` variant range, this test fails loudly.
-// Implemented by exhaustively sampling the strategy until a fixed cap
-// and counting distinct opcodes seen.
+// Guardrail test: if a future refactor omits any variant from
+// `opcode_strategy()`, this test fails loudly. Both inventories are read from
+// their Rust declarations; a stale numeric pin or an assumption about which
+// discriminant is last cannot hide a newly appended opcode.
+fn declared_unit_variant_names(source: &str, marker: &str) -> std::collections::BTreeSet<String> {
+    let (_, after_marker) = source
+        .split_once(marker)
+        .unwrap_or_else(|| panic!("could not find `{marker}`"));
+    let mut names = std::collections::BTreeSet::new();
+
+    for line in after_marker.lines() {
+        let code = line.split("//").next().unwrap_or("").trim();
+        if code == "}" {
+            return names;
+        }
+        if code.is_empty() || code.starts_with("#[") {
+            continue;
+        }
+        let declaration = code
+            .strip_suffix(',')
+            .unwrap_or_else(|| panic!("non-unit opcode declaration: `{code}`"));
+        let name = declaration
+            .split_once('=')
+            .map_or(declaration, |(name, _)| name)
+            .trim();
+        assert!(
+            !name.is_empty()
+                && name
+                    .chars()
+                    .all(|ch| ch == '_' || ch.is_ascii_alphanumeric()),
+            "invalid opcode identifier: `{name}`"
+        );
+        assert!(names.insert(name.to_string()), "duplicate opcode `{name}`");
+    }
+
+    panic!("unterminated opcode declaration after `{marker}`");
+}
+
+fn opcode_strategy_variant_names(source: &str) -> std::collections::BTreeSet<String> {
+    let (_, after_marker) = source
+        .split_once("fn opcode_strategy()")
+        .expect("opcode_strategy declaration");
+    let (body, _) = after_marker
+        .split_once("// Operand strategy")
+        .expect("operand-strategy section after opcode_strategy");
+    let mut names = std::collections::BTreeSet::new();
+
+    for line in body.lines() {
+        let mut code = line.split("//").next().unwrap_or("");
+        while let Some(start) = code.find("Just(") {
+            let after_just = &code[start + "Just(".len()..];
+            let end = after_just.find(')').expect("closed Just(opcode)");
+            let name = &after_just[..end];
+            assert!(
+                !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|ch| ch == '_' || ch.is_ascii_alphanumeric()),
+                "invalid opcode strategy entry: `{name}`"
+            );
+            assert!(
+                names.insert(name.to_string()),
+                "duplicate opcode strategy entry `{name}`"
+            );
+            code = &after_just[end + 1..];
+        }
+    }
+
+    names
+}
+
 #[test]
-fn opcode_strategy_covers_at_least_80_percent() {
+fn opcode_strategy_covers_every_opcode() {
     use proptest::strategy::ValueTree;
     use proptest::test_runner::TestRunner;
-    use std::collections::HashSet;
 
+    let declared = declared_unit_variant_names(
+        include_str!("../../trust-cg-ir/src/inst.rs"),
+        "pub enum AArch64Opcode {",
+    );
+    let enumerated = opcode_strategy_variant_names(include_str!("panic_fuzz_encode.rs"));
+    let missing: Vec<_> = declared.difference(&enumerated).collect();
+    let unexpected: Vec<_> = enumerated.difference(&declared).collect();
+    assert!(
+        missing.is_empty() && unexpected.is_empty(),
+        "opcode_strategy must enumerate the exact declaration; \
+         missing={missing:?}, unexpected={unexpected:?}"
+    );
+
+    // Source inventory alone is insufficient: an unreferenced local strategy
+    // would be counted above despite being unreachable from the returned
+    // union. Exercise the composed strategy under a deterministic runner too.
     let mut runner = TestRunner::deterministic();
-    let strat = opcode_strategy();
-    let mut seen: HashSet<AArch64Opcode> = HashSet::new();
-    let total_variants = AArch64Opcode::Nop as usize + 1;
-    let floor = (total_variants * 80).div_ceil(100);
-    // 10k draws is plenty to cover the uniformly-weighted variants under
-    // the current sub-strategy composition.
-    for _ in 0..10_000 {
-        let tree = strat.new_tree(&mut runner).expect("strategy tree");
-        seen.insert(tree.current());
-        if seen.len() >= total_variants {
+    let strategy = opcode_strategy();
+    let mut reachable = std::collections::HashSet::new();
+    for _ in 0..100_000 {
+        let tree = strategy
+            .new_tree(&mut runner)
+            .expect("opcode strategy tree");
+        reachable.insert(tree.current());
+        if reachable.len() == declared.len() {
             break;
         }
     }
-    assert!(
-        seen.len() >= floor,
-        "opcode_strategy only samples {} distinct variants; need >= {} (80% of {})",
-        seen.len(),
-        floor,
-        total_variants
+    assert_eq!(
+        reachable.len(),
+        declared.len(),
+        "opcode_strategy source inventory names every opcode, but only {} of {} are reachable",
+        reachable.len(),
+        declared.len(),
     );
 }
 

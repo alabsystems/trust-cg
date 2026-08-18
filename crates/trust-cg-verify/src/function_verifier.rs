@@ -2811,9 +2811,8 @@ impl FunctionVerifier {
             LdrRI | LdrbRI | LdrhRI | LdrsbRI | LdrshRI | LdrRO | LdrbRO | LdrhRO => {
                 Some(("load", ProofCategory::Memory))
             }
-            StrRI | StrbRI | StrhRI | StrRO | STRWui | STRXui | STRSui | STRDui => {
-                Some(("store", ProofCategory::Memory))
-            }
+            StrRI | StrbRI | StrhRI | StrRO | StrbRO | StrhRO | STRWui | STRXui | STRSui
+            | STRDui => Some(("store", ProofCategory::Memory)),
             // NEON post-index vector load/store — THE SAME shared whole-backend
             // unfaithful-load/store debt as the scalar Ldr*/Str* family above
             // (`classify_aarch64` documents NeonLdpQPost as "the paired form of the

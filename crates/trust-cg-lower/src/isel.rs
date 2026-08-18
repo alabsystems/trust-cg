@@ -40,6 +40,7 @@ use crate::function::{EhCallSite, EhFunctionInfo, EhLandingPad, Signature, Stack
 use crate::instructions::{
     AtomicOrdering, AtomicRmwOp, Block, FloatCC, Instruction, IntCC, Opcode, Value,
 };
+use crate::lattice_guard::{LatticeBoundsCapability, LatticeGuardCarrierBinding};
 use crate::overflow_idiom::{OverflowAnalysis, OverflowKind, detect_overflow_idioms};
 use crate::smulh_idiom::{SmulhAnalysis, detect_smulh_idioms};
 use crate::types::Type;
@@ -111,6 +112,27 @@ fn reg_class_for_type(ty: &Type) -> RegClass {
 
 /// 16-bit system register encoding for TPIDR_EL0.
 const TPIDR_EL0_SYSREG: i64 = 0xDE82;
+
+/// NEON **floating-point** arrangement selector for `.4S` (four binary32 lanes).
+///
+/// This is the trailing `Imm` operand of the FP vector-arithmetic MachInsts
+/// (`NeonFaddV`/`NeonFsubV`/`NeonFmulV`/`NeonFdivV`/`NeonFcmgtV`/…), decoded by
+/// `trust_cg_codegen::aarch64::encode::neon_fp_arrangement`.
+///
+/// ⚠ The FP table (`0 => 2S`, `1 => 4S`, `2 => 2D`) is a DIFFERENT namespace
+/// from the integer `neon_arrangement` table (`0 => 8B`, `1 => 16B`, `3 => 8H`,
+/// `5 => 4S`, `6 => 2D`) that the `V*I*` arithmetic arms pass. The two overlap
+/// numerically (integer `1` is `16B`; FP `1` is `4S`) without agreeing, so a
+/// constant from one family used in the other silently selects the wrong lane
+/// width rather than failing. Named constants exist so that confusion has to be
+/// spelled out to happen; `aarch64_fp_arrangement_selectors_match_encoder` in
+/// `trust-cg-codegen` pins each value against the decoder it feeds.
+const FP_ARRANGEMENT_4S: i64 = 1;
+
+/// NEON floating-point arrangement selector for `.2D` (two binary64 lanes).
+/// See [`FP_ARRANGEMENT_4S`] for why this namespace is kept distinct from the
+/// integer arrangement codes.
+const FP_ARRANGEMENT_2D: i64 = 2;
 
 /// Maximum constant length (in bytes) for which `select_memcpy` inlines the
 /// copy as an exact-width load/store sequence instead of a libc `memcpy` call.
@@ -913,6 +935,12 @@ pub struct ISelFunction {
     /// codegen pipeline re-derives each carrier's fingerprint and looks the obligation up here to
     /// build the kernel gate's carrier→obligation map — no new MachInst/MachFunction field needed.
     pub guard_obligations: std::collections::HashMap<u128, u64>,
+    /// Opaque, exact source-to-machine bindings for the decidable lattice bounds lane.
+    ///
+    /// Unlike `guard_obligations`, this collection is not caller-constructible: the selector
+    /// populates it only after a source-bound [`LatticeBoundsCapability`] exactly matches the
+    /// current function and LIR base/index pair. The codegen replay gate consumes it read-only.
+    lattice_guard_bindings: Vec<LatticeGuardCarrierBinding>,
     /// Exception-handling structure (Invoke/LandingPad), forwarded from the LIR
     /// `Function::eh_info`. `to_ir_func()` translates it into the resulting
     /// `MachFunction.eh_metadata` (still keyed by block; the codegen pipeline
@@ -953,9 +981,15 @@ impl ISelFunction {
             stack_slots: Vec::new(),
             jump_tables: Vec::new(),
             guard_obligations: std::collections::HashMap::new(),
+            lattice_guard_bindings: Vec::new(),
             eh_info: crate::function::EhFunctionInfo::default(),
             current_lowering_provenance: LoweringProvenance::UNATTRIBUTED,
         }
+    }
+
+    /// Selector-issued exact carrier bindings for lattice replay.
+    pub fn lattice_guard_bindings(&self) -> &[LatticeGuardCarrierBinding] {
+        &self.lattice_guard_bindings
     }
 
     /// Register a jump table and return its index. The returned index is
@@ -1585,6 +1619,13 @@ pub struct InstructionSelector {
     /// fall back to block-local counts — exact for single-block functions.
     /// Multi-block production drivers (pipeline `run_isel`) must seed this.
     value_use_counts: Option<HashMap<Value, usize>>,
+    /// Source-bound decidable-lattice capabilities supplied by the adapter.
+    ///
+    /// These are consulted only while selecting `GuardBoundsCheck`. A raw lattice-range
+    /// obligation id in caller-constructed LIR is insufficient: the capability must exactly match
+    /// this selector's function name and the guard's LIR base/index before the selector creates an
+    /// opaque machine-carrier binding.
+    lattice_bounds_capabilities: Vec<LatticeBoundsCapability>,
     /// Block currently being selected, used as the rematerialization site for
     /// cross-block `iconst` lookups. Set by `select_block_with_provenance` and
     /// cleared at the end of selection.
@@ -1658,6 +1699,7 @@ impl InstructionSelector {
             iconst_origins: HashMap::new(),
             uniform_v4i32_shift_imm_values: HashMap::new(),
             value_use_counts: None,
+            lattice_bounds_capabilities: Vec::new(),
             current_block: None,
             formal_args_block: None,
             select_cond_fold_analysis: SelectCondFoldAnalysis::default(),
@@ -1673,6 +1715,11 @@ impl InstructionSelector {
     /// `select_block*` on any multi-block function.
     pub fn seed_function_value_use_counts(&mut self, func: &crate::function::Function) {
         self.value_use_counts = Some(Self::function_value_use_counts(func.blocks.values()));
+    }
+
+    /// Seed exact source-bound lattice capabilities produced by the adapter.
+    pub fn seed_lattice_bounds_capabilities(&mut self, capabilities: &[LatticeBoundsCapability]) {
+        self.lattice_bounds_capabilities = capabilities.to_vec();
     }
 
     /// Count every `Value`'s occurrences as an instruction argument across
@@ -2696,24 +2743,92 @@ impl InstructionSelector {
                 self.select_v128_icmp(*cond, inst, block, 6, "V2I64Icmp")?
             }
             Opcode::V8I8Icmp { cond } => self.select_v8i8_icmp(*cond, inst, block)?,
-            // Packed-FP arithmetic is currently lowered only on x86-64
-            // (ADDPS/ADDPD families). Fail closed on AArch64 rather than
-            // miscompile; the NEON FADD/FSUB/FMUL/FDIV vector forms are not
-            // wired through this dispatch yet. (The integer vector forms
-            // above DO have AArch64 NEON lowering and must not be fail-closed.)
-            Opcode::V4F32Fadd
-            | Opcode::V4F32Fsub
-            | Opcode::V4F32Fmul
-            | Opcode::V4F32Fdiv
-            | Opcode::V2F64Fadd
-            | Opcode::V2F64Fsub
-            | Opcode::V2F64Fmul
-            | Opcode::V2F64Fdiv => {
-                return Err(ISelError::UnsupportedOpcode(format!(
-                    "{:?} is x86-64 typed vector lowering and has no AArch64 lowering",
-                    inst.opcode
-                )));
-            }
+            // Packed-FP arithmetic -> NEON FADD/FSUB/FMUL/FDIV (vector, same).
+            //
+            // These used to fail closed here ("x86-64 typed vector lowering"),
+            // which is why `native_vector.rs` still scalarizes `<4 x float>` /
+            // `<2 x double>` and why `rustc_codegen_trust_cg`'s `f32x4`/`f64x2`
+            // `std::simd` path hard-errored on AArch64. Nothing about the
+            // machine side was missing: `NeonFaddV`/`NeonFsubV`/`NeonFmulV`/
+            // `NeonFdivV` are already encoded (`encoding_neon::
+            // encode_fp_vec3_same`), already emitted by the `neon_farray` /
+            // `neon_fmap` / `neon_fpred` vectorizers, and already carry
+            // DISCHARGED lane obligations at BOTH arrangements the two shapes
+            // need (`coverage_gate`: `faddv.4s`/`faddv.2d` lane proofs, and
+            // likewise for sub/mul/div). Wiring the dispatch therefore adds NO
+            // machine opcode, NO encoding, and NO proof obligation — it only
+            // stops discarding a lowering the backend had already proven.
+            //
+            // The lane semantics match exactly: each LIR opcode is defined as
+            // the IEEE-754 binary operation applied INDEPENDENTLY per lane
+            // under round-to-nearest-even, which is precisely what the NEON
+            // vector form computes. No reassociation, no contraction, no
+            // horizontal step is introduced, so the packed form is bit-exact
+            // with the lane-by-lane scalar sequence it replaces.
+            //
+            // The trailing `Imm` is the FP arrangement selector read back by
+            // `encode::neon_fp_arrangement`, whose encoding is 0=2S, 1=4S,
+            // 2=2D — DELIBERATELY different from the integer `neon_arrangement`
+            // table (0=8B, 1=16B, 3=8H, 5=4S, 6=2D) used by the `V*I*` arms
+            // above. Passing an integer arrangement code here would silently
+            // select the wrong lane width, so the two families must never
+            // share a constant.
+            Opcode::V4F32Fadd => self.select_v128_arithmetic(
+                AArch64Opcode::NeonFaddV,
+                inst,
+                block,
+                FP_ARRANGEMENT_4S,
+                "V4F32 arithmetic",
+            )?,
+            Opcode::V4F32Fsub => self.select_v128_arithmetic(
+                AArch64Opcode::NeonFsubV,
+                inst,
+                block,
+                FP_ARRANGEMENT_4S,
+                "V4F32 arithmetic",
+            )?,
+            Opcode::V4F32Fmul => self.select_v128_arithmetic(
+                AArch64Opcode::NeonFmulV,
+                inst,
+                block,
+                FP_ARRANGEMENT_4S,
+                "V4F32 arithmetic",
+            )?,
+            Opcode::V4F32Fdiv => self.select_v128_arithmetic(
+                AArch64Opcode::NeonFdivV,
+                inst,
+                block,
+                FP_ARRANGEMENT_4S,
+                "V4F32 arithmetic",
+            )?,
+            Opcode::V2F64Fadd => self.select_v128_arithmetic(
+                AArch64Opcode::NeonFaddV,
+                inst,
+                block,
+                FP_ARRANGEMENT_2D,
+                "V2F64 arithmetic",
+            )?,
+            Opcode::V2F64Fsub => self.select_v128_arithmetic(
+                AArch64Opcode::NeonFsubV,
+                inst,
+                block,
+                FP_ARRANGEMENT_2D,
+                "V2F64 arithmetic",
+            )?,
+            Opcode::V2F64Fmul => self.select_v128_arithmetic(
+                AArch64Opcode::NeonFmulV,
+                inst,
+                block,
+                FP_ARRANGEMENT_2D,
+                "V2F64 arithmetic",
+            )?,
+            Opcode::V2F64Fdiv => self.select_v128_arithmetic(
+                AArch64Opcode::NeonFdivV,
+                inst,
+                block,
+                FP_ARRANGEMENT_2D,
+                "V2F64 arithmetic",
+            )?,
             Opcode::GuardDivZero { obligation } => {
                 self.select_guard_div_zero(inst, block, *obligation)?
             }
@@ -5369,6 +5484,20 @@ impl InstructionSelector {
                 &[b, i, GuardOperandRef::Imm(bound as i64)],
             );
             self.func.guard_obligations.insert(fp, obl);
+            let source_bound = self.lattice_bounds_capabilities.iter().find(|capability| {
+                capability.obligation_id() == obl
+                    && capability.matches_source_carrier(
+                        &self.func.name,
+                        inst.args[0],
+                        inst.args[1],
+                    )
+            });
+            if let Some(capability) = source_bound {
+                let binding = LatticeGuardCarrierBinding::new(capability, fp);
+                if !self.func.lattice_guard_bindings.contains(&binding) {
+                    self.func.lattice_guard_bindings.push(binding);
+                }
+            }
         }
 
         self.emit(
@@ -11550,20 +11679,31 @@ impl InstructionSelector {
             ),
         );
 
-        for lane in 1..4 {
-            let lane_value = self.use_value(&inst.args[lane])?;
-            self.emit(
-                block,
-                ISelInst::new(
-                    AArch64Opcode::NeonInsGen,
-                    vec![
-                        dst_op.clone(),
-                        lane_value,
-                        ISelOperand::Imm(lane as i64),
-                        ISelOperand::Imm(4),
-                    ],
-                ),
-            );
+        // A SPLAT (every lane the same SSA value) is exactly the `dup.4s`
+        // above: `DUP` already wrote that value into all four lanes, so each
+        // `INS` would only rewrite a lane with the value it already holds.
+        // Eliding them is semantics-preserving by construction — no new opcode
+        // and no new proof obligation. The V64 `V8I8PackLanes` path has always
+        // done this (hashbrown's control-byte broadcast); the V128 shapes did
+        // not, which cost 3 instructions per splat and, in a loop, three per
+        // iteration for every `splat (i32 K)` operand clang emits.
+        let is_splat = inst.args.iter().all(|arg| *arg == inst.args[0]);
+        if !is_splat {
+            for lane in 1..4 {
+                let lane_value = self.use_value(&inst.args[lane])?;
+                self.emit(
+                    block,
+                    ISelInst::new(
+                        AArch64Opcode::NeonInsGen,
+                        vec![
+                            dst_op.clone(),
+                            lane_value,
+                            ISelOperand::Imm(lane as i64),
+                            ISelOperand::Imm(4),
+                        ],
+                    ),
+                );
+            }
         }
 
         self.define_value(dst_val, dst_op, Type::V128);
@@ -11606,19 +11746,24 @@ impl InstructionSelector {
             ),
         );
 
-        let lane1 = self.use_value(&inst.args[1])?;
-        self.emit(
-            block,
-            ISelInst::new(
-                AArch64Opcode::NeonInsGen,
-                vec![
-                    dst_op.clone(),
-                    lane1,
-                    ISelOperand::Imm(1),
-                    ISelOperand::Imm(8),
-                ],
-            ),
-        );
+        // A splat is exactly the `dup.2d` above (see `select_v4i32_pack_lanes`
+        // for the argument): the `ins` would rewrite lane 1 with the value
+        // `dup` already put there.
+        if inst.args[1] != inst.args[0] {
+            let lane1 = self.use_value(&inst.args[1])?;
+            self.emit(
+                block,
+                ISelInst::new(
+                    AArch64Opcode::NeonInsGen,
+                    vec![
+                        dst_op.clone(),
+                        lane1,
+                        ISelOperand::Imm(1),
+                        ISelOperand::Imm(8),
+                    ],
+                ),
+            );
+        }
 
         self.define_value(dst_val, dst_op, Type::V128);
         Ok(())
@@ -11734,20 +11879,27 @@ impl InstructionSelector {
             ),
         );
 
-        for lane in 1..lane_count {
-            let lane_value = self.use_value(&inst.args[lane])?;
-            self.emit(
-                block,
-                ISelInst::new(
-                    AArch64Opcode::NeonInsGen,
-                    vec![
-                        dst_op.clone(),
-                        lane_value,
-                        ISelOperand::Imm(lane as i64),
-                        ISelOperand::Imm(element_size),
-                    ],
-                ),
-            );
+        // A splat is exactly the `dup` above (see `select_v4i32_pack_lanes`
+        // for the argument): every `ins` would rewrite a lane with the value
+        // `dup` already put there. This matters most for `<16 x i8>`, where a
+        // splat otherwise costs FIFTEEN redundant `ins`.
+        let is_splat = inst.args.iter().all(|arg| *arg == inst.args[0]);
+        if !is_splat {
+            for lane in 1..lane_count {
+                let lane_value = self.use_value(&inst.args[lane])?;
+                self.emit(
+                    block,
+                    ISelInst::new(
+                        AArch64Opcode::NeonInsGen,
+                        vec![
+                            dst_op.clone(),
+                            lane_value,
+                            ISelOperand::Imm(lane as i64),
+                            ISelOperand::Imm(element_size),
+                        ],
+                    ),
+                );
+            }
         }
 
         self.define_value(dst_val, dst_op, Type::V128);
@@ -17992,6 +18144,69 @@ mod tests {
             "unexpected V4I32PackLanes AArch64 error: {err:?}"
         );
         assert!(isel.func.blocks[&entry].insts.is_empty());
+    }
+
+    /// A V128 `PackLanes` whose lanes are all the SAME value is exactly one
+    /// `dup`: `dup` already broadcasts into every lane, so the `ins` sequence
+    /// that used to follow only rewrote each lane with the value it already
+    /// held. This is what makes a `splat (i32 K)` operand -- which clang emits
+    /// on nearly every vectorized loop -- cost one instruction instead of
+    /// `lanes`.
+    #[test]
+    fn select_v128_pack_lanes_splat_is_a_single_dup_on_aarch64() {
+        for (opcode, lane_ty, lanes, context) in [
+            (Opcode::V4I32PackLanes, Type::I32, 4usize, "V4I32PackLanes"),
+            (Opcode::V2I64PackLanes, Type::I64, 2, "V2I64PackLanes"),
+            (Opcode::V16I8PackLanes, Type::I8, 16, "V16I8PackLanes"),
+            (Opcode::V8I16PackLanes, Type::I16, 8, "V8I16PackLanes"),
+        ] {
+            // --- splat: one source value in every lane -> one `dup` ---------
+            let (mut isel, entry) = make_empty_isel();
+            let vreg = isel.new_vreg(RegClass::Gpr64);
+            isel.define_value(Value(0), ISelOperand::VReg(vreg), lane_ty.clone());
+            isel.select_instruction(
+                &Instruction {
+                    opcode: opcode.clone(),
+                    args: vec![Value(0); lanes],
+                    results: vec![Value(1)],
+                },
+                entry,
+            )
+            .unwrap_or_else(|e| panic!("{context} splat: {e:?}"));
+            let mfunc = isel.finalize();
+            let insts = &mfunc.blocks[&entry].insts;
+            assert_eq!(
+                insts.len(),
+                1,
+                "{context} splat should be a single dup, got {:?}",
+                insts.iter().map(|i| i.opcode).collect::<Vec<_>>()
+            );
+            assert_eq!(insts[0].opcode, AArch64Opcode::NeonDupGen, "{context}");
+
+            // --- distinct lanes: dup + (lanes-1) ins, unchanged -------------
+            let (mut isel, entry) = make_empty_isel();
+            for lane in 0..lanes {
+                let vreg = isel.new_vreg(RegClass::Gpr64);
+                isel.define_value(Value(lane as u32), ISelOperand::VReg(vreg), lane_ty.clone());
+            }
+            isel.select_instruction(
+                &Instruction {
+                    opcode: opcode.clone(),
+                    args: (0..lanes as u32).map(Value).collect(),
+                    results: vec![Value(lanes as u32)],
+                },
+                entry,
+            )
+            .unwrap_or_else(|e| panic!("{context} distinct: {e:?}"));
+            let mfunc = isel.finalize();
+            let insts = &mfunc.blocks[&entry].insts;
+            assert_eq!(
+                insts.len(),
+                lanes,
+                "{context} distinct lanes should still be dup + {} ins",
+                lanes - 1
+            );
+        }
     }
 
     #[test]
@@ -26820,6 +27035,35 @@ mod tests {
         assert_eq!(
             recorded_fp, kernel_fp,
             "ISel binding key must match kernel binding key"
+        );
+    }
+
+    #[test]
+    fn raw_lattice_range_obligation_cannot_mint_opaque_carrier_binding() {
+        let (mut isel, entry) = make_i64_isel();
+        let forged = crate::lattice_guard::LATTICE_OBLIGATION_BASE;
+        isel.select_instruction(
+            &Instruction {
+                opcode: Opcode::GuardBoundsCheck {
+                    bound: 8,
+                    obligation: Some(forged),
+                },
+                args: vec![Value(0), Value(1)],
+                results: vec![],
+            },
+            entry,
+        )
+        .unwrap();
+
+        let mfunc = isel.finalize();
+        assert_eq!(
+            mfunc.guard_obligations.values().copied().next(),
+            Some(forged)
+        );
+        assert!(
+            mfunc.lattice_guard_bindings().is_empty(),
+            "a caller-constructible obligation id without an exact source-bound capability must \
+             remain report metadata"
         );
     }
 

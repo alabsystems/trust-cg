@@ -6,30 +6,50 @@
 
 //! Static 32-byte alignment of innermost-loop-head blocks at emission.
 //!
-//! # Why
+//! # Why — READ THE PRICING SECTION BELOW BEFORE TRUSTING THIS PARAGRAPH
 //!
-//! Apple Silicon fetches instructions in aligned 32-byte lines. A short hot
-//! loop whose body STRADDLES a 32-byte boundary costs an extra fetch line
-//! every iteration; the same loop within one line does not. Because trust-cg
-//! (before this pass) laid blocks out at whatever byte offset the preceding
-//! code happened to end on, a 5-instruction inner loop landed on either side
-//! of that boundary by lottery — measured at 2-20% swings on fetch-bound
-//! scalar loops (the sieve diagnosis: identical opcode multisets, layout-only
-//! deltas, 0.68x from a profile-guided reorder whose entire effect was moving
-//! the clear-loop off a fetch boundary). clang plays the same card via loop
-//! `.p2align 5` on AArch64. This pass captures that win statically.
+//! The pass was built on this argument: Apple Silicon fetches instructions in
+//! aligned 32-byte lines, so a short hot loop whose body STRADDLES a boundary
+//! costs an extra fetch line every iteration, and because trust-cg laid blocks
+//! out at whatever byte offset the preceding code happened to end on, an inner
+//! loop landed on either side of that boundary by lottery — the observed 2-20%
+//! swings on scalar loops (the sieve diagnosis: identical opcode multisets,
+//! layout-only deltas).
+//!
+//! The swings are real. **The explanation is not.** The fetch-line premise was
+//! measured directly in 2026-08 and is false on this target at every loop size
+//! (see "BOTH SIDES OF THE TRADE ARE NOW PRICED"), so the swings are placement
+//! chaos — predictor and cache-set aliasing — that 32-byte alignment moves
+//! around but does not remove.
+//!
+//! The claim that "clang plays the same card via loop `.p2align 5` on AArch64"
+//! is also false for this target, and that is cheap to re-check: across all 70
+//! SingleSource C programs, `clang -O3` emits `.p2align 2` (383x), `.p2align 3`
+//! (293x) and `.p2align 4` (34x) — and `.p2align 5` **zero** times. The
+//! reference compiler does not 32-byte-align loops here.
 //!
 //! # What it does
 //!
 //! Immediately before branch resolution (the point where `block_order` and
-//! every instruction are FINAL), walk the layout and, for every block that is
-//! an INNERMOST loop header, insert up to 7 [`AArch64Opcode::AlignNop`]
-//! instructions (full alignment — no max-skip forfeits; see MAX_PAD_BYTES) at
-//! the very END of the layout-predecessor block so the header's first
-//! instruction starts on a function-relative 32-byte boundary. The module
-//! emitters then place any function containing an aligned header on a 32-byte
-//! section boundary ([`trust_cg_ir::MachFunction::text_align_log2`]), making
-//! the function-relative alignment absolute in the linked image.
+//! every instruction are FINAL), walk the layout and find every INNERMOST loop
+//! header. The pass then does TWO INDEPENDENT THINGS, and they must be reasoned
+//! about separately because only one of them executes:
+//!
+//! 1. PADDING: insert up to 7 [`AArch64Opcode::AlignNop`] instructions at the
+//!    very END of the layout-predecessor block, so the header's first
+//!    instruction starts on a function-relative 32-byte boundary. These are
+//!    real instructions on a fallthrough path — they RETIRE. Suppress with
+//!    `TCG_LOOP_ALIGN_NO_PAD=1`.
+//! 2. PLACEMENT: raise [`trust_cg_ir::MachFunction::text_align_log2`] so the
+//!    module emitters put a loop-bearing function on a 32-byte section
+//!    boundary. This costs no executed instruction, only dead inter-function
+//!    bytes, and it is what makes each head's offset mod 32 depend on its own
+//!    function's code alone rather than on the accumulated size of everything
+//!    emitted before it. Suppress with
+//!    `TCG_LOOP_ALIGN_NO_FUNC_PLACEMENT=1`.
+//!
+//! Both ship ON. See [`padding_disabled`] for the measured three-arm corpus
+//! comparison that kept padding on despite the mechanism evidence below.
 //!
 //! # Soundness argument (why NOP padding at a block seam preserves semantics)
 //!
@@ -70,6 +90,113 @@
 //! innermost-ness; for scattered layouts it degrades to a heuristic — which
 //! is fine, because alignment choice is PERF-ONLY and can never miscompile.
 //!
+//! # BOTH SIDES OF THE TRADE ARE NOW PRICED (2026-08-14) — and the benefit is 0
+//!
+//! Everything below this line about "an extra fetch line every iteration" was
+//! an ASSUMPTION. It had never been measured; every piece of evidence for it
+//! was a whole-program A/B delta, which cannot separate a fetch-line effect
+//! from the placement chaos the same switch causes. Both sides have now been
+//! measured directly on the target box (Apple Silicon, `tools/` PMC counters
+//! via `proc_pid_rusage`, randomized arm order, null-arm control):
+//!
+//! COST — executed pad NOPs are ~0.031 cycles each, not ~1.
+//!   `TCG_LOOP_ALIGN_IN_CYCLE_PAD=28` on Stanford/Quicksort adds **199.1M**
+//!   retired instructions (+19.2%) over the shipped budget and costs 6.2M of
+//!   336M cycles: 0.031 cyc/NOP (min) / 0.043 (trimmed median). On Queens the
+//!   same knob adds 10.3M NOPs for <=0.006 cyc/NOP. The `IN_CYCLE_MAX_PAD_BYTES`
+//!   budget and the seam-span gate were both derived from an executed-NOP cost
+//!   roughly 30x larger than the real one.
+//!
+//! BENEFIT — 32-byte head alignment is worth 0 cycles at every loop size.
+//!   Re-runnable witness: `tools/fetch_align_witness/align_price.py`. It builds
+//!   loops of byte length L in {16,32,64,128,256,512,1024,2048}, places each at
+//!   all 8 offsets mod 32, and reads PMC cycles in randomized arm order. There
+//!   is no step at the line boundary at any size — and at L>=128 the effect
+//!   that does exist points the WRONG WAY, the loop spanning one MORE fetch
+//!   line being 1-3.6% FASTER (L=512: 26.894 vs 25.927 cyc/iter). That
+//!   variation has period 8 BYTES, not 32, so it is not a fetch-line effect and
+//!   32-byte head alignment cannot capture it. Realistic shapes are flat to
+//!   four decimals: a Quicksort-style load/compare/taken-backedge scan loop
+//!   reads 1.0002 vs 1.0002. Mechanistically this is expected — these loops run
+//!   at 4.8-6.5 IPC, ~20-26 bytes/cycle, comfortably under the fetch width, so
+//!   a decoupled front end never exposes the crossing.
+//!
+//!   Confirmed on the real program, not just the microbenchmark: un-gating
+//!   Quicksort's two hottest heads (`while (a[i]<x)` and `while (x<a[j])`,
+//!   24-byte bodies — the ideal case for this pass) pays the NOP cost in full
+//!   with no offsetting gain, which bounds the alignment benefit at
+//!   **< 0.01 cycles per iteration**.
+//!
+//!   And the reference compiler agrees: across all 70 SingleSource C programs,
+//!   `clang -O3` on this target emits `.p2align 5` ZERO times (383 `.p2align 2`,
+//!   293 `.p2align 3`, 34 `.p2align 4`). It does not 32-byte-align loops here.
+//!
+//! ★ THE PASS IS **TWO** LOTTERIES, NOT ONE — measured 2026-08-15.
+//!   Prior sweeps toggled the pass (or all padding) WHOLESALE and landed inside
+//!   the noise envelope. Isolating the IN-CYCLE pads alone
+//!   (`TCG_LOOP_ALIGN_IN_CYCLE_PAD=0`, 37 of 65 programs change, and every one
+//!   only LOSES instructions) separates two components with OPPOSITE per-program
+//!   signs:
+//!
+//!   | program | in-cycle pads OFF (min/tmed) | whole pass OFF (recorded) |
+//!   |---|---|---|
+//!   | Shootout/sieve | **0.8926 / 0.8907** | 0.890 / 0.894 |
+//!   | McGill/chomp | 0.9556 / 0.9869 | — |
+//!   | CoyoteBench/huffbench | 0.9906 / 0.9907 | — |
+//!   | BenchmarkGame/nsieve-bits | 0.9916 / 0.9921 | — |
+//!   | Stanford/Quicksort | **1.0222 / 1.0419** | **0.839 / 0.813** |
+//!   | Stanford/Puzzle | 1.0219 / 1.0177 | — |
+//!   | geomean (36) | 0.9987 / 0.9974 (null 1.0033 / 1.0038) | — |
+//!
+//!   Read those two Quicksort columns together: turning the WHOLE pass off makes
+//!   Quicksort 16-19% FASTER, but turning off only the in-cycle pads makes it
+//!   2-4% SLOWER. So Quicksort's entire win comes from the **function/block
+//!   PLACEMENT** component, not from the pads — while sieve's entire win is the
+//!   **pads** (in-cycle-only 0.8926 reproduces whole-pass-off 0.890 almost
+//!   exactly). Anyone who tunes "padding" as one knob is averaging two
+//!   independent effects and will keep measuring zero.
+//!
+//!   The corpus geomean 0.9987/0.9974 sits inside the null (1.0033/1.0038), and
+//!   the arm makes the two WORST tail programs (Puzzle, Quicksort) worse, so the
+//!   default is unchanged. But the per-program effects are real, large, and
+//!   mechanically explained: on huffbench the pass puts 2 NOPs at 0x978/0x97c
+//!   INSIDE the 1.5e9-iteration decode loop, padding the head of an inner scan
+//!   loop **whose body executes ZERO times** — 3.0e9 retired NOPs, 3.19% of the
+//!   program's dynamic instructions, for an alignment worth 0.
+//!
+//!   ⇒ The tractable form of this lever is not a global budget but a
+//!   TRIP-COUNT-WEIGHTED one: an in-cycle pad costs 0.031-0.08 cyc times the
+//!   ENCLOSING loop's trip count, against a benefit of 0. That denominator is
+//!   exactly what the 2-pass AOT PGO infrastructure already collects. Without
+//!   profile data it is a coin flip; with it, it is a decision.
+//!
+//! TRIP COUNTS — the missing denominator, and it is ~1.
+//!   Instrumented Stanford/Quicksort (100 runs): 443,400 `Quicksort` calls,
+//!   1,708,300 do-while iterations, and the two scan loops the pass most wants
+//!   to align iterate **1.225 and 1.670 times per entry**. A "loop" entered
+//!   1.7M times and iterated 1.2 times per entry cannot repay 7 NOPs per entry
+//!   under ANY per-line price, let alone the measured one.
+//!
+//! CONSEQUENCE FOR ANYONE ASKED TO ADD A PER-LOOP COST MODEL: there is nothing
+//! to model. The quantity a cost model would trade the NOPs against is zero,
+//! so no ratio, no trip-count estimate and no profile feedback can make padding
+//! profitable — PGO would only weight a zero more accurately. The per-program
+//! swings this pass produces are real but they are placement chaos (branch
+//! predictor and cache-set aliasing), not fetch-line alignment, which is why
+//! every static model of them has been falsified and why landed settings
+//! "expire" whenever unrelated code shifts.
+//!
+//! THE PADDING STAYS ON ANYWAY, but NOT because it measures better — it does
+//! not measure at all. A three-arm corpus sweep first read "dropping padding
+//! costs 0.35%, min and median agreeing"; an independent re-run on a quieter
+//! box read 0.9968 min / 1.0009 med for the SAME comparison, i.e. the signs
+//! disagree and nothing is established in either direction. The full table and
+//! both readings are in [`padding_disabled`]. The setting is kept on inertia —
+//! no measurement entitles anyone to change it, and none entitles anyone to
+//! defend it either. That is exactly what a lottery ticket looks like: record
+//! the pricing, stop trying to derive the winning number, and do not spend a
+//! future round re-deriving a corpus geomean that lives inside its own noise.
+//!
 //! # Seam gate (executed-NOP control)
 //!
 //! Padding at a fallthrough seam is executed code. When the seam lies INSIDE
@@ -88,6 +215,9 @@
 //!
 //! `TCG_NO_LOOP_HEAD_ALIGN=1` disables the pass entirely; the emitted objects
 //! are then byte-identical to a build without this pass.
+//! `TCG_LOOP_ALIGN_NO_PAD=1` suppresses `AlignNop` PADDING while keeping
+//! 32-byte FUNCTION PLACEMENT — the "placement only" arm, which no previous
+//! switch could express (see [`padding_disabled`]).
 //! `TCG_LOOP_ALIGN_NO_SEAM_GATE=1` restores the ungated pad-every-
 //! fallthrough-seam policy; `TCG_LOOP_ALIGN_SEAM_SPAN=<bytes>` overrides the
 //! span threshold; `TCG_LOOP_ALIGN_MAX_SKIP=<bytes>` overrides the max-skip;
@@ -115,6 +245,15 @@ const LOOP_HEAD_ALIGN_BYTES: u32 = 32;
 /// padding makes every fallthrough-seam header deterministic. The cost is at
 /// most 7 executed NOPs per loop ENTRY on fallthrough seams (never per
 /// iteration).
+///
+/// SUPERSEDED (2026-08): the determinism argument in that paragraph does not
+/// hold — 32-byte FUNCTION PLACEMENT already fixes every head's offset mod 32
+/// as a function of its own function's code, so padding adds no determinism on
+/// top of it, only executed NOPs. And "the cost is at most 7 NOPs per loop
+/// entry" understates it: at an in-cycle seam the run executes once per pass
+/// through the ENCLOSING cycle, which is how Quicksort reaches 13.2M executed
+/// pad NOPs per 12 benchmark runs at the shipped budget. Suppress padding
+/// entirely with `TCG_LOOP_ALIGN_NO_PAD=1`; see [`padding_disabled`].
 const MAX_PAD_BYTES: u32 = 28;
 
 /// Effective max-skip: `TCG_LOOP_ALIGN_MAX_SKIP=<bytes>` overrides
@@ -157,6 +296,17 @@ const SEAM_GATE_MAX_SPAN_BYTES: u32 = 256;
 /// 18 executed NOPs in the hot function): 1.078 min / 1.184 trimmed vs clang
 /// with them, 0.870 / 0.824 without. Entry-only seams keep the full
 /// [`MAX_PAD_BYTES`] budget — their NOPs run once per loop entry.
+///
+/// SUPERSEDED (2026-08): this budget prices an executed NOP at roughly a
+/// cycle. Measured, it is **0.031 cycles** — relaxing the budget to 28 on
+/// Quicksort adds 199.1M retired instructions and costs 6.2M of 336M cycles.
+/// The number 8 was therefore fitted to a cost ~30x too large, against a
+/// benefit (fetch lines saved) that is zero. Do not re-tune it hoping to find
+/// the right value: no value of it can be right when the term it trades
+/// against is 0. Padding still ships only because no measurement says to stop
+/// it: the corpus aggregate that once appeared to prefer it (0.35%, both
+/// stats) did not reproduce on re-run — see [`padding_disabled`] and the
+/// pricing section in the module docs.
 const IN_CYCLE_MAX_PAD_BYTES: u32 = 8;
 
 /// `TCG_LOOP_ALIGN_IN_CYCLE_PAD=<bytes>` overrides
@@ -242,12 +392,26 @@ fn loop_head_align_disabled() -> bool {
 ///    which is why unrelated levers keep showing +/-1-2% per-program swings that
 ///    invert under `TCG_NO_LOOP_HEAD_ALIGN=1`. Always run that control before
 ///    attributing a regression to the transform under test.
-///  * A principled fix needs per-function execution frequency (the PGO arc),
-///    not another static heuristic. A cost-model attempt built on the
-///    padding-only reading — cumulative per-cycle pad budget, do-no-harm
-///    displacement check, self-recursive entry tier — was measured and
-///    FALSIFIED (worse on sieve/Quicksort/queens/misr, better only on
-///    Treesort); it is not in the tree.
+///  * A cost-model attempt built on the padding-only reading — cumulative
+///    per-cycle pad budget, do-no-harm displacement check, self-recursive
+///    entry tier — was measured and FALSIFIED (worse on sieve/Quicksort/
+///    queens/misr, better only on Treesort); it is not in the tree.
+///  * That note used to end "a principled fix needs per-function execution
+///    frequency (the PGO arc)". **It does not.** Profile data supplies trip
+///    counts, i.e. the multiplier on the BENEFIT term — and the benefit term
+///    has since been measured at zero, so a profile would only weight a zero
+///    more precisely. The trip counts were collected anyway (Quicksort's two
+///    hottest heads: 1.225 and 1.670 iterations per entry) and they say the
+///    same thing. Do not spend the PGO arc here.
+///
+/// STALENESS WARNING for the table above: it was taken at a different tree
+/// state and does not reproduce. Re-measured at b1802f82 with randomized arm
+/// order and a null-arm control, Queens' "padding buys 4.5%" inverts to
+/// 0.9769 min / 1.0157 med (signs disagree ⇒ nothing established), and
+/// Quicksort's "padding costs 20%" reads 1.0017 min / 1.0318 med. Treesort is
+/// not measurable at all on this instrument: four BYTE-IDENTICAL binaries
+/// spread 2.96% on min and 11.0% on trimmed median. Any per-program claim in
+/// this file below ~3% min / ~11% med on Treesort is inside the noise floor.
 ///
 /// Unset, this knob changes nothing: verified byte-identical objects against the
 /// pre-knob compiler across all 65 importable SingleSource programs.
@@ -265,18 +429,93 @@ fn cycle_check_disabled() -> bool {
     *DISABLED.get_or_init(|| std::env::var_os("TCG_LOOP_ALIGN_NO_CYCLE_CHECK").is_some())
 }
 
-/// Align innermost loop headers to 32 bytes by inserting `AlignNop` padding
-/// at layout seams. Must run when `block_order` and the instruction stream
-/// are FINAL, immediately before branch resolution — any instruction
-/// inserted or removed after this pass invalidates the computed alignment
-/// (though never correctness: `AlignNop`s are ordinary instructions to every
-/// later phase).
+/// EXPERIMENT KNOB: `TCG_LOOP_ALIGN_NO_PAD=1` suppresses `AlignNop` INSERTION
+/// while leaving 32-byte FUNCTION PLACEMENT in force.
+///
+/// This is the arm every prior decomposition was missing. The single
+/// `TCG_NO_LOOP_HEAD_ALIGN` switch turns off padding AND placement together,
+/// and [`func_placement_disabled`] gives "padding, no placement"; there was no
+/// way to ask for "placement, no padding" — which is precisely the
+/// configuration the mechanism evidence points at, since padding executes and
+/// placement does not.
+///
+/// WHY IT IS A KNOB AND NOT THE DEFAULT — the honest version.
+///
+/// The mechanism says padding should be free to drop: an executed pad NOP
+/// costs ~0.031 cycles, 32-byte head alignment is worth 0 cycles at every loop
+/// size measured, the loops being aligned iterate 1.2-1.7 times per entry, and
+/// the determinism argument for full padding is already supplied by the
+/// placement pin alone (see the module-level pricing section). Every one of
+/// those is a direct measurement.
+///
+/// THE CORPUS DOES NOT DECIDE IT EITHER — and that took two sweeps to learn.
+/// Three full interleaved sweeps (`tools/perf_sweep_interleaved.py`, headline
+/// on the instrument's OWN `trusted` field, paired per program):
+///
+/// | arm                           | first read (n=55) | re-run, quiet box (n=55) |
+/// |-------------------------------|-------------------|--------------------------|
+/// | padding + placement (shipped) | 1.0173 / 1.0142   | 1.0261 / 1.0186          |
+/// | placement only (this knob)    | 1.0209 / 1.0176   | 1.0228 / 1.0196          |
+/// | whole pass off                | 1.0218 / 1.0147   | 1.0218 / 1.0181          |
+/// | PAIRED: no-pad vs pad         | 1.0035 / 1.0034   | 0.9968 / 1.0009          |
+/// | PAIRED: pass-off vs pad       | 1.0044 / 1.0005   | 0.9958 / 0.9995          |
+///
+/// The first read said "dropping padding costs 0.35%, min AND median agreeing"
+/// — the one two-stat result that justified keeping it. It does not reproduce:
+/// re-measured, the same comparison is 0.9968 min / 1.0009 med, signs
+/// disagreeing, i.e. NOTHING ESTABLISHED. Note also that the shipped arm's own
+/// geomean moved 1.0173 -> 1.0261 on min between sweeps of BYTE-IDENTICAL
+/// objects; ~0.6% on min is this instrument's cross-session envelope, which is
+/// larger than every aggregate effect this pass has ever been credited with.
+/// Do not re-litigate the default on a corpus aggregate — it cannot resolve
+/// the question.
+///
+/// WHAT DOES REPRODUCE is per-program, large, and opposed. Pass-off vs shipped,
+/// min and median agreeing in both sweeps: Stanford/Quicksort 0.839 / 0.813 and
+/// Shootout/sieve 0.890 / 0.894 (the pass COSTS them 11-19%), against
+/// Stanford/Treesort 1.096 / 1.234 (the pass BUYS it 10-23%). Dropping padding
+/// alone moves Shootout/lists 1.068 / 1.090 the wrong way. The corpus geomean
+/// is the sum of these cancelling, and averaging them is what has hidden the
+/// real result for several rounds.
+///
+/// So the shipped setting is kept on INERTIA, not on evidence: no measurement
+/// entitles anyone to change it, and none entitles anyone to defend it. What
+/// this knob is FOR: separating the two effects in a per-program investigation
+/// — which is the only granularity at which this pass has ever measured — and
+/// re-testing cheaply after the code shifts. The productive question is not
+/// "pad or not" but "why does Treesort need the placement pin", since that is
+/// the one effect that survives both sweeps on both statistics.
+fn padding_disabled() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("TCG_LOOP_ALIGN_NO_PAD").is_some())
+}
+
+/// Align innermost loop headers to 32 bytes by inserting `AlignNop` padding at
+/// layout seams, and request 32-byte placement for loop-bearing functions.
+/// Padding can be suppressed independently with `TCG_LOOP_ALIGN_NO_PAD=1`
+/// (see [`padding_disabled`] for why that is a knob and not the default).
+///
+/// Must run when `block_order` and the instruction stream are FINAL,
+/// immediately before branch resolution: any instruction inserted or removed
+/// after this pass invalidates the computed alignment (though never
+/// correctness — `AlignNop`s are ordinary instructions to every later phase).
 ///
 /// Returns `true` if at least one innermost header is function-relative
-/// 32-byte aligned on exit (padding inserted, or already on a boundary), in
-/// which case `func.text_align_log2` has been raised so the object emitters
+/// 32-byte aligned on exit (padding inserted, or already on a boundary). In
+/// either case, and also on the `false` path when the function still carries a
+/// real cycle, `func.text_align_log2` has been raised so the object emitters
 /// place the function itself on a 32-byte boundary.
 pub fn align_innermost_loop_heads(func: &mut MachFunction) -> bool {
+    align_heads(func, !padding_disabled())
+}
+
+/// [`align_innermost_loop_heads`] with the padding policy passed explicitly.
+///
+/// The policy is a parameter rather than a bare env read so the unit tests can
+/// exercise BOTH arms in one process: the env switches are `OnceLock`-cached
+/// per process and cannot be toggled per test, which is exactly why the
+/// placement-only arm went unmeasured for so long.
+fn align_heads(func: &mut MachFunction, pad_heads: bool) -> bool {
     if loop_head_align_disabled() {
         return false;
     }
@@ -417,7 +656,7 @@ pub fn align_innermost_loop_heads(func: &mut MachFunction) -> bool {
                         || pad > in_cycle_max_pad_bytes());
                 if std::env::var_os("TCG_LOOP_ALIGN_TRACE").is_some() {
                     eprintln!(
-                        "[loop-align] fn={} head={:?} prev={:?} prev_last={:?} falls_through={} pad={} span_bytes={} seam_in_cycle={} seam_gated={}",
+                        "[loop-align] fn={} head={:?} prev={:?} prev_last={:?} falls_through={} pad={} span_bytes={} seam_in_cycle={} seam_gated={} pad_heads={} => {}",
                         func.name,
                         block_id,
                         prev_block,
@@ -426,10 +665,16 @@ pub fn align_innermost_loop_heads(func: &mut MachFunction) -> bool {
                         pad,
                         head_span_bytes,
                         seam_in_cycle,
-                        seam_gated
+                        seam_gated,
+                        pad_heads,
+                        if prev_falls_through && !seam_gated && pad_heads {
+                            "PAD"
+                        } else {
+                            "no-pad"
+                        }
                     );
                 }
-                if prev_falls_through && !seam_gated {
+                if prev_falls_through && !seam_gated && pad_heads {
                     for _ in 0..(pad / 4) {
                         let nop_id = func.push_inst(MachInst::new(AArch64Opcode::AlignNop, vec![]));
                         func.blocks[prev_block.0 as usize].insts.push(nop_id);
@@ -770,7 +1015,7 @@ mod tests {
     fn pads_unaligned_innermost_head_to_32() {
         // 6 entry insts = head at 24; pad 8 (2 nops) -> 32.
         let (mut f, head) = loop_func(6);
-        assert!(align_innermost_loop_heads(&mut f));
+        assert!(align_heads(&mut f, true));
         assert_eq!(align_nop_count(&f), 2);
         assert_eq!(head_offset(&f, head), 32);
         assert_eq!(head_offset(&f, head) % 32, 0);
@@ -788,7 +1033,7 @@ mod tests {
         // TCG_LOOP_ALIGN_MAX_SKIP A/B override; with the default, a head at
         // 16 pads 16 bytes (4 nops) instead of riding the lottery.
         let (mut f, head) = loop_func(4);
-        assert!(align_innermost_loop_heads(&mut f));
+        assert!(align_heads(&mut f, true));
         assert_eq!(align_nop_count(&f), 4);
         assert_eq!(head_offset(&f, head), 32);
         assert_eq!(f.text_align_log2, 5);
@@ -799,7 +1044,7 @@ mod tests {
         // 8 entry insts = head at 32 already; no NOPs, but the function must
         // still request 32-byte placement to make that boundary absolute.
         let (mut f, head) = loop_func(8);
-        assert!(align_innermost_loop_heads(&mut f));
+        assert!(align_heads(&mut f, true));
         assert_eq!(align_nop_count(&f), 0);
         assert_eq!(head_offset(&f, head), 32);
         assert_eq!(f.text_align_log2, 5);
@@ -864,7 +1109,7 @@ mod tests {
         // NOPs would execute once per outer iteration. 28 > IN_CYCLE_MAX_PAD
         // (8), so inner is GATED and rides the placement lottery instead —
         // the measured Quicksort policy (28-byte in-cycle pads cost 24%).
-        assert!(align_innermost_loop_heads(&mut f));
+        assert!(align_heads(&mut f, true));
         assert_eq!(head_offset(&f, outer), 32);
         assert_eq!(
             head_offset(&f, inner),
@@ -939,7 +1184,7 @@ mod tests {
         let ret = f.push_inst(MachInst::new(AArch64Opcode::Ret, vec![]));
         f.append_inst(exit, ret);
 
-        assert!(align_innermost_loop_heads(&mut f));
+        assert!(align_heads(&mut f, true));
         // A: entry seam (no enclosing cycle), 20 -> pad 12 -> 32.
         assert_eq!(head_offset(&f, outer), 32);
         // H: seam-gated — P's block got no padding, H rides the lottery
@@ -952,6 +1197,41 @@ mod tests {
         );
         assert_eq!(head_offset(&f, h), 44);
         assert_eq!(align_nop_count(&f), 3);
+    }
+
+    /// `TCG_LOOP_ALIGN_NO_PAD` must give PLACEMENT WITHOUT PADDING — the arm
+    /// no previous switch could express, and the one the mechanism evidence
+    /// points at (see [`padding_disabled`]). It must emit zero executed NOPs,
+    /// leave the head at its natural offset, and STILL pin the loop-bearing
+    /// function to 32 bytes; a version that dropped the pin as well would
+    /// silently be the whole-pass-off arm.
+    #[test]
+    fn no_pad_policy_keeps_placement_and_emits_no_nops() {
+        // 6 entry insts: with padding this head takes 8 bytes of NOPs and
+        // lands at 32 (see `pads_unaligned_innermost_head_to_32`).
+        let (mut f, head) = loop_func(6);
+        align_heads(&mut f, false);
+        assert_eq!(align_nop_count(&f), 0, "no-pad policy emits no padding");
+        assert_eq!(head_offset(&f, head), 24, "head keeps its natural offset");
+        assert_eq!(
+            f.text_align_log2, LOOP_HEAD_ALIGN_LOG2,
+            "function placement must survive the no-pad policy"
+        );
+    }
+
+    /// The shipped default still pads: guards against an accidental flip of
+    /// [`padding_disabled`], which a corpus sweep -- not a mechanism argument
+    /// -- is the only thing entitled to change.
+    #[test]
+    fn shipped_default_still_pads() {
+        let (mut f, head) = loop_func(6);
+        assert!(
+            std::env::var_os("TCG_LOOP_ALIGN_NO_PAD").is_none(),
+            "this test characterises the DEFAULT policy"
+        );
+        assert!(align_innermost_loop_heads(&mut f));
+        assert_eq!(align_nop_count(&f), 2);
+        assert_eq!(head_offset(&f, head), 32);
     }
 
     #[test]
@@ -970,7 +1250,7 @@ mod tests {
         // Entry head: offset 0 is aligned by function placement; the pass
         // must not insert padding, and (offset 0 % 32 == 0 case falls under
         // layout_idx == 0, excluded) must not request placement either.
-        assert!(!align_innermost_loop_heads(&mut f));
+        assert!(!align_heads(&mut f, true));
         assert_eq!(align_nop_count(&f), 0);
     }
 }

@@ -31,6 +31,8 @@ pub enum EncodeError {
     Imm21OutOfRange { value: i32 },
     #[error("invalid extend option {0:#05b}")]
     InvalidExtend(u8),
+    #[error("load/store {field} field value {value} does not fit in 2 bits")]
+    InvalidLoadStoreField { field: &'static str, value: u32 },
 }
 
 // ---------------------------------------------------------------------------
@@ -280,6 +282,12 @@ pub fn encode_ldr_str_post_index(
 ///
 /// * `extend` — register extend/shift type
 /// * `shift` — `true` to shift by access size (S=1), `false` for no shift (S=0)
+///
+/// [`LoadStoreOp`] spans only `opc` 0b00 (store) and 0b01 (load), which is
+/// every SCALAR access — but NOT the 128-bit SIMD&FP forms, which are
+/// `size=0b00` with `opc=0b10` (store) / `0b11` (load). Callers that must
+/// reach those use [`encode_ldr_str_register_fields`]; the 128-bit width is
+/// not expressible here and must never be approximated by `Double`.
 pub fn encode_ldr_str_register(
     size: LoadStoreSize,
     v: bool,
@@ -290,15 +298,69 @@ pub fn encode_ldr_str_register(
     rn: u8,
     rt: u8,
 ) -> Result<u32, EncodeError> {
+    encode_ldr_str_register_fields(size as u32, v, op as u32, rm, extend, shift, rn, rt)
+}
+
+/// Encode `LDR`/`STR` with register offset from the RAW `size` and `opc`
+/// fields.
+///
+/// ```text
+/// size(2) | 111 | V(1) | 00 | opc(2) | 1 | Rm(5) | option(3) | S(1) | 10 | Rn(5) | Rt(5)
+/// ```
+///
+/// The access WIDTH of a register-offset load/store is `size:opc<1>`, so for
+/// SIMD&FP it spans FOUR encodings that the typed [`LoadStoreSize`] /
+/// [`LoadStoreOp`] pair cannot express together:
+///
+/// ```text
+///   size=0b00 opc=0b01   B (1 byte)      size=0b00 opc=0b11   Q load  (16 bytes)
+///   size=0b01 opc=0b01   H (2 bytes)     size=0b00 opc=0b10   Q store (16 bytes)
+///   size=0b10 opc=0b01   S (4 bytes)
+///   size=0b11 opc=0b01   D (8 bytes)
+/// ```
+///
+/// A 128-bit access therefore sets the HIGH `opc` bit and a `size` of 0b00 —
+/// the same field pair the unsigned-offset FP path already derives through
+/// `fp_mem_fields_from_preg_class`. Taking the fields raw is what lets the
+/// register-offset arms share that one derivation instead of re-deriving the
+/// width from a 3-valued `FpSize` that has no `Quad` (which silently encoded
+/// every `Q` register-offset access as a 64-bit `D` access — a store that
+/// wrote 8 of its 16 bytes).
+///
+/// `size` and `opc` are checked to be 2-bit values so a mis-derived field
+/// cannot silently alias a different, well-formed instruction.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_ldr_str_register_fields(
+    size: u32,
+    v: bool,
+    opc: u32,
+    rm: u8,
+    extend: RegExtend,
+    shift: bool,
+    rn: u8,
+    rt: u8,
+) -> Result<u32, EncodeError> {
     check_reg(rm, 31)?;
     check_reg(rn, 31)?;
     check_reg(rt, 31)?;
+    if size > 0b11 {
+        return Err(EncodeError::InvalidLoadStoreField {
+            field: "size",
+            value: size,
+        });
+    }
+    if opc > 0b11 {
+        return Err(EncodeError::InvalidLoadStoreField {
+            field: "opc",
+            value: opc,
+        });
+    }
 
     let mut inst: u32 = 0;
-    inst |= (size as u32) << 30;
+    inst |= size << 30;
     inst |= 0b111 << 27;
     inst |= (v as u32) << 26;
-    inst |= (op as u32) << 22;
+    inst |= opc << 22;
     inst |= 1 << 21; // register-offset marker
     inst |= (rm as u32) << 16;
     inst |= (extend as u32) << 13;

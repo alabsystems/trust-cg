@@ -181,6 +181,20 @@ pub(crate) fn interp_inst(env: &mut HashMap<ValueId, SmtExpr>, node: &InstrNode)
                 | TrustIrBinOp::FRem
                 | TrustIrBinOp::FMin
                 | TrustIrBinOp::FMax => return None,
+                // BOOLEAN connectives (trust-ir 4b06918): UNREACHABLE from this
+                // bridge, not merely unsupported. Rust MIR has no boolean-connective
+                // BinOp — `&&`/`||` lower to control flow — and this bridge's sole
+                // producer, `rust_binop_to_trust_ir_binop`, maps mir BitAnd/BitOr/
+                // BitXor to the BITWISE `And`/`Or`/`Xor` above. Nothing here ever
+                // constructs BAnd/BOr/BXor. Skipping is the sound answer: these
+                // carry 0/1-carrier logical semantics (any nonzero is true), which
+                // is NOT bvand/bvor/bvxor, so a reflexive bitwise encoding would
+                // silently disagree with `trust_ir::interpret` and the Lean
+                // `semIntBinOp`. If the bridge ever learns to emit them, encode the
+                // carrier explicitly here — do not fold them into the arms above.
+                TrustIrBinOp::BAnd | TrustIrBinOp::BOr | TrustIrBinOp::BXor => {
+                    return None;
+                }
             }
         }
         Inst::UnOp { op, ty, operand } => {

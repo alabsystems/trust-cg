@@ -981,6 +981,25 @@ impl MachOWriter {
                 (section_data_end as u128) - u128::from(fileoff),
             )?
         };
+        // A segment's VM image must cover its FILE image: `vmsize >= filesize`
+        // is a Mach-O well-formedness invariant (`llvm-objdump` rejects the
+        // object outright with "filesize field ... greater than vmsize field",
+        // which loses `objdump`, `llvm-nm -S` and every downstream tool).
+        //
+        // The two cursors above CANNOT be assumed to grow together: the file
+        // cursor starts at `header_plus_lc` while the VM cursor starts at 0, so
+        // at each section they sit at different residues modulo that section's
+        // alignment and receive DIFFERENT amounts of padding. Whenever a
+        // section needs more file padding than VM padding, `filesize` outgrows
+        // the VM extent and the object is malformed. (Found by the native
+        // vector witness: adding a 16-byte-aligned constant pool shifted the
+        // residues and produced exactly that object.)
+        //
+        // Raising `vmsize` to the file extent is the conservative repair: it
+        // moves no section address, no symbol value and no relocation — only
+        // the segment's declared memory size, which for a relocatable object
+        // nothing maps and the linker recomputes.
+        let vmsize = vm_cursor.max(filesize);
 
         Ok(MachOLayoutPlan {
             nsects,
@@ -1006,7 +1025,7 @@ impl MachOWriter {
             nextdefsym,
             iundefsym,
             nundefsym,
-            vmsize: vm_cursor,
+            vmsize,
             fileoff,
             filesize,
             file_len,
@@ -2184,6 +2203,42 @@ mod tests {
             "filesize should cover all sections: got {}",
             filesize
         );
+    }
+
+    /// A segment's VM image must cover its FILE image at EVERY section-size /
+    /// alignment combination. The file cursor starts at `header_plus_lc` and
+    /// the VM cursor at 0, so the two receive different alignment padding; a
+    /// size that makes the file cursor need MORE padding than the VM cursor
+    /// used to emit `vmsize < filesize`, which is malformed Mach-O and makes
+    /// `llvm-objdump` refuse the object ("filesize field ... greater than
+    /// vmsize field") even though the linker accepts it.
+    ///
+    /// Sweeping the text size across two full 16-byte periods covers every
+    /// residue the two cursors can disagree on.
+    #[test]
+    fn segment_vmsize_always_covers_filesize_across_alignment_residues() {
+        for text_len in 0usize..48 {
+            for data_align_log2 in [3u32, 4u32] {
+                let mut writer = MachOWriter::new();
+                writer.add_text_section(&vec![0u8; text_len]);
+                writer.add_custom_section(
+                    b"__const",
+                    b"__DATA",
+                    &[0u8; 16],
+                    data_align_log2,
+                    S_REGULAR,
+                );
+                let bytes = writer.write().unwrap();
+                let seg_offset = MACH_HEADER_64_SIZE as usize;
+                let vmsize = read_u64(&bytes, seg_offset + 32);
+                let filesize = read_u64(&bytes, seg_offset + 48);
+                assert!(
+                    vmsize >= filesize,
+                    "vmsize {vmsize} < filesize {filesize} for text_len={text_len} \
+                     data_align=2^{data_align_log2}: malformed Mach-O segment"
+                );
+            }
+        }
     }
 
     // =====================================================================

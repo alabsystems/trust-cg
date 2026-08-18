@@ -2241,7 +2241,12 @@ fn materialize_spilled_register_offset_mem(
     new_block_insts: &mut Vec<InstId>,
     debug_info: &mut SpillMaterializationDebugInfo,
 ) -> Result<bool, PipelineError> {
-    let is_store = inst_snapshot.opcode == IrOpcode::StrRO;
+    // Stores include the narrow register-offset siblings (STRB/STRH) the
+    // ext_addr narrow-store fold emits, exactly mirroring the loads below.
+    let is_store = matches!(
+        inst_snapshot.opcode,
+        IrOpcode::StrRO | IrOpcode::StrbRO | IrOpcode::StrhRO
+    );
     // Loads include the narrow register-offset siblings (LDRB/LDRH) the
     // ext_addr fold emits. Their access WIDTH is fixed by the opcode (1/2
     // bytes), NOT the transfer class — so both the scale derivation and the
@@ -2324,8 +2329,8 @@ fn materialize_spilled_register_offset_mem(
     // emitter, otherwise the reconstructed effective address would diverge.
     let ro_scale: u32 = if ro_shifted {
         let log2 = match inst_snapshot.opcode {
-            IrOpcode::LdrbRO => Some(0),
-            IrOpcode::LdrhRO => Some(1),
+            IrOpcode::LdrbRO | IrOpcode::StrbRO => Some(0),
+            IrOpcode::LdrhRO | IrOpcode::StrhRO => Some(1),
             _ => register_offset_scale_log2(transfer_vreg.class),
         };
         log2.ok_or_else(|| {
@@ -2419,9 +2424,19 @@ fn materialize_spilled_register_offset_mem(
             ir_func.push_inst(make_spill_load(value_scratch, transfer_slot, source_loc));
         new_block_insts.push(load_value_id);
 
+        // Preserve the ACCESS WIDTH when decomposing to the immediate-offset
+        // form, exactly as the load arm below does: a narrow register-offset
+        // store must become the matching narrow immediate store (STRB/STRH),
+        // never the full-width STR — otherwise it would write 4/8 bytes where
+        // the program stores 1/2, smashing the neighbouring bytes.
+        let ri_opcode = match inst_snapshot.opcode {
+            IrOpcode::StrbRO => IrOpcode::StrbRI,
+            IrOpcode::StrhRO => IrOpcode::StrhRI,
+            _ => IrOpcode::StrRI,
+        };
         let inst = &mut ir_func.insts[inst_id.0 as usize];
-        inst.opcode = IrOpcode::StrRI;
-        inst.flags = IrOpcode::StrRI.default_flags();
+        inst.opcode = ri_opcode;
+        inst.flags = ri_opcode.default_flags();
         inst.operands = vec![
             IrOperand::PReg(value_scratch),
             IrOperand::PReg(addr_scratch),
@@ -3662,7 +3677,12 @@ fn spill_facts_compare_only(opcode: IrOpcode) -> bool {
 fn spill_facts_plain_user_store(opcode: IrOpcode) -> bool {
     matches!(
         opcode,
-        IrOpcode::StrRI | IrOpcode::StrbRI | IrOpcode::StrhRI | IrOpcode::StrRO
+        IrOpcode::StrRI
+            | IrOpcode::StrbRI
+            | IrOpcode::StrhRI
+            | IrOpcode::StrRO
+            | IrOpcode::StrbRO
+            | IrOpcode::StrhRO
     )
 }
 
@@ -5462,13 +5482,17 @@ pub(crate) fn guard_kernel_gate_enabled() -> bool {
     true
 }
 
+enum AArch64KernelGate {
+    Empty,
+    Lattice(trust_cg_lower::lattice_guard::LatticeGuardReplayAuthority),
+}
+
 /// Build the production AArch64 guard gate.
 ///
 /// Producer-owned status, lineage, `ProofRef` labels and synthesized ids remain report metadata:
 /// they contribute NOTHING here, exactly as before. The one thing that does contribute is a
 /// [`trust_cg_lower::lattice_guard::LatticeBoundsCapability`] — a decidable, obligation-bound,
-/// replayable authorization minted by trust-ir's own solver-free `implies`. See
-/// [`install_lattice_guard_authority`].
+/// replayable authorization minted by trust-ir's own solver-free `implies`.
 ///
 /// Returning `Some` is load-bearing: `None` would select the legacy label-only optimizer.
 fn build_guard_kernel_gate(
@@ -5476,116 +5500,32 @@ fn build_guard_kernel_gate(
     isel_func: &trust_cg_lower::isel::ISelFunction,
     proof_ctx: Option<&trust_cg_lower::ProofContext>,
     _trust_ir_module: Option<&trust_ir::Module>,
-) -> Option<(
-    trust_cg_ir::DischargedEvidenceTable,
-    std::collections::HashMap<InstId, (u128, Option<u128>)>,
-)> {
-    // Start from the fail-closed production position: empty evidence AND empty bindings, so even a
-    // forged matching pair cannot reach `decide`.
-    let mut evidence = trust_cg_lower::guard_evidence::production_guard_replay_evidence();
-    let mut obligations: std::collections::HashMap<InstId, (u128, Option<u128>)> =
-        std::collections::HashMap::new();
+) -> Option<AArch64KernelGate> {
+    let Some(ctx) = proof_ctx else {
+        return Some(AArch64KernelGate::Empty);
+    };
 
-    if let Some(ctx) = proof_ctx {
-        install_lattice_guard_authority(ir_func, isel_func, ctx, &mut evidence, &mut obligations);
-    }
-
-    Some((evidence, obligations))
-}
-
-/// **The payoff, wired.** Turn every replayed lattice capability into kernel evidence bound to the
-/// exact carrier it was certified for.
-///
-/// Four independent conditions must ALL hold before a single carrier is bound. Any one failing
-/// leaves the carrier untouched, so it expands to a runtime bounds check exactly as today:
-///
-/// 1. **Authority.** `lattice_guard_replay_authority_available()` — the `lattice-guard-elision`
-///    Cargo feature. A default build returns here having done nothing at all.
-/// 2. **Replay.** Every capability is re-decided from scratch against the module's interned
-///    predicate/universe tables, and both of its ids re-derived. A capability that does not
-///    reproduce is discarded (and does not disable the others — it simply is not authority).
-/// 3. **Carrier binding.** The ISel recorded `fingerprint -> obligation id` in
-///    `guard_obligations`, keyed by the operand fingerprint the kernel itself computes. We
-///    re-derive that fingerprint from the LIVE MachInst and look it up; a carrier whose operands
-///    do not fingerprint to a lattice obligation is not bound.
-/// 4. **Kernel + re-check.** Binding only fills the receipt slot. `trust_cg_ir::decide` still has
-///    to authorize, and the independent operand re-check still has to re-justify, or the compile
-///    fails closed.
-///
-/// The `ProofAnnotation::InBounds` stamp is applied to EXACTLY the carriers bound in (3) — never
-/// broadcast — because the proof-consuming pass dispatches on it. Stamping is therefore not an
-/// authority grant: an annotated carrier with no kernel-authorized obligation is still kept.
-fn install_lattice_guard_authority(
-    ir_func: &mut IrMachFunction,
-    isel_func: &trust_cg_lower::isel::ISelFunction,
-    proof_ctx: &trust_cg_lower::ProofContext,
-    evidence: &mut trust_cg_ir::DischargedEvidenceTable,
-    obligations: &mut std::collections::HashMap<InstId, (u128, Option<u128>)>,
-) {
-    use trust_cg_ir::GuardTarget;
-    use trust_cg_lower::lattice_guard;
-
-    // (1) Authority.
-    if !lattice_guard::lattice_guard_replay_authority_available() {
-        return;
-    }
-    if proof_ctx.lattice_bounds_capabilities.is_empty() || isel_func.guard_obligations.is_empty() {
-        return;
-    }
-
-    // (2) Replay every capability against the module's own tables, then index by obligation id.
-    let env = &proof_ctx.refinement_env;
-    let mut replayed: std::collections::HashMap<u64, u128> = std::collections::HashMap::new();
-    for capability in &proof_ctx.lattice_bounds_capabilities {
-        if capability.replay(env) {
-            replayed.insert(capability.obligation_id(), capability.lineage_digest());
-        }
-    }
-    if replayed.is_empty() {
-        return;
-    }
-
-    // (3) Bind carriers whose re-derived operand fingerprint names a replayed lattice obligation.
-    let target = trust_cg_ir::AArch64GuardTarget;
-    let mut bound: Vec<InstId> = Vec::new();
-    for idx in 0..ir_func.insts.len() {
-        let inst_id = InstId(idx as u32);
-        let Some(kind) = target.classify_carrier(ir_func.inst(inst_id)) else {
-            continue;
-        };
-        // Only the bounds-guard family is lattice-certifiable today; every other guard kind stays
-        // exactly as fail-closed as it was.
-        if kind != trust_cg_ir::GuardKind::BoundsCheck {
-            continue;
-        }
-        let identity = target.operand_identity(ir_func.inst(inst_id));
-        let fingerprint = trust_cg_ir::fingerprint_for_kind(kind, &identity.operands);
-        let Some(&obligation_id) = isel_func.guard_obligations.get(&fingerprint) else {
-            continue;
-        };
-        // Defence in depth: only ids minted by the lattice, and only ones that replayed.
-        if !lattice_guard::is_lattice_obligation_id(obligation_id) {
-            continue;
-        }
-        let Some(&lineage) = replayed.get(&obligation_id) else {
-            continue;
-        };
-        evidence.insert(
-            u128::from(obligation_id),
-            trust_cg_ir::DischargeStatus::Certified,
-            Some(lineage),
+    let authority =
+        trust_cg_lower::lattice_guard::LatticeGuardReplayAuthority::replay_and_bind_aarch64(
+            ir_func,
+            isel_func.lattice_guard_bindings(),
+            &ctx.refinement_env,
+            &ctx.lattice_bounds_capabilities,
         );
-        obligations.insert(inst_id, (u128::from(obligation_id), Some(lineage)));
-        bound.push(inst_id);
+    if !authority.is_enabled() {
+        return Some(AArch64KernelGate::Empty);
     }
 
-    // Stamp the annotation on exactly the bound carriers so the proof pass reaches them.
+    // Stamp the dispatch annotation on exactly the replay-bound carriers. The opaque authority
+    // still has to authorize and independently re-check each deletion in the proof pass.
+    let bound: Vec<InstId> = authority.bound_inst_ids().collect();
     for inst_id in bound {
         let inst = ir_func.inst_mut(inst_id);
         if inst.proof.is_none() {
             inst.proof = Some(trust_cg_ir::ProofAnnotation::InBounds);
         }
     }
+    Some(AArch64KernelGate::Lattice(authority))
 }
 
 /// Propagate proof annotations from the adapter's [`ProofContext`](trust_cg_lower::ProofContext)
@@ -15365,6 +15305,9 @@ impl Pipeline {
         };
 
         let mut isel = InstructionSelector::new(input.name.clone(), sig.clone());
+        if let Some(ctx) = proof_ctx {
+            isel.seed_lattice_bounds_capabilities(&ctx.lattice_bounds_capabilities);
+        }
 
         // Propagate stack slot metadata from the LIR function to the ISel.
         isel.set_stack_slots(input.stack_slots.clone());
@@ -15494,10 +15437,7 @@ impl Pipeline {
         func: &mut IrMachFunction,
         proof_metadata: Option<trust_cg_opt::proof_opts::ProofOptimizationMetadata>,
         provenance: Option<&mut trust_cg_ir::ProvenanceMap>,
-        kernel_gate: Option<(
-            trust_cg_ir::DischargedEvidenceTable,
-            std::collections::HashMap<InstId, (u128, Option<u128>)>,
-        )>,
+        kernel_gate: Option<AArch64KernelGate>,
     ) -> Result<trust_cg_opt::PassStats, PipelineError> {
         let function = func.name.clone();
         catch_optimization_invariant(function, || {
@@ -15538,10 +15478,7 @@ impl Pipeline {
             func,
             None,
             provenance,
-            Some((
-                trust_cg_lower::guard_evidence::production_guard_replay_evidence(),
-                std::collections::HashMap::new(),
-            )),
+            Some(AArch64KernelGate::Empty),
         )
     }
 
@@ -15550,10 +15487,7 @@ impl Pipeline {
         func: &mut IrMachFunction,
         proof_metadata: Option<trust_cg_opt::proof_opts::ProofOptimizationMetadata>,
         provenance: Option<&mut trust_cg_ir::ProvenanceMap>,
-        kernel_gate: Option<(
-            trust_cg_ir::DischargedEvidenceTable,
-            std::collections::HashMap<InstId, (u128, Option<u128>)>,
-        )>,
+        kernel_gate: Option<AArch64KernelGate>,
     ) -> trust_cg_opt::PassStats {
         use trust_cg_opt::pass_manager::MachinePass;
         use trust_cg_opt::pipeline::{OptLevel as OptOptLevel, OptimizationPipeline};
@@ -15593,9 +15527,18 @@ impl Pipeline {
         if self.certified_pass_execution {
             pipeline = pipeline.with_certified_pass_execution();
         }
-        if let Some((evidence, obligations)) = kernel_gate {
-            // Route every candidate through the fail-closed kernel policy.
-            pipeline = pipeline.with_kernel_gate(evidence, obligations);
+        match kernel_gate {
+            Some(AArch64KernelGate::Empty) => {
+                // Route every candidate through the fail-closed empty-authority policy.
+                pipeline = pipeline.with_kernel_gate(
+                    trust_cg_lower::guard_evidence::production_guard_replay_evidence(),
+                    std::collections::HashMap::new(),
+                );
+            }
+            Some(AArch64KernelGate::Lattice(authority)) => {
+                pipeline = pipeline.with_lattice_kernel_gate(authority);
+            }
+            None => {}
         }
         if let Some(metadata) = proof_metadata {
             pipeline = pipeline.with_proof_optimization_metadata(metadata);
@@ -16153,6 +16096,23 @@ impl Pipeline {
         // or instruction changes) and gated with `post_ra` so it only runs when
         // coalescing has actually emptied the trampolines. Kill switch:
         // TRUST_CG_DISABLE_PASSES=branch_forward.
+        // Phase 6.8: POST-RA scalar post-index formation. The `lsl`/`add`/`ldr`
+        // address recompute this folds does not exist in the mid-end -- the
+        // optimizer's `post_index` pass is provably inert there, because the
+        // index is a loop-carried register (2 defs, 3 reads, different block) or
+        // the load sits on a diamond arm. Post-RA is the first point the shape
+        // exists, and where the binary patch that priced this lever operated.
+        // Kill switch: TRUST_CG_DISABLE_PASSES=post_index_late.
+        if post_ra_enabled && !self.pass_disabled("post_index_late") {
+            let pi = crate::post_index_late::form_post_index_loads(ir_func);
+            if pi.folded > 0 && trust_cg_time_pipeline_enabled() {
+                eprintln!(
+                    "[trust-cg-time-regalloc] func={} pass=pipeline stage=post-index-late folded={}",
+                    ir_func.name, pi.folded
+                );
+            }
+        }
+
         if post_ra_enabled && !self.pass_disabled("branch_forward") {
             let t = ra_time.then(Instant::now);
             let bf_stats = crate::branch_forward::forward_post_ra_branches(ir_func);
@@ -26236,6 +26196,138 @@ mod tests {
                 IrOperand::Imm(0),
             ]
         );
+    }
+
+    // ---- Narrow register-offset STORE spill decomposition -----------------
+    //
+    // These two tests exist because the path they cover is UNREACHABLE from the
+    // benchmark corpus. A mutation probe that replaced the width-preserving
+    // opcode choice with a flat `StrRI` changed ZERO of 63 corpus objects and
+    // could not be killed by an executable differential witness — including one
+    // built specifically to spill around a byte/halfword scatter. An unreachable
+    // path is exactly the kind that ships broken, so it is pinned directly here
+    // instead of being left to the corpus.
+    //
+    // The defect being pinned: decomposing `StrbRO`/`StrhRO` into the immediate
+    // form must preserve the ACCESS WIDTH. Choosing `StrRI` would write 8 bytes
+    // where the program writes 1 or 2, silently smashing adjacent memory while
+    // storing the correct value at the correct address.
+
+    #[test]
+    fn materialize_spilled_operands_strbro_keeps_byte_width() {
+        // STRB Wval, [Xbase, Xindex] (option=0b011, S=0, 1-byte access).
+        let sig = IrSignature::new(vec![], vec![]);
+        let mut func = IrMachFunction::new("test".to_string(), sig);
+
+        let value = VReg::new(0, RegClass::Gpr32);
+        let base = VReg::new(1, RegClass::Gpr64);
+        let index = VReg::new(2, RegClass::Gpr64);
+        let inst_id = func.push_inst(IrMachInst::new(
+            IrOpcode::StrbRO,
+            vec![
+                IrOperand::VReg(value),
+                IrOperand::VReg(base),
+                IrOperand::VReg(index),
+                IrOperand::Imm(0b011 << 1), // LSL, S=0 — log2(1) == 0
+            ],
+        ));
+        func.append_inst(func.entry, inst_id);
+
+        let spills = vec![
+            trust_cg_regalloc::SpillInfo {
+                vreg: value,
+                slot: StackSlotId(0),
+            },
+            trust_cg_regalloc::SpillInfo {
+                vreg: base,
+                slot: StackSlotId(1),
+            },
+            trust_cg_regalloc::SpillInfo {
+                vreg: index,
+                slot: StackSlotId(2),
+            },
+        ];
+
+        materialize_spilled_operands(&mut func, &spills).unwrap();
+
+        let block = &func.blocks[func.entry.0 as usize];
+        // A byte access has scale log2(1) = 0, so NO LslRI is emitted.
+        assert!(
+            block
+                .insts
+                .iter()
+                .all(|&id| func.inst(id).opcode != IrOpcode::LslRI),
+            "byte access must not be scaled"
+        );
+
+        let store = func.inst(*block.insts.last().unwrap());
+        assert_eq!(
+            store.opcode,
+            IrOpcode::StrbRI,
+            "a spilled StrbRO must decompose to a BYTE store, not a full-width STR"
+        );
+        assert_eq!(store.operands[2], IrOperand::Imm(0));
+    }
+
+    #[test]
+    fn materialize_spilled_operands_strhro_keeps_half_width_and_scale() {
+        // STRH Wval, [Xbase, Xindex, LSL #1] (option=0b011, S=1, 2-byte access).
+        let sig = IrSignature::new(vec![], vec![]);
+        let mut func = IrMachFunction::new("test".to_string(), sig);
+
+        let value = VReg::new(0, RegClass::Gpr32);
+        let base = VReg::new(1, RegClass::Gpr64);
+        let index = VReg::new(2, RegClass::Gpr64);
+        let inst_id = func.push_inst(IrMachInst::new(
+            IrOpcode::StrhRO,
+            vec![
+                IrOperand::VReg(value),
+                IrOperand::VReg(base),
+                IrOperand::VReg(index),
+                IrOperand::Imm((0b011 << 1) | 1), // LSL, S=1 — log2(2) == 1
+            ],
+        ));
+        func.append_inst(func.entry, inst_id);
+
+        let spills = vec![
+            trust_cg_regalloc::SpillInfo {
+                vreg: value,
+                slot: StackSlotId(0),
+            },
+            trust_cg_regalloc::SpillInfo {
+                vreg: base,
+                slot: StackSlotId(1),
+            },
+            trust_cg_regalloc::SpillInfo {
+                vreg: index,
+                slot: StackSlotId(2),
+            },
+        ];
+
+        materialize_spilled_operands(&mut func, &spills).unwrap();
+
+        let block = &func.blocks[func.entry.0 as usize];
+        // The halfword scale must come from the OPCODE (log2(2) = 1), not from
+        // the Gpr32 transfer class (which would wrongly give log2(4) = 2).
+        let shift = block
+            .insts
+            .iter()
+            .map(|&id| func.inst(id))
+            .find(|i| i.opcode == IrOpcode::LslRI)
+            .expect("halfword access with S=1 must be scaled");
+        assert_eq!(
+            shift.operands[2],
+            IrOperand::Imm(1),
+            "halfword scale must be log2(2) = 1"
+        );
+
+        let store = func.inst(*block.insts.last().unwrap());
+        assert_eq!(
+            store.opcode,
+            IrOpcode::StrhRI,
+            "a spilled StrhRO must decompose to a HALFWORD store, not a full-width STR"
+        );
+        assert_eq!(store.operands[2], IrOperand::Imm(0));
     }
 
     #[test]

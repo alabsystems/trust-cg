@@ -1875,7 +1875,26 @@ fn decode_neon_ldst_single_post_imm(word: u32) -> Result<Instruction, DecodeErro
 
     let q = bit(word, 30);
     let size = bits(word, 10, 2) as u8;
-    validate_neon_vector_arrangement(word, q, size)?;
+    // NO arrangement table here, deliberately.
+    //
+    // This arm used to call `validate_neon_vector_arrangement`, which rejects
+    // `q=0, size=0b11`. That rule belongs to the AdvSIMD three-same class (the
+    // validator's other caller), where the 64-bit-lane arrangement genuinely
+    // does not exist. In THIS encoding — LD1/ST1 (multiple structures, one
+    // register), post-indexed — `size:Q = 11:0` is the perfectly legal
+    // `{<Vt>.1D}` arrangement, so the check refused allocated instructions and
+    // its reason string asserted an allocation fact the architecture
+    // contradicts.
+    //
+    // MEASURED with Apple/LLVM 21 objdump on the raw words:
+    //   0x0cdf7c00 -> ld1.1d { v0 }, [x0], #8
+    //   0x0c9f7c00 -> st1.1d { v0 }, [x0], #8
+    //
+    // Every `(size, Q)` pair is allocated in this encoding, so there is no
+    // partial table to substitute — the correct number of checks is zero.
+    // Sharing a validator across two classes with DIFFERENT allocation tables
+    // is the hazard; `validate_scalar_load_store` avoids it by taking a
+    // `ScalarLoadStoreForm` discriminator.
 
     Ok(Instruction::NeonLdStSinglePostImm(NeonLdStSinglePostImm {
         q,

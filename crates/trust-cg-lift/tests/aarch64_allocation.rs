@@ -299,6 +299,21 @@ fn still_accepts_prefetch_without_writeback() {
     accepts(0xf880_8081, "prfum pldl1strm, [x4, #8]");
 }
 
+/// LD1/ST1 (one register, post-indexed) DOES allocate the 64-bit lane.
+///
+/// `q=0, size=0b11` has no arrangement in the AdvSIMD three-same class, and a
+/// shared validator was applying that class's rule here — refusing allocated
+/// instructions with a reason that asserted the opposite of the architecture.
+/// The two classes have DIFFERENT allocation tables, which is exactly why
+/// `validate_scalar_load_store` takes a form discriminator instead of being
+/// shared blind.
+#[test]
+fn still_accepts_ld1_st1_one_register_64bit_lane() {
+    // raw words from the sweep; objdump: ld1.1d / st1.1d { v0 }, [x0], #8
+    accepts(0x0cdf_7c00, "ld1.1d { v0 }, [x0], #8");
+    accepts(0x0c9f_7c00, "st1.1d { v0 }, [x0], #8");
+}
+
 /// NEON MUL has no 64-bit-lane arrangement, unlike ADD/SUB/CMxx.
 #[test]
 fn refuses_neon_mul_with_64bit_elements() {

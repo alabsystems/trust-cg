@@ -2724,7 +2724,7 @@ fn produces_def(op: AArch64Opcode) -> bool {
     use AArch64Opcode::*;
     !matches!(
         op,
-        CmpRR | CmpRI | BCond | B | StrRI | StrbRI | StrhRI | StrRO
+        CmpRR | CmpRI | BCond | B | StrRI | StrbRI | StrhRI | StrRO | StrbRO | StrhRO
     )
 }
 

@@ -17,7 +17,9 @@
 
 use std::path::Path;
 
+mod native_vector;
 mod parser;
+mod vector;
 
 pub use parser::{import_module, import_text};
 

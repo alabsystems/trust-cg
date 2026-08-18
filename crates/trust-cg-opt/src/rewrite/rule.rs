@@ -74,6 +74,10 @@ impl RuleBuilder {
 
     /// Start a rule that matches any instruction whose opcode falls in
     /// the given category.
+    ///
+    /// Categories can include semantically distinct scalar, SIMD, shifted,
+    /// and fused forms. Use this only when the rule is sound for every member;
+    /// otherwise prefer [`Self::match_opcode`].
     pub fn match_category(name: &'static str, category: OpcodeCategory) -> Self {
         Self {
             name,

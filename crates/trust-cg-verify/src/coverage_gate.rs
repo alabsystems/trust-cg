@@ -1030,6 +1030,8 @@ pub fn classify_aarch64(opcode: AArch64Opcode) -> OpcodeClass {
         | O::StrbRI
         | O::StrhRI
         | O::StrRO
+        | O::StrbRO
+        | O::StrhRO
         | O::VolatileStrRI
         | O::VolatileStrbRI
         | O::VolatileStrhRI => EmittableNeedsProof,
@@ -2944,6 +2946,8 @@ pub fn aarch64_deferred_value_op_reason(opcode: AArch64Opcode) -> Option<&'stati
         | O::StrbRI
         | O::StrhRI
         | O::StrRO
+        | O::StrbRO
+        | O::StrhRO
         | O::VolatileStrRI
         | O::VolatileStrbRI
         | O::VolatileStrhRI => Some(
@@ -3955,6 +3959,8 @@ pub const ALL_AARCH64_OPCODES: &[AArch64Opcode] = {
         StrRO,
         LdrbRO,
         LdrhRO,
+        StrbRO,
+        StrhRO,
         LdrswRO,
         // Address materialization
         Adr,

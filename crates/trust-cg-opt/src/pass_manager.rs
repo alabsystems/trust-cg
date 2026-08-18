@@ -468,6 +468,14 @@ fn bookkeeping_name(pass_name: &str) -> String {
     format!("{pass_name}::bookkeeping")
 }
 
+/// Cached `TCG_DIAG_CHANGED` flag: read the environment once per process so
+/// the default-off path costs one branch per pass run, not a getenv.
+fn diag_changed_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("TCG_DIAG_CHANGED").is_some())
+}
+
 fn log_pass_start(func: &MachFunction, iteration: u32, pass_name: &str) -> Option<Instant> {
     if !should_time_passes() {
         return None;
@@ -663,9 +671,31 @@ impl PassManager {
                 stats.runs[i].1 += 1;
                 let pass_name = pass.name().to_string();
                 let before_cfg = current_cfg;
+                // DIAGNOSTIC (default off, `TCG_DIAG_CHANGED=1`): verify each
+                // pass's claimed change against actual function content. A
+                // pass that reports `changed` without changing anything defeats
+                // the no-op skip (every claim re-arms all passes) and fakes
+                // convergence pressure; this catches it red-handed. Ruled out
+                // as the cause of the 4-iteration v2_memfill convergence tail
+                // on 2026-08-13 (zero false claims — the tail is genuine
+                // progressive enabling), kept for the next suspect.
+                let diag_pre = diag_changed_enabled().then(|| format!("{func:?}"));
                 let timer = log_pass_start(func, iteration + 1, &pass_name);
                 let pass_changed = pass.run_with_analyses(func, &mut cache);
                 log_pass_end(func, iteration + 1, &pass_name, pass_changed, timer);
+                if let Some(pre) = diag_pre {
+                    if pass_changed {
+                        let post = format!("{func:?}");
+                        if pre == post {
+                            eprintln!(
+                                "TCG_DIAG_CHANGED FALSE-CHANGED iter={} pass={} func={}",
+                                iteration + 1,
+                                pass_name,
+                                func.name
+                            );
+                        }
+                    }
+                }
                 let bk = log_pass_start(func, iteration + 1, &bookkeeping_name(&pass_name));
                 collect_proof_optimization_certificates(&mut stats, pass.as_mut());
                 collect_certified_pass_runs(&mut stats, pass.as_mut());

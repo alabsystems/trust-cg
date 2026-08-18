@@ -1484,11 +1484,36 @@ fn store_access_size(inst: &MachInst) -> Option<i64> {
     }
 }
 
+/// An UPPER BOUND on the transfer width, in bytes, of a register class.
+///
+/// This feeds the byte range a store is assumed to clobber and the range a
+/// hoisted load is assumed to read, and the runtime check then proves those
+/// ranges disjoint. Only ONE direction of error is unsound: a range that is too
+/// SMALL lets the pass prove a disjointness that does not hold and hoist a load
+/// across its own clobber. A range that is too LARGE can only make the check
+/// fail and send execution down the untouched slow loop.
+///
+/// The old `_ => 8` catch-all was therefore safe for every class NARROWER than
+/// 8 bytes — and unsound for the one class that is WIDER: `Fpr128`, a 16-byte
+/// `STR Q` / `LDR Q`, which the addressing-mode fold and the NEON vectorizers
+/// both produce. That single under-estimate is corrected here.
+///
+/// The narrow classes deliberately keep the conservative 8: tightening them to
+/// their exact widths is a separate, purely-permissive change that moves
+/// shipping `-O1` code (measured: Linpack's disjointness check goes from
+/// `lsl #3` to `lsl #2`), and it belongs in a round that can measure it rather
+/// than riding along with a soundness fix. The match is exhaustive, so a new
+/// `RegClass` variant is a compile error rather than a silent default.
 fn class_bytes(class: RegClass) -> i64 {
     match class {
-        RegClass::Gpr64 => 8,
-        RegClass::Gpr32 => 4,
-        _ => 8,
+        RegClass::Fpr128 => 16,
+        RegClass::Gpr64
+        | RegClass::Fpr64
+        | RegClass::System
+        | RegClass::Gpr32
+        | RegClass::Fpr32
+        | RegClass::Fpr16
+        | RegClass::Fpr8 => 8,
     }
 }
 

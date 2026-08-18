@@ -292,6 +292,50 @@ fn scan_function(func: &MachFunction) -> ScanResult {
     }
 }
 
+/// The single source of truth for the ORDER in which stack slots are laid out.
+///
+/// Slots grow DOWNWARD, so the slot yielded FIRST gets the HIGHEST address.
+///
+/// # Why this is shared
+///
+/// Two functions walk the slot list with the identical downward algorithm
+/// (`offset -= size; offset &= !(align - 1)`): [`compute_stack_slot_area`],
+/// which computes the frame SIZE to reserve, and [`stack_slot_frame_offsets`],
+/// which computes each slot's ADDRESS. They agree only because they visit the
+/// slots in the same order. Reordering one without the other places the deepest
+/// slots past the reserved area and into the outgoing-argument region, where a
+/// callee's stores destroy them (this exact desynchronization produced five
+/// gcc-c-torture miscompiles when the protector hoist was first attempted).
+/// Routing both through this helper makes them agree BY CONSTRUCTION.
+///
+/// # Why the protector slot goes first
+///
+/// The stack-protector canary only detects an overflow that must CROSS it to
+/// reach the return address. Allocated in program order it lands last, hence
+/// DEEPEST — below every local buffer — so an upward overflow reaches the saved
+/// FP/LR without ever touching it and the protector cannot fire for the threat
+/// model it exists for. Emitting it first puts it adjacent to the frame record,
+/// above every other local, matching clang.
+///
+/// The canary slot carries 16-byte alignment (see [`ensure_stack_protector_slot`]),
+/// so it consumes one full stack granule: because both walkers round each slot's
+/// base DOWN to that slot's own alignment, every slot beneath the canary keeps
+/// the alignment it would have had without it, with no separate padding logic.
+///
+/// Fail-closed: an out-of-range `stack_protector_slot` index is ignored, which
+/// degrades to plain allocation order in BOTH walkers rather than panicking or
+/// desynchronizing them.
+fn stack_slot_layout_order(func: &MachFunction) -> impl Iterator<Item = usize> + '_ {
+    let slot_count = func.stack_slots.len();
+    let protector = func
+        .stack_protector_slot
+        .map(|slot| slot.0 as usize)
+        .filter(|idx| *idx < slot_count);
+    protector
+        .into_iter()
+        .chain((0..slot_count).filter(move |idx| Some(*idx) != protector))
+}
+
 /// Compute the total size of all stack slots (spills + locals), respecting alignment.
 ///
 /// This MUST mirror the DOWNWARD allocation performed by
@@ -314,7 +358,8 @@ fn scan_function(func: &MachFunction) -> ScanResult {
 fn compute_stack_slot_area(func: &MachFunction) -> u32 {
     let mut offset: i32 = 0;
     let mut max_align: u32 = STACK_ALIGNMENT;
-    for slot in &func.stack_slots {
+    for idx in stack_slot_layout_order(func) {
+        let slot = &func.stack_slots[idx];
         if slot.is_runtime_sized() {
             continue;
         }
@@ -368,12 +413,25 @@ fn function_has_frame_pointer_dependencies(func: &MachFunction) -> bool {
 }
 
 /// Reserve the fixed frame slot that holds the entry stack guard value.
+///
+/// The guard value is 8 bytes but the slot is declared 16-byte aligned. That is
+/// load-bearing, not cosmetic: [`stack_slot_layout_order`] hoists this slot to
+/// the TOP of the local area (adjacent to the saved FP/LR), and both frame
+/// walkers round each slot's base DOWN to its own alignment. A 16-aligned
+/// canary therefore consumes exactly one stack granule and leaves every slot
+/// beneath it on the alignment it would have had otherwise — no separate
+/// padding logic, which is what desynchronized the two walkers in the earlier
+/// attempt at this fix. `compute_stack_slot_area`'s `max_align - STACK_ALIGNMENT`
+/// slack term also stays 0, since 16 == `STACK_ALIGNMENT`.
+///
+/// Note this only changes the slot's LAYOUT position; the slot ID is still
+/// handed out in allocation order by `alloc_stack_slot`.
 pub fn ensure_stack_protector_slot(func: &mut MachFunction) {
     if !func.stack_protector.is_enabled() || func.stack_protector_slot.is_some() {
         return;
     }
 
-    let slot = func.alloc_stack_slot(StackSlot::new(8, 8));
+    let slot = func.alloc_stack_slot(StackSlot::new(8, STACK_ALIGNMENT));
     func.stack_protector_slot = Some(slot);
 }
 
@@ -1593,16 +1651,19 @@ fn base_reg_name(base: PReg) -> String {
 /// signed offset from FP to the start of that slot; runtime-sized slots return
 /// `None` because they do not have a single static frame offset.
 pub fn stack_slot_frame_offsets(func: &MachFunction, layout: &FrameLayout) -> Vec<Option<i32>> {
-    let mut offsets = Vec::with_capacity(func.stack_slots.len());
+    // Indexed by slot ID; visited in [`stack_slot_layout_order`], which is the
+    // same order [`compute_stack_slot_area`] uses to size the reserved area.
+    let mut offsets = vec![None; func.stack_slots.len()];
     // Spill/local area starts immediately below FP. The callee-saved area is
     // above FP-relative locals because FP is established after the initial
     // callee-save pre-index allocation.
     // We lay out slots growing downward from there.
     let mut current_offset = layout.fp_to_spill_offset;
 
-    for slot in &func.stack_slots {
+    for idx in stack_slot_layout_order(func) {
+        let slot = &func.stack_slots[idx];
         if slot.is_runtime_sized() {
-            offsets.push(None);
+            // Runtime-sized slots have no single static offset; they keep None.
             continue;
         }
         // Grow downward: subtract size, then align.
@@ -1613,7 +1674,7 @@ pub fn stack_slot_frame_offsets(func: &MachFunction, layout: &FrameLayout) -> Ve
             // Round down to alignment boundary (for negative offsets).
             current_offset &= !(align - 1);
         }
-        offsets.push(Some(current_offset));
+        offsets[idx] = Some(current_offset);
     }
 
     offsets
@@ -4624,7 +4685,9 @@ mod tests {
         assert!(layout.uses_frame_pointer);
         assert!(!layout.uses_red_zone);
         assert_eq!(layout.callee_saved_pairs.len(), 1);
-        assert_eq!(layout.spill_area_size, 8);
+        // The canary slot is 16-byte aligned (one full granule) so that hoisting
+        // it above the locals cannot shift any other slot off its alignment.
+        assert_eq!(layout.spill_area_size, 16);
         assert_eq!(layout.total_frame_size, 32);
 
         insert_prologue_epilogue(&mut func, &layout).unwrap();
@@ -4648,7 +4711,7 @@ mod tests {
                         [
                             MachOperand::PReg(reg),
                             MachOperand::MemOp { base, offset },
-                        ] if *reg == X16 && *base == X29 && *offset == -8
+                        ] if *reg == X16 && *base == X29 && *offset == -16
                     )
             })
             .expect("stack protector should save guard to the fixed FP-relative slot");
@@ -4656,6 +4719,169 @@ mod tests {
             guard_store_index > 2,
             "guard save must run after the frame pointer prologue: {opcodes:?}"
         );
+    }
+
+    /// A representative matrix of local-slot shapes for the frame-layout pins:
+    /// narrow scalars, wide scalars, over-aligned buffers, odd-sized char
+    /// arrays (the classic smashable buffer), and runtime-sized allocas.
+    fn protector_layout_slot_shapes() -> Vec<Vec<StackSlot>> {
+        vec![
+            vec![StackSlot::new(64, 1)],
+            vec![StackSlot::new(1, 1)],
+            vec![StackSlot::new(97, 16)],
+            vec![StackSlot::new(4, 4), StackSlot::new(8, 8)],
+            vec![
+                StackSlot::new(3, 1),
+                StackSlot::new(4, 4),
+                StackSlot::new(8, 8),
+                StackSlot::new(16, 16),
+            ],
+            vec![StackSlot::new(32, 32), StackSlot::new(7, 1)],
+            vec![
+                StackSlot::new(12, 4),
+                StackSlot::new_dynamic(StackSlotSizeSource::Unknown, 16),
+                StackSlot::new(40, 8),
+            ],
+            vec![
+                StackSlot::new(1, 1),
+                StackSlot::new(1, 1),
+                StackSlot::new(1, 1),
+                StackSlot::new(255, 16),
+                StackSlot::new(9, 1),
+            ],
+        ]
+    }
+
+    fn make_protected_func(name: &str, slots: &[StackSlot]) -> MachFunction {
+        let mut func = make_func(name, vec![MachInst::new(AArch64Opcode::Ret, vec![])]);
+        for slot in slots {
+            func.alloc_stack_slot(*slot);
+        }
+        func.stack_protector = StackProtectorMode::StackGuard;
+        ensure_stack_protector_slot(&mut func);
+        func
+    }
+
+    /// SECURITY PIN. The stack-protector canary must sit ABOVE every other
+    /// stack slot, adjacent to the saved FP/LR frame record.
+    ///
+    /// A canary allocated in program order lands LAST, and since slots grow
+    /// downward that makes it the DEEPEST slot — below every local buffer. An
+    /// upward buffer overflow then reaches the saved return address without
+    /// ever crossing the guard, so the protector cannot fire for the threat
+    /// model it exists for. Witness before the fix: Queens `_Doit` kept the
+    /// canary at x29-0xe8 with every address-taken local at x29-0x14..-0xdc
+    /// ABOVE it, and a real smash silently corrupted the frame instead of
+    /// trapping.
+    #[test]
+    fn stack_protector_canary_sits_above_every_other_slot() {
+        for (case, slots) in protector_layout_slot_shapes().iter().enumerate() {
+            let func = make_protected_func(&format!("ssp_above_{case}"), slots);
+            let layout = compute_frame_layout(&func, 0, false);
+            let offsets = stack_slot_frame_offsets(&func, &layout);
+
+            let protector_id = func
+                .stack_protector_slot
+                .expect("protected function must have a canary slot");
+            let canary = offsets[protector_id.0 as usize]
+                .expect("the canary is a fixed-size slot and must have a static offset");
+
+            for (idx, offset) in offsets.iter().enumerate() {
+                if idx == protector_id.0 as usize {
+                    continue;
+                }
+                let Some(offset) = *offset else { continue };
+                assert!(
+                    offset < canary,
+                    "case {case}: slot {idx} sits at {offset} which is NOT below the \
+                     canary at {canary} — an overflow of that slot can reach the \
+                     saved FP/LR without crossing the guard",
+                );
+            }
+
+            // Adjacent to the frame record: nothing may be reserved between the
+            // top of the local area and the canary's own granule.
+            assert_eq!(
+                canary,
+                layout.fp_to_spill_offset - STACK_ALIGNMENT as i32,
+                "case {case}: canary must be the first slot below the frame record",
+            );
+        }
+    }
+
+    /// The reserved slot area must cover every slot the layout actually places,
+    /// for the protector-hoisted order. `compute_stack_slot_area` (frame SIZE)
+    /// and `stack_slot_frame_offsets` (slot ADDRESSES) run the same downward
+    /// algorithm and agree only because they share `stack_slot_layout_order`;
+    /// desynchronizing them pushes the deepest slots past SP into the
+    /// outgoing-argument area, where a callee's stores destroy them. That is
+    /// exactly the failure mode that produced five gcc-c-torture miscompiles
+    /// when this hoist was first attempted.
+    #[test]
+    fn stack_protector_hoist_keeps_slot_area_and_offsets_in_sync() {
+        for (case, slots) in protector_layout_slot_shapes().iter().enumerate() {
+            let func = make_protected_func(&format!("ssp_sync_{case}"), slots);
+            let layout = compute_frame_layout(&func, 0, false);
+            let offsets = stack_slot_frame_offsets(&func, &layout);
+
+            let area_bottom = layout.fp_to_spill_offset - layout.spill_area_size as i32;
+            for (idx, offset) in offsets.iter().enumerate() {
+                let Some(offset) = *offset else { continue };
+                assert!(
+                    offset >= area_bottom,
+                    "case {case}: slot {idx} at {offset} falls below the reserved area \
+                     bottom {area_bottom} (spill_area_size={}) — a callee would clobber it",
+                    layout.spill_area_size,
+                );
+            }
+
+            // Every fixed slot keeps its own alignment despite the hoist.
+            for (idx, offset) in offsets.iter().enumerate() {
+                let Some(offset) = *offset else { continue };
+                let align = func.stack_slots[idx].align as i32;
+                assert_eq!(
+                    offset & (align - 1),
+                    0,
+                    "case {case}: slot {idx} at {offset} is not {align}-byte aligned",
+                );
+            }
+
+            // Slots must not overlap.
+            let mut placed: Vec<(i32, i32)> = offsets
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, offset)| {
+                    offset.map(|offset| (offset, offset + func.stack_slots[idx].size as i32))
+                })
+                .collect();
+            placed.sort_unstable();
+            for pair in placed.windows(2) {
+                assert!(
+                    pair[0].1 <= pair[1].0,
+                    "case {case}: slot ranges {:?} and {:?} overlap",
+                    pair[0],
+                    pair[1],
+                );
+            }
+        }
+    }
+
+    /// Hoisting the canary must not perturb the layout of functions that have
+    /// no protector: `stack_slot_layout_order` degrades to plain allocation
+    /// order when `stack_protector_slot` is `None`.
+    #[test]
+    fn stack_slot_layout_order_is_identity_without_a_protector() {
+        for (case, slots) in protector_layout_slot_shapes().iter().enumerate() {
+            let mut func = make_func(
+                &format!("no_ssp_{case}"),
+                vec![MachInst::new(AArch64Opcode::Ret, vec![])],
+            );
+            for slot in slots {
+                func.alloc_stack_slot(*slot);
+            }
+            let order: Vec<usize> = stack_slot_layout_order(&func).collect();
+            assert_eq!(order, (0..slots.len()).collect::<Vec<_>>(), "case {case}");
+        }
     }
 
     #[test]

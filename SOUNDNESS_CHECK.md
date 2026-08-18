@@ -52,7 +52,7 @@ The trust-cg portion runs these `trust-cg-verify` integration-test targets:
 | Target | Evidence checked |
 | --- | --- |
 | `soundness_manifest` | Every registered fail-closed invariant has a live enforcing test, including all nine differential bridge IDs. |
-| `coverage_gate_tests` | Accepted/deferred opcode inventory: AArch64 155/246 with 91 explicitly deferred RED rows; x86-64 163/192 with 29; RISC-V 14/17 with 3; and WebAssembly 109/111 with 2. The test passes with exactly these named classifications and fails on unknown drift. The ratios report accepted evidence obligations for inventoried emitted value/effect opcodes, not correctness-proof or end-to-end compiler-proof percentages. A default `Statistical(N)` Valid result is regression evidence, not a formal proof. |
+| `coverage_gate_tests` | Accepted/deferred opcode inventory: AArch64 155/248 with 93 explicitly deferred RED rows; x86-64 163/192 with 29; RISC-V 14/17 with 3; and WebAssembly 109/111 with 2. The test passes with exactly these named classifications and fails on unknown drift. The ratios report accepted evidence obligations for inventoried emitted value/effect opcodes, not correctness-proof or end-to-end compiler-proof percentages. A default `Statistical(N)` Valid result is regression evidence, not a formal proof. |
 | `meta_theorems` | Property-level executable invariants. |
 | `mutation_catalog` | Mutation-harness invariants. |
 | `proof_gate_strict` | Non-degeneracy and fail-closed proof-gate behavior. |

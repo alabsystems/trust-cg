@@ -50,12 +50,18 @@
 //! * **Base must be exactly SP.** Only `MemOp { base == SP }` accesses are
 //!   tracked. FP/X29-relative addressing is where the frame/incoming-arg/callee-
 //!   saved area lives (caller/prologue-initialized and MIXED with spills); the
-//!   presence of ANY `MemOp { base == X29 }` DECLINES the function (it is a framed
-//!   function whose spills are FP-relative — out of scope for this SP-only slice,
-//!   which is what keeps it sound). See `frame::resolve_slot_operand`
-//!   (`trust-cg-codegen/src/frame.rs` ~:1538): spills resolve to `(X29, off)` on a
-//!   frame-pointer frame and only to `(SP, off)` on a frameless (zero-frame / red-
-//!   zone leaf) frame. This slice therefore only ANALYZES frameless functions.
+//!   presence of ANY `MemOp { base == X29 }` DECLINES the function (a framed
+//!   function whose spills are FP-relative is out of scope for this SP-only
+//!   slice). NOTE this X29-decline is NOT what keeps the slice sound on its own:
+//!   since the deep-slot SP preference in `frame::resolve_slot_operand`
+//!   (`trust-cg-codegen/src/frame.rs`, `FrameIndexEliminator`), a FRAMED function
+//!   can resolve deep spill slots to `(SP, off)` with no X29 MemOp anywhere.
+//!   Soundness for those functions rests entirely on the SP-invariance bail
+//!   below: any frame deep enough to trigger the SP form has
+//!   `sp_adjustment > 0`, so its prologue contains a `SUB SP` (and `MOV X29,SP`
+//!   / `STP` writeback) that DECLINES the function before any SP MemOp can be
+//!   mis-modeled as a frameless spill slot. Do not relax that bail without
+//!   restoring a framed-function guard here.
 //! * **SP must be invariant and un-escaped.** `[SP,#k]` only names a single fixed
 //!   address if SP never changes and no SP-derived pointer ever enters a GPR (from
 //!   which an untracked store could alias `[SP,#k]`). Any instruction that uses SP

@@ -1957,6 +1957,14 @@ impl<'a> FunctionScan<'a> {
             BinOp::Shl => lhs.bvshl(rhs),
             BinOp::LShr => lhs.bvlshr(rhs),
             BinOp::AShr => lhs.bvashr(rhs),
+            // Trust: the BOOLEAN connectives (trust-ir 4b06918). Exact rather than
+            // approximate: trust-ir's validator admits BAnd/BOr/BXor on `Bool` only,
+            // so the carrier is the 1-bit bitvector, on which the bitwise BV ops ARE
+            // the logical ones -- the same identification `AYBridge.lean`'s
+            // `encodeBinOp` makes for these opcodes.
+            BinOp::BAnd => lhs.bvand(rhs),
+            BinOp::BOr => lhs.bvor(rhs),
+            BinOp::BXor => lhs.bvxor(rhs),
             BinOp::SRem
             | BinOp::FAdd
             | BinOp::FSub

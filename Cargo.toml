@@ -29,7 +29,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["Andrew Yates <andrewyates.name@gmail.com>"]
@@ -56,8 +56,8 @@ anyhow = "1.0"
 # publication maps the exact pin to anonymous public HTTPS.
 # When built inside the `alabsystems/trust` superproject, that superproject's
 # `.cargo/config.toml` redirects this git dep to its `first-party/trust-ir`.
-trust-ir = { git = "https://github.com/alabsystems/trust-ir.git", rev = "f497428646b05c2f20ff0017f6b01d4924935d12", features = ["serde", "parser", "binary", "dialect-verif-example", "clean-expr"] }
-trust-ir-build = { git = "https://github.com/alabsystems/trust-ir.git", rev = "f497428646b05c2f20ff0017f6b01d4924935d12" }
+trust-ir = { git = "https://github.com/alabsystems/trust-ir.git", rev = "32a2c54b555c884a40020093f5910cbb5e2050ab", features = ["serde", "parser", "binary", "dialect-verif-example", "clean-expr"] }
+trust-ir-build = { git = "https://github.com/alabsystems/trust-ir.git", rev = "32a2c54b555c884a40020093f5910cbb5e2050ab" }
 
 # Internal crates
 trust-cg-ir = { path = "crates/trust-cg-ir" }

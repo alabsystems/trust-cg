@@ -285,6 +285,14 @@ fn assert_object_promotes(
 // aarch64_macho_data/call/tlvp_reloc_proofs lanes and the report is built
 // under the default-Enforce ENC-9 reparse binding, so a module whose
 // relocation kinds are all lane-covered promotes end to end.
+//
+// The promoting cases pass `--target=aarch64-apple-darwin` EXPLICITLY: they
+// exercise the Mach-O Certified composition, which is target property, not a
+// host property. With the target implicit they compile for the host default,
+// and on an aarch64-Linux host that is the aarch64-ELF lane — whose registry
+// is empty BY DESIGN (every function emits a DWARF FDE pc-begin PREL32 row,
+// uncovered), directly contradicting Case 4b below, which pins that the same
+// module under --target=aarch64-unknown-linux-gnu must be REJECTED.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -300,6 +308,7 @@ fn cli_emit_proofs_promotes_covered_object_relocations() {
 
     let output = Command::new(trust_cg_bin())
         .arg("-c")
+        .arg("--target=aarch64-apple-darwin")
         .arg("-o")
         .arg(&out_path)
         .arg(format!("--emit-proofs={}", proofs_dir.display()))
@@ -331,6 +340,7 @@ fn cli_emit_proofs_promotes_frame_spill_object() {
 
     let output = Command::new(trust_cg_bin())
         .arg("-c")
+        .arg("--target=aarch64-apple-darwin")
         .arg("-o")
         .arg(&out_path)
         .arg("--opt-level=0")
@@ -363,6 +373,7 @@ fn cli_emit_proofs_fcmp_clears_object_authority_gate() {
 
     let output = Command::new(trust_cg_bin())
         .arg("-c")
+        .arg("--target=aarch64-apple-darwin")
         .arg("-o")
         .arg(&out_path)
         .arg(format!("--emit-proofs={}", proofs_dir.display()))
@@ -405,6 +416,7 @@ fn cli_sidecar_io_failure_fails_loudly_after_object_promotes() {
 
     let output = Command::new(trust_cg_bin())
         .arg("-c")
+        .arg("--target=aarch64-apple-darwin")
         .arg("-o")
         .arg(&out_path)
         .arg(format!("--emit-proofs={}", proofs_dir.display()))

@@ -52,6 +52,19 @@ fn csinc(cond: i64) -> MachInst {
     )
 }
 
+/// FCSEL d, a, b, <cond> — the scalar-FP conditional select. Its condition is
+/// operand 3, exactly like CSEL/CSINC; the encoder reads `imm_val(inst, 3)`.
+fn fcsel(cond: i64) -> MachInst {
+    MachInst::new(
+        AArch64Opcode::FcselRR,
+        vec![fpr64(5), fpr64(6), fpr64(7), imm(cond)],
+    )
+}
+
+fn fpr64(id: u32) -> MachOperand {
+    MachOperand::VReg(VReg::new(id, RegClass::Fpr64))
+}
+
 const EQ: i64 = 0b0000;
 const NE: i64 = 0b0001;
 const HS: i64 = 0b0010;
@@ -76,6 +89,35 @@ fn fuses_when_consumer_does_not_read_carry() {
         let mut pass = AndCmpFuse;
         assert!(pass.run(&mut func), "cond {cond:#06b} should fuse");
         assert!(fused(&func), "cond {cond:#06b}: expected a Tst");
+    }
+}
+
+/// `FcselRR` is an NZCV reader per `effects::reads_flags`, so leaving it out of
+/// `cond_operand_index` did not make the pass wrong — it made it INERT wherever
+/// the flags reach a scalar-FP select. That is the whole of Misc/perlin's hot
+/// loop: 16 fusible AND/CMP pairs, every one declined, worth 2.2% of the
+/// program's cycles. Losing this arm again would silently cost that back.
+#[test]
+fn fuses_when_the_flag_consumer_is_a_scalar_fp_select() {
+    for cond in [EQ, NE, GE] {
+        let (mut func, _) = seq_with(fcsel(cond), 1);
+        let mut pass = AndCmpFuse;
+        assert!(pass.run(&mut func), "FCSEL cond {cond:#06b} should fuse");
+        assert!(fused(&func), "FCSEL cond {cond:#06b}: expected a Tst");
+    }
+}
+
+/// ...and the C-flag guard must still bite through the FP select.
+#[test]
+fn refuses_when_the_scalar_fp_select_reads_carry() {
+    for cond in [HS, LO, HI, LS] {
+        let (mut func, _) = seq_with(fcsel(cond), 1);
+        let mut pass = AndCmpFuse;
+        pass.run(&mut func);
+        assert!(
+            !fused(&func),
+            "FCSEL cond {cond:#06b} READS C — fusing here is a miscompile"
+        );
     }
 }
 
@@ -311,4 +353,118 @@ fn carry_reading_condition_set_is_exactly_hs_lo_hi_ls() {
         let expected = matches!(c, 0b0010 | 0b0011 | 0b1000 | 0b1001);
         assert_eq!(cond_reads_carry(c), expected, "cond {c:#06b}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// The REGISTER-operand arm (`AND Rd,Rn,Rm` + `CMP Rd,#0` -> `TST Rn,Rm`).
+//
+// OPT-IN: `TCG_AND_CMP_FUSE_RR=1`. Default OFF because it measured at the
+// instrument's null corpus-wide -- see the switch's doc comment. These tests pin
+// the BEHAVIOUR so the arm cannot rot while it is parked, and pin the guard that
+// the immediate arm never needed: `AndRR` has TWO source reads to move down to
+// the CMP, not one.
+
+fn rr_seq(consumer: MachInst) -> (MachFunction, BlockId) {
+    single_block_func(vec![
+        MachInst::new(AArch64Opcode::AndRR, vec![vreg64(2), vreg64(0), vreg64(1)]),
+        MachInst::new(AArch64Opcode::CmpRI, vec![vreg64(2), imm(0)]),
+        consumer,
+        // trailing flag WRITER: kills the definition so `flags_safe_after`
+        // is deciding on the consumer, not on flags escaping the block. Without
+        // it every one of these tests would pass for the wrong reason.
+        MachInst::new(AArch64Opcode::CmpRI, vec![vreg64(9), imm(3)]),
+    ])
+}
+
+fn with_rr_arm<T>(f: impl FnOnce() -> T) -> T {
+    trust_cg_process_env::with_env_overrides(&[("TCG_AND_CMP_FUSE_RR", "1")], f)
+}
+
+#[test]
+fn rr_arm_is_off_by_default() {
+    let (mut func, _) = rr_seq(csinc(EQ));
+    let mut pass = AndCmpFuse;
+    assert!(
+        !pass.run(&mut func),
+        "register arm must be inert by default"
+    );
+    assert!(
+        !fused(&func),
+        "default build must not emit a register-form Tst"
+    );
+}
+
+#[test]
+fn rr_arm_fuses_when_enabled_and_no_consumer_reads_carry() {
+    with_rr_arm(|| {
+        for cond in [EQ, NE, GE] {
+            let (mut func, _) = rr_seq(csinc(cond));
+            let mut pass = AndCmpFuse;
+            assert!(pass.run(&mut func), "cond {cond:#06b} should fuse");
+            assert!(fused(&func), "cond {cond:#06b}: expected a Tst");
+        }
+    });
+}
+
+#[test]
+fn rr_arm_obeys_the_same_carry_guard() {
+    with_rr_arm(|| {
+        for cond in [HS, LO, HI, LS] {
+            let (mut func, _) = rr_seq(csinc(cond));
+            let mut pass = AndCmpFuse;
+            assert!(
+                !pass.run(&mut func),
+                "cond {cond:#06b} reads C: must refuse"
+            );
+            assert!(!fused(&func), "cond {cond:#06b}: must not emit a Tst");
+        }
+    });
+}
+
+/// THE GUARD THE IMMEDIATE ARM NEVER NEEDED. `TST Rn,Rm` reads BOTH sources at
+/// the CMP's position, so a write to EITHER between the AND and the CMP would
+/// make the fused form read a different value. The immediate arm only ever had
+/// one source to check; missing the second here is a silent miscompile.
+#[test]
+fn rr_arm_refuses_when_either_source_is_redefined_before_the_cmp() {
+    for clobbered in [0u32, 1u32] {
+        with_rr_arm(|| {
+            let (mut func, _) = single_block_func(vec![
+                MachInst::new(AArch64Opcode::AndRR, vec![vreg64(2), vreg64(0), vreg64(1)]),
+                // redefine one of the AND's sources between the AND and the CMP
+                MachInst::new(
+                    AArch64Opcode::AddRI,
+                    vec![vreg64(clobbered), vreg64(8), imm(1)],
+                ),
+                MachInst::new(AArch64Opcode::CmpRI, vec![vreg64(2), imm(0)]),
+                csinc(EQ),
+                MachInst::new(AArch64Opcode::CmpRI, vec![vreg64(9), imm(3)]),
+            ]);
+            let mut pass = AndCmpFuse;
+            assert!(
+                !pass.run(&mut func),
+                "v{clobbered} redefined before the CMP: must refuse"
+            );
+            assert!(!fused(&func), "v{clobbered}: must not emit a Tst");
+        });
+    }
+}
+
+/// The AND result must be dead after the CMP; if the mask is still live the
+/// fused form (which discards it into XZR) would lose it.
+#[test]
+fn rr_arm_refuses_when_the_and_result_is_still_live() {
+    with_rr_arm(|| {
+        let (mut func, _) = single_block_func(vec![
+            MachInst::new(AArch64Opcode::AndRR, vec![vreg64(2), vreg64(0), vreg64(1)]),
+            MachInst::new(AArch64Opcode::CmpRI, vec![vreg64(2), imm(0)]),
+            csinc(EQ),
+            // a second reader of the masked value
+            MachInst::new(AArch64Opcode::AddRI, vec![vreg64(4), vreg64(2), imm(1)]),
+            MachInst::new(AArch64Opcode::CmpRI, vec![vreg64(9), imm(3)]),
+        ]);
+        let mut pass = AndCmpFuse;
+        assert!(!pass.run(&mut func), "masked value still live: must refuse");
+        assert!(!fused(&func));
+    });
 }

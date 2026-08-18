@@ -97,9 +97,7 @@
 //! former missing relations. [`register_migrated`] registers all patterns
 //! 1-52; [`crate::rotate_idiom::RotateIdiom`] carries pattern 53.
 
-use trust_cg_ir::{
-    AArch64Opcode, AArch64Target, MachInst, MachOperand, OpcodeCategory, TargetInfo,
-};
+use trust_cg_ir::{AArch64Opcode, AArch64Target, MachInst, MachOperand, TargetInfo};
 
 use crate::rewrite::constraint::{
     DefinedByOneOf, DefinedByOpcode, DefinerImmEquals, DefinerImmEqualsOuterImm,
@@ -128,7 +126,7 @@ pub fn rule_self_move_delete() -> Rule {
 
 /// Build the `add x, y, #0` → `mov x, y` rule.
 pub fn rule_add_ri_zero() -> Rule {
-    RuleBuilder::match_category("add-ri-zero-to-mov", OpcodeCategory::AddRI)
+    RuleBuilder::match_opcode("add-ri-zero-to-mov", AArch64Opcode::AddRI)
         .benefit(10)
         .constrain(ImmEquals { idx: 2, value: 0 })
         .rewrite_with(add_ri_zero_rewrite)
@@ -150,7 +148,7 @@ fn add_ri_zero_rewrite(ctx: &MatchCtx<'_>) -> RewriteAction {
 
 /// Build the `sub x, y, #0` → `mov x, y` rule.
 pub fn rule_sub_ri_zero() -> Rule {
-    RuleBuilder::match_category("sub-ri-zero-to-mov", OpcodeCategory::SubRI)
+    RuleBuilder::match_opcode("sub-ri-zero-to-mov", AArch64Opcode::SubRI)
         .benefit(10)
         .constrain(ImmEquals { idx: 2, value: 0 })
         .rewrite_with(sub_ri_zero_rewrite)
@@ -172,7 +170,7 @@ fn sub_ri_zero_rewrite(ctx: &MatchCtx<'_>) -> RewriteAction {
 
 /// Build the `eor x, y, y` → `mov x, #0` rule.
 pub fn rule_xor_self_zero() -> Rule {
-    RuleBuilder::match_category("xor-self-to-zero", OpcodeCategory::XorRR)
+    RuleBuilder::match_opcode("xor-self-to-zero", AArch64Opcode::EorRR)
         .benefit(10)
         .constrain(OperandsEqual { a: 1, b: 2 })
         .rewrite_with(xor_self_rewrite)
@@ -210,7 +208,7 @@ fn xor_self_rewrite(ctx: &MatchCtx<'_>) -> RewriteAction {
 
 /// Build the `lsl x, y, #0` → `mov x, y` rule.
 pub fn rule_lsl_ri_zero() -> Rule {
-    RuleBuilder::match_category("lsl-ri-zero-to-mov", OpcodeCategory::ShlRI)
+    RuleBuilder::match_opcode("lsl-ri-zero-to-mov", AArch64Opcode::LslRI)
         .benefit(10)
         .constrain(ImmEquals { idx: 2, value: 0 })
         .rewrite_with(shift_ri_zero_rewrite)
@@ -218,7 +216,7 @@ pub fn rule_lsl_ri_zero() -> Rule {
 
 /// Build the `lsr x, y, #0` → `mov x, y` rule.
 pub fn rule_lsr_ri_zero() -> Rule {
-    RuleBuilder::match_category("lsr-ri-zero-to-mov", OpcodeCategory::ShrRI)
+    RuleBuilder::match_opcode("lsr-ri-zero-to-mov", AArch64Opcode::LsrRI)
         .benefit(10)
         .constrain(ImmEquals { idx: 2, value: 0 })
         .rewrite_with(shift_ri_zero_rewrite)
@@ -226,7 +224,7 @@ pub fn rule_lsr_ri_zero() -> Rule {
 
 /// Build the `asr x, y, #0` → `mov x, y` rule.
 pub fn rule_asr_ri_zero() -> Rule {
-    RuleBuilder::match_category("asr-ri-zero-to-mov", OpcodeCategory::SarRI)
+    RuleBuilder::match_opcode("asr-ri-zero-to-mov", AArch64Opcode::AsrRI)
         .benefit(10)
         .constrain(ImmEquals { idx: 2, value: 0 })
         .rewrite_with(shift_ri_zero_rewrite)
@@ -248,7 +246,7 @@ fn shift_ri_zero_rewrite(ctx: &MatchCtx<'_>) -> RewriteAction {
 
 /// Build the `sub x, y, y` → `mov x, #0` rule.
 pub fn rule_sub_self_zero() -> Rule {
-    RuleBuilder::match_category("sub-self-to-zero", OpcodeCategory::SubRR)
+    RuleBuilder::match_opcode("sub-self-to-zero", AArch64Opcode::SubRR)
         .benefit(10)
         .constrain(OperandsEqual { a: 1, b: 2 })
         .rewrite_with(sub_self_rewrite)
@@ -271,7 +269,7 @@ fn sub_self_rewrite(ctx: &MatchCtx<'_>) -> RewriteAction {
 
 /// Build the `orr x, y, #0` → `mov x, y` rule.
 pub fn rule_orr_ri_zero() -> Rule {
-    RuleBuilder::match_category("orr-ri-zero-to-mov", OpcodeCategory::OrRI)
+    RuleBuilder::match_opcode("orr-ri-zero-to-mov", AArch64Opcode::OrrRI)
         .benefit(10)
         .constrain(ImmEquals { idx: 2, value: 0 })
         .rewrite_with(orr_ri_zero_rewrite)
@@ -289,7 +287,7 @@ fn orr_ri_zero_rewrite(ctx: &MatchCtx<'_>) -> RewriteAction {
 
 /// Build the `orr x, y, #-1` → `mov x, #-1` rule.
 pub fn rule_orr_ri_minus_one() -> Rule {
-    RuleBuilder::match_category("orr-ri-all-ones-to-movi", OpcodeCategory::OrRI)
+    RuleBuilder::match_opcode("orr-ri-all-ones-to-movi", AArch64Opcode::OrrRI)
         .benefit(10)
         .constrain(ImmEquals { idx: 2, value: -1 })
         .rewrite_with(orr_ri_minus_one_rewrite)
@@ -311,7 +309,7 @@ fn orr_ri_minus_one_rewrite(ctx: &MatchCtx<'_>) -> RewriteAction {
 
 /// Build the `eor x, y, #0` → `mov x, y` rule.
 pub fn rule_eor_ri_zero() -> Rule {
-    RuleBuilder::match_category("eor-ri-zero-to-mov", OpcodeCategory::XorRI)
+    RuleBuilder::match_opcode("eor-ri-zero-to-mov", AArch64Opcode::EorRI)
         .benefit(10)
         .constrain(ImmEquals { idx: 2, value: 0 })
         .rewrite_with(eor_ri_zero_rewrite)
@@ -334,7 +332,7 @@ fn eor_ri_zero_rewrite(ctx: &MatchCtx<'_>) -> RewriteAction {
 
 /// Build the `and x, y, #0` → `mov x, #0` rule.
 pub fn rule_and_ri_zero() -> Rule {
-    RuleBuilder::match_category("and-ri-zero-to-zero", OpcodeCategory::AndRI)
+    RuleBuilder::match_opcode("and-ri-zero-to-zero", AArch64Opcode::AndRI)
         .benefit(10)
         .constrain(ImmEquals { idx: 2, value: 0 })
         .rewrite_with(and_ri_zero_rewrite)
@@ -352,7 +350,7 @@ fn and_ri_zero_rewrite(ctx: &MatchCtx<'_>) -> RewriteAction {
 
 /// Build the `and x, y, #-1` → `mov x, y` rule.
 pub fn rule_and_ri_minus_one() -> Rule {
-    RuleBuilder::match_category("and-ri-all-ones-to-mov", OpcodeCategory::AndRI)
+    RuleBuilder::match_opcode("and-ri-all-ones-to-mov", AArch64Opcode::AndRI)
         .benefit(10)
         .constrain(ImmEquals { idx: 2, value: -1 })
         .rewrite_with(and_ri_minus_one_rewrite)
@@ -374,7 +372,7 @@ fn and_ri_minus_one_rewrite(ctx: &MatchCtx<'_>) -> RewriteAction {
 
 /// Build the `orr x, y, y` → `mov x, y` rule.
 pub fn rule_orr_self() -> Rule {
-    RuleBuilder::match_category("orr-self-to-mov", OpcodeCategory::OrRR)
+    RuleBuilder::match_opcode("orr-self-to-mov", AArch64Opcode::OrrRR)
         .benefit(10)
         .constrain(OperandsEqual { a: 1, b: 2 })
         .rewrite_with(logical_self_rewrite)
@@ -382,7 +380,7 @@ pub fn rule_orr_self() -> Rule {
 
 /// Build the `and x, y, y` → `mov x, y` rule.
 pub fn rule_and_self() -> Rule {
-    RuleBuilder::match_category("and-self-to-mov", OpcodeCategory::AndRR)
+    RuleBuilder::match_opcode("and-self-to-mov", AArch64Opcode::AndRR)
         .benefit(10)
         .constrain(OperandsEqual { a: 1, b: 2 })
         .rewrite_with(logical_self_rewrite)
@@ -404,7 +402,7 @@ fn logical_self_rewrite(ctx: &MatchCtx<'_>) -> RewriteAction {
 
 /// Build the `add x, y, y` → `lsl x, y, #1` rule.
 pub fn rule_add_self_to_shl() -> Rule {
-    RuleBuilder::match_category("add-self-to-shl", OpcodeCategory::AddRR)
+    RuleBuilder::match_opcode("add-self-to-shl", AArch64Opcode::AddRR)
         .benefit(10)
         .constrain(OperandsEqual { a: 1, b: 2 })
         .rewrite_with(add_self_to_shl_rewrite)
@@ -430,7 +428,7 @@ fn add_self_to_shl_rewrite(ctx: &MatchCtx<'_>) -> RewriteAction {
 
 /// Build the `nop` → delete rule.
 pub fn rule_nop_delete() -> Rule {
-    RuleBuilder::match_category("nop-delete", OpcodeCategory::Nop)
+    RuleBuilder::match_opcode("nop-delete", AArch64Opcode::Nop)
         .benefit(20)
         .rewrite_with(|_ctx| RewriteAction::Delete)
 }
@@ -442,7 +440,7 @@ pub fn rule_nop_delete() -> Rule {
 
 /// Build the `add x, y, #-N` → `sub x, y, #N` rule.
 pub fn rule_add_ri_negative_canonicalize() -> Rule {
-    RuleBuilder::match_category("add-ri-negative-to-sub", OpcodeCategory::AddRI)
+    RuleBuilder::match_opcode("add-ri-negative-to-sub", AArch64Opcode::AddRI)
         .benefit(5)
         .constrain(ImmNegativeNonMin { idx: 2 })
         .rewrite_with(add_ri_negative_rewrite)
@@ -476,7 +474,7 @@ fn add_ri_negative_rewrite(ctx: &MatchCtx<'_>) -> RewriteAction {
 
 /// Build the `sub x, y, #-N` → `add x, y, #N` rule.
 pub fn rule_sub_ri_negative_canonicalize() -> Rule {
-    RuleBuilder::match_category("sub-ri-negative-to-add", OpcodeCategory::SubRI)
+    RuleBuilder::match_opcode("sub-ri-negative-to-add", AArch64Opcode::SubRI)
         .benefit(5)
         .constrain(ImmNegativeNonMin { idx: 2 })
         .rewrite_with(sub_ri_negative_rewrite)
@@ -654,7 +652,7 @@ pub fn rule_uxtw_uxtw() -> Rule {
 //
 // Each rule below uses `MatchCtx::definer_of` (via the `DefinedByOpcode` /
 // `DefinedByOneOf` constraints and in-rewriter reads). The same-block
-// def map is built once per block by the engine — these rules re-use it.
+// The engine maintains one forward def map per block — these rules re-use it.
 // =========================================================================
 
 // -------------------------------------------------------------------------
@@ -664,7 +662,7 @@ pub fn rule_uxtw_uxtw() -> Rule {
 
 /// `add x, y, neg(z)` → `sub x, y, z` — RHS operand is defined by NEG.
 pub fn rule_add_neg_rhs() -> Rule {
-    RuleBuilder::match_category("add-of-neg-rhs-to-sub", OpcodeCategory::AddRR)
+    RuleBuilder::match_opcode("add-of-neg-rhs-to-sub", AArch64Opcode::AddRR)
         .benefit(15)
         .constrain(DefinedByOpcode {
             idx: 2,
@@ -691,7 +689,7 @@ pub fn rule_add_neg_rhs() -> Rule {
 
 /// `add x, neg(z), y` → `sub x, y, z` — LHS operand is defined by NEG.
 pub fn rule_add_neg_lhs() -> Rule {
-    RuleBuilder::match_category("add-of-neg-lhs-to-sub", OpcodeCategory::AddRR)
+    RuleBuilder::match_opcode("add-of-neg-lhs-to-sub", AArch64Opcode::AddRR)
         .benefit(14)
         .constrain(DefinedByOpcode {
             idx: 1,
@@ -723,7 +721,7 @@ pub fn rule_add_neg_lhs() -> Rule {
 
 /// `sub x, y, neg(z)` → `add x, y, z`.
 pub fn rule_sub_neg_to_add() -> Rule {
-    RuleBuilder::match_category("sub-of-neg-to-add", OpcodeCategory::SubRR)
+    RuleBuilder::match_opcode("sub-of-neg-to-add", AArch64Opcode::SubRR)
         .benefit(15)
         .constrain(DefinedByOpcode {
             idx: 2,
@@ -878,7 +876,7 @@ fn rule_mul_movi_const(
     benefit: i32,
     rewriter: fn(&MatchCtx<'_>) -> RewriteAction,
 ) -> Rule {
-    RuleBuilder::match_category(name, OpcodeCategory::MulRR)
+    RuleBuilder::match_opcode(name, AArch64Opcode::MulRR)
         .benefit(benefit)
         .constrain(DefinedByOpcode {
             idx: const_idx,
@@ -1032,7 +1030,7 @@ fn udiv_pow2_rewrite(ctx: &MatchCtx<'_>) -> RewriteAction {
 
 /// Pattern 23: `mul x, y, MovI(#2^k)` -> `lsl x, y, #k`.
 pub fn rule_mul_pow2_rhs() -> Rule {
-    RuleBuilder::match_category("mul-pow2-rhs-to-lsl", OpcodeCategory::MulRR)
+    RuleBuilder::match_opcode("mul-pow2-rhs-to-lsl", AArch64Opcode::MulRR)
         .benefit(14)
         .constrain(DefinedByOpcode {
             idx: 2,
@@ -1047,7 +1045,7 @@ pub fn rule_mul_pow2_rhs() -> Rule {
 
 /// Pattern 23 commuted: `mul x, MovI(#2^k), y` -> `lsl x, y, #k`.
 pub fn rule_mul_pow2_lhs() -> Rule {
-    RuleBuilder::match_category("mul-pow2-lhs-to-lsl", OpcodeCategory::MulRR)
+    RuleBuilder::match_opcode("mul-pow2-lhs-to-lsl", AArch64Opcode::MulRR)
         .benefit(14)
         .constrain(DefinedByOpcode {
             idx: 1,
@@ -1299,7 +1297,7 @@ pub fn rule_sdiv_by_neg_one() -> Rule {
 
 /// Pattern 42 with ADD in its canonical form: `sub(add(x, y), y)` → `mov x`.
 pub fn rule_sub_of_add_cancel_rhs() -> Rule {
-    RuleBuilder::match_category("sub-of-add-cancel-rhs", OpcodeCategory::SubRR)
+    RuleBuilder::match_opcode("sub-of-add-cancel-rhs", AArch64Opcode::SubRR)
         .benefit(15)
         .constrain(DefinedByOpcode {
             idx: 1,
@@ -1327,7 +1325,7 @@ pub fn rule_sub_of_add_cancel_rhs() -> Rule {
 
 /// Pattern 42 with ADD commuted: `sub(add(y, x), y)` → `mov x`.
 pub fn rule_sub_of_add_cancel_lhs() -> Rule {
-    RuleBuilder::match_category("sub-of-add-cancel-lhs", OpcodeCategory::SubRR)
+    RuleBuilder::match_opcode("sub-of-add-cancel-lhs", AArch64Opcode::SubRR)
         .benefit(14)
         .constrain(DefinedByOpcode {
             idx: 1,
@@ -1366,7 +1364,7 @@ pub fn rule_sub_of_add_cancel_lhs() -> Rule {
 
 /// Pattern 41: `add(sub(x, y), y)` → `mov x` — LHS is the SUB definer.
 pub fn rule_add_of_sub_cancel_lhs_def() -> Rule {
-    RuleBuilder::match_category("add-of-sub-cancel-lhs-def", OpcodeCategory::AddRR)
+    RuleBuilder::match_opcode("add-of-sub-cancel-lhs-def", AArch64Opcode::AddRR)
         .benefit(15)
         .constrain(DefinedByOpcode {
             idx: 1,
@@ -1397,7 +1395,7 @@ pub fn rule_add_of_sub_cancel_lhs_def() -> Rule {
 /// collapse to "`outer[1]` equals the SUB subtrahend; emit `mov` of the
 /// SUB minuend".
 pub fn rule_add_of_sub_cancel_rhs_def() -> Rule {
-    RuleBuilder::match_category("add-of-sub-cancel-rhs-def", OpcodeCategory::AddRR)
+    RuleBuilder::match_opcode("add-of-sub-cancel-rhs-def", AArch64Opcode::AddRR)
         .benefit(14)
         .constrain(DefinedByOpcode {
             idx: 2,
@@ -1441,7 +1439,7 @@ pub fn rule_add_of_sub_cancel_rhs_def() -> Rule {
 
 /// Pattern 52a: `eor(eor(x, y), y)` → `mov x` — LHS def, outer-rhs matches inner-rhs.
 pub fn rule_eor_cancel_lhs_def_outer_rhs_matches_inner_rhs() -> Rule {
-    RuleBuilder::match_category("eor-cancel-lhs-def-rhs-rhs", OpcodeCategory::XorRR)
+    RuleBuilder::match_opcode("eor-cancel-lhs-def-rhs-rhs", AArch64Opcode::EorRR)
         .benefit(13)
         .constrain(DefinedByOpcode {
             idx: 1,
@@ -1457,7 +1455,7 @@ pub fn rule_eor_cancel_lhs_def_outer_rhs_matches_inner_rhs() -> Rule {
 
 /// Pattern 52b: `eor(eor(y, x), y)` → `mov x` — LHS def, outer-rhs matches inner-lhs.
 pub fn rule_eor_cancel_lhs_def_outer_rhs_matches_inner_lhs() -> Rule {
-    RuleBuilder::match_category("eor-cancel-lhs-def-rhs-lhs", OpcodeCategory::XorRR)
+    RuleBuilder::match_opcode("eor-cancel-lhs-def-rhs-lhs", AArch64Opcode::EorRR)
         .benefit(13)
         .constrain(DefinedByOpcode {
             idx: 1,
@@ -1473,7 +1471,7 @@ pub fn rule_eor_cancel_lhs_def_outer_rhs_matches_inner_lhs() -> Rule {
 
 /// Pattern 52c: `eor(y, eor(x, y))` → `mov x` — RHS def, outer-lhs matches inner-rhs.
 pub fn rule_eor_cancel_rhs_def_outer_lhs_matches_inner_rhs() -> Rule {
-    RuleBuilder::match_category("eor-cancel-rhs-def-lhs-rhs", OpcodeCategory::XorRR)
+    RuleBuilder::match_opcode("eor-cancel-rhs-def-lhs-rhs", AArch64Opcode::EorRR)
         .benefit(13)
         .constrain(DefinedByOpcode {
             idx: 2,
@@ -1489,7 +1487,7 @@ pub fn rule_eor_cancel_rhs_def_outer_lhs_matches_inner_rhs() -> Rule {
 
 /// Pattern 52d: `eor(y, eor(y, x))` → `mov x` — RHS def, outer-lhs matches inner-lhs.
 pub fn rule_eor_cancel_rhs_def_outer_lhs_matches_inner_lhs() -> Rule {
-    RuleBuilder::match_category("eor-cancel-rhs-def-lhs-lhs", OpcodeCategory::XorRR)
+    RuleBuilder::match_opcode("eor-cancel-rhs-def-lhs-lhs", AArch64Opcode::EorRR)
         .benefit(13)
         .constrain(DefinedByOpcode {
             idx: 2,
@@ -1892,7 +1890,9 @@ pub fn register_migrated(engine: &mut RewriteEngine) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use trust_cg_ir::{AArch64Opcode, BlockId, MachFunction, RegClass, Signature, VReg};
+    use trust_cg_ir::{
+        AArch64Opcode, BlockId, MachFunction, OpcodeCategory, RegClass, Signature, VReg,
+    };
 
     fn vreg(id: u32) -> MachOperand {
         MachOperand::VReg(VReg::new(id, RegClass::Gpr64))
@@ -2016,6 +2016,81 @@ mod tests {
                 assert_eq!(after.operands.len(), 4);
             }
         }
+    }
+
+    #[test]
+    fn xor_self_rejects_shifted_eor_category_neighbors() {
+        // `y ^ rotate(y, 1)`, `y ^ (y << 1)`, and `y ^ (y >> 1)` are not
+        // zero. These fused instructions share the target-independent XorRR
+        // category with EorRR, so the scalar identity rule must match exactly.
+        for opcode in [
+            AArch64Opcode::EorRRShift,
+            AArch64Opcode::EorRRLsl,
+            AArch64Opcode::EorRRLsr,
+        ] {
+            let (mut func, entry) = single_block_func(vec![MachInst::new(
+                opcode,
+                vec![vreg(0), vreg(7), vreg(7), MachOperand::Imm(1)],
+            )]);
+            let mut engine = RewriteEngine::new();
+            engine.register(rule_xor_self_zero());
+            let stats = engine.run_to_fixpoint(&mut func, 4);
+
+            assert_eq!(stats.rewrites, 0, "{opcode:?} matched EorRR identity");
+            assert_eq!(func.inst(func.block(entry).insts[0]).opcode, opcode);
+        }
+    }
+
+    #[test]
+    fn scalar_rules_reject_distinct_arithmetic_category_neighbors() {
+        // AddRIShift12 applies its immediate after a 12-bit shift; rewriting
+        // it as an unshifted SubRI changes the value. NeonAddV/NeonSubV are
+        // SIMD operations and must never enter scalar integer identities.
+        let fpr = |id| MachOperand::VReg(VReg::new(id, RegClass::Fpr128));
+        let cases = [
+            (
+                MachInst::new(
+                    AArch64Opcode::AddRIShift12,
+                    vec![vreg(0), vreg(1), MachOperand::Imm(-1)],
+                ),
+                rule_add_ri_negative_canonicalize(),
+            ),
+            (
+                MachInst::new(AArch64Opcode::NeonAddV, vec![fpr(0), fpr(3), fpr(3)]),
+                rule_add_self_to_shl(),
+            ),
+            (
+                MachInst::new(AArch64Opcode::NeonSubV, vec![fpr(0), fpr(3), fpr(3)]),
+                rule_sub_self_zero(),
+            ),
+        ];
+
+        for (inst, rule) in cases {
+            let opcode = inst.opcode;
+            let (mut func, entry) = single_block_func(vec![inst]);
+            let mut engine = RewriteEngine::new();
+            engine.register(rule);
+            let stats = engine.run_to_fixpoint(&mut func, 4);
+
+            assert_eq!(stats.rewrites, 0, "{opcode:?} matched a scalar identity");
+            assert_eq!(func.inst(func.block(entry).insts[0]).opcode, opcode);
+        }
+    }
+
+    #[test]
+    fn scalar_mul_rule_rejects_neon_category_neighbor() {
+        let fpr = |id| MachOperand::VReg(VReg::new(id, RegClass::Fpr128));
+        let (mut func, entry) = single_block_func(vec![
+            MachInst::new(AArch64Opcode::MovI, vec![fpr(1), MachOperand::Imm(1)]),
+            MachInst::new(AArch64Opcode::NeonMulV, vec![fpr(0), fpr(2), fpr(1)]),
+        ]);
+        let mut engine = RewriteEngine::new();
+        engine.register(rule_mul_by_one_rhs());
+        let stats = engine.run_to_fixpoint(&mut func, 4);
+
+        assert_eq!(stats.rewrites, 0, "NeonMulV matched scalar MulRR rule");
+        let neon_mul = func.block(entry).insts[1];
+        assert_eq!(func.inst(neon_mul).opcode, AArch64Opcode::NeonMulV);
     }
 
     #[test]

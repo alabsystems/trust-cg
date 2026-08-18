@@ -494,6 +494,49 @@ fn enum_with_producer_layout_fails_closed() {
 }
 
 #[test]
+fn untagged_enum_layout_fails_closed_until_lir_has_a_tag_free_carrier() {
+    let enum_ty = Ty::Enum(EnumId::new(0));
+    let mut module = make_identity_function(vec![enum_ty.clone()], vec![enum_ty]);
+    module.enums = vec![EnumDef {
+        id: EnumId::new(0),
+        name: "TagFreeI64".to_string(),
+        variants: vec![EnumVariant {
+            name: "Only".to_string(),
+            fields: vec![Ty::I64],
+            field_names: vec!["value".to_string()],
+        }],
+        discriminants: Vec::new(),
+        repr: None,
+        layout: Some(EnumLayoutDescriptor {
+            encoding: EnumTagEncoding::Untagged,
+            size: 8,
+            align: 8,
+            variant_field_offsets: vec![vec![0]],
+        }),
+    }];
+
+    match trust_cg_lower::adapter::translate_module(&module)
+        .expect_err("a tag-free image must not become CG's tag-carrying Type::Enum")
+    {
+        AdapterError::UnsupportedType(msg) => {
+            assert!(
+                msg.contains("EnumDef.layout"),
+                "must name the authority: {msg}"
+            );
+            assert!(
+                msg.contains("untagged encoding"),
+                "must name the encoding: {msg}"
+            );
+            assert!(
+                msg.contains("no tag-free representation"),
+                "must name the missing capability: {msg}"
+            );
+        }
+        other => panic!("expected UnsupportedType, got {other:?}"),
+    }
+}
+
+#[test]
 fn enum_semantics_that_canonical_lowering_does_not_honor_fail_closed() {
     let enum_ty = Ty::Enum(EnumId::new(0));
     let canonical = EnumDef {

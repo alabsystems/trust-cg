@@ -49,7 +49,7 @@ mod common;
 use common::a64_interp::{A64Interp, MachoText, extract_text, symbol_addrs, text_branch_relocs};
 use trust_cg_codegen::compiler::{Compiler, CompilerConfig};
 use trust_cg_codegen::pipeline::OptLevel;
-use trust_cg_codegen::target::Target;
+use trust_cg_codegen::target::{Target, TargetSpec};
 use trust_ir::{
     BinOp, Block as B, BlockId, CallingConv, CastOp, FieldDef, FuncId, FuncTy, FuncTyId,
     Function as F, Inst, InstrNode, Linkage, Module as M, StructDef, StructId, Ty, ValueId,
@@ -200,11 +200,19 @@ fn module(
 }
 
 fn compile(m: &M, opt: OptLevel) -> Vec<u8> {
-    let c = Compiler::new(CompilerConfig {
-        opt_level: opt,
-        target: Target::Aarch64,
-        ..CompilerConfig::default()
-    });
+    // Explicit Darwin spec: the interp harness parses Mach-O (`extract_text`
+    // asserts MH_MAGIC_64), and the default target spec is host-OS-aware —
+    // on a Linux host it would emit ELF. Cross-emission only, never linked or
+    // executed natively; same pattern as e2e_x86_64_dispatcher's
+    // compile_aarch64_darwin_module.
+    let c = Compiler::new_for_target_spec(
+        CompilerConfig {
+            opt_level: opt,
+            target: Target::Aarch64,
+            ..CompilerConfig::default()
+        },
+        TargetSpec::parse("aarch64-apple-darwin").expect("parse aarch64-apple-darwin target spec"),
+    );
     c.compile(m).expect("aarch64 compile").object_code
 }
 

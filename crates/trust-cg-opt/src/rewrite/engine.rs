@@ -14,13 +14,14 @@
 //!   location when replacing, matching the behavior of the hand-written
 //!   peephole pass,
 //! - optionally records provenance for in-place replacements and deletions,
-//! - invalidates the per-block def map after any change, and
+//! - maintains a forward, block-local reaching-definition map over the
+//!   surviving post-rewrite instructions, and
 //! - iterates to fixed point.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
 
-use trust_cg_ir::{BlockId, InstId, MachFunction, MachOperand, PassId, ProvenanceMap, VReg};
+use trust_cg_ir::{InstId, MachFunction, MachOperand, PassId, ProvenanceMap, VReg};
 
 use crate::rewrite::matcher::MatchCtx;
 use crate::rewrite::rewriter::RewriteAction;
@@ -112,8 +113,11 @@ impl RewriteEngine {
         let mut to_delete: HashSet<InstId> = HashSet::new();
 
         for block_id in func.block_order.clone() {
-            // Build def map for this block.
-            let mut def_map = build_def_map(func, block_id);
+            // Forward reaching-definition map for this block. Start empty and
+            // record a definition only after its instruction has been visited:
+            // preloading the block's final writers lets a rule inspect a future
+            // redefinition and is unsound in non-SSA machine IR.
+            let mut def_map = HashMap::new();
             let inst_ids = func.block(block_id).insts.clone();
             for inst_id in inst_ids {
                 if to_delete.contains(&inst_id) {
@@ -165,11 +169,6 @@ impl RewriteEngine {
                             if new_inst.source_loc.is_none() {
                                 new_inst.source_loc = orig_loc;
                             }
-                            // Update def map if the new instruction defs a
-                            // VReg in operand 0.
-                            if let Some(MachOperand::VReg(dst)) = new_inst.operands.first() {
-                                def_map.insert(*dst, inst_id);
-                            }
                             *func.inst_mut(inst_id) = new_inst;
                             if let (Some(provenance), Some(pass)) =
                                 (provenance.as_deref_mut(), provenance_pass)
@@ -194,19 +193,17 @@ impl RewriteEngine {
                                     ),
                                 );
                             }
-                            // Remove from def map so downstream rules in this
-                            // block can't see the deleted definer.
-                            let inst = func.inst(inst_id);
-                            if let Some(MachOperand::VReg(dst)) = inst.operands.first()
-                                && def_map.get(dst) == Some(&inst_id)
-                            {
-                                def_map.remove(dst);
-                            }
                             stats.rewrites += 1;
                             stats.rule_fires[rule_idx] += 1;
                             changes += 1;
                         }
                     }
+                }
+
+                // Only a surviving instruction may become the reaching
+                // definer for later instructions. Use its post-rewrite shape.
+                if !to_delete.contains(&inst_id) {
+                    record_definition(&mut def_map, func.inst(inst_id), inst_id);
                 }
             }
         }
@@ -232,23 +229,26 @@ impl Default for RewriteEngine {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Build a VReg → defining InstId map for the given block.
-fn build_def_map(func: &MachFunction, block_id: BlockId) -> HashMap<VReg, InstId> {
-    let mut map = HashMap::new();
-    for &inst_id in &func.block(block_id).insts {
-        let inst = func.inst(inst_id);
-        if inst.opcode.produces_value()
-            && let Some(MachOperand::VReg(dst)) = inst.operands.first()
-        {
-            map.insert(*dst, inst_id);
-        }
+/// Record one instruction's value definition in a forward block-local map.
+fn record_definition(
+    def_map: &mut HashMap<VReg, InstId>,
+    inst: &trust_cg_ir::MachInst,
+    id: InstId,
+) {
+    if inst.opcode.produces_value()
+        && let Some(MachOperand::VReg(dst)) = inst.operands.first()
+    {
+        def_map.insert(*dst, id);
     }
-    map
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rewrite::patterns::{
+        rule_add_self_to_shl, rule_lsr_lsl_to_and, rule_mul_by_one_rhs, rule_mul_by_zero_rhs,
+        rule_self_move_delete,
+    };
     use trust_cg_ir::{AArch64Opcode, RegClass, Signature};
 
     fn vreg(id: u32, class: RegClass) -> MachOperand {
@@ -256,7 +256,7 @@ mod tests {
     }
 
     #[test]
-    fn build_def_map_keeps_same_id_different_classes_distinct() {
+    fn reaching_def_map_keeps_same_id_different_classes_distinct() {
         let mut func = MachFunction::new("t".into(), Signature::new(vec![], vec![]));
         let entry = func.entry;
         let gpr32 = func.push_inst(trust_cg_ir::MachInst::new(
@@ -270,9 +270,116 @@ mod tests {
         ));
         func.append_inst(entry, gpr64);
 
-        let def_map = build_def_map(&func, entry);
+        let mut def_map = HashMap::new();
+        record_definition(&mut def_map, func.inst(gpr32), gpr32);
+        record_definition(&mut def_map, func.inst(gpr64), gpr64);
 
         assert_eq!(def_map.get(&VReg::new(1, RegClass::Gpr32)), Some(&gpr32));
         assert_eq!(def_map.get(&VReg::new(1, RegClass::Gpr64)), Some(&gpr64));
+    }
+
+    #[test]
+    fn rewrite_uses_latest_prior_writer_never_future_redefinition() {
+        // movi v1, #1
+        // mul  v2, v3, v1   ; must see #1 and rewrite to mov v2, v3
+        // movi v1, #0       ; future writer must not rewrite the MUL to zero
+        let mut func = MachFunction::new("t".into(), Signature::new(vec![], vec![]));
+        let entry = func.entry;
+        let v = |id| MachOperand::VReg(VReg::new(id, RegClass::Gpr64));
+        let prior = func.push_inst(trust_cg_ir::MachInst::new(
+            AArch64Opcode::MovI,
+            vec![v(1), MachOperand::Imm(1)],
+        ));
+        func.append_inst(entry, prior);
+        let mul = func.push_inst(trust_cg_ir::MachInst::new(
+            AArch64Opcode::MulRR,
+            vec![v(2), v(3), v(1)],
+        ));
+        func.append_inst(entry, mul);
+        let future = func.push_inst(trust_cg_ir::MachInst::new(
+            AArch64Opcode::MovI,
+            vec![v(1), MachOperand::Imm(0)],
+        ));
+        func.append_inst(entry, future);
+
+        let mut engine = RewriteEngine::new();
+        engine.register(rule_mul_by_zero_rhs());
+        engine.register(rule_mul_by_one_rhs());
+        let stats = engine.run_to_fixpoint(&mut func, 4);
+
+        assert_eq!(stats.rewrites, 1);
+        let rewritten = func.inst(mul);
+        assert_eq!(rewritten.opcode, AArch64Opcode::MovR);
+        assert_eq!(rewritten.operands, vec![v(2), v(3)]);
+    }
+
+    #[test]
+    fn rewritten_instruction_becomes_reaching_def_for_later_rule() {
+        // add v1, v0, v0  -> lsl v1, v0, #1
+        // lsr v2, v1, #1  -> and v2, v0, #0x7fff_ffff_ffff_ffff
+        let mut func = MachFunction::new("t".into(), Signature::new(vec![], vec![]));
+        let entry = func.entry;
+        let v = |id| MachOperand::VReg(VReg::new(id, RegClass::Gpr64));
+        let add = func.push_inst(trust_cg_ir::MachInst::new(
+            AArch64Opcode::AddRR,
+            vec![v(1), v(0), v(0)],
+        ));
+        func.append_inst(entry, add);
+        let lsr = func.push_inst(trust_cg_ir::MachInst::new(
+            AArch64Opcode::LsrRI,
+            vec![v(2), v(1), MachOperand::Imm(1)],
+        ));
+        func.append_inst(entry, lsr);
+
+        let mut engine = RewriteEngine::new();
+        engine.register(rule_add_self_to_shl());
+        engine.register(rule_lsr_lsl_to_and());
+        let stats = engine.run_to_fixpoint(&mut func, 4);
+
+        assert_eq!(stats.rewrites, 2);
+        assert_eq!(func.inst(add).opcode, AArch64Opcode::LslRI);
+        let rewritten = func.inst(lsr);
+        assert_eq!(rewritten.opcode, AArch64Opcode::AndRI);
+        assert_eq!(
+            rewritten.operands,
+            vec![v(2), v(0), MachOperand::Imm(i64::MAX)]
+        );
+    }
+
+    #[test]
+    fn deleted_self_move_preserves_prior_reaching_def() {
+        // movi v1, #1
+        // mov  v1, v1      ; deleted, prior v1 definition remains reaching
+        // mul  v2, v3, v1  ; therefore rewrites by one, not by zero/unknown
+        let mut func = MachFunction::new("t".into(), Signature::new(vec![], vec![]));
+        let entry = func.entry;
+        let v = |id| MachOperand::VReg(VReg::new(id, RegClass::Gpr64));
+        let prior = func.push_inst(trust_cg_ir::MachInst::new(
+            AArch64Opcode::MovI,
+            vec![v(1), MachOperand::Imm(1)],
+        ));
+        func.append_inst(entry, prior);
+        let self_move = func.push_inst(trust_cg_ir::MachInst::new(
+            AArch64Opcode::MovR,
+            vec![v(1), v(1)],
+        ));
+        func.append_inst(entry, self_move);
+        let mul = func.push_inst(trust_cg_ir::MachInst::new(
+            AArch64Opcode::MulRR,
+            vec![v(2), v(3), v(1)],
+        ));
+        func.append_inst(entry, mul);
+
+        let mut engine = RewriteEngine::new();
+        engine.register(rule_self_move_delete());
+        engine.register(rule_mul_by_zero_rhs());
+        engine.register(rule_mul_by_one_rhs());
+        let stats = engine.run_to_fixpoint(&mut func, 4);
+
+        assert_eq!(stats.rewrites, 2);
+        assert!(!func.block(entry).insts.contains(&self_move));
+        let rewritten = func.inst(mul);
+        assert_eq!(rewritten.opcode, AArch64Opcode::MovR);
+        assert_eq!(rewritten.operands, vec![v(2), v(3)]);
     }
 }

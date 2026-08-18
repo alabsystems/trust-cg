@@ -57,7 +57,7 @@ trust-cg-verify = { path = "../trust-cg-verify", default-features = false }
 # Trust Codegen workspace. The git source + features mirror the root workspace's
 # `workspace.dependencies.trust-ir` so feature unification with the
 # trust-cg-codegen/trust-cg-lower path deps stays consistent.
-trust-ir = { git = "https://github.com/alabsystems/trust-ir.git", rev = "f497428646b05c2f20ff0017f6b01d4924935d12", features = ["serde", "parser", "binary", "dialect-verif-example", "clean-expr"] }
+trust-ir = { git = "https://github.com/alabsystems/trust-ir.git", rev = "32a2c54b555c884a40020093f5910cbb5e2050ab", features = ["serde", "parser", "binary", "dialect-verif-example", "clean-expr"] }
 
 [package.metadata.rust-analyzer]
 # Tell rust-analyzer to enable `rustc_private` so it indexes our

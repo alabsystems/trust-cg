@@ -1218,26 +1218,40 @@ impl PRegSet {
     }
 }
 
-/// `overlap_masks()[q]` = the set of all encodings `m` with
+/// `overlap_masks().get(q)` = the set of all encodings `m` with
 /// `pregs_overlap(PReg(m), PReg(q))` — the exact orientation used by both
 /// `remove_overlapping_pregs` (kill side) and the `live_out` overlap queries.
-/// Built once per process directly from `allocator_pregs_overlap`, so it is
-/// correct by construction for every target the allocator models.
-fn overlap_masks() -> &'static [PRegSet] {
-    use std::sync::OnceLock;
-    static MASKS: OnceLock<Vec<PRegSet>> = OnceLock::new();
-    MASKS.get_or_init(|| {
-        let mut masks = vec![PRegSet::EMPTY; PREG_SET_BITS as usize];
-        for (q, mask) in masks.iter_mut().enumerate() {
-            let q_reg = PReg::new(q as u16);
+/// Each mask is built on first use directly from `pregs_overlap`, so it is
+/// correct by construction for every target the allocator models. Laziness is
+/// load-bearing for compile time: the eager 640×640 sweep (409,600
+/// `pregs_overlap` calls, ~1.8 ms) was a per-process tax paid by even an
+/// empty crate, while a real compile only ever queries the few dozen
+/// encodings its instructions actually define.
+struct OverlapMasks {
+    cells: Box<[std::sync::OnceLock<PRegSet>]>,
+}
+
+impl OverlapMasks {
+    fn get(&self, q: u16) -> &PRegSet {
+        self.cells[q as usize].get_or_init(|| {
+            let mut mask = PRegSet::EMPTY;
+            let q_reg = PReg::new(q);
             for m in 0..PREG_SET_BITS {
                 let m_reg = PReg::new(m);
                 if pregs_overlap(m_reg, q_reg) {
                     mask.insert(m_reg);
                 }
             }
-        }
-        masks
+            mask
+        })
+    }
+}
+
+fn overlap_masks() -> &'static OverlapMasks {
+    use std::sync::OnceLock;
+    static MASKS: OnceLock<OverlapMasks> = OnceLock::new();
+    MASKS.get_or_init(|| OverlapMasks {
+        cells: (0..PREG_SET_BITS).map(|_| OnceLock::new()).collect(),
     })
 }
 
@@ -1264,7 +1278,7 @@ struct BlockSummary {
     kill: PRegSet,
 }
 
-fn block_summary(func: &MachFunction, block_idx: usize, masks: &[PRegSet]) -> BlockSummary {
+fn block_summary(func: &MachFunction, block_idx: usize, masks: &OverlapMasks) -> BlockSummary {
     let mut gen_set = PRegSet::EMPTY;
     let mut kill = PRegSet::EMPTY;
     // FORWARD walk; see the composition lemma. NOP'd instructions have empty
@@ -1289,11 +1303,11 @@ fn block_summary(func: &MachFunction, block_idx: usize, masks: &[PRegSet]) -> Bl
         // Then defs (overlap-expanded) into KILL.
         for op in &inst.defs {
             if let MachOperand::PReg(preg) = op {
-                kill.union_with(&masks[preg.encoding() as usize]);
+                kill.union_with(masks.get(preg.encoding()));
             }
         }
         for &preg in &inst.implicit_defs {
-            kill.union_with(&masks[preg.encoding() as usize]);
+            kill.union_with(masks.get(preg.encoding()));
         }
     }
     BlockSummary { gen_set, kill }

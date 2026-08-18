@@ -23,14 +23,12 @@
 # is ZERO soundness failures — a counterexample (the solver DISPROVED an
 # obligation) or an error hard-fails the gate; that is the only thing that can
 # indicate a miscompile. Solver-capacity PENDING (timeouts/unknown) are REPORTED,
-# never a pass and never a hard fail: a timeout is never evidence of a bug, and
-# WHICH obligations time out is non-deterministic (depends on machine load and
-# the per-obligation budget), so failing on them would make the gate flaky rather
-# than stronger. As of 2026-06-08 ~1569/1570 discharge formally with 0 soundness
-# failures (the earlier 22 were fixed: FCVTZS_NaN isNaN-guard, atomic/memory
-# non-interference no-wrap+alignment preconditions, 120s strict budget); the lone
-# stubborn capacity case is `MUL Xd,Xn,#-1 == NEG` (a true 64-bit identity AY
-# bit-blasts). Several minutes; quick smoke via
+# never a pass. Only five audited wide x86 bit-vector obligations may remain
+# pending (Sdiv I32/I64, Srem I32/I64, and V2I64 widening Umul); an entry may
+# graduate to Verified, but any new pending name hard-fails the floor. The
+# registry contains exactly 1,869 unique obligations, so the five-row capacity
+# ceiling requires at least 1,864 formally Verified rows and 0 soundness
+# failures. Several minutes; quick smoke via
 # `--test representative_arithmetic_is_formally_verified`.
 #
 # v0.1.0 intentionally exposes only the external solver lane. It uses an `ay`
@@ -167,7 +165,7 @@ case "${TEST_FILTER}" in
         echo "${gate_summary}" ;;
     representative_arithmetic_is_formally_verified)
         echo "proof gate OK (SMOKE): 6 representative arithmetic obligations formally Verified" \
-             "via AY, plus the fail-closed contract tests. This is NOT the full-database" \
+             "via AY with strict no-statistical-fallback assertions. This is NOT the full-database" \
              "formal floor — run '--test full_database_is_formally_verified' for that." ;;
     *)
         echo "proof gate OK: selected test '${TEST_FILTER}' passed via AY." \

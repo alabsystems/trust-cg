@@ -360,7 +360,7 @@ fn manifest() -> Vec<SoundnessInvariant> {
         // ---- (H) the 4 headline pins + honest-red discipline ---------------
         SoundnessInvariant {
             id: "H",
-            description: "The 4 accepted-obligation pins (AArch64 155/246, RISC-V 14/17, \
+            description: "The 4 accepted-obligation pins (AArch64 155/248, RISC-V 14/17, \
                           WASM 109/111, x86-64 163/192 accepted/emitted-value-effect) hold, and \
                           every uncovered row is an explicit DeferredUnfaithfulModel rather than \
                           a wiring gap. These are evidence-inventory ratios, not formal-proof or \
@@ -403,7 +403,9 @@ fn manifest() -> Vec<SoundnessInvariant> {
                           reconstructed shifted-source forms, yielding 153/246 with 93 RED rows; \
                           Umull then left the deferred set via its faithful zext64 widening \
                           obligation, and complete packed-NZCV TST authority removed another \
-                          RED row. The combined inventory is 155/246 with 91 RED rows.",
+                          RED row. StrbRO/StrhRO then entered the explicit audit universe as \
+                          two honest memory-effect gaps. The combined inventory is 155/248 \
+                          with 93 RED rows.",
             enforcement: InProcess {
                 check_name: "inproc_headline_pins_and_honest",
                 reexercise: inproc_headline_pins_and_honest,
@@ -1178,8 +1180,9 @@ fn inproc_headline_pins_and_honest() {
         // NeonRev32V bring the inventory to 151/244 with 93 explicit deferred
         // rows. EorRRLsl/EorRRLsr reach 153/246. UMULL's faithful widening
         // theorem and complete packed-NZCV TST authority each remove one more
-        // deferred row, yielding 155/246 with 91 deferred rows.
-        (GateArch::AArch64, 246usize, 155usize),
+        // deferred row, yielding 155/246 with 91 deferred rows. StrbRO/StrhRO
+        // add two honest register-offset store gaps to the current inventory.
+        (GateArch::AArch64, 248usize, 155usize),
         (GateArch::RiscV, 17usize, 14usize),
         (GateArch::Wasm, 111usize, 109usize),
         (GateArch::X86_64, 192usize, 163usize),

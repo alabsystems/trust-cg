@@ -40,8 +40,9 @@ pub struct MatchCtx<'a> {
     pub block_id: BlockId,
     /// Enclosing function (read-only view).
     pub func: &'a MachFunction,
-    /// Def map for the current block: VReg -> defining InstId.
-    /// Rebuilt per block; see [`crate::rewrite::engine::RewriteEngine`].
+    /// Forward reaching-def map for the current block: VReg -> prior InstId.
+    /// Built as the engine walks the block; see
+    /// [`crate::rewrite::engine::RewriteEngine`].
     pub def_map: &'a HashMap<VReg, InstId>,
 }
 
@@ -68,11 +69,11 @@ impl<'a> MatchCtx<'a> {
     /// Alias of [`operand_def`](Self::operand_def) named for
     /// definer-driven pattern construction.
     ///
-    /// Returns the unique in-block definer of the VReg at operand
+    /// Returns the latest prior in-block definer of the VReg at operand
     /// position `idx`, or `None` when the operand is not a VReg, is a
     /// block param, is defined outside the current block, or comes from
-    /// a phi / call-return (anything that isn't a single definer we can
-    /// see walking the block).
+    /// a phi / call-return (anything that has no definer observed during
+    /// the current forward block walk).
     #[inline]
     pub fn definer_of(&self, idx: usize) -> Option<&MachInst> {
         self.operand_def(idx)
@@ -96,6 +97,11 @@ impl Matcher for OpcodeMatcher {
 }
 
 /// Matches any instruction whose opcode falls in the given category.
+///
+/// Categories deliberately group some distinct scalar, SIMD, shifted, and
+/// fused forms. A rule may use this matcher only when its constraints and
+/// replacement are sound for every member of the category; algebraic
+/// identities tied to one instruction form should use [`OpcodeMatcher`].
 pub struct CategoryMatcher {
     pub category: OpcodeCategory,
 }

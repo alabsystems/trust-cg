@@ -82,6 +82,7 @@ pub mod dwarf_cfi;
 pub mod dwarf_cfi_decode_check;
 pub mod dwarf_info;
 pub mod elf;
+pub mod post_index_late;
 pub use trust_cg_process_env as env_lock;
 pub mod error;
 pub mod exception_handling;

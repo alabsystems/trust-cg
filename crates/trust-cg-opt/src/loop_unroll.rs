@@ -100,6 +100,16 @@ fn bounded_early_exit_unroll_enabled() -> bool {
     std::env::var_os("TCG_NO_BOUNDED_EARLY_EXIT_UNROLL").is_none()
 }
 
+/// Multiple exit edges in the bounded-early-exit full unroll (default ON).
+/// Kill switch `TCG_NO_BEE_MULTI_EXIT` (any value) restores the historical
+/// exactly-one-exit-edge gate, which the clang -O2 shape of Stanford `Queens`'s
+/// `Try` fails (three exit edges: the trip test, the post-recursion early
+/// return, and the `*q = true` landing pad). See the exit-edge policy note in
+/// [`analyze_bounded_early_exit_loop`] for why extra exits need no rewriting.
+fn bee_multi_exit_enabled() -> bool {
+    std::env::var_os("TCG_NO_BEE_MULTI_EXIT").is_none()
+}
+
 /// Compile-time kill switch for the const-addr full unroll: set
 /// `TCG_NO_CONST_ADDR_UNROLL` (any value) to disable it.
 fn const_addr_unroll_enabled() -> bool {
@@ -110,6 +120,15 @@ fn const_addr_unroll_enabled() -> bool {
 /// set `TCG_NO_DIAMOND_CONST_TRIP_UNROLL` (any value) to disable it.
 fn diamond_unroll_enabled() -> bool {
     std::env::var_os("TCG_NO_DIAMOND_CONST_TRIP_UNROLL").is_none()
+}
+
+/// Compile-time kill switch for the BOUNDED-trip extension of the diamond-body
+/// unroll (trip count proven `<= M` by a dominating guard rather than exactly
+/// `M`; every clone but the last keeps a real exit test): set
+/// `TCG_NO_DIAMOND_BOUNDED_TRIP_UNROLL` (any value) to disable it and fall back
+/// to exact-constant trip counts only.
+fn diamond_bounded_trip_enabled() -> bool {
+    std::env::var_os("TCG_NO_DIAMOND_BOUNDED_TRIP_UNROLL").is_none()
 }
 
 /// Compile-time kill switch for per-clone vreg renaming inside the
@@ -645,6 +664,23 @@ fn swap_rel(r: Rel) -> Rel {
         Rel::UGt => Rel::ULt,
         Rel::ULe => Rel::UGe,
         Rel::UGe => Rel::ULe,
+    }
+}
+
+/// The `CondCode` whose flags-test materializes `a REL b` after `CMP a, b`.
+/// Inverse of `rel_from_int_cc` (total on the relations that function produces).
+fn cc_from_rel(r: Rel) -> CondCode {
+    match r {
+        Rel::Eq => CondCode::EQ,
+        Rel::Ne => CondCode::NE,
+        Rel::SLt => CondCode::LT,
+        Rel::SLe => CondCode::LE,
+        Rel::SGt => CondCode::GT,
+        Rel::SGe => CondCode::GE,
+        Rel::ULt => CondCode::LO,
+        Rel::ULe => CondCode::LS,
+        Rel::UGt => CondCode::HI,
+        Rel::UGe => CondCode::HS,
     }
 }
 
@@ -1714,6 +1750,22 @@ fn analyze_bounded_early_exit_loop(
     lp: &NaturalLoop,
     def_map: &HashMap<VReg, Vec<InstId>>,
 ) -> Option<BoundedEarlyExitLoop> {
+    let dbg = std::env::var("TCG_BEE_DEBUG").as_deref() == Ok("1");
+    macro_rules! gate {
+        ($n:expr, $why:expr) => {{
+            if dbg {
+                eprintln!(
+                    "BEE reject fn={} header=B{} body={}: gate{} {}",
+                    func.name,
+                    lp.header.0,
+                    lp.body.len(),
+                    $n,
+                    $why
+                );
+            }
+            return None;
+        }};
+    }
     let _preheader = lp.preheader?;
     let header = lp.header;
     let latch = lp.latch;
@@ -1721,49 +1773,164 @@ fn analyze_bounded_early_exit_loop(
     // Multi-block loop only (the clean 2-block shape is handled by
     // `analyze_copy_counted_loop`).
     if lp.body.len() < 3 || latch == header || !lp.body.contains(&latch) {
-        return None;
+        gate!(1, "not a multi-block loop with a distinct in-body latch");
     }
 
-    // The loop must have EXACTLY ONE exit edge (body -> non-body). Its source is
-    // the exit-test block `T`, its target the exit block `X`. Every "early exit"
-    // inside the trial stays in the loop (branches to `T`).
-    let mut exit_edge: Option<(BlockId, BlockId)> = None;
+    // ---- SINGLE ENTRY (structural precondition for cloning at all) ----------
+    // The unrolled chain is `preheader -> clone_1 -> ... -> clone_m`, and every
+    // clone materializes its iteration's IV as a CONSTANT in its own header.
+    // That is only equivalent to the original loop if the ONLY way into the
+    // loop's code is through the header, from the preheader: an edge from
+    // outside into any other body block would, after the transform, land in
+    // clone 1 with `iv_next` holding a stale constant instead of the
+    // register-carried IV the original would have had.
+    //
+    // BELT AND BRACES, not the load-bearing gate: `compute_loop_body` walks
+    // predecessors back from the latch and stops only at the header, so any
+    // outside block that jumps into the body is itself ABSORBED into the body
+    // (together with its own predecessors), which normally destroys the unique
+    // non-body header predecessor and makes `lp.preheader` `None` two lines
+    // above. Every multi-entry shape that could be constructed against this
+    // analysis is already refused there — no test pins this loop, because none
+    // can reach it. It is kept so the requirement is stated where the transform
+    // depends on it and so the pass fails closed if the body computation or the
+    // preheader rule ever changes.
+    for &b in &lp.body {
+        for &p in &func.block(b).preds {
+            if lp.body.contains(&p) {
+                continue;
+            }
+            if b == header && p == _preheader {
+                continue;
+            }
+            gate!(
+                1,
+                format!("loop is multi-entry: B{} enters body block B{}", p.0, b.0)
+            );
+        }
+    }
+    // ---- SINGLE BACK-EDGE ---------------------------------------------------
+    // `LoopAnalysis` MERGES multiple back-edges into one loop and keeps only the
+    // first latch (see `LoopAnalysis::compute`), so a second in-body predecessor
+    // of the header is invisible to the latch checks below. It is fatal here:
+    // that block is cloned verbatim, its `B header` operand is remapped through
+    // the clone map to *its own clone's header*, and the clone spins forever.
+    // Refuse unless the latch is the header's only in-body predecessor.
+    for &p in &func.block(header).preds {
+        if lp.body.contains(&p) && p != latch {
+            gate!(1, format!("second back-edge into the header from B{}", p.0));
+        }
+    }
+
+    // ---- The exit-test block `T` and the exit block `X` ---------------------
+    // `T` is derived from the LATCH (not from the exit-edge set): the latch is
+    // the block the unroller rewires per iteration, so its single predecessor is
+    // by construction the block whose continue/exit branch the unroll rebuilds.
+    let lsuccs = &func.block(latch).succs;
+    if lsuccs.len() != 1 || lsuccs[0] != header {
+        gate!(3, "latch is not a single-successor back-edge block");
+    }
+    let lpreds = &func.block(latch).preds;
+    if lpreds.len() != 1 {
+        gate!(3, "latch has more than one predecessor");
+    }
+    let t = lpreds[0];
+    if t == header || t == latch {
+        gate!(3, "exit-test block is the header or the latch");
+    }
+    // `T`'s successors are exactly {latch (continue), X (exit)}, with `X` out of
+    // the loop.
+    let tsuccs = &func.block(t).succs;
+    if tsuccs.len() != 2 || !tsuccs.contains(&latch) {
+        gate!(3, "exit-test block is not a two-way continue/exit split");
+    }
+    let x = *tsuccs.iter().find(|&&s| s != latch)?;
+    if lp.body.contains(&x) {
+        gate!(3, "exit-test block's non-latch successor stays in the loop");
+    }
+
+    // ---- Exit-edge policy ---------------------------------------------------
+    // Collect every body -> non-body edge. `T -> X` is the loop's trip-test
+    // exit; ANY OTHER exit edge is an "early return" out of the trial (Queens'
+    // `Try` at -O2: the post-recursion `*q != 0` test returns directly, and the
+    // `else *q = true` arm falls into a store-and-return landing pad, instead of
+    // both re-joining the merged `j != 8 && !*q` test the -O1 shape builds).
+    //
+    // ADMITTING THEM IS SOUND, and needs no rewriting at all:
+    //   * each clone is a verbatim copy of the body, so an early-exit branch in
+    //     clone k targets a NON-body block, is therefore absent from the clone
+    //     map, and keeps pointing at the original out-of-loop block — exactly
+    //     the edge iteration k would have taken;
+    //   * at most one clone ever reaches an exit, so the exit target reads the
+    //     values that clone produced;
+    //   * a body-defined vreg that is USED outside the body is excluded from
+    //     per-clone renaming by `renamable_body_vregs` (its condition 2), so
+    //     every clone writes it under the SAME name and the exit target reads
+    //     the executing clone's value. This is the machine-level form of "all
+    //     exit edges agree on the block arguments they pass": there are no
+    //     block parameters at this level, the values are carried in named
+    //     registers, and the renamer is what keeps the names identical across
+    //     clones.
+    //
+    // REFUSED, because the final clone omits the latch entirely: an exit edge
+    // whose SOURCE is the latch would silently lose its path on the last
+    // iteration. (`lsuccs == [header]` above already implies this; the explicit
+    // check is the pin.)
+    //
+    // Kill switch `TCG_NO_BEE_MULTI_EXIT=1` restores the historical
+    // exactly-one-exit-edge gate (byte-identical output).
+    let mut all_exits: Vec<(BlockId, BlockId)> = Vec::new();
     for &b in &lp.body {
         for &s in &func.block(b).succs {
             if !lp.body.contains(&s) {
-                if exit_edge.is_some() {
-                    return None;
-                }
-                exit_edge = Some((b, s));
+                all_exits.push((b, s));
             }
         }
     }
-    let (t, x) = exit_edge?;
-    if t == header || t == latch {
-        return None;
+    all_exits.sort_unstable();
+    all_exits.dedup();
+    if !all_exits.contains(&(t, x)) {
+        gate!(2, "the trip-test exit edge is missing from the exit set");
     }
-
-    // Latch must be the clean back-edge block: single pred == `T` (its continue
-    // successor), single succ == header, reached only from `T`. The unroller
-    // redirects the latch per iteration, so nothing else may enter it.
-    let lsuccs = &func.block(latch).succs;
-    if lsuccs.len() != 1 || lsuccs[0] != header {
-        return None;
+    if !bee_multi_exit_enabled() && all_exits.len() != 1 {
+        gate!(
+            2,
+            format!(
+                "{} exit edges (multi-exit disabled) {:?}",
+                all_exits.len(),
+                all_exits
+                    .iter()
+                    .map(|(a, b)| (a.0, b.0))
+                    .collect::<Vec<_>>()
+            )
+        );
     }
-    let lpreds = &func.block(latch).preds;
-    if lpreds.len() != 1 || lpreds[0] != t {
-        return None;
+    for &(s, d) in &all_exits {
+        if s == latch {
+            gate!(
+                2,
+                format!("exit edge B{} -> B{} leaves from the latch", s.0, d.0)
+            );
+        }
     }
-    // `T`'s successors are exactly {latch (continue), X (exit)}.
-    let tsuccs = &func.block(t).succs;
-    if tsuccs.len() != 2 || !tsuccs.contains(&latch) || !tsuccs.contains(&x) {
-        return None;
+    if dbg && all_exits.len() > 1 {
+        eprintln!(
+            "BEE multi-exit fn={} header=B{}: {:?} (trip-test B{} -> B{})",
+            func.name,
+            header.0,
+            all_exits
+                .iter()
+                .map(|(a, b)| (a.0, b.0))
+                .collect::<Vec<_>>(),
+            t.0,
+            x.0
+        );
     }
 
     // ---- `T` terminator: ... CmpRI vcond,#0 ; BCond[NE]->latch ; B->X ----
     let tinsts = func.block(t).insts.clone();
     if tinsts.len() < 4 {
-        return None;
+        gate!(4, "exit-test block is too short");
     }
     let b_term = *tinsts.last()?;
     let bcond = tinsts[tinsts.len() - 2];
@@ -1772,34 +1939,41 @@ fn analyze_bounded_early_exit_loop(
     let b_inst = func.inst(b_term);
     if b_inst.opcode != AArch64Opcode::B || b_inst.operands.first() != Some(&MachOperand::Block(x))
     {
-        return None;
+        gate!(5, "exit-test terminator is not `B -> X`");
     }
     let bcond_inst = func.inst(bcond);
     if bcond_inst.opcode != AArch64Opcode::BCond {
-        return None;
+        gate!(6, "penultimate terminator is not a BCond");
     }
     // Canonical br_if lowering: BCond[NE] taken (cond != 0) to the in-loop
     // continue target (the latch); the fall-through `B` goes to the exit.
     if cc_from_operand(bcond_inst.operands.first()?)? != CondCode::NE {
-        return None;
+        gate!(7, "continue BCond is not NE");
     }
     match bcond_inst.operands.get(1)? {
         MachOperand::Block(bt) if *bt == latch => {}
-        _ => return None,
+        _ => gate!(8, "continue BCond does not target the latch"),
     }
 
     let vcmp_inst = func.inst(vcond_cmp);
     if vcmp_inst.opcode != AArch64Opcode::CmpRI
         || vcmp_inst.operands.get(1).and_then(|op| op.as_imm()) != Some(0)
     {
-        return None;
+        gate!(9, "branch compare is not `CmpRI vcond, #0`");
     }
     let vcond = vcmp_inst.operands.first()?.as_vreg()?;
 
     // vcond = AndRR(a, b), defined in `T`.
-    let andrr = *def_map.get(&vcond)?.iter().find(|&&id| {
-        func.inst(id).opcode == AArch64Opcode::AndRR && func.block(t).insts.contains(&id)
-    })?;
+    let Some(&andrr) = def_map.get(&vcond).and_then(|d| {
+        d.iter().find(|&&id| {
+            func.inst(id).opcode == AArch64Opcode::AndRR && func.block(t).insts.contains(&id)
+        })
+    }) else {
+        gate!(
+            10,
+            "branch condition is not an AndRR defined in the exit-test block"
+        );
+    };
     let andrr_inst = func.inst(andrr);
     let a = andrr_inst.operands.get(1)?.as_vreg()?;
     let b = andrr_inst.operands.get(2)?.as_vreg()?;
@@ -1811,12 +1985,12 @@ fn analyze_bounded_early_exit_loop(
     for cand in [a, b] {
         if let Some(m) = match_trip_cset(func, def_map, lp, t, header, cand) {
             if trip.is_some() {
-                return None; // ambiguous: both look like the trip test
+                gate!(11, "both AndRR operands look like the trip test");
             }
             trip = Some(m);
         } else {
             if dyn_cond.is_some() {
-                return None; // neither is a trip test
+                gate!(11, "neither AndRR operand is a trip test");
             }
             dyn_cond = Some(cand);
         }
@@ -1827,14 +2001,20 @@ fn analyze_bounded_early_exit_loop(
     // SOUNDNESS: the non-final copies test `dyn_cond != 0` in place of the
     // original `AndRR(trip_bool, dyn) != 0`. With the trip test compile-time
     // TRUE, `AndRR(1, dyn) = dyn & 1`, so `dyn != 0` matches the original only
-    // when `dyn` is a 0/1 boolean. Require `dyn_cond` to be produced by a
-    // `CSet` (always 0 or 1) — else fail closed.
-    let dyn_is_bool = def_map.get(&dyn_cond).is_some_and(|defs| {
-        defs.iter()
-            .all(|&id| func.inst(id).opcode == AArch64Opcode::CSet)
-    });
+    // when `dyn` is a 0/1 boolean. Prove that; else fail closed.
+    let dyn_is_bool = vreg_is_boolean(func, def_map, dyn_cond);
     if !dyn_is_bool {
-        return None;
+        gate!(
+            12,
+            format!(
+                "dynamic condition v{} defs {:?}",
+                dyn_cond.id,
+                def_map.get(&dyn_cond).map(|d| d
+                    .iter()
+                    .map(|&i| (func.inst(i).opcode, func.inst(i).operands.clone()))
+                    .collect::<Vec<_>>())
+            )
+        );
     }
 
     // ---- Prove the constant trip count `M`. The loop continues while
@@ -1843,15 +2023,15 @@ fn analyze_bounded_early_exit_loop(
     let init = trip.iv_init;
     let k = trip.k;
     if step == 0 {
-        return None;
+        gate!(13, "IV step is zero");
     }
     let diff = k - init;
     if diff % step != 0 {
-        return None;
+        gate!(13, "limit is not reached exactly by the IV step");
     }
     let m = diff / step;
     if m < 2 || m > BEE_MAX_TRIP_COUNT as i128 {
-        return None;
+        gate!(13, format!("trip count {m} out of range"));
     }
     // Every materialized IV value must fit a 16-bit Movz, and none before the
     // last may already equal K (a linear IV hits K exactly once, at m — this is
@@ -1859,10 +2039,10 @@ fn analyze_bounded_early_exit_loop(
     for j in 1..=m {
         let v = init + j * step;
         if !(0..=0xffff).contains(&v) {
-            return None;
+            gate!(13, "materialized IV does not fit a 16-bit Movz");
         }
         if j < m && v == k {
-            return None;
+            gate!(13, "IV hits the limit before the last iteration");
         }
     }
 
@@ -1876,7 +2056,13 @@ fn analyze_bounded_early_exit_loop(
     // Code-growth cap on total cloned instructions.
     let body_inst_total: usize = body_blocks.iter().map(|b| func.block(*b).insts.len()).sum();
     if body_inst_total.saturating_mul(m as usize - 1) > BEE_MAX_CLONED_INSTS {
-        return None;
+        gate!(
+            14,
+            format!(
+                "code growth cap: {body_inst_total} insts x {} clones",
+                m - 1
+            )
+        );
     }
 
     Some(BoundedEarlyExitLoop {
@@ -1896,6 +2082,78 @@ fn analyze_bounded_early_exit_loop(
         b_term,
         body_blocks,
     })
+}
+
+/// Prove that every value `v` can hold at run time is 0 or 1.
+///
+/// Used by [`analyze_bounded_early_exit_loop`]: the unroll's non-final copies
+/// test `dyn != 0` where the original tested `AndRR(trip_bool, dyn) != 0`. With
+/// the trip test compile-time TRUE the original reduces to `(dyn & 1) != 0`, so
+/// the two agree exactly when `dyn` is a 0/1 boolean.
+///
+/// A vreg is boolean when EVERY definition of it (whole function) is one of:
+///   * `CSet` — architecturally 0 or 1;
+///   * a constant materialization of 0 or 1 (`Movz`, via `movz_value`);
+///   * `MovR dst, src` — a block-argument / phi copy whose source is itself
+///     provably boolean.
+///
+/// The `MovR` case is what clang -O2 needs. At -O1 the `!*q` test is recomputed
+/// inside the merged exit-test block, so the condition is a single `CSet`; at
+/// -O2 LLVM turns it into `%38 = phi i1 [ %35, %33 ], [ true, %23 ], [ true,
+/// %19 ], [ true, %13 ]`, which lowers to FOUR `MovR` block-argument copies —
+/// three from a materialized `1`, one from the `CSet` of `*q == 0`. Every
+/// incoming value is still 0 or 1, so the reduction is exactly as valid as at
+/// -O1, but the old CSet-only test could not see it.
+///
+/// Termination: `seen` blocks re-entry, so a cyclic copy web is rejected (it is
+/// visited once, then its second visit returns `false`). A vreg with NO
+/// definition (a function argument, or a physreg-defined value) is NOT boolean.
+///
+/// Kill switch `TCG_NO_BEE_BOOL_PHI` (any value) restores the historical
+/// CSet-only test, which is the `seen`-free special case.
+fn vreg_is_boolean(func: &MachFunction, def_map: &HashMap<VReg, Vec<InstId>>, v: VReg) -> bool {
+    /// `memo[v]`: `Some(r)` = settled, `None` = in progress on the current DFS
+    /// path (a copy cycle) which settles to `false` — fail closed.
+    fn go(
+        func: &MachFunction,
+        def_map: &HashMap<VReg, Vec<InstId>>,
+        v: VReg,
+        memo: &mut HashMap<VReg, Option<bool>>,
+        copies: bool,
+    ) -> bool {
+        match memo.get(&v) {
+            Some(Some(r)) => return *r,
+            Some(None) => return false,
+            None => {}
+        }
+        memo.insert(v, None);
+        let r = match def_map.get(&v) {
+            Some(defs) if !defs.is_empty() => defs.iter().all(|&id| {
+                let inst = func.inst(id);
+                match inst.opcode {
+                    AArch64Opcode::CSet => true,
+                    // `MovR dst, src` (a block-argument / phi copy): boolean iff
+                    // `src` is.
+                    AArch64Opcode::MovR if copies => match inst.operands.get(1) {
+                        Some(MachOperand::VReg(src)) => go(func, def_map, *src, memo, copies),
+                        _ => false,
+                    },
+                    _ => matches!(
+                        crate::reaching_const::movz_value(inst),
+                        Some((_, c)) if c == 0 || c == 1
+                    ),
+                }
+            }),
+            // No definition at all (function argument / physreg-defined): not
+            // provably boolean.
+            _ => false,
+        };
+        memo.insert(v, Some(r));
+        r
+    }
+    let copies = std::env::var_os("TCG_NO_BEE_BOOL_PHI").is_none();
+    let mut memo = HashMap::new();
+    go(func, def_map, v, &mut memo, copies)
 }
 
 /// A matched trip-limit CSet: `CSet cset, NE` fed by `CmpRI iv_next, #K`, where
@@ -2326,10 +2584,27 @@ fn unroll_bounded_early_exit(
 // unroll). Kill switch: `TCG_NO_DIAMOND_CONST_TRIP_UNROLL`.
 // ===========================================================================
 
+/// The BOUNDED-trip variant of the diamond unroll: the trip count is not a
+/// compile-time constant, only proven `<= trip_count` by a dominating guard.
+/// Every clone but the last therefore keeps a real runtime exit test.
+#[derive(Clone)]
+struct DiamondBoundedTrip {
+    /// The loop-INVARIANT vreg the trip test compares the IV against.
+    bound_vreg: VReg,
+    /// Relation for which the loop EXITS when `exit_rel(x_m, bound)` holds,
+    /// `x_m` being the compared IV expression after body execution `m`.
+    exit_rel: Rel,
+    /// `x_m = sim_init + m * step`.
+    sim_init: i128,
+}
+
 /// A recognized diamond-body constant-trip loop, ready for full unroll.
 struct DiamondConstTripLoop {
-    /// Number of body executions `M` (>= 2).
+    /// Number of body executions `M` (>= 2). Exact when `bounded` is `None`,
+    /// otherwise a proven MAXIMUM.
     trip_count: u64,
+    /// Set when the trip count is only bounded, not exact.
+    bounded: Option<DiamondBoundedTrip>,
     /// The loop-carried IV vreg (phi-copied through preheader + latch).
     iv_vreg: VReg,
     /// The IV-increment instruction (`AddRI`/`SubRI`) and its destination.
@@ -2516,6 +2791,262 @@ fn strict_const_of(
         }
     }
     None
+}
+
+/// Decompose `v` into `root + offset` over the STRICT same-class affine chain
+/// (`AddRI`/`SubRI`/`MovR`/`Copy`), plus the two 32->64 widenings. `root` is the
+/// first value the walk cannot decompose further.
+///
+/// Every step goes through `unique_def`, so the returned `root` is SINGLE-DEF
+/// function-wide. That is the property the guard transfer rides on: one def
+/// dominates both the guard's compare and the loop's use, and no redefinition
+/// can intervene, so "the value tested at the guard" and "the value used as the
+/// loop bound" are the same value. Fails closed (`None`) on a multi-def or
+/// undefined root, and on a chain that bottoms out at a compile-time constant
+/// (`strict_const_of`'s job, and a constant root carries no guard fact).
+///
+/// `Sxtw` preserves the signed integer value outright. `Uxtw` does NOT — it is
+/// the identity only when its 32-bit source is non-negative — so the third
+/// return value reports the accumulated offset at the point the zero-extension
+/// was crossed, leaving the caller to discharge
+/// `root + offset - zext_at >= 0` from a proven lower bound. At most one
+/// zero-extension is admitted.
+fn strict_affine_root(
+    func: &MachFunction,
+    def_map: &HashMap<VReg, Vec<InstId>>,
+    v: VReg,
+) -> Option<(VReg, i128, Option<i128>)> {
+    let mut cur = v;
+    let mut offset: i128 = 0;
+    let mut zext_at: Option<i128> = None;
+    for _ in 0..64 {
+        let inst = unique_def(func, def_map, cur)?;
+        match inst.opcode {
+            AArch64Opcode::AddRI => {
+                let src = inst.operands.get(1)?.as_vreg()?;
+                if src.class != cur.class {
+                    return None;
+                }
+                offset += inst.operands.get(2)?.as_imm()? as i128;
+                cur = src;
+            }
+            AArch64Opcode::SubRI => {
+                let src = inst.operands.get(1)?.as_vreg()?;
+                if src.class != cur.class {
+                    return None;
+                }
+                offset -= inst.operands.get(2)?.as_imm()? as i128;
+                cur = src;
+            }
+            AArch64Opcode::MovR | AArch64Opcode::Copy => {
+                let src = inst.operands.get(1)?.as_vreg()?;
+                if src.class != cur.class {
+                    return None;
+                }
+                cur = src;
+            }
+            AArch64Opcode::Sxtw => {
+                // `sxtw x, w` is the identity on the SIGNED integer value, so
+                // the accumulated offset carries across unchanged.
+                let src = inst.operands.get(1)?.as_vreg()?;
+                if cur.class != trust_cg_ir::RegClass::Gpr64
+                    || src.class != trust_cg_ir::RegClass::Gpr32
+                {
+                    return None;
+                }
+                cur = src;
+            }
+            AArch64Opcode::Uxtw => {
+                // `uxtw x, w` equals its source's integer value only when that
+                // 32-bit source is non-negative; record the crossing so the
+                // caller can discharge it. A second one would need a second
+                // side condition — fail closed instead.
+                let src = inst.operands.get(1)?.as_vreg()?;
+                if cur.class != trust_cg_ir::RegClass::Gpr64
+                    || src.class != trust_cg_ir::RegClass::Gpr32
+                    || zext_at.is_some()
+                {
+                    return None;
+                }
+                zext_at = Some(offset);
+                cur = src;
+            }
+            // A constant root carries no guard fact — that is the exact-trip path.
+            AArch64Opcode::Movz | AArch64Opcode::MovI => return None,
+            _ => return Some((cur, offset, zext_at)),
+        }
+    }
+    None
+}
+
+/// Parse `g`'s terminator tail as the importer's guard shape
+/// `[CmpRI rr,#C] CSet vcond,cc; CmpRI vcond,#0; BCond[NE|EQ] -> bt; B -> bf`
+/// where `rr` resolves to `root` through plain moves. Returns the relation that
+/// holds on the `BCond`-TAKEN edge, the constant, and the two arm targets.
+///
+/// The flag-setting compare is located with `nearest_flag_setter` (guard blocks
+/// are not the pinned five-instruction trip-test shape, so positional indexing
+/// mis-parses them), which also proves nothing between it and the `CSet`
+/// clobbers the flags.
+fn guard_relation(
+    func: &MachFunction,
+    def_map: &HashMap<VReg, Vec<InstId>>,
+    g: BlockId,
+    root: VReg,
+) -> Option<(Rel, i128, BlockId, BlockId)> {
+    let insts = &func.block(g).insts;
+    let n = insts.len();
+    if n < 3 {
+        return None;
+    }
+    let b_term = insts[n - 1];
+    let bcond = insts[n - 2];
+    let vcond_cmp = insts[n - 3];
+
+    let b_inst = func.inst(b_term);
+    if b_inst.opcode != AArch64Opcode::B {
+        return None;
+    }
+    let bf = match b_inst.operands.first()? {
+        MachOperand::Block(bb) => *bb,
+        _ => return None,
+    };
+    let bcond_inst = func.inst(bcond);
+    if bcond_inst.opcode != AArch64Opcode::BCond {
+        return None;
+    }
+    let taken_when_cond_true = match cc_from_operand(bcond_inst.operands.first()?)? {
+        CondCode::NE => true,
+        CondCode::EQ => false,
+        _ => return None,
+    };
+    let bt = match bcond_inst.operands.get(1)? {
+        MachOperand::Block(bb) => *bb,
+        _ => return None,
+    };
+    // `CmpRI vcond, #0`.
+    let vcmp_inst = func.inst(vcond_cmp);
+    if vcmp_inst.opcode != AArch64Opcode::CmpRI
+        || vcmp_inst.operands.get(1).and_then(|op| op.as_imm()) != Some(0)
+    {
+        return None;
+    }
+    let vcond = vcmp_inst.operands.first()?.as_vreg()?;
+    // `vcond`'s UNIQUE def must be a `CSet` — NOT necessarily in this block.
+    // clang materializes a loop-invariant guard condition once and then
+    // branches on it at several places (ReedSolomon computes `l[u] < 1` once
+    // and re-tests it at the Chien outer-loop header to skip the inner loop),
+    // so requiring the `CSet` locally would miss the only guard that dominates
+    // the preheader. Single-def is what makes the remote read exact: no other
+    // definition of `vcond` can reach this test.
+    let cset_defs = def_map.get(&vcond)?;
+    if cset_defs.len() != 1 {
+        return None;
+    }
+    let cset = cset_defs[0];
+    let cset_inst = func.inst(cset);
+    if cset_inst.opcode != AArch64Opcode::CSet {
+        return None;
+    }
+    let cc_set = cc_from_operand(cset_inst.operands.get(1)?)?;
+    // The block and position of that `CSet`, so its own flag setter is found in
+    // the block that actually computes it.
+    let (cset_blk, cset_pos) = func.block_order.iter().find_map(|&b| {
+        func.block(b)
+            .insts
+            .iter()
+            .position(|&i| i == cset)
+            .map(|p| (b, p))
+    })?;
+    // NOTE: `vcond` deliberately may have other readers. This function only
+    // READS a guard to learn a fact — it deletes nothing — so the diamond
+    // analyzer's "no surviving reader" requirement does not apply. What the
+    // fact rides on is locality: `CSet` / `CmpRI vcond,#0` / `BCond` are
+    // ADJACENT, so no redefinition of `vcond` and no flag write can intervene,
+    // and `nearest_flag_setter` proves the same for `flag_cmp` -> `CSet`.
+    // (clang routinely shares one `l[u] < 1` condition across two guards.)
+    //
+    // The flag-setting compare must be `CmpRI rr, #C` with `rr` == `root`.
+    let flag_cmp = nearest_flag_setter(func, &func.block(cset_blk).insts, cset_pos)?;
+    let flag_inst = func.inst(flag_cmp);
+    if flag_inst.opcode != AArch64Opcode::CmpRI {
+        return None;
+    }
+    let rr = flag_inst.operands.first()?.as_vreg()?;
+    if rr != root && !is_plain_move_chain(func, def_map, rr, root) {
+        return None;
+    }
+    let c = flag_inst.operands.get(1)?.as_imm()? as i128;
+    let rel = rel_from_int_cc(cc_set)?;
+    let on_taken = if taken_when_cond_true {
+        rel
+    } else {
+        negate_rel(rel)
+    };
+    Some((on_taken, c, bt, bf))
+}
+
+/// Prove `LO <= root <= HI` from conditional guards that dominate `preheader`,
+/// returning the tightest bounds found (either side may be unknown).
+///
+/// EDGE dominance, not block dominance, is the load-bearing requirement. Block
+/// dominance alone admits a guard arm that is also the JOIN of a preceding
+/// two-way branch — reached from both sides, so the branch condition does NOT
+/// hold there — which yields facts that are simply false. Requiring the arm's
+/// predecessor list to be exactly `[g]` makes "control reached `preheader`
+/// through this edge" equivalent to "this arm dominates `preheader`". Exactly
+/// one arm must qualify; ambiguity fails closed.
+///
+/// Signedness discipline: the bounds are SIGNED facts. An unsigned `<`/`<=`
+/// against a non-negative constant pins the value into `[0, C]`, which is a
+/// sound signed fact on both sides. An unsigned `>`/`>=` is NOT: a
+/// signed-negative value is unsigned-huge and satisfies it, so it yields
+/// nothing.
+fn dominating_bounds(
+    func: &MachFunction,
+    def_map: &HashMap<VReg, Vec<InstId>>,
+    dom: &DomTree,
+    preheader: BlockId,
+    root: VReg,
+) -> (Option<i128>, Option<i128>) {
+    let mut lo: Option<i128> = None;
+    let mut hi: Option<i128> = None;
+    for &g in &func.block_order {
+        if g == preheader || !dom.dominates(g, preheader) {
+            continue;
+        }
+        let Some((on_taken, c, bt, bf)) = guard_relation(func, def_map, g, root) else {
+            continue;
+        };
+        let edge_dominates = |arm: BlockId| -> bool {
+            dom.dominates(arm, preheader) && func.block(arm).preds == vec![g]
+        };
+        let (t_ok, f_ok) = (edge_dominates(bt), edge_dominates(bf));
+        let held = if t_ok && !f_ok {
+            on_taken
+        } else if f_ok && !t_ok {
+            negate_rel(on_taken)
+        } else {
+            continue;
+        };
+        let (l, h): (Option<i128>, Option<i128>) = match held {
+            Rel::SLt => (None, Some(c - 1)),
+            Rel::SLe => (None, Some(c)),
+            Rel::SGt => (Some(c + 1), None),
+            Rel::SGe => (Some(c), None),
+            Rel::Eq => (Some(c), Some(c)),
+            Rel::ULt if c >= 0 => (Some(0), Some(c - 1)),
+            Rel::ULe if c >= 0 => (Some(0), Some(c)),
+            _ => continue,
+        };
+        if let Some(l) = l {
+            lo = Some(lo.map_or(l, |b: i128| b.max(l)));
+        }
+        if let Some(h) = h {
+            hi = Some(hi.map_or(h, |b: i128| b.min(h)));
+        }
+    }
+    (lo, hi)
 }
 
 /// The body blocks minus the back edge form a DAG whose DFS from `header`
@@ -2817,20 +3348,10 @@ fn analyze_diamond_const_trip_loop(
         return None;
     }
 
-    // ---- Constant init & bound (strict same-class chains only); prove the
-    //      trip count exactly. ----
+    // ---- Constant init; then the trip count, either EXACTLY (compile-time
+    //      constant bound) or as a proven MAXIMUM (limit capped by a guard that
+    //      dominates the preheader). ----
     let init = strict_const_of(func, def_map, iv.init_src)?;
-    let bound = if let Some(imm) = op_b_imm {
-        imm as i128
-    } else if iv.is_a {
-        strict_const_of(func, def_map, op_b_vreg?)?
-    } else {
-        strict_const_of(func, def_map, op_a)?
-    };
-    let bound_aff = Affine {
-        base: None,
-        offset: bound,
-    };
 
     let p = rel_from_int_cc(cc_set)?;
     let rel_xl = if iv.is_a { p } else { swap_rel(p) };
@@ -2844,19 +3365,132 @@ fn analyze_diamond_const_trip_loop(
     // The compared IV expression on iteration m is `init + m*step` (post-inc)
     // or `init + (m-1)*step` (pre-inc); shift the simulated init for the
     // latter so `simulate_trip`'s `x = init' + m*step` models it exactly.
+    let sim_init_off = if pre_inc { init - iv.int_step } else { init };
     let sim_init = Affine {
         base: None,
-        offset: if pre_inc { init - iv.int_step } else { init },
+        offset: sim_init_off,
     };
     let width = width_of(op_a);
-    let trip_count = simulate_trip(
-        sim_init,
-        bound_aff,
-        iv.int_step,
-        exit_rel,
-        width,
-        DIAMOND_UNROLL_MAX_TRIP + 1,
-    )?;
+
+    // The vreg holding the limit (the non-IV side of the compare), if any.
+    let bound_vreg = if op_b_imm.is_some() {
+        None
+    } else if iv.is_a {
+        Some(op_b_vreg?)
+    } else {
+        Some(op_a)
+    };
+    let const_bound = match (op_b_imm, bound_vreg) {
+        (Some(imm), _) => Some(imm as i128),
+        (None, Some(bv)) => strict_const_of(func, def_map, bv),
+        (None, None) => None,
+    };
+
+    let (trip_count, bounded) = match const_bound {
+        Some(bound) => {
+            let bound_aff = Affine {
+                base: None,
+                offset: bound,
+            };
+            let tc = simulate_trip(
+                sim_init,
+                bound_aff,
+                iv.int_step,
+                exit_rel,
+                width,
+                DIAMOND_UNROLL_MAX_TRIP + 1,
+            )?;
+            (tc, None)
+        }
+        None => {
+            if !diamond_bounded_trip_enabled() {
+                return None;
+            }
+            let bv = bound_vreg?;
+            // Only the ASCENDING signed form (`while x < K` / `x <= K`): the
+            // "no (M+1)-th iteration" proof reads an UPPER bound on the limit,
+            // which only caps the trip count when the IV climbs toward it under
+            // a signed test. Everything else fails closed.
+            if iv.int_step <= 0 || !matches!(exit_rel, Rel::SGt | Rel::SGe | Rel::Eq) {
+                return None;
+            }
+            // The retained tests re-read the limit at every clone, so it must be
+            // a plain GPR of the compare's own width and loop-INVARIANT: a def
+            // inside the body would change what the later tests mean.
+            if !matches!(
+                bv.class,
+                trust_cg_ir::RegClass::Gpr32 | trust_cg_ir::RegClass::Gpr64
+            ) || bv.class != op_a.class
+            {
+                return None;
+            }
+            for &b in &body_blocks {
+                for &iid in &func.block(b).insts {
+                    let inst = func.inst(iid);
+                    if inst_produces_value(inst)
+                        && inst.operands.first().and_then(|op| op.as_vreg()) == Some(bv)
+                    {
+                        return None;
+                    }
+                }
+            }
+            let (root, off, zext_at) = strict_affine_root(func, def_map, bv)?;
+            let (lo_root, hi_root) = dominating_bounds(func, def_map, &dom, preheader, root);
+            // Discharge the zero-extension side condition: `uxtw` is only the
+            // identity we assumed if its 32-bit source could not be negative.
+            if let Some(zoff) = zext_at
+                && !matches!(lo_root, Some(l) if l + off - zoff >= 0)
+            {
+                return None;
+            }
+            let hi = hi_root? + off;
+            let lo = lo_root.map(|l| l + off);
+            // `M` = the largest iteration count any admissible limit can produce.
+            // Clones 1..M-1 keep a real runtime test, so a shorter run exits
+            // exactly where the original loop did; the guard rules out an
+            // (M+1)-th iteration, which is what lets the last clone drop its test.
+            let found: Option<u64> = match exit_rel {
+                // Ordered exit (`while x < K` / `x <= K`): the smallest `M` for
+                // which the test is TRUE for EVERY admissible limit.
+                Rel::SGt | Rel::SGe => (1..=DIAMOND_UNROLL_MAX_TRIP).find(|&mm| {
+                    let xm = sim_init_off + (mm as i128) * iv.int_step;
+                    if exit_rel == Rel::SGt {
+                        xm > hi
+                    } else {
+                        xm >= hi
+                    }
+                }),
+                // Equality exit (`while x != K` — clang's rotated counted form):
+                // the loop leaves exactly at `m = K - sim_init`, so a unit step
+                // AND a lower bound are both required. Without `K >= sim_init+1`
+                // some admissible limit is never hit at all and the original
+                // would not leave through this test, so capping the clone chain
+                // would invent an exit that does not exist.
+                Rel::Eq if iv.int_step == 1 => match lo {
+                    Some(l) if l - sim_init_off >= 1 => u64::try_from(hi - sim_init_off).ok(),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let tc = found?;
+            // Each retained test is `CmpRI bound, #x_m`: every `x_m` must be an
+            // encodable unsigned 12-bit immediate.
+            for m in 1..tc {
+                let xm = sim_init_off + (m as i128) * iv.int_step;
+                if !(0..=4095).contains(&xm) {
+                    return None;
+                }
+            }
+            (
+                tc,
+                Some(DiamondBoundedTrip {
+                    bound_vreg: bv,
+                    exit_rel,
+                    sim_init: sim_init_off,
+                }),
+            )
+        }
+    };
     if !(2..=DIAMOND_UNROLL_MAX_TRIP).contains(&trip_count) {
         return None;
     }
@@ -2913,6 +3547,7 @@ fn analyze_diamond_const_trip_loop(
 
     Some(DiamondConstTripLoop {
         trip_count,
+        bounded,
         iv_vreg: iv.iv_vreg,
         inc_inst: iv.inc_inst,
         inc_dst: iv.inc_dst,
@@ -2949,6 +3584,9 @@ fn unroll_diamond_const_trip(
     // fixed name: it is re-materialized as a per-clone `Movz` and the cloned
     // latch phi-copies must keep reading it.
     let renamable: Vec<VReg> = renamable_body_vregs(func, &body, dcl.inc_dst);
+
+    // Source location carried by the retained bounded-trip exit tests.
+    let loc_t = func.inst(dcl.bcond).source_loc;
 
     // `T`'s kept instructions: everything except the dropped trip-test tail.
     let drop_all = [dcl.flag_cmp, dcl.cset, dcl.vcond_cmp, dcl.bcond, dcl.b_term];
@@ -3007,8 +3645,27 @@ fn unroll_diamond_const_trip(
     if let Some(p) = provenance.as_deref_mut() {
         p.record_in_place_transform(dcl.b_term, loop_unroll_pass_id());
     }
-    func.block_mut(t).succs.retain(|&s| s == latch);
-    func.block_mut(x).preds.retain(|&p| p != t);
+    if let Some(bt) = dcl.bounded.as_ref() {
+        // Bounded trip: iteration 1 may already be the last one, so it keeps a
+        // real runtime exit test and the `T -> X` edge stays live.
+        let x_1 = bt.sim_init + dcl.iv_step;
+        let (cmp_id, bc_id) = bounded_exit_test(func, bt, x_1, x, loc_t);
+        let pos = func
+            .block(t)
+            .insts
+            .iter()
+            .position(|&id| id == dcl.b_term)
+            .expect("the trailing `B` is retained in T");
+        func.block_mut(t).insts.insert(pos, cmp_id);
+        func.block_mut(t).insts.insert(pos + 1, bc_id);
+        if let Some(p) = provenance.as_deref_mut() {
+            p.record_clone(dcl.bcond, cmp_id, loop_unroll_pass_id());
+            p.record_clone(dcl.bcond, bc_id, loop_unroll_pass_id());
+        }
+    } else {
+        func.block_mut(t).succs.retain(|&s| s == latch);
+        func.block_mut(x).preds.retain(|&p| p != t);
+    }
     // (c) redirect the original latch back edge: header -> iteration-2 header.
     redirect_branch_and_edge(func, latch, header, header_of(2));
     if let Some(p) = provenance.as_deref_mut()
@@ -3052,8 +3709,22 @@ fn unroll_diamond_const_trip(
                 }
             }
             if bo == t {
-                // Every clone's `T` continues into its own latch; the trip
-                // test's outcome is compile-time proven.
+                // Exact trip: every clone's `T` continues into its own latch,
+                // the trip test's outcome being compile-time proven. BOUNDED
+                // trip: only the LAST clone knows it is done (the dominating
+                // guard rules out an `M+1`-th iteration); every earlier clone
+                // keeps a real runtime test so a shorter run exits exactly
+                // where the original loop did.
+                if !is_last && let Some(bt) = dcl.bounded.as_ref() {
+                    let x_k = bt.sim_init + (k as i128) * dcl.iv_step;
+                    let (cmp_id, bc_id) = bounded_exit_test(func, bt, x_k, x, loc_t);
+                    func.append_inst(nb, cmp_id);
+                    func.append_inst(nb, bc_id);
+                    if let Some(p) = provenance.as_deref_mut() {
+                        p.record_clone(dcl.bcond, cmp_id, loop_unroll_pass_id());
+                        p.record_clone(dcl.bcond, bc_id, loop_unroll_pass_id());
+                    }
+                }
                 push_branch(func, nb, map[&latch], provenance.as_deref_mut(), dcl.b_term);
             } else if bo == latch {
                 let next = if is_last { x } else { header_of(k + 1) };
@@ -3241,7 +3912,6 @@ fn fold_iv_affine_addresses(
             candidates.push((iid, dst, base, va * vb));
         }
     }
-
     for (madd, dst, base, off) in candidates {
         // Every use of `dst` anywhere in the function must be inside `blocks`
         // and be the base operand of a `LdrRI`/`StrRI` with an encodable
@@ -3443,6 +4113,44 @@ fn fold_const_index_addresses(
 }
 
 /// Build a `Movz dst, #value` (16-bit immediate), carrying `loc`.
+/// Build the collapsed bounded-trip exit test for one clone:
+/// `CmpRI bound, #x_m` followed by `BCond[cc] -> exit`.
+///
+/// Inside a clone the IV is a compile-time constant, so the original
+/// five-instruction trip test (`Cmp`/`CSet`/`CmpRI vcond,#0`/`BCond`/`B`)
+/// collapses to a single compare of the loop-invariant limit against an
+/// immediate. The emitted compare computes `bound - x_m`, i.e. it materializes
+/// relations of the form `bound REL x_m`, so the exit condition
+/// `exit_rel(x_m, bound)` is tested through `swap_rel`.
+fn bounded_exit_test(
+    func: &mut MachFunction,
+    bt: &DiamondBoundedTrip,
+    x_m: i128,
+    exit: BlockId,
+    loc: Option<SourceLoc>,
+) -> (InstId, InstId) {
+    let mut cmp = MachInst::new(
+        AArch64Opcode::CmpRI,
+        vec![
+            MachOperand::VReg(bt.bound_vreg),
+            MachOperand::Imm(x_m as i64),
+        ],
+    );
+    cmp.source_loc = loc;
+    let cmp_id = func.push_inst(cmp);
+    let cc = cc_from_rel(swap_rel(bt.exit_rel));
+    let mut bc = MachInst::new(
+        AArch64Opcode::BCond,
+        vec![
+            MachOperand::Imm(cc.encoding() as i64),
+            MachOperand::Block(exit),
+        ],
+    );
+    bc.source_loc = loc;
+    let bc_id = func.push_inst(bc);
+    (cmp_id, bc_id)
+}
+
 fn movz_inst(dst: VReg, value: i128, loc: Option<SourceLoc>) -> MachInst {
     let mut inst = MachInst::new(
         AArch64Opcode::Movz,
@@ -3880,6 +4588,970 @@ fn rewrite_branch_target(
         }
     }
     None
+}
+
+// ===========================================================================
+// PARTIAL (factor) UNROLL — `partial-unroll`
+//
+// Every unroller above is a FULL unroller capped at a small trip count
+// (`TCG_MAX_UNROLL_TRIP_COUNT`=4, `HOT_MAX_TRIP_COUNT`=6, `BEE_MAX_TRIP_COUNT`
+// =16, `CONST_ADDR_UNROLL_MAX_TRIP`=16, `DIAMOND_UNROLL_MAX_TRIP`=16). A loop
+// whose constant trip count is LARGER than every cap is unreachable by all of
+// them: too big to replicate in full, and nothing downstream unrolls it by a
+// factor. ReedSolomon's 188-trip `data[51+i] = data_in[i]` copy loops are the
+// witness (2-block, so the diamond tier declines them at `lp.body.len() < 3`).
+//
+// This tier closes that gap: it replicates the body `K` times INSIDE the loop
+// and executes the `N mod K` remainder as a PEELED PROLOGUE ahead of it.
+//
+//   preheader                         preheader
+//     |                                 |
+//     v                                 v
+//   header: BODY ; TEST  <-+          peel:  (BODY ; CARRY) x r ; B header
+//     |          \         |            |
+//     v           `-> exit |            v
+//   latch:  CARRY ; B -----+          header: BODY (CARRY ; BODY) x (K-1) ; TEST
+//                                       |          \
+//                                       v           `-> exit
+//                                     latch:  CARRY ; B --> header
+//
+// ## Why the remainder is EXACTLY right (the whole soundness argument)
+//
+// The recognized loop is the importer's 2-block do-while: the header holds the
+// body and the trip test, the latch holds the loop-carried phi-copies (CARRY)
+// and the back edge. `simulate_trip` proves the exact iteration count `N` by
+// W-bit simulation of `iv_m = init + m*step` against the loop-invariant bound,
+// so `N = q*K + r` with `r = N mod K` is a COMPILE-TIME split — no runtime
+// remainder computation, no division, no guard.
+//
+//   * The peel block runs iterations `1..=r` as `r` verbatim copies of one
+//     whole iteration (`BODY ; CARRY`). Machine IR here is NOT SSA, so a
+//     verbatim copy of the body re-executes it on the same vregs: `r` copies
+//     ARE `r` iterations (the identical argument `unroll_copy_based` relies
+//     on). It is entered exactly where the loop was entered (the preheader's
+//     `header` branch operand is redirected to it) and unconditionally falls
+//     into the header, so it cannot change WHETHER the loop runs.
+//   * The header then runs `K` iterations per trip and tests ONCE, at the end
+//     of the `K`-th body — where `iv` is `init + (r + m*K)*step` after trip
+//     `m`. Because `K | (N - r)`, the value `init + N*step` (the only value at
+//     which the ORIGINAL test fires) IS one of those test points, and it is
+//     reached at `m = q`. Every earlier test point `r + m*K` with `m < q` is
+//     an iteration index the original loop also ran without exiting, so the
+//     original relation was false there — the test fires at exactly the same
+//     iteration under ANY relation (EQ/NE/signed/unsigned), not just `!=`.
+//   * Total executions: `r + q*K = N`. Bit-identical to the original.
+//
+// Nothing else is edited: the test, the bound, the IV step and the exit edge
+// are untouched, so a mis-modeled trip count cannot silently drop or duplicate
+// iterations — it can only refuse to fire.
+//
+// FAIL-CLOSED preconditions: exact 2-block shape; the loop control is a
+// CONTIGUOUS suffix of the header (so the split into "body" and "control" is
+// total — an instruction that is neither is impossible); every body/carry
+// instruction is a plain value instruction (no branch, no terminator, no call,
+// no trap pseudo — an `IS_BRANCH` trap pseudo would otherwise be silently
+// dropped by a branch-filtering body collector); the bound is loop-invariant.
+//
+// Cost model (see `choose_partial_factor`): per loop ENTRY the instruction
+// count is `N*B + floor(N/K)*C` (peel included — peeling MOVES iterations, it
+// does not add any), so larger `K` is monotonically better on work and the
+// only real cost is CODE SIZE `(K-1+r)*B`. `K` is therefore the largest factor
+// whose growth fits `PARTIAL_MAX_GROWTH_INSTS`, capped at `PARTIAL_MAX_K`.
+// Register pressure is NOT a constraint here: verbatim replication reuses the
+// same vregs (unlike `scalar_unroll`'s renamed lanes), so the concurrent live
+// set is unchanged.
+//
+// Kill switch: `TCG_NO_PARTIAL_UNROLL`. Factor override: `TCG_PARTIAL_UNROLL_K`
+// (exact) / `TCG_PARTIAL_UNROLL_MAX_K` (cap). Dump: `TRUST_CG_DUMP_PARTIAL`.
+// ===========================================================================
+
+/// Partial unroll: trip-count simulation cap. The recognizer simulates the IV
+/// one step at a time, so this bounds analysis cost per candidate loop.
+const PARTIAL_SIM_CAP: u64 = 1 << 16;
+
+/// Partial unroll: smallest constant trip count worth a factor unroll. Below
+/// this the full unrollers above already had their chance and the peel/clone
+/// code growth is not repaid.
+const PARTIAL_MIN_TRIP: u64 = 8;
+
+/// Partial unroll: largest factor. Beyond 8 the per-iteration control saving
+/// `C*(K-1)/K` has saturated while code size keeps growing linearly.
+const PARTIAL_MAX_K: u64 = 8;
+
+/// Partial unroll: largest per-iteration body (header body + latch carry,
+/// non-control instructions). A body this size already amortizes its own
+/// control; unrolling it only inflates code.
+const PARTIAL_MAX_BODY_INSTS: usize = 24;
+
+/// Partial unroll: code-growth budget, in cloned instructions, per loop
+/// (`(K - 1 + N mod K) * body`).
+const PARTIAL_MAX_GROWTH_INSTS: usize = 128;
+
+/// Partial unroll: code-growth budget, in cloned instructions, per FUNCTION.
+/// Without profile data every constant-trip loop looks equally worth
+/// unrolling, so a function full of them (Linpack's `main` has nine) inflates
+/// far beyond what the loop-overhead saving repays and the surrounding hot
+/// code pays for it in fetch. Loops are taken in layout order until the budget
+/// is spent. Override for A/B sweeps: `TCG_PARTIAL_UNROLL_FUNC_BUDGET`.
+///
+/// MEASURED (counter A/B, interleaved, min AND 20%-trimmed median agreeing):
+/// unbounded growth wins 0.9934/0.9835 over the fired set but REGRESSES
+/// Linpack `main` (nine constant-trip loops, +39% function size) by +1.0% and
+/// Shootout-matrix by +0.6% — both with FEWER retired instructions, i.e. pure
+/// fetch-side cost. At 400 both regressions vanish (Linpack 0.9998/0.9994,
+/// matrix 1.0014/1.0028) while every win is kept (Shootout-lists 0.914/0.913,
+/// ReedSolomon 0.976/0.976), and the set geomean improves to 0.9887/0.9893.
+const PARTIAL_MAX_FUNC_GROWTH_INSTS: usize = 400;
+
+/// Compile-time kill switch for the partial (factor) unroll: set
+/// `TCG_NO_PARTIAL_UNROLL` (any value) to disable it.
+fn partial_unroll_enabled() -> bool {
+    std::env::var_os("TCG_NO_PARTIAL_UNROLL").is_none()
+}
+
+/// Optional exact factor override (`TCG_PARTIAL_UNROLL_K`), for A/B sweeps.
+fn partial_unroll_forced_k() -> Option<u64> {
+    std::env::var("TCG_PARTIAL_UNROLL_K")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&k| (2..=64).contains(&k))
+}
+
+/// Per-function code-growth budget (`TCG_PARTIAL_UNROLL_FUNC_BUDGET`).
+fn partial_unroll_func_budget() -> usize {
+    std::env::var("TCG_PARTIAL_UNROLL_FUNC_BUDGET")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(PARTIAL_MAX_FUNC_GROWTH_INSTS)
+}
+
+/// Optional factor cap override (`TCG_PARTIAL_UNROLL_MAX_K`), for A/B sweeps.
+fn partial_unroll_max_k() -> u64 {
+    std::env::var("TCG_PARTIAL_UNROLL_MAX_K")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&k| (2..=64).contains(&k))
+        .unwrap_or(PARTIAL_MAX_K)
+}
+
+/// A recognized partial-unroll candidate: the importer's 2-block counted
+/// do-while with a proven constant trip count.
+struct PartialLoop {
+    /// Proven number of body executions.
+    trip_count: u64,
+    /// Loop header (body + trip test).
+    header: BlockId,
+    /// Loop latch (loop-carried copies + back edge).
+    latch: BlockId,
+    /// Header instructions BEFORE the control suffix, in order.
+    header_body: Vec<InstId>,
+    /// Latch instructions before its terminating `B header`, in order.
+    carry: Vec<InstId>,
+    /// Index in the header's instruction list where the control suffix starts.
+    ctrl_start: usize,
+}
+
+impl PartialLoop {
+    /// Instructions in one whole iteration (body + loop-carried copies).
+    fn body_len(&self) -> usize {
+        self.header_body.len() + self.carry.len()
+    }
+}
+
+/// Every instruction that a verbatim clone must be able to reproduce: a plain
+/// value instruction. Branch / terminator (including the `IS_BRANCH` trap
+/// pseudos) and calls are refused so the body split stays total and the clone
+/// stays cheap.
+fn partial_cloneable(inst: &MachInst) -> bool {
+    !inst.flags.is_branch() && !inst.flags.is_terminator() && !inst.flags.is_call()
+}
+
+/// The same totality test with CALLS ADMITTED — used only by the late
+/// call-bearing full-unroll tier (`CallUnroll`).
+///
+/// Cloning a `Bl`/`Blr` verbatim is sound for exactly the reason cloning any
+/// other instruction is: the replicator copies the whole iteration in order, so
+/// each clone's argument setup still immediately precedes its own call and each
+/// clone's result reads still immediately follow it. A call carries no
+/// position-dependent state — the ABI clobber set is a property of the opcode
+/// that register allocation re-derives at every site — and `TailCall` stays
+/// refused because it is also `IS_TERMINATOR`. What calls cost is CODE, which
+/// is why the general partial tier declines them and this tier prices them
+/// explicitly (see `CALL_UNROLL_MIN_TRIP`).
+fn call_unroll_cloneable(inst: &MachInst) -> bool {
+    !inst.flags.is_branch() && !inst.flags.is_terminator()
+}
+
+/// Recognize the 2-block counted do-while and prove its exact trip count.
+/// Accepts BOTH loop-control dialects: the importer's `Cmp ; CSet ; CmpRI #0 ;
+/// BCond ; B` and the folded `Cmp ; BCond ; B` that later passes leave behind.
+/// Fails closed on anything it cannot prove.
+///
+/// `cloneable` is the per-tier totality predicate for the body split: the
+/// factor tier passes `partial_cloneable` (no calls), the late call tier passes
+/// `call_unroll_cloneable`.
+fn analyze_partial_loop(
+    func: &MachFunction,
+    lp: &NaturalLoop,
+    def_map: &HashMap<VReg, Vec<InstId>>,
+    cloneable: fn(&MachInst) -> bool,
+) -> Option<PartialLoop> {
+    let preheader = lp.preheader?;
+    let header = lp.header;
+    let latch = lp.latch;
+
+    // ---- Structure: exactly {header, latch}, single back edge, single exit --
+    if header == latch || lp.body.len() != 2 || !lp.body.contains(&latch) {
+        return None;
+    }
+    // The peel is spliced onto the preheader's edge; a header that is ALSO the
+    // function entry has an implicit entry edge that no `preds` list carries,
+    // so redirecting the explicit preheader would leave the entry path running
+    // the loop WITHOUT its remainder. Fail closed.
+    if header == func.entry || preheader == header {
+        return None;
+    }
+    let hpreds = &func.block(header).preds;
+    if hpreds.len() != 2 || !hpreds.contains(&preheader) || !hpreds.contains(&latch) {
+        return None;
+    }
+    let lsuccs = &func.block(latch).succs;
+    if lsuccs.len() != 1 || lsuccs[0] != header {
+        return None;
+    }
+    let lpreds = &func.block(latch).preds;
+    if lpreds.len() != 1 || lpreds[0] != header {
+        return None;
+    }
+    let hsuccs = &func.block(header).succs;
+    if hsuccs.len() != 2 || !hsuccs.contains(&latch) {
+        return None;
+    }
+    let exit_block = *hsuccs.iter().find(|&&s| s != latch)?;
+    if lp.body.contains(&exit_block) {
+        return None;
+    }
+
+    // ---- Header terminators: [.., BCond(cc, T), B(F)] with {T,F}={latch,exit}
+    let hinsts = func.block(header).insts.clone();
+    if hinsts.len() < 3 {
+        return None;
+    }
+    let n = hinsts.len();
+    let b_last = hinsts[n - 1];
+    let bcond = hinsts[n - 2];
+    if func.inst(b_last).opcode != AArch64Opcode::B
+        || func.inst(bcond).opcode != AArch64Opcode::BCond
+    {
+        return None;
+    }
+    let cc_br = cc_from_operand(func.inst(bcond).operands.first()?)?;
+    let t_target = match func.inst(bcond).operands.get(1)? {
+        MachOperand::Block(b) => *b,
+        _ => return None,
+    };
+    let f_target = match func.inst(b_last).operands.first()? {
+        MachOperand::Block(b) => *b,
+        _ => return None,
+    };
+    if !((t_target == latch && f_target == exit_block)
+        || (t_target == exit_block && f_target == latch))
+    {
+        return None;
+    }
+
+    // ---- Control suffix: CSet dialect or folded direct-compare dialect ------
+    // Returns (index of the flag-setting compare, the compare's condition code,
+    // whether the BCond is taken when that condition HOLDS).
+    let i3 = n.checked_sub(3)?;
+    let i3_inst = func.inst(hinsts[i3]);
+    let (ctrl_start, cc_set, taken_when_cond_true) = if i3_inst.opcode == AArch64Opcode::CmpRI
+        && i3_inst.operands.get(1).and_then(|op| op.as_imm()) == Some(0)
+        && n >= 5
+    {
+        // `Cmp ; CSet cond, cc ; CmpRI cond, #0 ; BCond ; B`.
+        let cond_vreg = i3_inst.operands.first()?.as_vreg()?;
+        let cset_id = hinsts[n - 4];
+        let cset_inst = func.inst(cset_id);
+        if cset_inst.opcode != AArch64Opcode::CSet
+            || cset_inst.operands.first()?.as_vreg()? != cond_vreg
+        {
+            return None;
+        }
+        // The `br_if` lowering emits B.NE (branch when cond != 0); accept EQ.
+        let taken = match cc_br {
+            CondCode::NE => true,
+            CondCode::EQ => false,
+            _ => return None,
+        };
+        let cc = cc_from_operand(cset_inst.operands.get(1)?)?;
+        (n - 5, cc, taken)
+    } else if AArch64Target::writes_flags(i3_inst.opcode) {
+        // Folded: `Cmp ; BCond(cc) ; B`.
+        (i3, cc_br, true)
+    } else {
+        return None;
+    };
+    let flag_cmp = hinsts[ctrl_start];
+    let flag_inst = func.inst(flag_cmp);
+    let is_fp = flag_inst.opcode == AArch64Opcode::Fcmp;
+
+    // ---- Compare operands -------------------------------------------------
+    let (op_a, op_b_vreg, op_b_imm) = match flag_inst.opcode {
+        AArch64Opcode::CmpRR | AArch64Opcode::Fcmp => (
+            flag_inst.operands.first()?.as_vreg()?,
+            Some(flag_inst.operands.get(1)?.as_vreg()?),
+            None,
+        ),
+        AArch64Opcode::CmpRI => (
+            flag_inst.operands.first()?.as_vreg()?,
+            None,
+            Some(flag_inst.operands.get(1)?.as_imm()?),
+        ),
+        _ => return None,
+    };
+
+    // ---- Identify the incremented IV among the compare operands -----------
+    let candidates: Vec<(VReg, bool)> = match (op_b_vreg, op_b_imm) {
+        (Some(b), None) => vec![(op_a, true), (b, false)],
+        (None, Some(_)) => vec![(op_a, true)],
+        _ => return None,
+    };
+    let mut found: Option<IvInc> = None;
+    for (cand, is_a) in candidates {
+        if let Some(inc) = try_iv_increment(func, def_map, lp, cand, is_fp) {
+            if found.is_some() {
+                return None; // ambiguous
+            }
+            found = Some(IvInc { is_a, ..inc });
+        }
+    }
+    let iv = found?;
+    if is_fp {
+        // The FP-IV dialect is the full unroller's business (exact constants
+        // only); a factor unroll of it buys nothing this tier can prove.
+        return None;
+    }
+
+    // ---- Trip count -------------------------------------------------------
+    let init_aff = affine_of(func, def_map, iv.init_src);
+    let bound_aff = if let Some(imm) = op_b_imm {
+        Affine {
+            base: None,
+            offset: imm as i128,
+        }
+    } else if iv.is_a {
+        affine_of(func, def_map, op_b_vreg?)
+    } else {
+        affine_of(func, def_map, op_a)
+    };
+    // Both affine bases must be loop-INVARIANT: `simulate_trip` cancels them
+    // symbolically, which is only sound if neither changes across iterations.
+    for base in [init_aff.base, bound_aff.base].into_iter().flatten() {
+        if !all_defs_outside_body(func, lp, def_map, base) {
+            return None;
+        }
+    }
+    let width = width_of(op_a);
+    let p = rel_from_int_cc(cc_set)?;
+    let rel_xl = if iv.is_a { p } else { swap_rel(p) };
+    let goes_to_exit_when_taken = t_target == exit_block;
+    let exit_when_cond_true = goes_to_exit_when_taken == taken_when_cond_true;
+    let exit_rel = if exit_when_cond_true {
+        rel_xl
+    } else {
+        negate_rel(rel_xl)
+    };
+    let trip_count = simulate_trip(
+        init_aff,
+        bound_aff,
+        iv.int_step,
+        exit_rel,
+        width,
+        PARTIAL_SIM_CAP,
+    )?;
+
+    // ---- Body split (total by construction: the control is a suffix) -------
+    let header_body: Vec<InstId> = hinsts[..ctrl_start].to_vec();
+    if header_body.iter().any(|&id| !cloneable(func.inst(id))) {
+        return None;
+    }
+    // The trip test must read the IV value produced by the body that PRECEDES
+    // it. `simulate_trip` models exactly that; a compare fed through a copy
+    // defined in the LATCH would instead see the PREVIOUS iteration's value and
+    // the model would be off by one. Require every def of the IV increment (and
+    // of the operand the compare literally reads) to live in the header body.
+    let in_body = |v: VReg| {
+        def_map
+            .get(&v)
+            .is_some_and(|ds| !ds.is_empty() && ds.iter().all(|d| header_body.contains(d)))
+    };
+    let iv_side = if iv.is_a { op_a } else { op_b_vreg? };
+    if !in_body(iv_side) || !in_body(iv.inc_dst) {
+        return None;
+    }
+    let linsts = func.block(latch).insts.clone();
+    let last_l = *linsts.last()?;
+    if func.inst(last_l).opcode != AArch64Opcode::B {
+        return None;
+    }
+    let carry: Vec<InstId> = linsts[..linsts.len() - 1].to_vec();
+    if carry.iter().any(|&id| !cloneable(func.inst(id))) {
+        return None;
+    }
+
+    Some(PartialLoop {
+        trip_count,
+        header,
+        latch,
+        header_body,
+        carry,
+        ctrl_start,
+    })
+}
+
+/// Choose the unroll factor `K`.
+///
+/// Per loop ENTRY the executed instruction count after unrolling by `K` is
+/// `N*B + floor(N/K)*C` — the peel does not add work, it MOVES `r` iterations
+/// out of the loop — so work falls monotonically in `K` and the binding cost is
+/// CODE SIZE `(K - 1 + N mod K) * B`. Pick the largest admissible `K` whose
+/// growth fits the budget. Returns `None` when no factor is worth it.
+fn choose_partial_factor(trip_count: u64, body_len: usize) -> Option<u64> {
+    if body_len == 0 || body_len > PARTIAL_MAX_BODY_INSTS {
+        return None;
+    }
+    if trip_count < PARTIAL_MIN_TRIP {
+        return None;
+    }
+    let max_k = partial_unroll_max_k().min(trip_count / 2);
+    if let Some(forced) = partial_unroll_forced_k() {
+        if forced > trip_count / 2 {
+            return None;
+        }
+        return Some(forced);
+    }
+    let mut best = None;
+    for k in 2..=max_k {
+        let r = trip_count % k;
+        let growth = (k - 1 + r) as usize * body_len;
+        if growth <= PARTIAL_MAX_GROWTH_INSTS {
+            best = Some(k);
+        }
+    }
+    best
+}
+
+/// Splice new blocks into `block_order` immediately before `before`.
+fn partial_insert_block_before(func: &mut MachFunction, before: BlockId, new_block: BlockId) {
+    let mut reordered = Vec::with_capacity(func.block_order.len());
+    for &b in &func.block_order {
+        if b == before {
+            reordered.push(new_block);
+        }
+        if b != new_block {
+            reordered.push(b);
+        }
+    }
+    func.block_order = reordered;
+}
+
+/// Redirect every branch operand `old -> new` in `block`'s terminator group
+/// (the trailing branch instructions), and fix the CFG edges.
+fn partial_redirect_all(func: &mut MachFunction, block: BlockId, old: BlockId, new: BlockId) {
+    for iid in func.block(block).insts.clone() {
+        if !func.inst(iid).flags.is_branch() {
+            continue;
+        }
+        for op in &mut func.inst_mut(iid).operands {
+            if let MachOperand::Block(b) = op
+                && *b == old
+            {
+                *b = new;
+            }
+        }
+    }
+    func.block_mut(block).succs.retain(|s| *s != old);
+    func.block_mut(old).preds.retain(|p| *p != block);
+    func.add_edge(block, new);
+}
+
+/// Apply the partial unroll: peel `N mod K` iterations ahead of the loop and
+/// replicate the body `K` times inside it.
+fn partial_unroll_apply(
+    func: &mut MachFunction,
+    lp: &NaturalLoop,
+    pl: &PartialLoop,
+    k: u64,
+    mut provenance: Option<&mut ProvenanceMap>,
+) -> bool {
+    let Some(preheader) = lp.preheader else {
+        return false;
+    };
+    let header = pl.header;
+    let r = (pl.trip_count % k) as usize;
+
+    // One whole iteration entered AT the header (body then loop-carried copies)
+    // and the same iteration entered AFTER a carry (the in-loop clone shape).
+    let unit: Vec<InstId> = pl
+        .header_body
+        .iter()
+        .chain(pl.carry.iter())
+        .copied()
+        .collect();
+    let rot_unit: Vec<InstId> = pl
+        .carry
+        .iter()
+        .chain(pl.header_body.iter())
+        .copied()
+        .collect();
+
+    // --- Peel: r verbatim iterations in a fresh block ahead of the header ---
+    if r > 0 {
+        let peel = func.create_block();
+        partial_insert_block_before(func, header, peel);
+        for _ in 0..r {
+            for &iid in &unit {
+                let inst = func.inst(iid).clone();
+                let new_id = func.push_inst(inst);
+                func.append_inst(peel, new_id);
+                if let Some(p) = provenance.as_deref_mut() {
+                    p.record_clone(iid, new_id, loop_unroll_pass_id());
+                }
+            }
+        }
+        let term_loc = func
+            .block(header)
+            .insts
+            .last()
+            .map(|&i| func.inst(i).source_loc);
+        let mut br = MachInst::new(AArch64Opcode::B, vec![MachOperand::Block(header)]);
+        br.source_loc = term_loc.flatten();
+        let br_id = func.push_inst(br);
+        func.append_inst(peel, br_id);
+        func.add_edge(peel, header);
+        // COMMIT: the loop entry now goes through the peel.
+        partial_redirect_all(func, preheader, header, peel);
+    }
+
+    // --- In-loop: K-1 extra (carry ; body) copies before the trip test ------
+    let mut cloned: Vec<(InstId, InstId)> = Vec::new();
+    for _ in 1..k {
+        for &iid in &rot_unit {
+            let inst = func.inst(iid).clone();
+            let new_id = func.push_inst(inst);
+            cloned.push((iid, new_id));
+        }
+    }
+    let at = pl.ctrl_start;
+    let ids: Vec<InstId> = cloned.iter().map(|&(_, id)| id).collect();
+    func.block_mut(header).insts.splice(at..at, ids);
+    if let Some(p) = provenance.as_deref_mut() {
+        for (src, dst) in cloned {
+            p.record_clone(src, dst, loop_unroll_pass_id());
+        }
+    }
+    true
+}
+
+/// The partial (factor) unroll pass.
+#[derive(Debug, Clone, Default)]
+pub struct PartialUnroll {
+    fired: usize,
+}
+
+impl PartialUnroll {
+    pub fn new() -> Self {
+        Self { fired: 0 }
+    }
+
+    /// Loops partially unrolled in the last `run`.
+    pub fn fired(&self) -> usize {
+        self.fired
+    }
+
+    fn run_with_loop_analysis(
+        &mut self,
+        func: &mut MachFunction,
+        loop_analysis: &LoopAnalysis,
+        mut provenance: Option<&mut ProvenanceMap>,
+    ) -> bool {
+        self.fired = 0;
+        if !partial_unroll_enabled() || loop_analysis.is_empty() {
+            return false;
+        }
+        let dump = std::env::var_os("TRUST_CG_DUMP_PARTIAL").is_some();
+        let all_loops: Vec<NaturalLoop> = loop_analysis.all_loops().cloned().collect();
+        let innermost: Vec<&NaturalLoop> = all_loops
+            .iter()
+            .filter(|lp| {
+                !all_loops
+                    .iter()
+                    .any(|other| other.parent == Some(lp.header))
+            })
+            .collect();
+        let def_map = build_def_map(func);
+
+        // Collect first, mutate after: the transform invalidates block layout
+        // for later loops, and every candidate is independent (innermost, and
+        // each edits only its own header/latch/preheader).
+        let mut plans: Vec<(NaturalLoop, PartialLoop, u64)> = Vec::new();
+        let func_budget = partial_unroll_func_budget();
+        let mut spent = 0usize;
+        for lp in &innermost {
+            let Some(pl) = analyze_partial_loop(func, lp, &def_map, partial_cloneable) else {
+                continue;
+            };
+            let Some(k) = choose_partial_factor(pl.trip_count, pl.body_len()) else {
+                if dump {
+                    eprintln!(
+                        "[partial-unroll] {}: header={:?} trip={} body={} DECLINED (cost model)",
+                        func.name,
+                        pl.header,
+                        pl.trip_count,
+                        pl.body_len()
+                    );
+                }
+                continue;
+            };
+            let growth = (k - 1 + pl.trip_count % k) as usize * pl.body_len();
+            if spent + growth > func_budget {
+                if dump {
+                    eprintln!(
+                        "[partial-unroll] {}: header={:?} trip={} body={} DECLINED \
+                         (function growth budget: {} + {} > {})",
+                        func.name,
+                        pl.header,
+                        pl.trip_count,
+                        pl.body_len(),
+                        spent,
+                        growth,
+                        func_budget
+                    );
+                }
+                continue;
+            }
+            spent += growth;
+            if dump {
+                eprintln!(
+                    "[partial-unroll] {}: header={:?} trip={} body={} K={} peel={} growth={}",
+                    func.name,
+                    pl.header,
+                    pl.trip_count,
+                    pl.body_len(),
+                    k,
+                    pl.trip_count % k,
+                    growth
+                );
+            }
+            plans.push(((*lp).clone(), pl, k));
+        }
+        if plans.is_empty() {
+            return false;
+        }
+        let mut changed = false;
+        for (lp, pl, k) in plans {
+            // Re-validate that the header still looks exactly as analyzed (a
+            // previous plan in this same run must not have perturbed it).
+            let hinsts = &func.block(pl.header).insts;
+            if hinsts.len() < pl.ctrl_start + 2
+                || hinsts[..pl.ctrl_start] != pl.header_body[..]
+                || func.block(pl.latch).insts.len() != pl.carry.len() + 1
+            {
+                continue;
+            }
+            if partial_unroll_apply(func, &lp, &pl, k, provenance.as_deref_mut()) {
+                self.fired += 1;
+                changed = true;
+            }
+        }
+        changed
+    }
+}
+
+impl MachinePass for PartialUnroll {
+    fn name(&self) -> &str {
+        "partial-unroll"
+    }
+
+    fn run(&mut self, func: &mut MachFunction) -> bool {
+        let dom = DomTree::compute(func);
+        let loop_analysis = LoopAnalysis::compute(func, &dom);
+        self.run_with_loop_analysis(func, &loop_analysis, None)
+    }
+
+    fn run_with_analyses(&mut self, func: &mut MachFunction, analyses: &mut AnalysisCache) -> bool {
+        let loop_analysis = analyses.loop_analysis(func).clone();
+        self.run_with_loop_analysis(func, &loop_analysis, None)
+    }
+
+    fn run_with_provenance(
+        &mut self,
+        func: &mut MachFunction,
+        provenance: &mut ProvenanceMap,
+    ) -> bool {
+        let dom = DomTree::compute(func);
+        let loop_analysis = LoopAnalysis::compute(func, &dom);
+        self.run_with_loop_analysis(func, &loop_analysis, Some(provenance))
+    }
+
+    fn run_with_analyses_and_provenance(
+        &mut self,
+        func: &mut MachFunction,
+        analyses: &mut AnalysisCache,
+        provenance: &mut ProvenanceMap,
+    ) -> bool {
+        let loop_analysis = analyses.loop_analysis(func).clone();
+        self.run_with_loop_analysis(func, &loop_analysis, Some(provenance))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Late call-bearing exact-trip FULL unroll (`call-unroll`)
+// ---------------------------------------------------------------------------
+
+/// Smallest trip count the call tier will fully unroll.
+///
+/// The saving is `(N-1)` executions of the loop-control suffix plus `(N-1)`
+/// back-edge branches; the cost is `(N-1) * body_len` of extra CODE. Both scale
+/// with `N-1`, so a ratio model cannot separate a profitable trip count from an
+/// unprofitable one — the threshold can only be empirical, and it is set
+/// CONSERVATIVELY.
+///
+/// What was measured (almabench, PMC cycles of a renamed `bench_main`, min of
+/// 9 interleaved samples, stdout bit-exact vs clang -O3 in every arm):
+///
+/// | tier                                  | retired insts | cycles  |
+/// | ------------------------------------- | ------------- | ------- |
+/// | off (HEAD)                            | 1.00000       | 1.00000 |
+/// | on, `MIN_TRIP = 4` (planetpv's trip-8) | 0.99704      | 0.99065 |
+/// | on, `MIN_TRIP = 2` (+ its trip-2 loop) | 0.99668      | 0.98963 |
+///
+/// NOTE — an inherited claim that `planetpv`'s trip-2 `k = 8..9` loop is a
+/// ~0.9-point LOSS did NOT reproduce through the compiler: admitting it is a
+/// further 0.1% WIN, and the only extra corpus program it pulls in
+/// (`Misc/fbench`) measures 0.99943 cycles, a wash. 4 is kept anyway because
+/// that 0.1% is far inside the wall-clock noise floor (a byte-identical null
+/// arm spreads ~0.3% on this program) and was not reproduced in both alignment
+/// regimes — it does not meet the bar for a default. Use
+/// `TCG_CALL_UNROLL_MIN_TRIP=2` to sweep it.
+const CALL_UNROLL_MIN_TRIP: u64 = 4;
+
+/// Largest trip count the call tier will fully unroll: past this the straight
+/// line stops fitting the fetch window and the tier is pure code growth.
+const CALL_UNROLL_MAX_TRIP: u64 = 8;
+
+/// Largest one-iteration body (header body + loop-carried copies) the call tier
+/// will replicate. `planetpv`'s k-loop measures 48 machine instructions HERE
+/// (40 after regalloc coalescing) once `ptr-iv-sr` has collapsed its six
+/// address chains to walking pointers; the cap leaves headroom without
+/// admitting a visibly different class of loop.
+const CALL_UNROLL_MAX_BODY_INSTS: usize = 56;
+
+/// Largest total clone budget per loop (`(N-1) * body_len`).
+const CALL_UNROLL_MAX_CLONED_INSTS: usize = 400;
+
+/// Compile-time kill switch for the late call-bearing full unroll: set
+/// `TCG_NO_CALL_UNROLL` (any value) to disable it. With it set the compiler is
+/// byte-identical to a build without the tier.
+fn call_unroll_enabled() -> bool {
+    std::env::var_os("TCG_NO_CALL_UNROLL").is_none()
+}
+
+/// Optional minimum-trip override (`TCG_CALL_UNROLL_MIN_TRIP`), for A/B sweeps.
+fn call_unroll_min_trip() -> u64 {
+    std::env::var("TCG_CALL_UNROLL_MIN_TRIP")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&t| (2..=64).contains(&t))
+        .unwrap_or(CALL_UNROLL_MIN_TRIP)
+}
+
+/// Late call-bearing exact-trip FULL unroll.
+///
+/// # Why a separate tier, and why LATE
+///
+/// The early `loop-unroll` slot runs before `ext-addr` and `ptr-iv-sr`. Fully
+/// unrolling a 2D array walk there DELETES the loop, so `ptr-iv-sr` — whose
+/// module doc names "almabench planetpv k-loops" as its motivating case — can
+/// never fire on it, and every clone keeps the unreduced 4-instruction address
+/// chain (`lsl ; madd ; add ; ldr`) instead of a zero-offset load off a walking
+/// pointer.
+///
+/// That is not a guess. Toggling `TCG_NO_PTR_IV_SR` around THIS slot reproduces
+/// the pre-`ptr-iv-sr` placement exactly, and `planetpv` splits three ways
+/// (static count in the emitted object; cycles are PMC, min of 9 interleaved):
+///
+/// | arm                       | madd | lsl | cycles vs HEAD |
+/// | ------------------------- | ---- | --- | -------------- |
+/// | HEAD (loop, reduced)      |  16  |  9  | 1.00000        |
+/// | unroll, ptr-iv-sr OFF     |  58  | 51  | 1.00951        |
+/// | unroll, ptr-iv-sr ON      |  16  |  9  | 0.98898        |
+///
+/// `+42 = 6 arrays x 7 extra clones` of address arithmetic, and the unreduced
+/// unroll is a WASH against not unrolling at all (1.00951 vs 1.00943 for the
+/// no-unroll/no-ptr-iv-sr control). One pass-order edge is the entire prize.
+/// Run after `ptr-iv-sr` and the clones inherit the reduced body, so the unroll
+/// only ever REMOVES work: the `(N-1)` loop-control suffixes and back-edge
+/// branches.
+///
+/// # What it does
+///
+/// A full unroll is the factor unroll at `K = N`: the verbatim replicator
+/// (`partial_unroll_apply`) splices `N-1` extra `(carry ; body)` copies ahead of
+/// the header's control suffix. The trip test then fails on its first execution
+/// and the latch becomes unreachable, so the loop control costs one evaluation
+/// per loop ENTRY instead of `N`. Nothing about the trip test, the bound, the
+/// step or the exit edge is rewritten, so a mis-modeled trip count can only
+/// make the tier refuse, never miscompile.
+///
+/// # Admission
+///
+/// * the body must CONTAIN a call — that is the only thing this tier does that
+///   `partial-unroll` will not, and it keeps the two tiers disjoint by
+///   construction, so the tier cannot silently re-decide a loop the general
+///   cost model already ruled on;
+/// * `CALL_UNROLL_MIN_TRIP <= N <= CALL_UNROLL_MAX_TRIP`;
+/// * body and clone-budget caps.
+///
+/// Kill switch: `TCG_NO_CALL_UNROLL`; per-pass bisect:
+/// `TRUST_CG_DISABLE_PASSES=callunroll`.
+#[derive(Debug, Clone, Default)]
+pub struct CallUnroll {
+    fired: usize,
+}
+
+impl CallUnroll {
+    pub fn new() -> Self {
+        Self { fired: 0 }
+    }
+
+    /// Loops fully unrolled in the last `run`.
+    pub fn fired(&self) -> usize {
+        self.fired
+    }
+
+    fn run_with_loop_analysis(
+        &mut self,
+        func: &mut MachFunction,
+        loop_analysis: &LoopAnalysis,
+        mut provenance: Option<&mut ProvenanceMap>,
+    ) -> bool {
+        self.fired = 0;
+        if !call_unroll_enabled() || loop_analysis.is_empty() {
+            return false;
+        }
+        let dump = std::env::var_os("TRUST_CG_DUMP_CALL_UNROLL").is_some();
+        let min_trip = call_unroll_min_trip();
+        let all_loops: Vec<NaturalLoop> = loop_analysis.all_loops().cloned().collect();
+        let innermost: Vec<&NaturalLoop> = all_loops
+            .iter()
+            .filter(|lp| {
+                !all_loops
+                    .iter()
+                    .any(|other| other.parent == Some(lp.header))
+            })
+            .collect();
+        let def_map = build_def_map(func);
+
+        // Collect first, mutate after (same discipline as `partial-unroll`:
+        // the transform invalidates block layout for later candidates, and
+        // every candidate is innermost and edits only its own header).
+        let mut plans: Vec<(NaturalLoop, PartialLoop)> = Vec::new();
+        for lp in &innermost {
+            let Some(pl) = analyze_partial_loop(func, lp, &def_map, call_unroll_cloneable) else {
+                continue;
+            };
+            let body_len = pl.body_len();
+            // Disjointness from `partial-unroll`: a call in the body is the
+            // defining feature of this tier. Without one the general cost model
+            // owns the loop.
+            let has_call = pl
+                .header_body
+                .iter()
+                .chain(pl.carry.iter())
+                .any(|&id| func.inst(id).flags.is_call());
+            let cloned = (pl.trip_count.saturating_sub(1)) as usize * body_len;
+            let admit = has_call
+                && pl.trip_count >= min_trip
+                && pl.trip_count <= CALL_UNROLL_MAX_TRIP
+                && body_len > 0
+                && body_len <= CALL_UNROLL_MAX_BODY_INSTS
+                && cloned <= CALL_UNROLL_MAX_CLONED_INSTS;
+            if dump {
+                eprintln!(
+                    "[call-unroll] {}: header={:?} trip={} body={} call={} cloned={} {}",
+                    func.name,
+                    pl.header,
+                    pl.trip_count,
+                    body_len,
+                    has_call,
+                    cloned,
+                    if admit { "ADMIT" } else { "DECLINED" }
+                );
+            }
+            if admit {
+                plans.push(((*lp).clone(), pl));
+            }
+        }
+        if plans.is_empty() {
+            return false;
+        }
+        let mut changed = false;
+        for (lp, pl) in plans {
+            // Re-validate that the header still looks exactly as analyzed.
+            let hinsts = &func.block(pl.header).insts;
+            if hinsts.len() < pl.ctrl_start + 2
+                || hinsts[..pl.ctrl_start] != pl.header_body[..]
+                || func.block(pl.latch).insts.len() != pl.carry.len() + 1
+            {
+                continue;
+            }
+            let k = pl.trip_count;
+            if partial_unroll_apply(func, &lp, &pl, k, provenance.as_deref_mut()) {
+                self.fired += 1;
+                changed = true;
+            }
+        }
+        changed
+    }
+}
+
+impl MachinePass for CallUnroll {
+    fn name(&self) -> &str {
+        "call-unroll"
+    }
+
+    fn run(&mut self, func: &mut MachFunction) -> bool {
+        let dom = DomTree::compute(func);
+        let loop_analysis = LoopAnalysis::compute(func, &dom);
+        self.run_with_loop_analysis(func, &loop_analysis, None)
+    }
+
+    fn run_with_analyses(&mut self, func: &mut MachFunction, analyses: &mut AnalysisCache) -> bool {
+        let loop_analysis = analyses.loop_analysis(func).clone();
+        self.run_with_loop_analysis(func, &loop_analysis, None)
+    }
+
+    fn run_with_provenance(
+        &mut self,
+        func: &mut MachFunction,
+        provenance: &mut ProvenanceMap,
+    ) -> bool {
+        let dom = DomTree::compute(func);
+        let loop_analysis = LoopAnalysis::compute(func, &dom);
+        self.run_with_loop_analysis(func, &loop_analysis, Some(provenance))
+    }
+
+    fn run_with_analyses_and_provenance(
+        &mut self,
+        func: &mut MachFunction,
+        analyses: &mut AnalysisCache,
+        provenance: &mut ProvenanceMap,
+    ) -> bool {
+        let loop_analysis = analyses.loop_analysis(func).clone();
+        self.run_with_loop_analysis(func, &loop_analysis, Some(provenance))
+    }
 }
 
 #[cfg(test)]
@@ -4320,6 +5992,177 @@ mod tests {
         let mut pass = LoopUnroll::default();
         let changed = pass.run(&mut func);
         assert!(!changed, "trip count above the cap must fail closed");
+    }
+
+    /// Add a SECOND exit edge to the bounded early-exit loop: an extra
+    /// early-return block reached from the body. This is the clang -O2 shape of
+    /// Queens' `Try`, where the post-recursion `*q != 0` test returns directly
+    /// instead of rejoining the merged trip test. Splits `bb2` into
+    /// `bb2 -> {bb3, pad}` with `pad` a `Ret` landing pad outside the loop.
+    fn add_second_exit(func: &mut MachFunction) -> BlockId {
+        let bb2 = BlockId(2);
+        let bb3 = BlockId(3);
+        let pad = func.create_block();
+        let ret = func.push_inst(MachInst::new(AArch64Opcode::Ret, vec![]));
+        func.append_inst(pad, ret);
+
+        // bb2 currently ends in `B bb3`; replace with a conditional split.
+        func.block_mut(bb2).insts.pop();
+        let cs = func.push_inst(MachInst::new(AArch64Opcode::CSet, vec![vreg(7), imm(0)]));
+        func.append_inst(bb2, cs);
+        let cmp = func.push_inst(MachInst::new(AArch64Opcode::CmpRI, vec![vreg(7), imm(0)]));
+        func.append_inst(bb2, cmp);
+        let bc = func.push_inst(MachInst::new(
+            AArch64Opcode::BCond,
+            vec![imm(1), MachOperand::Block(pad)],
+        ));
+        func.append_inst(bb2, bc);
+        let b = func.push_inst(MachInst::new(
+            AArch64Opcode::B,
+            vec![MachOperand::Block(bb3)],
+        ));
+        func.append_inst(bb2, b);
+        func.add_edge(bb2, pad);
+        pad
+    }
+
+    #[test]
+    fn test_bounded_early_exit_admits_a_second_exit_edge() {
+        // The historical gate demanded EXACTLY ONE body -> non-body edge, which
+        // the clang -O2 shape of Queens' `Try` fails (it has three). Extra exits
+        // need no rewriting: each clone copies the branch verbatim and it still
+        // targets the same out-of-loop block.
+        let mut func = make_bounded_early_exit_loop(3);
+        let pad = add_second_exit(&mut func);
+        let mut pass = LoopUnroll::default();
+        assert!(
+            pass.run(&mut func),
+            "a second exit edge must not block the unroll"
+        );
+        // Every unrolled iteration keeps its own early-exit edge into the SAME
+        // landing pad -- control leaves the chain at the original block.
+        let pad_preds = func.block(pad).preds.len();
+        assert!(
+            pad_preds >= 3,
+            "each of the 3 unrolled iterations must keep its early-exit edge \
+             into the landing pad (got {pad_preds} preds)"
+        );
+        assert!(
+            func.block(pad).succs.is_empty(),
+            "the exit landing pad must not be cloned or rewired"
+        );
+    }
+
+    #[test]
+    fn test_bounded_early_exit_refuses_second_back_edge() {
+        // SOUNDNESS PIN (a latent miscompile this gate closes). `LoopAnalysis`
+        // MERGES multiple back-edges into one loop and keeps only the FIRST
+        // latch, so a second in-body predecessor of the header is invisible to
+        // every latch check. It is fatal: that block is cloned verbatim, its
+        // `B header` operand is remapped through the clone map to the CLONE'S
+        // OWN header, and the clone spins forever.
+        //
+        // Shape: `bb2` becomes a two-way split `{bb3, bb6}` where `bb6` is a
+        // single-successor `B bb1` -- a second latch that keeps `bb4` the
+        // analysis's chosen latch, so every other gate still passes.
+        let mut func = make_bounded_early_exit_loop(3);
+        let bb6 = func.create_block();
+        let back = func.push_inst(MachInst::new(
+            AArch64Opcode::B,
+            vec![MachOperand::Block(BlockId(1))],
+        ));
+        func.append_inst(bb6, back);
+        func.add_edge(bb6, BlockId(1));
+
+        // bb2 currently ends in `B bb3`; make it `... ; BCond -> bb6 ; B bb3`.
+        func.block_mut(BlockId(2)).insts.pop();
+        let cmp = func.push_inst(MachInst::new(AArch64Opcode::CmpRI, vec![vreg(6), imm(0)]));
+        func.append_inst(BlockId(2), cmp);
+        let bc = func.push_inst(MachInst::new(
+            AArch64Opcode::BCond,
+            vec![imm(1), MachOperand::Block(bb6)],
+        ));
+        func.append_inst(BlockId(2), bc);
+        let b = func.push_inst(MachInst::new(
+            AArch64Opcode::B,
+            vec![MachOperand::Block(BlockId(3))],
+        ));
+        func.append_inst(BlockId(2), b);
+        func.add_edge(BlockId(2), bb6);
+
+        let mut pass = LoopUnroll::default();
+        assert!(
+            !pass.run(&mut func),
+            "a second back-edge into the header must fail closed"
+        );
+    }
+
+    /// Re-route the dynamic early-exit condition `v3` through a phi-copy web
+    /// (the clang -O2 lowering of `phi i1 [ %cmp, .. ], [ true, .. ]`):
+    /// `v9 = CSet ; v3 = MovR v9` in the exit-test block, plus a second
+    /// definition `v8 = Movz #c ; v3 = MovR v8` on the preheader path.
+    fn phi_copy_the_dynamic_condition(func: &mut MachFunction, c: i64) {
+        let bb3 = BlockId(3);
+        let pos = func
+            .block(bb3)
+            .insts
+            .iter()
+            .position(|&i| func.inst(i).opcode == AArch64Opcode::CSet)
+            .unwrap();
+        let cset_id = func.block(bb3).insts[pos];
+        func.inst_mut(cset_id).operands[0] = vreg(9);
+        let mov = func.push_inst(MachInst::new(AArch64Opcode::MovR, vec![vreg(3), vreg(9)]));
+        func.block_mut(bb3).insts.insert(pos + 1, mov);
+
+        let bb0 = func.entry;
+        let movz = func.push_inst(MachInst::new(AArch64Opcode::Movz, vec![vreg(8), imm(c)]));
+        func.block_mut(bb0).insts.insert(0, movz);
+        let mov2 = func.push_inst(MachInst::new(AArch64Opcode::MovR, vec![vreg(3), vreg(8)]));
+        func.block_mut(bb0).insts.insert(1, mov2);
+    }
+
+    #[test]
+    fn test_bounded_early_exit_admits_phi_copied_boolean_condition() {
+        // At -O1 the `!*q` test is recomputed in the merged exit-test block, so
+        // the dynamic condition is a single `CSet`. At -O2 LLVM turns it into a
+        // phi over i1, which lowers to `MovR` block-argument copies from a
+        // materialized 1 and from the CSet -- every incoming value is still 0/1,
+        // so `dyn != 0` is still exactly `(dyn & 1) != 0`.
+        let mut func = make_bounded_early_exit_loop(3);
+        phi_copy_the_dynamic_condition(&mut func, 1);
+        let mut pass = LoopUnroll::default();
+        assert!(
+            pass.run(&mut func),
+            "a phi-copied 0/1 dynamic condition must be admitted"
+        );
+    }
+
+    #[test]
+    fn test_bounded_early_exit_refuses_non_boolean_phi_copied_condition() {
+        // MUTATION KILL for the boolean prover: the same copy web, but the
+        // constant is 2. `2 != 0` is TRUE while `(2 & 1) != 0` is FALSE, so
+        // dropping the trip test would change behaviour -- fail closed.
+        let mut func = make_bounded_early_exit_loop(3);
+        phi_copy_the_dynamic_condition(&mut func, 2);
+        let mut pass = LoopUnroll::default();
+        assert!(
+            !pass.run(&mut func),
+            "a non-0/1 dynamic condition must fail closed"
+        );
+    }
+
+    #[test]
+    fn test_bounded_early_exit_refuses_copy_cycle_dynamic_condition() {
+        // MUTATION KILL for the prover's cycle handling: a self-referential
+        // copy web is unprovable and must fail closed rather than recurse.
+        let mut func = make_bounded_early_exit_loop(3);
+        phi_copy_the_dynamic_condition(&mut func, 1);
+        // Make the constant source a copy of the condition itself: v8 = MovR v3.
+        let bb0 = func.entry;
+        let movz_id = func.block(bb0).insts[0];
+        *func.inst_mut(movz_id) = MachInst::new(AArch64Opcode::MovR, vec![vreg(8), vreg(3)]);
+        let mut pass = LoopUnroll::default();
+        assert!(!pass.run(&mut func), "a cyclic copy web must fail closed");
     }
 
     #[test]
@@ -5653,5 +7496,832 @@ mod tests {
         let mut pass = LoopUnroll::default();
         assert!(!pass.run(&mut func), "vcond reuse must fail closed");
         assert!(func.block(BlockId(5)).succs.contains(&BlockId(1)));
+    }
+
+    // ---- BOUNDED-trip diamond unroll (ReedSolomon's Chien search) ----------
+
+    /// How the bounded-trip fixture should be perturbed.
+    #[derive(Clone, Copy, PartialEq)]
+    enum BTripShape {
+        /// Both guards present: `1 <= n <= 8`, limit `n+1`, 8 iterations max.
+        Sound,
+        /// Drop `n < 9`: no upper bound, so no `M` can be proven.
+        NoUpperGuard,
+        /// Drop `n >= 1`: an equality exit needs the lower bound too, or some
+        /// admissible limit is never hit and the loop would not leave here.
+        NoLowerGuard,
+        /// Drop `n >= 1` AND widen the limit with `Sxtw` instead of `Uxtw`, so
+        /// the zero-extension side condition cannot be what refuses: this
+        /// isolates the equality exit's own need for a lower bound.
+        NoLowerGuardSignExtended,
+        /// Give the lower-bound guard's surviving arm a SECOND predecessor, so
+        /// it is a JOIN: reached without the branch condition holding. Block
+        /// dominance still holds; EDGE dominance must not.
+        LowerArmIsJoin,
+    }
+
+    /// Build the ReedSolomon Chien-search shape: an ASCENDING diamond loop whose
+    /// limit is `n + 1` (a `Uxtw` of an `AddRI`), left by an EQUALITY test, and
+    /// whose trip count is knowable only from two guards dominating the
+    /// preheader.
+    ///
+    /// ```text
+    ///   g1: v31=Copy x1 ; v30=LdrRI[v31] ; CmpRI v30,#9 ; CSet v32,LT
+    ///       CmpRI v32,#0 ; BCond[NE]->g2 ; B ->x          (taken: n < 9)
+    ///   g2: CmpRI v30,#1 ; CSet v33,LT ; CmpRI v33,#0
+    ///       BCond[NE]->x ; B ->ph                         (fallthru: n >= 1)
+    ///   ph: v34=AddRI v30,#1 ; v35=Uxtw v34 ; v1=iv=1 ; v2=4 ; v20=Copy x0
+    ///   h : v4=Madd v1,v2,v20 ; v5=Ldr[v4] ; CmpRI v5,#1 ; BCond[EQ]->a ; B ->b
+    ///   a : v7=MovR v5 ; B ->t          b: v7=Movz #9 ; B ->t
+    ///   t : v8=Madd v1,v2,v20 ; Str v7,[v8] ; v9=AddRI v1,#1
+    ///       CmpRR v9,v35 ; CSet v10,EQ ; CmpRI v10,#0 ; BCond[NE]->x ; B ->l
+    ///   l : v1=MovR v9 ; B ->h          x: Ret
+    /// ```
+    fn make_diamond_bounded_trip_loop(shape: BTripShape) -> MachFunction {
+        let mut func = MachFunction::new("chien_loop".to_string(), Signature::new(vec![], vec![]));
+        let g1 = func.entry;
+        let g2 = func.create_block();
+        let ph = func.create_block();
+        let h = func.create_block();
+        let a = func.create_block();
+        let b = func.create_block();
+        let t = func.create_block();
+        let l = func.create_block();
+        let x = func.create_block();
+        let side = func.create_block(); // only used by LowerArmIsJoin
+
+        let push = |func: &mut MachFunction, blk, op, ops: Vec<MachOperand>| {
+            let id = func.push_inst(MachInst::new(op, ops));
+            func.append_inst(blk, id);
+        };
+        let w = |id: u32| vreg_class(id, RegClass::Gpr32);
+        const LT: i64 = 11;
+        const NE: i64 = 1;
+        const EQ: i64 = 0;
+
+        // g1: load n, then `n < 9`.
+        push(
+            &mut func,
+            g1,
+            AArch64Opcode::Copy,
+            vec![vreg(31), MachOperand::PReg(PReg::new(1))],
+        );
+        push(
+            &mut func,
+            g1,
+            AArch64Opcode::LdrRI,
+            vec![w(30), vreg(31), imm(0)],
+        );
+        if shape == BTripShape::NoUpperGuard {
+            push(
+                &mut func,
+                g1,
+                AArch64Opcode::B,
+                vec![MachOperand::Block(g2)],
+            );
+            func.add_edge(g1, g2);
+        } else {
+            push(&mut func, g1, AArch64Opcode::CmpRI, vec![w(30), imm(9)]);
+            push(&mut func, g1, AArch64Opcode::CSet, vec![vreg(32), imm(LT)]);
+            push(&mut func, g1, AArch64Opcode::CmpRI, vec![vreg(32), imm(0)]);
+            push(
+                &mut func,
+                g1,
+                AArch64Opcode::BCond,
+                vec![imm(NE), MachOperand::Block(g2)],
+            );
+            push(&mut func, g1, AArch64Opcode::B, vec![MachOperand::Block(x)]);
+            func.add_edge(g1, g2);
+            func.add_edge(g1, x);
+        }
+
+        // g2: `n >= 1` on the fallthrough edge into the preheader.
+        if matches!(
+            shape,
+            BTripShape::NoLowerGuard | BTripShape::NoLowerGuardSignExtended
+        ) {
+            push(
+                &mut func,
+                g2,
+                AArch64Opcode::B,
+                vec![MachOperand::Block(ph)],
+            );
+            func.add_edge(g2, ph);
+        } else {
+            // For `LowerArmIsJoin` the `n < 1` arm ALSO funnels into the
+            // preheader (through `side`), so `ph` is reached from BOTH arms and
+            // the branch condition does not hold there. `ph` still block-
+            // dominates itself, which is exactly why block dominance is not
+            // enough — only the edge test rejects this.
+            let taken = if shape == BTripShape::LowerArmIsJoin {
+                side
+            } else {
+                x
+            };
+            push(&mut func, g2, AArch64Opcode::CmpRI, vec![w(30), imm(1)]);
+            push(&mut func, g2, AArch64Opcode::CSet, vec![vreg(33), imm(LT)]);
+            push(&mut func, g2, AArch64Opcode::CmpRI, vec![vreg(33), imm(0)]);
+            push(
+                &mut func,
+                g2,
+                AArch64Opcode::BCond,
+                vec![imm(NE), MachOperand::Block(taken)],
+            );
+            push(
+                &mut func,
+                g2,
+                AArch64Opcode::B,
+                vec![MachOperand::Block(ph)],
+            );
+            func.add_edge(g2, taken);
+            func.add_edge(g2, ph);
+            if shape == BTripShape::LowerArmIsJoin {
+                push(
+                    &mut func,
+                    side,
+                    AArch64Opcode::B,
+                    vec![MachOperand::Block(ph)],
+                );
+                func.add_edge(side, ph);
+            }
+        }
+
+        // ph: limit = uxtw(n + 1); iv = 1.
+        push(
+            &mut func,
+            ph,
+            AArch64Opcode::AddRI,
+            vec![w(34), w(30), imm(1)],
+        );
+        let widen = if shape == BTripShape::NoLowerGuardSignExtended {
+            AArch64Opcode::Sxtw
+        } else {
+            AArch64Opcode::Uxtw
+        };
+        push(&mut func, ph, widen, vec![vreg(35), w(34)]);
+        push(&mut func, ph, AArch64Opcode::Movz, vec![vreg(0), imm(1)]);
+        push(&mut func, ph, AArch64Opcode::MovR, vec![vreg(1), vreg(0)]);
+        push(&mut func, ph, AArch64Opcode::Movz, vec![vreg(2), imm(4)]);
+        push(
+            &mut func,
+            ph,
+            AArch64Opcode::Copy,
+            vec![vreg(20), MachOperand::PReg(PReg::new(0))],
+        );
+        push(&mut func, ph, AArch64Opcode::B, vec![MachOperand::Block(h)]);
+
+        // header: load reg[j], diamond branch on it.
+        push(
+            &mut func,
+            h,
+            AArch64Opcode::Madd,
+            vec![vreg(4), vreg(1), vreg(2), vreg(20)],
+        );
+        push(
+            &mut func,
+            h,
+            AArch64Opcode::LdrRI,
+            vec![w(5), vreg(4), imm(0)],
+        );
+        push(&mut func, h, AArch64Opcode::CmpRI, vec![w(5), imm(1)]);
+        push(
+            &mut func,
+            h,
+            AArch64Opcode::BCond,
+            vec![imm(EQ), MachOperand::Block(a)],
+        );
+        push(&mut func, h, AArch64Opcode::B, vec![MachOperand::Block(b)]);
+        push(&mut func, a, AArch64Opcode::MovR, vec![w(7), w(5)]);
+        push(&mut func, a, AArch64Opcode::B, vec![MachOperand::Block(t)]);
+        push(&mut func, b, AArch64Opcode::Movz, vec![w(7), imm(9)]);
+        push(&mut func, b, AArch64Opcode::B, vec![MachOperand::Block(t)]);
+
+        // T: store reg[j], advance, equality trip test against the limit.
+        push(
+            &mut func,
+            t,
+            AArch64Opcode::Madd,
+            vec![vreg(8), vreg(1), vreg(2), vreg(20)],
+        );
+        push(
+            &mut func,
+            t,
+            AArch64Opcode::StrRI,
+            vec![w(7), vreg(8), imm(0)],
+        );
+        push(
+            &mut func,
+            t,
+            AArch64Opcode::AddRI,
+            vec![vreg(9), vreg(1), imm(1)],
+        );
+        push(&mut func, t, AArch64Opcode::CmpRR, vec![vreg(9), vreg(35)]);
+        push(&mut func, t, AArch64Opcode::CSet, vec![vreg(10), imm(EQ)]);
+        push(&mut func, t, AArch64Opcode::CmpRI, vec![vreg(10), imm(0)]);
+        push(
+            &mut func,
+            t,
+            AArch64Opcode::BCond,
+            vec![imm(NE), MachOperand::Block(x)],
+        );
+        push(&mut func, t, AArch64Opcode::B, vec![MachOperand::Block(l)]);
+        push(&mut func, l, AArch64Opcode::MovR, vec![vreg(1), vreg(9)]);
+        push(&mut func, l, AArch64Opcode::B, vec![MachOperand::Block(h)]);
+        push(&mut func, x, AArch64Opcode::Ret, vec![]);
+
+        func.add_edge(ph, h);
+        func.add_edge(h, a);
+        func.add_edge(h, b);
+        func.add_edge(a, t);
+        func.add_edge(b, t);
+        func.add_edge(t, x);
+        func.add_edge(t, l);
+        func.add_edge(l, h);
+        func.next_vreg = 100;
+        func
+    }
+
+    /// Count `CmpRI` instructions that test `limit` — one per RETAINED
+    /// bounded-trip exit test.
+    fn count_limit_tests(func: &MachFunction, limit: VReg) -> usize {
+        let mut n = 0;
+        for &blk in &func.block_order {
+            for &iid in &func.block(blk).insts {
+                let inst = func.inst(iid);
+                if inst.opcode == AArch64Opcode::CmpRI
+                    && inst.operands.first().and_then(|o| o.as_vreg()) == Some(limit)
+                {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    #[test]
+    fn test_diamond_bounded_trip_unroll_fires_on_guarded_limit() {
+        // `1 <= n <= 8` proven by two dominating guards, limit `n+1`, equality
+        // exit: 8 clones, and the IV-indexed addresses fold to constants.
+        let mut func = make_diamond_bounded_trip_loop(BTripShape::Sound);
+        let mut pass = LoopUnroll::default();
+        assert!(
+            pass.run(&mut func),
+            "guard-bounded diamond loop must unroll"
+        );
+
+        let (mut strs, madds) = diamond_strs_and_madds(&func);
+        strs.sort_unstable();
+        assert_eq!(
+            strs,
+            vec![4, 8, 12, 16, 20, 24, 28, 32],
+            "each clone's store must fold to its own constant offset"
+        );
+        assert_eq!(madds, 0, "every IV-indexed Madd must fold away");
+    }
+
+    #[test]
+    fn test_diamond_bounded_trip_keeps_an_exit_test_in_every_clone_but_the_last() {
+        // THE soundness pin. The runtime trip count is only bounded, so clones
+        // 1..M-1 must each still be able to leave the loop; only the last may
+        // rely on the guard. Losing any of these tests silently runs extra
+        // iterations of the body.
+        let mut func = make_diamond_bounded_trip_loop(BTripShape::Sound);
+        let mut pass = LoopUnroll::default();
+        assert!(pass.run(&mut func));
+
+        let limit = VReg::new(35, RegClass::Gpr64);
+        assert_eq!(
+            count_limit_tests(&func, limit),
+            7,
+            "8 clones must retain exactly 7 runtime exit tests"
+        );
+        // ...and each must actually branch OUT of the loop, not merely compare:
+        // every `CmpRI limit,#x` is immediately followed by a `BCond` whose
+        // target is the function's exit block.
+        let mut paired = 0;
+        for &blk in &func.block_order {
+            let insts = func.block(blk).insts.clone();
+            for pair in insts.windows(2) {
+                let cmp = func.inst(pair[0]);
+                if cmp.opcode != AArch64Opcode::CmpRI
+                    || cmp.operands.first().and_then(|o| o.as_vreg()) != Some(limit)
+                {
+                    continue;
+                }
+                let br = func.inst(pair[1]);
+                assert_eq!(br.opcode, AArch64Opcode::BCond, "limit test must branch");
+                let MachOperand::Block(tgt) = br.operands[1] else {
+                    panic!("BCond target must be a block")
+                };
+                assert!(
+                    func.block(tgt)
+                        .insts
+                        .iter()
+                        .any(|&i| func.inst(i).opcode == AArch64Opcode::Ret),
+                    "the retained test must leave the loop"
+                );
+                paired += 1;
+            }
+        }
+        assert_eq!(
+            paired, 7,
+            "every retained test must branch to the exit block"
+        );
+    }
+
+    #[test]
+    fn test_diamond_bounded_trip_refuses_without_upper_bound() {
+        // No dominating `n < 9`: nothing caps the trip count, so no clone chain
+        // may be capped either.
+        let mut func = make_diamond_bounded_trip_loop(BTripShape::NoUpperGuard);
+        let mut pass = LoopUnroll::default();
+        assert!(!pass.run(&mut func), "unbounded limit must fail closed");
+    }
+
+    #[test]
+    fn test_diamond_bounded_trip_refuses_without_lower_bound() {
+        // An EQUALITY exit leaves at `m = K - init`. Without `K >= init+1` some
+        // admissible limit is never hit, so the original would not leave through
+        // this test at all and capping the chain would invent an exit.
+        let mut func = make_diamond_bounded_trip_loop(BTripShape::NoLowerGuard);
+        let mut pass = LoopUnroll::default();
+        assert!(
+            !pass.run(&mut func),
+            "equality exit needs a lower bound too"
+        );
+    }
+
+    #[test]
+    fn test_diamond_bounded_trip_equality_exit_needs_lower_bound_even_when_widening_is_exact() {
+        // Same as above but the limit is SIGN-extended, so the `uxtw`
+        // side condition cannot be what refuses. What remains is the equality
+        // exit's own requirement: without `K >= init+1` the loop is not
+        // guaranteed to leave through this test at all.
+        let mut func = make_diamond_bounded_trip_loop(BTripShape::NoLowerGuardSignExtended);
+        let def_map = build_def_map(&func);
+        let (_, _, zext_at) = strict_affine_root(&func, &def_map, VReg::new(35, RegClass::Gpr64))
+            .expect("limit is affine");
+        assert_eq!(zext_at, None, "sign extension carries no side condition");
+        let mut pass = LoopUnroll::default();
+        assert!(
+            !pass.run(&mut func),
+            "equality exit must still refuse without a lower bound"
+        );
+    }
+
+    #[test]
+    fn test_diamond_bounded_trip_refuses_join_arm() {
+        // EDGE dominance, not block dominance: the guard arm here is also
+        // reached from `side`, so the branch condition does NOT hold on entry
+        // to the preheader even though the arm still dominates it.
+        let mut func = make_diamond_bounded_trip_loop(BTripShape::LowerArmIsJoin);
+        let mut pass = LoopUnroll::default();
+        assert!(
+            !pass.run(&mut func),
+            "a guard arm that is also a join proves nothing"
+        );
+    }
+
+    #[test]
+    fn test_diamond_bounded_trip_zero_extended_limit_needs_nonnegative_source() {
+        // `uxtw` is only value-preserving when its 32-bit source cannot be
+        // negative; that side condition is discharged from the LOWER bound, so
+        // dropping the lower guard must also drop this transform.
+        let func = make_diamond_bounded_trip_loop(BTripShape::NoLowerGuard);
+        let def_map = build_def_map(&func);
+        let limit = VReg::new(35, RegClass::Gpr64);
+        let (root, off, zext_at) =
+            strict_affine_root(&func, &def_map, limit).expect("limit is affine");
+        assert_eq!(root, VReg::new(30, RegClass::Gpr32), "root is the loaded n");
+        assert_eq!(off, 1, "limit is n + 1");
+        assert_eq!(zext_at, Some(0), "the uxtw crossing must be reported");
+    }
+
+    // =====================================================================
+    // PARTIAL (factor) unroll
+    // =====================================================================
+
+    /// The loop header of `make_copy_counted_loop` is always `BlockId(1)` and
+    /// its latch `BlockId(3)`; the peel block (when one is emitted) is the
+    /// header's third predecessor, created last.
+    const PL_HEADER: BlockId = BlockId(1);
+    const PL_LATCH: BlockId = BlockId(3);
+
+    /// Body-work instructions (`AddRI v20, _, #10`) in one block.
+    fn block_work(func: &MachFunction, b: BlockId) -> usize {
+        func.block(b)
+            .insts
+            .iter()
+            .filter(|&&iid| {
+                let inst = func.inst(iid);
+                inst.opcode == AArch64Opcode::AddRI
+                    && inst.operands.get(2).and_then(|o| o.as_imm()) == Some(10)
+            })
+            .count()
+    }
+
+    /// The peeled prologue block, if the transform emitted one: a header
+    /// predecessor that is neither the latch nor the original preheader.
+    fn peel_block(func: &MachFunction) -> Option<BlockId> {
+        func.block(PL_HEADER)
+            .preds
+            .iter()
+            .copied()
+            .find(|&p| p != PL_LATCH && p != BlockId(0))
+    }
+
+    /// THE remainder-correctness pin. For every trip count in a sweep that
+    /// deliberately includes 0, 1, primes and every `N mod K` residue, a fired
+    /// partial unroll must satisfy `N = r + q*K` EXACTLY: `r` peeled iterations,
+    /// `r < K`, and `K | (N - r)`.
+    #[test]
+    fn test_partial_unroll_remainder_is_exact_over_trip_sweep() {
+        let trips: [i64; 34] = [
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 19, 23, 24, 25, 29, 31, 32,
+            33, 47, 48, 49, 63, 64, 65, 101, 188, 255,
+        ];
+        let mut fired = 0usize;
+        for n in trips {
+            let mut func = make_copy_counted_loop(0, 1, n);
+            let mut pass = PartialUnroll::new();
+            let changed = pass.run(&mut func);
+            if !changed {
+                assert!(
+                    n < PARTIAL_MIN_TRIP as i64,
+                    "trip {n} should have been partially unrolled"
+                );
+                continue;
+            }
+            fired += 1;
+            let k = block_work(&func, PL_HEADER) as i64;
+            let r = peel_block(&func).map_or(0, |p| block_work(&func, p) as i64);
+            assert!(k >= 2, "trip {n}: factor {k} must be >= 2");
+            assert!(r < k, "trip {n}: remainder {r} must be < factor {k}");
+            assert_eq!(
+                (n - r) % k,
+                0,
+                "trip {n}: factor {k} must divide the {} main-loop iterations",
+                n - r
+            );
+            // The whole invariant, restated as executed iterations.
+            let q = (n - r) / k;
+            assert_eq!(r + q * k, n, "trip {n}: r + q*K must equal the trip count");
+            // The loop itself is untouched: back edge, exit edge, control.
+            assert!(
+                func.block(PL_LATCH).succs.contains(&PL_HEADER),
+                "trip {n}: the back edge must survive a PARTIAL unroll"
+            );
+            assert!(
+                func.block(PL_HEADER).succs.contains(&BlockId(2)),
+                "trip {n}: the exit edge must survive"
+            );
+            let hinsts = &func.block(PL_HEADER).insts;
+            let last = func.inst(hinsts[hinsts.len() - 1]).opcode;
+            let bcond = func.inst(hinsts[hinsts.len() - 2]).opcode;
+            assert_eq!(last, AArch64Opcode::B);
+            assert_eq!(bcond, AArch64Opcode::BCond);
+        }
+        assert!(
+            fired >= 20,
+            "the sweep must exercise the transform: {fired}"
+        );
+    }
+
+    /// Trip counts the full unrollers already own (and the degenerate 0/1
+    /// cases) must never reach the partial tier.
+    #[test]
+    fn test_partial_unroll_declines_small_and_degenerate_trips() {
+        for n in 0..PARTIAL_MIN_TRIP as i64 {
+            let mut func = make_copy_counted_loop(0, 1, n);
+            let before = func.num_blocks();
+            let mut pass = PartialUnroll::new();
+            assert!(!pass.run(&mut func), "trip {n} must not partially unroll");
+            assert_eq!(func.num_blocks(), before, "trip {n} must be untouched");
+            assert!(func.block(PL_LATCH).succs.contains(&PL_HEADER));
+        }
+    }
+
+    /// A non-unit and a negative step must still split the trip count exactly.
+    #[test]
+    fn test_partial_unroll_non_unit_and_negative_step() {
+        // step 2, bound 50 -> trip 25 (odd, so a peel is forced).
+        let mut func = make_copy_counted_loop(0, 2, 50);
+        let mut pass = PartialUnroll::new();
+        assert!(pass.run(&mut func), "step-2 loop should partially unroll");
+        let k = block_work(&func, PL_HEADER) as i64;
+        let r = peel_block(&func).map_or(0, |p| block_work(&func, p) as i64);
+        assert!(r < k && (25 - r) % k == 0, "K={k} r={r}");
+
+        // step -1 counting down from 37 to 0 -> trip 37 (prime).
+        let mut func = make_copy_counted_loop(37, -1, 0);
+        let mut pass = PartialUnroll::new();
+        assert!(pass.run(&mut func), "down-counting loop should unroll");
+        let k = block_work(&func, PL_HEADER) as i64;
+        let r = peel_block(&func).map_or(0, |p| block_work(&func, p) as i64);
+        assert!(r < k && (37 - r) % k == 0, "K={k} r={r}");
+    }
+
+    /// The folded `Cmp ; BCond ; B` control dialect (what later passes leave
+    /// behind once the `CSet`+`CmpRI #0` pair is collapsed) must be recognized
+    /// with the same exact remainder.
+    #[test]
+    fn test_partial_unroll_folded_bcond_dialect() {
+        let mut func = make_copy_counted_loop(0, 1, 101);
+        // Header: [work, inc, cmp, cset, cmpri, bcond, b] -> drop cset+cmpri and
+        // put the compare's own condition on the BCond (exit when EQ).
+        let hinsts = func.block(PL_HEADER).insts.clone();
+        let (cset, cmpri, bcond) = (hinsts[3], hinsts[4], hinsts[5]);
+        *func.inst_mut(bcond) = MachInst::new(
+            AArch64Opcode::BCond,
+            vec![cc_imm(CondCode::EQ), MachOperand::Block(BlockId(2))],
+        );
+        let b_last = hinsts[6];
+        *func.inst_mut(b_last) =
+            MachInst::new(AArch64Opcode::B, vec![MachOperand::Block(BlockId(3))]);
+        func.block_mut(PL_HEADER)
+            .insts
+            .retain(|&i| i != cset && i != cmpri);
+
+        let mut pass = PartialUnroll::new();
+        assert!(pass.run(&mut func), "folded dialect should be recognized");
+        let k = block_work(&func, PL_HEADER) as i64;
+        let r = peel_block(&func).map_or(0, |p| block_work(&func, p) as i64);
+        assert!(r < k && (101 - r) % k == 0, "K={k} r={r}");
+    }
+
+    /// A call in the body is refused: cloning it is sound but never profitable,
+    /// and the refusal keeps the clone set trivially total.
+    #[test]
+    fn test_partial_unroll_refuses_call_in_body() {
+        let mut func = make_copy_counted_loop(0, 1, 100);
+        let call = func.push_inst(MachInst::new(AArch64Opcode::Bl, vec![]));
+        func.block_mut(PL_HEADER).insts.insert(0, call);
+        let mut pass = PartialUnroll::new();
+        assert!(!pass.run(&mut func), "a call in the body must fail closed");
+    }
+
+    /// A trap pseudo carries `IS_BRANCH`; a branch-filtering body collector
+    /// would silently DROP it from every clone. The partial tier refuses the
+    /// loop instead (its body split is total by construction).
+    #[test]
+    fn test_partial_unroll_refuses_branch_pseudo_in_body() {
+        let mut func = make_copy_counted_loop(0, 1, 100);
+        let trap = func.push_inst(MachInst::new(AArch64Opcode::TrapNullIfZero, vec![vreg(1)]));
+        func.block_mut(PL_HEADER).insts.insert(0, trap);
+        let mut pass = PartialUnroll::new();
+        assert!(!pass.run(&mut func), "a trap pseudo must fail closed");
+
+        // Same for the latch's carry chain.
+        let mut func = make_copy_counted_loop(0, 1, 100);
+        let trap = func.push_inst(MachInst::new(AArch64Opcode::TrapNullIfZero, vec![vreg(1)]));
+        func.block_mut(PL_LATCH).insts.insert(0, trap);
+        let mut pass = PartialUnroll::new();
+        assert!(
+            !pass.run(&mut func),
+            "a trap pseudo in the carry must fail closed"
+        );
+    }
+
+    /// An instruction between the trip compare and the branch breaks the
+    /// "control is a contiguous suffix" precondition: fail closed.
+    #[test]
+    fn test_partial_unroll_refuses_non_suffix_control() {
+        let mut func = make_copy_counted_loop(0, 1, 100);
+        let extra = func.push_inst(MachInst::new(
+            AArch64Opcode::AddRI,
+            vec![vreg(21), vreg(1), imm(10)],
+        ));
+        // Splice between the CSet and the CmpRI cond,#0.
+        func.block_mut(PL_HEADER).insts.insert(4, extra);
+        let mut pass = PartialUnroll::new();
+        assert!(
+            !pass.run(&mut func),
+            "a non-suffix control must fail closed"
+        );
+    }
+
+    /// A body larger than `PARTIAL_MAX_BODY_INSTS` already amortizes its own
+    /// loop control; the cost model declines it.
+    #[test]
+    fn test_partial_unroll_declines_oversized_body() {
+        let mut func = make_copy_counted_loop(0, 1, 100);
+        for _ in 0..PARTIAL_MAX_BODY_INSTS {
+            let filler = func.push_inst(MachInst::new(
+                AArch64Opcode::AddRI,
+                vec![vreg(30), vreg(1), imm(3)],
+            ));
+            func.block_mut(PL_HEADER).insts.insert(0, filler);
+        }
+        let mut pass = PartialUnroll::new();
+        assert!(!pass.run(&mut func), "an oversized body must be declined");
+    }
+
+    /// The cost model never proposes a factor larger than half the trip count
+    /// (the main loop must run at least twice) and never exceeds the cap.
+    #[test]
+    fn test_partial_factor_cost_model_bounds() {
+        for n in 1u64..=4096 {
+            for body in 1usize..=PARTIAL_MAX_BODY_INSTS {
+                if let Some(k) = choose_partial_factor(n, body) {
+                    assert!(n >= PARTIAL_MIN_TRIP, "n={n} below the min trip");
+                    assert!((2..=PARTIAL_MAX_K).contains(&k), "n={n} body={body} k={k}");
+                    assert!(k <= n / 2, "n={n} k={k} must leave >=2 main trips");
+                    let growth = (k - 1 + n % k) as usize * body;
+                    assert!(
+                        growth <= PARTIAL_MAX_GROWTH_INSTS,
+                        "n={n} body={body} k={k} growth={growth}"
+                    );
+                }
+            }
+        }
+        assert_eq!(choose_partial_factor(1000, 0), None, "empty body");
+        assert_eq!(
+            choose_partial_factor(1000, PARTIAL_MAX_BODY_INSTS + 1),
+            None,
+            "oversized body"
+        );
+    }
+
+    /// The partial tier only ever ADDS clones: it must not remove the loop's
+    /// control, its back edge or its exit, so a wrong trip model can only
+    /// refuse to fire — never drop or duplicate iterations.
+    #[test]
+    fn test_partial_unroll_is_purely_additive() {
+        let mut func = make_copy_counted_loop(0, 1, 188);
+        let control_before: Vec<AArch64Opcode> = func
+            .block(PL_HEADER)
+            .insts
+            .iter()
+            .rev()
+            .take(5)
+            .map(|&i| func.inst(i).opcode)
+            .collect();
+        let mut pass = PartialUnroll::new();
+        assert!(pass.run(&mut func));
+        let control_after: Vec<AArch64Opcode> = func
+            .block(PL_HEADER)
+            .insts
+            .iter()
+            .rev()
+            .take(5)
+            .map(|&i| func.inst(i).opcode)
+            .collect();
+        assert_eq!(
+            control_before, control_after,
+            "control suffix must be intact"
+        );
+        assert_eq!(func.block(PL_LATCH).succs, vec![PL_HEADER]);
+        assert_eq!(pass.fired(), 1);
+    }
+    // =====================================================================
+    // LATE CALL-BEARING EXACT-TRIP FULL UNROLL  (`call-unroll`)
+    // =====================================================================
+
+    /// Put a `Bl` at the head of the loop body, which is the ONLY thing that
+    /// separates this tier's candidates from `partial-unroll`'s.
+    fn make_call_bearing_loop(init: i64, step: i64, limit: i64) -> MachFunction {
+        let mut func = make_copy_counted_loop(init, step, limit);
+        let call = func.push_inst(MachInst::new(AArch64Opcode::Bl, vec![]));
+        func.block_mut(PL_HEADER).insts.insert(0, call);
+        func
+    }
+
+    /// The tier fully unrolls at `K = N`: every iteration's body appears
+    /// exactly once, the loop-carried copy is replicated with it, and the trip
+    /// test / bound / step / exit edge are untouched, so the surviving control
+    /// evaluates ONCE per loop entry.
+    #[test]
+    fn test_call_unroll_full_unrolls_at_trip_count() {
+        for trip in [4usize, 5, 8] {
+            let mut func = make_call_bearing_loop(0, 1, trip as i64);
+            let mut pass = CallUnroll::new();
+            assert!(pass.run(&mut func), "trip {trip} must unroll");
+            assert_eq!(pass.fired(), 1);
+            assert_eq!(
+                count_body_work(&func),
+                trip,
+                "trip {trip}: body must appear exactly N times"
+            );
+            let calls = func
+                .block_order
+                .iter()
+                .flat_map(|&b| func.block(b).insts.iter().copied())
+                .filter(|&iid| func.inst(iid).flags.is_call())
+                .count();
+            assert_eq!(calls, trip, "trip {trip}: the call is replicated with it");
+            // No peel block: `N mod N == 0`.
+            assert!(peel_block(&func).is_none(), "a full unroll peels nothing");
+            // Control suffix and CFG intact.
+            let h = &func.block(PL_HEADER).insts;
+            assert_eq!(func.inst(h[h.len() - 1]).opcode, AArch64Opcode::B);
+            assert_eq!(func.inst(h[h.len() - 2]).opcode, AArch64Opcode::BCond);
+            assert!(func.block(PL_LATCH).succs.contains(&PL_HEADER));
+        }
+    }
+
+    /// Disjointness from `partial-unroll`: without a call in the body this tier
+    /// declines, so it can never re-decide a loop the general cost model owns.
+    #[test]
+    fn test_call_unroll_declines_call_free_body() {
+        let mut func = make_copy_counted_loop(0, 1, 8);
+        let mut pass = CallUnroll::new();
+        assert!(!pass.run(&mut func), "a call-free body is not this tier's");
+        assert_eq!(count_body_work(&func), 1);
+    }
+
+    /// THE loop2 EXCLUSION PIN.  almabench `planetpv` has two call-bearing
+    /// exact-trip loops: the trip-8 `k`-loop (the target) and the trip-2
+    /// `k = 8..9` loop.  `CALL_UNROLL_MIN_TRIP` must admit the first and refuse
+    /// the second, and every trip below the threshold with it.
+    #[test]
+    fn test_call_unroll_min_trip_excludes_short_loops() {
+        for trip in [2i64, 3] {
+            let mut func = make_call_bearing_loop(0, 1, trip);
+            let mut pass = CallUnroll::new();
+            assert!(
+                !pass.run(&mut func),
+                "trip {trip} is below CALL_UNROLL_MIN_TRIP and must be refused"
+            );
+            assert_eq!(count_body_work(&func), 1, "trip {trip}: loop left intact");
+        }
+        // ...and the loop2-shaped case specifically: init 8, step 1, bound 10.
+        let mut func = make_call_bearing_loop(8, 1, 10);
+        let mut pass = CallUnroll::new();
+        assert!(
+            !pass.run(&mut func),
+            "planetpv's trip-2 k=8..9 loop must be refused"
+        );
+        assert_eq!(count_body_work(&func), 1);
+    }
+
+    /// Above `CALL_UNROLL_MAX_TRIP` the straight line stops paying: refuse.
+    #[test]
+    fn test_call_unroll_declines_above_max_trip() {
+        let mut func = make_call_bearing_loop(0, 1, CALL_UNROLL_MAX_TRIP as i64 + 1);
+        let mut pass = CallUnroll::new();
+        assert!(!pass.run(&mut func), "trip > MAX must fail closed");
+        assert_eq!(count_body_work(&func), 1);
+    }
+
+    /// A `TailCall` is `IS_CALL` *and* `IS_TERMINATOR`.  Admitting calls must
+    /// not admit terminators: a clone of the body after a terminator is
+    /// unreachable and the body split would no longer be total.
+    #[test]
+    fn test_call_unroll_refuses_tail_call_and_branch_pseudos() {
+        for op in [
+            AArch64Opcode::TailCall,
+            AArch64Opcode::TrapNullIfZero,
+            AArch64Opcode::Ret,
+        ] {
+            let mut func = make_call_bearing_loop(0, 1, 8);
+            let bad = func.push_inst(MachInst::new(op, vec![vreg(1)]));
+            func.block_mut(PL_HEADER).insts.insert(0, bad);
+            let mut pass = CallUnroll::new();
+            assert!(!pass.run(&mut func), "{op:?} in the body must fail closed");
+
+            // Same for the latch's carry chain.
+            let mut func = make_call_bearing_loop(0, 1, 8);
+            let bad = func.push_inst(MachInst::new(op, vec![vreg(1)]));
+            func.block_mut(PL_LATCH).insts.insert(0, bad);
+            let mut pass = CallUnroll::new();
+            assert!(!pass.run(&mut func), "{op:?} in the carry must fail closed");
+        }
+    }
+
+    /// A body larger than the clone budget is refused rather than replicated:
+    /// the tier's only cost is code, so the caps are the whole cost model.
+    #[test]
+    fn test_call_unroll_declines_oversized_body() {
+        let mut func = make_call_bearing_loop(0, 1, 8);
+        for _ in 0..CALL_UNROLL_MAX_BODY_INSTS {
+            let filler = func.push_inst(MachInst::new(
+                AArch64Opcode::AddRI,
+                vec![vreg(30), vreg(1), imm(3)],
+            ));
+            func.block_mut(PL_HEADER).insts.insert(0, filler);
+        }
+        let mut pass = CallUnroll::new();
+        assert!(!pass.run(&mut func), "an oversized body must fail closed");
+        assert_eq!(count_body_work(&func), 1);
+    }
+
+    /// The folded `Cmp ; BCond ; B` dialect is the one that actually reaches
+    /// this slot: `cmp-branch-fusion` runs long before it.  The tier must
+    /// recognize it, not just the importer's `CSet` form.
+    #[test]
+    fn test_call_unroll_folded_bcond_dialect() {
+        let mut func = make_call_bearing_loop(0, 1, 8);
+        // Drop `CSet ; CmpRI cond,#0` and retarget the BCond onto the compare's
+        // own condition, i.e. what cmp-branch-fusion leaves behind.
+        let hinsts = func.block(PL_HEADER).insts.clone();
+        let n = hinsts.len();
+        let bcond = hinsts[n - 2];
+        func.inst_mut(bcond).operands[0] = cc_imm(CondCode::EQ);
+        func.block_mut(PL_HEADER)
+            .insts
+            .retain(|&i| i != hinsts[n - 3] && i != hinsts[n - 4]);
+        let mut pass = CallUnroll::new();
+        assert!(pass.run(&mut func), "folded dialect must be recognized");
+        assert_eq!(count_body_work(&func), 8);
     }
 }

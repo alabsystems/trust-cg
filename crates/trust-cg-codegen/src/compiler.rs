@@ -4249,9 +4249,9 @@ impl Compiler {
             // `JitValidationMode::ensure_supported` fails closed in
             // `to_jit_config` — and legacy promotion cannot produce proofs here.
             let _ = (isel_funcs, lir_functions, per_func_emitted_code);
-            return Err(CompileError::ProofsUnsupportedForTarget {
+            Err(CompileError::ProofsUnsupportedForTarget {
                 target: self.config.target,
-            });
+            })
         }
 
         #[cfg(feature = "verify")]

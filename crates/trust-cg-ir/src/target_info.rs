@@ -245,8 +245,8 @@ impl AArch64Opcode {
 
             // Memory stores
             StrRI | StrPreIndex | StrPostIndex | StrbRI | StrhRI | StpRI | StpPreIndex | StrRO
-            | STRWui | STRXui | STRSui | STRDui | NeonSt1Post | NeonStpQPost | Stlr | Stlrb
-            | Stlrh | Stlxr => OpcodeCategory::Store,
+            | StrbRO | StrhRO | STRWui | STRXui | STRSui | STRDui | NeonSt1Post | NeonStpQPost
+            | Stlr | Stlrb | Stlrh | Stlxr => OpcodeCategory::Store,
 
             // Pseudo
             Phi => OpcodeCategory::Phi,

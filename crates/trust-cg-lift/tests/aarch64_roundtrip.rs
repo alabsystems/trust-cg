@@ -3292,18 +3292,31 @@ fn unsupported_neon_movi_op_fails_closed() {
     assert_eq!(decode(word), Err(DecodeError::Unsupported { word }));
 }
 
+/// Clearing `Q` on a `D2` LD1 post-index yields the `{Vt.1D}` form, which IS
+/// allocated — it must decode, not be refused.
+///
+/// This test previously asserted the opposite, expecting
+/// `Unallocated { reason: "NEON vector q=0 size=0b11 arrangement is
+/// unallocated" }`. That reason belongs to the AdvSIMD three-same class; a
+/// shared validator was applying it to this encoding too, where every
+/// `(size, Q)` pair is allocated. objdump on the raw word (Apple/LLVM 21) names
+/// it `ld1.1d { v0 }, [x1], #8`, so the old expectation asserted an allocation
+/// fact the architecture contradicts.
 #[test]
-fn rejects_unallocated_neon_ldst_single_post_imm_arrangement() {
+fn accepts_neon_ldst_single_post_imm_64bit_lane() {
     let word = encoding_neon::encode_ld1_post_imm(encoding_neon::VectorArrangement::D2, 1, 0)
         .unwrap()
         & !(1 << 30);
 
     assert_eq!(
         decode(word),
-        Err(DecodeError::Unallocated {
-            word,
-            reason: "NEON vector q=0 size=0b11 arrangement is unallocated",
-        })
+        Ok(Instruction::NeonLdStSinglePostImm(NeonLdStSinglePostImm {
+            q: false,
+            load: true,
+            size: 0b11,
+            rn: 1,
+            rt: 0,
+        }))
     );
 }
 

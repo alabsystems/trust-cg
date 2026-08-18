@@ -122,6 +122,7 @@ pub mod pass_manager;
 pub mod passes;
 pub mod pgo;
 pub mod pipeline;
+pub mod post_index;
 pub mod proof_opts;
 pub mod ptr_iv_sr;
 pub mod reaching_const;

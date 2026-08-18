@@ -247,7 +247,18 @@ impl CodegenBackend for TrustCgCodegenBackend {
     }
 
     fn codegen_crate(&self, tcx: TyCtxt<'_>, _crate_info: &CrateInfo) -> Box<dyn Any> {
-        Box::new(codegen_crate(tcx))
+        // Untrimmed pretty-printing for the WHOLE backend scope. The default
+        // (trimmed) printer's first use computes `trimmed_def_paths` — a
+        // whole-visible-universe sweep (`visible_parent_map`, 399
+        // `module_children` decodes, 14k `is_doc_hidden` queries; ~9 ms
+        // measured via -Zself-profile on v2_memfill) that rustc otherwise
+        // only pays when printing a user-facing diagnostic, and that the LLVM
+        // backend never triggers. The bridge formats paths/types only for
+        // internal classifiers (substring/suffix matches — unchanged by the
+        // added leading segments) and its own fail-closed error strings
+        // (which full paths make MORE precise), so nothing here needs
+        // trimmed rendering.
+        rustc_middle::ty::print::with_no_trimmed_paths!(Box::new(codegen_crate(tcx)))
     }
 
     fn join_codegen(
@@ -1480,21 +1491,6 @@ fn attach_compile_artifact_cache(compiler: Compiler, emit_proofs: bool) -> Compi
     compiler.with_compile_artifact_cache(config)
 }
 
-/// Largest aggregate-copy lane count the P1 memory-refinement lane will queue.
-///
-/// See the size-bound comment at the `aggregate_copy_spec` call site. Default
-/// 256 lanes (2 KiB at 8-byte lanes); override with `TCG_MEM_REFINE_MAX_LANES`.
-fn mem_refine_max_lanes() -> u64 {
-    static MAX: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *MAX.get_or_init(|| {
-        trust_cg_codegen::env_lock::var("TCG_MEM_REFINE_MAX_LANES")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(256)
-    })
-}
-
 /// `TCG_TIME_CODEGEN` — per-mono-item codegen attribution.
 ///
 /// INERT BY DEFAULT: every entry point is a cheap `is_enabled()` check that
@@ -1914,8 +1910,29 @@ fn is_stdlib_precondition_check<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx
     // renders it relative (e.g. "unreachable_unchecked::precondition_check", no
     // "core::" prefix), so a prefix check would miss it while the crate is exact.
     let krate = tcx.crate_name(def_id.krate);
+    // `with_no_trimmed_paths!`: the default `def_path_str` uses the TRIMMED
+    // pretty printer, whose first call computes `trimmed_def_paths` — a
+    // whole-visible-universe sweep (`visible_parent_map` + `module_children`
+    // + 14k `is_doc_hidden` queries, ~9 ms) that rustc otherwise only pays
+    // when actually printing a user-facing diagnostic. This classifier runs
+    // per mono item, so it must use the untrimmed printer; the full path only
+    // ADDS leading segments, and trimming never touches the LAST segment, so
+    // the `ends_with` verdict is unchanged.
+    // Raw DefPath segments, not the pretty printer: this runs per mono item,
+    // and ANY cross-crate `def_path_str` (trimmed or not) computes rustc's
+    // `visible_parent_map` (399 `module_children` metadata decodes, ~4 ms)
+    // on first use. The last path segment IS the function's own name, so
+    // segment identity is exactly the intended check — and strictly stricter
+    // than the old rendered-string `ends_with` (a hypothetical
+    // `foo_precondition_check` no longer matches; stricter is the SAFE
+    // direction for a classifier that downgrades bodies to no-op stubs).
     matches!(krate.as_str(), "core" | "std" | "alloc")
-        && tcx.def_path_str(def_id).ends_with("precondition_check")
+        && tcx
+            .def_path(def_id)
+            .data
+            .last()
+            .and_then(|seg| seg.data.get_opt_name())
+            .is_some_and(|name| name.as_str() == "precondition_check")
 }
 
 /// A std/core/alloc iterator-internal body that is DEAD once the bounded-adapter
@@ -1932,7 +1949,11 @@ fn is_dead_std_iterator_reduction_body<'tcx>(tcx: TyCtxt<'tcx>, instance: Instan
     if !matches!(tcx.crate_name(def_id.krate).as_str(), "core" | "std" | "alloc") {
         return false;
     }
-    let p = tcx.def_path_str(def_id);
+    // Untrimmed printer: avoids the ~9 ms one-time `trimmed_def_paths` sweep
+    // (see `is_stdlib_precondition_check`); every pattern below is a substring
+    // or suffix match, and the full path only adds leading segments. Any
+    // theoretical new EXCLUDE match is fail-closed (fewer trap stubs).
+    let p = rustc_middle::ty::print::with_no_trimmed_paths!(tcx.def_path_str(def_id));
     // EXCLUDE `step_by`: its `spec_fold` is NOT intercepted (the routing fails closed
     // on a StepBy chain), so trapping it would turn the clean compile-fail into a
     // runtime SIGILL. Leaving it untrapped keeps step_by reductions fail-closed at
@@ -2088,7 +2109,8 @@ fn is_dead_intercepted_heap_alloc_glue<'tcx>(tcx: TyCtxt<'tcx>, instance: Instan
     if !matches!(tcx.crate_name(def_id.krate).as_str(), "core" | "std" | "alloc") {
         return false;
     }
-    let p = tcx.def_path_str(def_id);
+    // Untrimmed printer: same rationale as `is_dead_std_iterator_reduction_body`.
+    let p = rustc_middle::ty::print::with_no_trimmed_paths!(tcx.def_path_str(def_id));
 
     // Whether `self_ty` is one of the collections the bridge INTERCEPTS at drop
     // (its glue lowers to a direct `__rust_dealloc`, never a call to that glue).
@@ -30222,6 +30244,15 @@ fn refine_binop_opcode(op: TrustIrBinOp) -> Option<LowerOpcode> {
         // Shifts are routed through `MaskedShift` (see the shift opcode mapper),
         // never the raw `BinOp` family.
         TrustIrBinOp::Shl | TrustIrBinOp::LShr | TrustIrBinOp::AShr => return None,
+        // BOOLEAN connectives (trust-ir 4b06918): UNREACHABLE here. Rust MIR has no
+        // boolean-connective BinOp (`&&`/`||` lower to control flow), and
+        // `rust_binop_to_trust_ir_binop` — the only producer feeding this mapper —
+        // sends mir BitAnd/BitOr/BitXor to the BITWISE `And`/`Or`/`Xor` above. They
+        // are listed only to keep this match exhaustive against trust-ir's enum.
+        // `None` = skip, which is the sound default: their 0/1-carrier logical
+        // semantics are not `Band`/`Bor`/`Bxor`, so mapping them there would encode
+        // a different function than the one trust-ir defines.
+        TrustIrBinOp::BAnd | TrustIrBinOp::BOr | TrustIrBinOp::BXor => return None,
         // FRem: SKIPPED — sound. `a % b` on floats lowers to a libm `fmod`/`fmodf`
         // CALL (see `rust_float_binop_to_trust_ir_binop`), not a native op, so
         // there is no trust-ir arithmetic node to encode and the verifier has no
@@ -31910,9 +31941,16 @@ fn emit_unwinding_panic_raise<'tcx>(
                 }
             }
         }
+        // `with_forced_trimmed_paths!`: this string is baked into the emitted
+        // binary, so it must render exactly as it did before the backend-wide
+        // untrimmed-paths scope; the expensive trimmed-paths computation is
+        // acceptable here because this fallback is only reached when lowering
+        // a panic whose message we could not lower.
         let text = format!(
             "panic raised via `{}` (message not lowered by trust-cg)",
-            ctx.tcx.def_path_str(callee_def_id)
+            rustc_middle::ty::print::with_forced_trimmed_paths!(
+                ctx.tcx.def_path_str(callee_def_id)
+            )
         );
         let len = text.len() as u64;
         let alloc_id = ctx.tcx.allocate_bytes_dedup(text.into_bytes(), 0);
@@ -32302,10 +32340,19 @@ fn callee_needs_extern_caller_location<'tcx>(
 /// `next_back` (`pre_dec_end` -> `<*mut T>::sub` -> `isize::unchecked_neg` ->
 /// `unchecked_neg::precondition_check`) link.
 fn callee_is_stdlib_precondition_check<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> bool {
+    // Raw DefPath segments, not the pretty printer: this runs per lowered
+    // CALL, and any cross-crate `def_path_str` computes `visible_parent_map`
+    // (399 metadata decodes, ~4 ms) on first use. Same conversion and safety
+    // argument as `is_stdlib_precondition_check`.
     matches!(
         tcx.crate_name(def_id.krate).as_str(),
         "core" | "std" | "alloc"
-    ) && tcx.def_path_str(def_id).ends_with("precondition_check")
+    ) && tcx
+        .def_path(def_id)
+        .data
+        .last()
+        .and_then(|seg| seg.data.get_opt_name())
+        .is_some_and(|name| name.as_str() == "precondition_check")
 }
 
 /// Whether this compilation uses the `abort` panic strategy (`-Cpanic=abort`, or
@@ -36871,8 +36918,26 @@ fn lower_direct_call_terminator<'tcx>(
     if call.args.len() == 1
         && callee_item_name_str(ctx.tcx, callee_instance.def_id()).as_str() == "drop"
         && {
-            let path = ctx.tcx.def_path_str(callee_instance.def_id());
-            path == "std::mem::drop" || path == "core::mem::drop"
+            // Raw DefPath segments, not `def_path_str`: the `== "drop"` name
+            // gate above matches every `Drop::drop` impl method too, so this
+            // arm's path check runs for all drop-glue lowering — and any
+            // cross-crate `def_path_str` computes `visible_parent_map`
+            // (~4 ms) on first use. `mem::drop` is a single free fn defined
+            // in core (std::mem re-exports it), so the resolved DefId is
+            // exactly crate `core`/`std`, path `mem::drop` — two segments.
+            let did = callee_instance.def_id();
+            matches!(ctx.tcx.crate_name(did.krate).as_str(), "core" | "std") && {
+                let dp = ctx.tcx.def_path(did);
+                dp.data.len() == 2
+                    && dp.data[0]
+                        .data
+                        .get_opt_name()
+                        .is_some_and(|n| n.as_str() == "mem")
+                    && dp.data[1]
+                        .data
+                        .get_opt_name()
+                        .is_some_and(|n| n.as_str() == "drop")
+            }
         }
     {
         let arg_ty = ctx.monomorphize_ty(operand_rust_ty(ctx, body, &call.args[0].node)?);
@@ -37357,9 +37422,13 @@ fn lower_direct_call_terminator<'tcx>(
             block.body.push(InstrNode::new(Inst::Unreachable));
             return Ok(());
         }
+        // Baked into the binary — force the pre-wrap trimmed rendering (see the
+        // sibling fallback above).
         let text = format!(
             "panic raised via `{}` (message not lowered by trust-cg)",
-            ctx.tcx.def_path_str(callee_instance.def_id())
+            rustc_middle::ty::print::with_forced_trimmed_paths!(
+                ctx.tcx.def_path_str(callee_instance.def_id())
+            )
         );
         let len = text.len() as u64;
         let alloc_id = ctx.tcx.allocate_bytes_dedup(text.into_bytes(), 0);
@@ -74326,7 +74395,18 @@ fn rust_ty_to_trust_ir_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Result<Trust
         }
     }
     let _pop = PopActiveTy(ty_key);
-    rust_ty_to_trust_ir_ty_inner(tcx, ty)
+    // `with_no_visible_paths!`: the error strings this family builds embed
+    // `{ty:?}` renderings, and for `dyn Trait`-bearing types the Debug impl
+    // walks rustc's visible-def-path printer, whose first use computes
+    // `visible_parent_map` (399 `module_children` metadata decodes, ~4 ms —
+    // gdb-pinned: `try_print_visible_def_path_recur` reached from this
+    // function via `compute_memory_backed_locals` on every real compile).
+    // Many callers use the Result as a pure lowerability CLASSIFIER and
+    // discard the string, so the rendering must be cheap; the strings that do
+    // surface are fail-closed compile diagnostics where the crate-local path
+    // (`alloc::boxed::Box` vs `std::boxed::Box`) is equally precise. Binary
+    // output never contains these strings.
+    rustc_middle::ty::print::with_no_visible_paths!(rust_ty_to_trust_ir_ty_inner(tcx, ty))
 }
 
 fn rust_ty_to_trust_ir_ty_inner<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Result<TrustIrTy, String> {

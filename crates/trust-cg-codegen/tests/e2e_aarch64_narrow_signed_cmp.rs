@@ -16,6 +16,7 @@ use std::process::Command;
 
 use trust_cg_codegen::compiler::{Compiler, CompilerConfig};
 use trust_cg_codegen::pipeline::OptLevel;
+use trust_cg_codegen::target::TargetSpec;
 
 use trust_ir::{
     Block as TrustIrBlock, CastOp, Constant, FuncTy, Function as TrustIrFunction, ICmpOp, Inst,
@@ -163,10 +164,16 @@ fn build_module() -> TrustIrModule {
 }
 
 fn compile_to_obj_at(module: &TrustIrModule, opt_level: OptLevel) -> Vec<u8> {
-    let compiler = Compiler::new(CompilerConfig {
-        opt_level,
-        ..CompilerConfig::default()
-    });
+    // Explicit Darwin spec: the a64 interp harness parses Mach-O, and the
+    // default target spec is host-OS-aware (ELF on a Linux host).
+    // Cross-emission only; same pattern as a64_abi_probe.
+    let compiler = Compiler::new_for_target_spec(
+        CompilerConfig {
+            opt_level,
+            ..CompilerConfig::default()
+        },
+        TargetSpec::parse("aarch64-apple-darwin").expect("parse aarch64-apple-darwin target spec"),
+    );
     let result = compiler
         .compile(module)
         .expect("narrow compare must compile");

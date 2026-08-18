@@ -575,14 +575,15 @@ fn full_proof_suite_known_category_counts() {
     let neon = db.count_by_category(ProofCategory::NeonLowering);
     assert!(neon >= 22, "NeonLowering: expected >= 22, got {}", neon);
 
-    // Memory: floor 54. The static degenerate X==X Load_I*/Store_I* [Xn,#imm]
+    // Memory: floor 52. The static degenerate X==X Load_I*/Store_I* [Xn,#imm]
     // self-equalities, WriteCombine_I32, and Aligned_ScaledOffset_I32 (14 total)
-    // were RETRACTED in #62 — the GENUINE store-then-load Roundtrip + QF_ABV array
-    // theory + non-interference/endianness/forwarding/subword/LDP proofs carry the
-    // real load/store coverage and remain.
+    // were RETRACTED in #62. The I32/I64 roundtrips are counted once in their
+    // dedicated LoadStoreLowering category; the remaining GENUINE roundtrip +
+    // QF_ABV array theory + non-interference/endianness/forwarding/subword/LDP
+    // proofs carry the real load/store coverage.
     assert!(
-        db.count_by_category(ProofCategory::Memory) >= 54,
-        "expected >= 54 memory proofs, got {}",
+        db.count_by_category(ProofCategory::Memory) >= 52,
+        "expected >= 52 memory proofs, got {}",
         db.count_by_category(ProofCategory::Memory)
     );
 

@@ -184,6 +184,68 @@ fn run_ext_addr_fold(func: &mut MachFunction, mut provenance: Option<&mut Proven
     // path. Enable with TCG_EXT_ADDR_XBLOCK_STORE=1 (do-no-harm default).
     let xblock_store_enabled = crate::env_lock::var_os("TCG_EXT_ADDR_XBLOCK_STORE").is_some();
 
+    // Switch (fail-open to DISABLED) for the NARROW-STORE fold: byte and
+    // halfword stores into `StrbRO`/`StrhRO`. OPT-IN — enable with
+    // `TCG_EXT_ADDR_NARROW_STORE=1`. Default-off is a do-no-harm decision backed
+    // by the measurement below, and it exactly mirrors Fold (A) above, which is
+    // default-off for the same reason on the wide store.
+    //
+    // WHY IT EXISTS — the STORE-ADDRESS FOLD ASYMMETRY. This pass folded
+    // `LdrbRI`/`LdrhRI` into `LdrbRO`/`LdrhRO` but had no store counterpart,
+    // because the IR had no narrow register-offset STORE opcode at all. The
+    // asymmetry is NOT an operand-role or def/use-position bug in the plan
+    // machinery (`StrRI` -> `StrRO` has always ridden the same helpers, so the
+    // store role was already correct); it was a missing opcode, so narrow
+    // stores fell out of the opcode match on the pass's very first gate.
+    //
+    // The visible cost is a copy loop that spends 4 instructions per element
+    // where 2 suffice — the load side folds `[reg, reg]`, the store side keeps
+    // `add x0, xB, xI ; strb w1, [x0]`:
+    //
+    // ```text
+    // before  ldrb w1, [x26, x2] ; add x0, x16, x2 ; strb w1, [x0]
+    // after   ldrb w1, [x26, x2] ; strb w1, [x16, x2]
+    // ```
+    //
+    // SITE COUNT, from an env-gated trace at the fire point (R4 — NOT from
+    // counting the shape in finished objects): 11 `StrbRI` sites reach the pass
+    // with a zero offset, a private single-def `Gpr64` address, and an available
+    // single-def `Add` producer — passing every gate the LOAD path applies — and
+    // were declined by the opcode match alone: huffbench/compdecomp x6,
+    // ReedSolomon rsenc_204 x2 / main x2 / rsdec_204 x1. That is exactly the
+    // count of unfolded `add`+`strb` pairs in the two objects (6 and 5), and
+    // clang emits ZERO of them (it emits 6 and 3 `strb [reg, reg]` instead).
+    //
+    // PROFITABILITY — WHY THIS IS OFF BY DEFAULT. The static asymmetry is real
+    // (clang emits `strb [reg, reg]` at every one of these sites and trust-cg
+    // emitted `add` + `strb [reg]`), but closing it did not pay anywhere:
+    //
+    // * Folding EVERY narrow store, in-loop ones included, made the corpus
+    //   slower. huffbench (6 sites, all in hot loops) ran +1.23%/+0.82% slower
+    //   at the shipping default and +1.57%/+1.84% slower under
+    //   `TCG_NO_LOOP_HEAD_ALIGN=1` — min and 20%-trimmed median agreeing in sign
+    //   in BOTH alignment arms, so it is the transform, not padding. That
+    //   reproduces the cost already documented for the wide in-loop `StrRO` in
+    //   `try_madd_general_plan`: register-offset addressing on a STORE adds AGU
+    //   work off the critical path, once per iteration.
+    //   (sieve and richards_benchmark FLIPPED SIGN between the two alignment
+    //   arms — how a repadding artifact presents — so their deltas are not
+    //   attributable to this fold in either direction.)
+    // * Adding the in-loop gate below cut the corpus from 20 folded sites to 1
+    //   (an acyclic store in huffbench). huffbench still measured +1.26%/+0.57%
+    //   and +1.35%/+1.85% slower; a single removed `add` at an acyclic site
+    //   cannot cost 1%, so that residual is object-layout shift (the object
+    //   shrank 32 bytes) — but there is no measurable WIN to weigh against it.
+    //
+    // So: no configuration of this fold is a demonstrated improvement, and the
+    // one program it changes measures slower in every arm. The opcodes,
+    // encoder, verifier coverage and spill-width decomposition all stay (they
+    // are correctness infrastructure, pinned by unit tests and an executable
+    // differential witness); only the FIRING is default-off. With the switch
+    // unset the compiler is byte-identical to the pre-lever build across the
+    // whole 63-object corpus.
+    let narrow_store_enabled = crate::env_lock::var_os("TCG_EXT_ADDR_NARROW_STORE").is_some();
+
     // Kill switch (fail-open to enabled) for the SEXT-SCALE lever: the
     // cross-block-capable single-def Madd fold. A scaled-index `Madd` address
     // (`stack[s]` in Towers' Push/Pop/Move) is computed once and reused for a
@@ -213,8 +275,42 @@ fn run_ext_addr_fold(func: &mut MachFunction, mut provenance: Option<&mut Proven
                 AArch64Opcode::StrRI => (AArch64Opcode::StrRO, None),
                 AArch64Opcode::LdrbRI => (AArch64Opcode::LdrbRO, Some(1)),
                 AArch64Opcode::LdrhRI => (AArch64Opcode::LdrhRO, Some(2)),
+                // The narrow STORES. These were absent until the store-address
+                // fold asymmetry was measured: the IR simply had no `StrbRO` /
+                // `StrhRO` opcode, so every byte/halfword store fell through
+                // this match and kept a separate `add` for its address while
+                // the byte LOAD beside it folded. The width handling is
+                // identical to the loads (opcode-fixed, `narrow_size`), so they
+                // ride the same plan machinery with no special-casing below.
+                //
+                // The IN-LOOP gate below is the profitability half of the story
+                // and is NOT optional — see `narrow_store_enabled`.
+                AArch64Opcode::StrbRI if narrow_store_enabled => (AArch64Opcode::StrbRO, Some(1)),
+                AArch64Opcode::StrhRI if narrow_store_enabled => (AArch64Opcode::StrhRO, Some(2)),
                 _ => continue,
             };
+            // A narrow STORE inside a loop is DECLINED, for exactly the reason
+            // `try_madd_general_plan` already declines an in-loop `StrRO`:
+            // folding a store into register-offset addressing in a (typically
+            // memory-bound) loop adds AGU work off the critical path. That was
+            // measured before for the wide store (which is why Fold (A) is
+            // default-off) and re-measured here for the narrow store — folding
+            // in-loop byte stores costs huffbench +0.8%/+1.8% (min/trimmed
+            // median, both alignment arms agreeing in sign). A store at an
+            // ACYCLIC site still folds: deleting its address chain is a pure
+            // win with no per-iteration AGU cost. LOADS are always folded —
+            // their address IS the critical path, so RO addressing only helps,
+            // which is the real asymmetry between the two sides.
+            if matches!(new_opcode, AArch64Opcode::StrbRO | AArch64Opcode::StrhRO) {
+                if domtree.is_none() {
+                    let dt = DomTree::compute(func);
+                    loops = Some(LoopAnalysis::compute(func, &dt));
+                    domtree = Some(dt);
+                }
+                if loops.as_ref().unwrap().is_in_loop(block_id) {
+                    continue;
+                }
+            }
             if inst.operands.len() != 3 {
                 continue;
             }

@@ -443,3 +443,127 @@ fn pin_ldrh_w_lsl_shifted() {
         "ldrh w0, [x1, x2, lsl #1]",
     );
 }
+
+// ===========================================================================
+// Narrow register-offset STORES (STRB / STRH) — the ext_addr narrow-store
+// fold, the store mirror of the LDRB/LDRH pins above. Verified against the
+// system assembler:
+//
+//   clang -c roenc_st.s -arch arm64 && objdump -d roenc_st.o (2026-08-13)
+//
+// These pins matter more than usual: the corpus reaches the STRB form only,
+// never STRH, and never the spilled decomposition — so the encoding of the
+// halfword form has no benchmark that would notice if it were wrong. The
+// 0x38.../0x78... size prefixes and the opc=00 store bits are load-bearing:
+// a 0xB8... would write 4 bytes, and opc=01 would turn the store into a LOAD.
+
+#[test]
+fn pin_strb_w_sxtw() {
+    // strb w1, [x2, w3, sxtw] = 3823c841
+    assert_pin(
+        AArch64Opcode::StrbRO,
+        vec![preg(W1), preg(X2), preg(W3), imm(SXTW_S0)],
+        0x3823c841,
+        "strb w1, [x2, w3, sxtw]",
+    );
+}
+
+#[test]
+fn pin_strb_w_uxtw() {
+    // strb w1, [x2, w3, uxtw] = 38234841
+    assert_pin(
+        AArch64Opcode::StrbRO,
+        vec![preg(W1), preg(X2), preg(W3), imm(UXTW_S0)],
+        0x38234841,
+        "strb w1, [x2, w3, uxtw]",
+    );
+}
+
+#[test]
+fn pin_strb_w_high_regs_sxtw() {
+    // strb w28, [x27, w26, sxtw] = 383acb7c
+    assert_pin(
+        AArch64Opcode::StrbRO,
+        vec![preg(W28), preg(X27), preg(W26), imm(SXTW_S0)],
+        0x383acb7c,
+        "strb w28, [x27, w26, sxtw]",
+    );
+}
+
+#[test]
+fn pin_strb_w_high_regs_uxtw() {
+    // strb w28, [x27, w26, uxtw] = 383a4b7c
+    assert_pin(
+        AArch64Opcode::StrbRO,
+        vec![preg(W28), preg(X27), preg(W26), imm(UXTW_S0)],
+        0x383a4b7c,
+        "strb w28, [x27, w26, uxtw]",
+    );
+}
+
+#[test]
+fn pin_strb_w_lsl_plain() {
+    // strb w1, [x2, x3] = 38236841 — LSL, S=0 (64-bit index, no extend).
+    // This is the exact shape the byte-copy fold emits.
+    assert_pin(
+        AArch64Opcode::StrbRO,
+        vec![preg(W1), preg(X2), preg(X3), imm(LSL_S0)],
+        0x38236841,
+        "strb w1, [x2, x3]",
+    );
+}
+
+#[test]
+fn pin_strh_w_sxtw_shifted() {
+    // strh w1, [x2, w3, sxtw #1] = 7823d841
+    assert_pin(
+        AArch64Opcode::StrhRO,
+        vec![preg(W1), preg(X2), preg(W3), imm(SXTW_S1)],
+        0x7823d841,
+        "strh w1, [x2, w3, sxtw #1]",
+    );
+}
+
+#[test]
+fn pin_strh_w_uxtw_shifted() {
+    // strh w1, [x2, w3, uxtw #1] = 78235841
+    assert_pin(
+        AArch64Opcode::StrhRO,
+        vec![preg(W1), preg(X2), preg(W3), imm(UXTW_S1)],
+        0x78235841,
+        "strh w1, [x2, w3, uxtw #1]",
+    );
+}
+
+#[test]
+fn pin_strh_w_lsl_shifted() {
+    // strh w1, [x2, x3, lsl #1] = 78237841 — the shape the halfword fold emits.
+    assert_pin(
+        AArch64Opcode::StrhRO,
+        vec![preg(W1), preg(X2), preg(X3), imm(LSL_S1)],
+        0x78237841,
+        "strh w1, [x2, x3, lsl #1]",
+    );
+}
+
+#[test]
+fn pin_strh_w_lsl_unshifted() {
+    // strh w1, [x2, x3] = 78236841 — S=0 halfword (index already in bytes).
+    assert_pin(
+        AArch64Opcode::StrhRO,
+        vec![preg(W1), preg(X2), preg(X3), imm(LSL_S0)],
+        0x78236841,
+        "strh w1, [x2, x3]",
+    );
+}
+
+#[test]
+fn pin_strh_w_high_regs_sxtw_shifted() {
+    // strh w28, [x27, w26, sxtw #1] = 783adb7c
+    assert_pin(
+        AArch64Opcode::StrhRO,
+        vec![preg(W28), preg(X27), preg(W26), imm(SXTW_S1)],
+        0x783adb7c,
+        "strh w28, [x27, w26, sxtw #1]",
+    );
+}

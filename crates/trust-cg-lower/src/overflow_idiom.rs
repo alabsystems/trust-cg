@@ -296,7 +296,7 @@ pub fn detect_overflow_idioms(
                     a,
                     b,
                     sum_val,
-                    &use_count,
+                    use_count,
                     instructions,
                     terminator_idx,
                 );
@@ -343,7 +343,7 @@ pub fn detect_overflow_idioms(
             a,
             b,
             sum_val,
-            &use_count,
+            use_count,
             instructions,
             terminator_idx,
         );

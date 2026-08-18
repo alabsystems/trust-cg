@@ -661,16 +661,34 @@ fn scalar_transfer_scale(inst: &MachInst) -> Option<i64> {
     }
 }
 
-fn scalar_writeback_transfer_hw(inst: &MachInst, idx: usize) -> Result<u32, EncodeError> {
+/// Transfer register of a scalar writeback form, plus the access WIDTH implied
+/// by its register class.
+///
+/// The width is DERIVED, exactly as the unsigned-offset `LdrRI`/`StrRI` arms
+/// derive theirs, rather than hardcoded. Before this, `encode_scalar_writeback`
+/// pinned `LoadStoreSize::Double` and this helper REJECTED any 32-bit transfer
+/// register — so every pre-existing producer necessarily passes a `Gpr64` and
+/// still encodes as `Double`. Deriving therefore cannot change any instruction
+/// that encoded before; it only admits the `Gpr32` form (`ldr w1, [x16], #4`),
+/// which `post_index_late` needs and which had no representation at all.
+fn scalar_writeback_transfer_hw(
+    inst: &MachInst,
+    idx: usize,
+) -> Result<(u32, encoding_mem::LoadStoreSize), EncodeError> {
     match inst.operands.get(idx) {
         Some(MachOperand::PReg(p)) if preg_class(*p) == RegClass::Gpr64 && *p != SP => {
-            Ok(p.hw_enc() as u32)
+            Ok((p.hw_enc() as u32, encoding_mem::LoadStoreSize::Double))
         }
-        Some(MachOperand::Special(SpecialReg::XZR)) => Ok(31),
+        Some(MachOperand::PReg(p)) if preg_class(*p) == RegClass::Gpr32 => {
+            Ok((p.hw_enc() as u32, encoding_mem::LoadStoreSize::Word))
+        }
+        Some(MachOperand::Special(SpecialReg::XZR)) => {
+            Ok((31, encoding_mem::LoadStoreSize::Double))
+        }
         Some(other) => Err(EncodeError::InvalidOperand {
             opcode: inst.opcode,
             index: idx,
-            desc: format!("expected 64-bit GPR or XZR transfer register, got {other:?}"),
+            desc: format!("expected 32/64-bit GPR or XZR transfer register, got {other:?}"),
         }),
         None => Err(EncodeError::MissingOperand {
             opcode: inst.opcode,
@@ -704,7 +722,7 @@ fn encode_scalar_writeback(
     pre_index: bool,
     op: encoding_mem::LoadStoreOp,
 ) -> Result<u32, EncodeError> {
-    let rt = scalar_writeback_transfer_hw(inst, 0)?;
+    let (rt, size) = scalar_writeback_transfer_hw(inst, 0)?;
     let rn = scalar_writeback_base_hw(inst, 1)?;
     if rn != 31 && rt == rn {
         return Err(EncodeError::InvalidOperand {
@@ -722,21 +740,11 @@ fn encode_scalar_writeback(
 
     if pre_index {
         Ok(encoding_mem::encode_ldr_str_pre_index(
-            encoding_mem::LoadStoreSize::Double,
-            false,
-            op,
-            imm9,
-            rn as u8,
-            rt as u8,
+            size, false, op, imm9, rn as u8, rt as u8,
         )?)
     } else {
         Ok(encoding_mem::encode_ldr_str_post_index(
-            encoding_mem::LoadStoreSize::Double,
-            false,
-            op,
-            imm9,
-            rn as u8,
-            rt as u8,
+            size, false, op, imm9, rn as u8, rt as u8,
         )?)
     }
 }
@@ -4102,17 +4110,20 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 (0b011, 0)
             };
             if is_fpr(inst, 0) {
-                // FP register-offset load: V=1
-                let fp_sz = fp_size_from_inst(inst);
-                let mem_size = match fp_sz {
-                    FpSize::Half => encoding_mem::LoadStoreSize::Half, // 16-bit (H registers)
-                    FpSize::Single => encoding_mem::LoadStoreSize::Word, // 32-bit (S registers)
-                    FpSize::Double => encoding_mem::LoadStoreSize::Double, // 64-bit (D registers)
-                };
-                Ok(encoding_mem::encode_ldr_str_register(
-                    mem_size,
+                // FP register-offset load: V=1. The (size, opc) pair comes from
+                // the SAME derivation the unsigned-offset FP path uses, so the
+                // 128-bit form (size=0b00, opc=0b11) is reachable and every
+                // other class keeps its exact width. Deriving it from `FpSize`
+                // instead — which has no `Quad` and folds `Fpr128` into
+                // `Double` — encoded a 16-byte `Q` access as an 8-byte `D`
+                // access, silently halving every register-offset vector
+                // load/store. `fp_mem_fields_from_inst` fails closed on any
+                // class with no FP memory encoding rather than defaulting.
+                let (size, _scale, opc) = fp_mem_fields_from_inst(inst, 0, 0b01)?;
+                Ok(encoding_mem::encode_ldr_str_register_fields(
+                    size,
                     true,
-                    encoding_mem::LoadStoreOp::Load,
+                    opc,
                     rm as u8,
                     match option {
                         0b010 => encoding_mem::RegExtend::Uxtw,
@@ -4188,6 +4199,52 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
             )?)
         }
 
+        // STRB/STRH Wt, [Xn, Xm{, extend {#amount}}] — narrow register-offset
+        // STORE, the exact mirror of the `LdrbRO`/`LdrhRO` arm above with
+        // `LoadStoreOp::Store` (opc=00) instead of Load (opc=01). The access
+        // WIDTH comes from the OPCODE (byte / halfword) and is NEVER derived
+        // from `sf` or the transfer class: `strb` writes the low 8 bits and
+        // `strh` the low 16 bits of the transfer register regardless of whether
+        // isel handed us a W or an X. That is why this arm does not call
+        // `sf_from_operand` at all — a narrow store has no 32/64 variant, so
+        // there is no `sf`-derived size to get wrong (compare the `Fcvtzs`
+        // hardcoded-`sf` class of defect: here the width is opcode-fixed by
+        // construction, so a wider transfer register cannot widen the access).
+        // V=0 (integer). The packed extend 4th operand is `(option << 1) | S`,
+        // identical to `StrRO`; for byte accesses `S` is a no-op (log2(1)=0),
+        // for halfword `S=1` shifts the index by 1.
+        AArch64Opcode::StrbRO | AArch64Opcode::StrhRO => {
+            let rt = preg_hw(inst, 0)?;
+            let rn = preg_hw(inst, 1)?;
+            let rm = preg_hw(inst, 2)?;
+            let (option, s) = if inst.operands.len() > 3 {
+                let packed = imm_val(inst, 3) as u32;
+                ((packed >> 1) & 0b111, packed & 1)
+            } else {
+                (0b011, 0)
+            };
+            let size = if inst.opcode == AArch64Opcode::StrbRO {
+                encoding_mem::LoadStoreSize::Byte
+            } else {
+                encoding_mem::LoadStoreSize::Half
+            };
+            Ok(encoding_mem::encode_ldr_str_register(
+                size,
+                false,
+                encoding_mem::LoadStoreOp::Store,
+                rm as u8,
+                match option {
+                    0b010 => encoding_mem::RegExtend::Uxtw,
+                    0b110 => encoding_mem::RegExtend::Sxtw,
+                    0b111 => encoding_mem::RegExtend::Sxtx,
+                    _ => encoding_mem::RegExtend::Lsl,
+                },
+                s != 0,
+                rn as u8,
+                rt as u8,
+            )?)
+        }
+
         // STR Rt, [Rn, Rm{, extend {#amount}}] — register offset store
         // Same encoding format as LdrRO but with opc=00 (store)
         // Operands: [Rt, Rn, Rm] — default LSL, no shift (S=0)
@@ -4203,16 +4260,15 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 (0b011, 0)
             };
             if is_fpr(inst, 0) {
-                let fp_sz = fp_size_from_inst(inst);
-                let mem_size = match fp_sz {
-                    FpSize::Half => encoding_mem::LoadStoreSize::Half, // 16-bit (H registers)
-                    FpSize::Single => encoding_mem::LoadStoreSize::Word, // 32-bit (S registers)
-                    FpSize::Double => encoding_mem::LoadStoreSize::Double, // 64-bit (D registers)
-                };
-                Ok(encoding_mem::encode_ldr_str_register(
-                    mem_size,
+                // FP register-offset store: V=1, opc base 0b00. Same exact
+                // (size, opc) derivation as the load arm above and as the
+                // unsigned-offset FP path — see there for why `FpSize` must
+                // NOT be used to size a memory access.
+                let (size, _scale, opc) = fp_mem_fields_from_inst(inst, 0, 0b00)?;
+                Ok(encoding_mem::encode_ldr_str_register_fields(
+                    size,
                     true,
-                    encoding_mem::LoadStoreOp::Store,
+                    opc,
                     rm as u8,
                     match option {
                         0b010 => encoding_mem::RegExtend::Uxtw,
@@ -4963,6 +5019,69 @@ mod tests {
     /// Helper to build a MachInst with given opcode and operands.
     fn mk(opcode: AArch64Opcode, ops: Vec<MachOperand>) -> MachInst {
         MachInst::new(opcode, ops)
+    }
+
+    /// PIN: the FP arrangement selector values the AArch64 ISel emits decode to
+    /// the lane widths it intends.
+    ///
+    /// `trust_cg_lower::isel` passes `FP_ARRANGEMENT_4S = 1` and
+    /// `FP_ARRANGEMENT_2D = 2` as the trailing `Imm` of every FP vector
+    /// arithmetic MachInst. Those numbers mean nothing on their own — they are
+    /// indices into THIS decoder — and the FP table deliberately does NOT agree
+    /// with the integer `neon_arrangement` table (`5 => 4S`, `6 => 2D`) that the
+    /// `V*I*` ISel arms pass. The two families therefore MUST NOT share
+    /// constants, and this test is where that contract is checked rather than
+    /// assumed. `V4F32Fadd` lowered with the integer `5` would silently decode
+    /// through the `_ =>` default arm instead of failing.
+    ///
+    /// The end-to-end behaviour is covered by
+    /// `tools/native_vector_witness` (mutations `fp_arrangement_width_swap` and
+    /// `fp_arrangement_integer_namespace`, both KILLED); this is the cheap
+    /// static half that fails in `cargo test` rather than in a witness run.
+    #[test]
+    fn aarch64_fp_arrangement_selectors_match_encoder() {
+        use encoding_neon::FpVectorArrangement;
+        // The three values the FP table defines, and only those.
+        for (sel, want) in [
+            (0i64, FpVectorArrangement::S2),
+            (1, FpVectorArrangement::S4),
+            (2, FpVectorArrangement::D2),
+        ] {
+            let inst = mk(
+                AArch64Opcode::NeonFaddV,
+                vec![preg(V0), preg(V1), preg(V2), imm(sel)],
+            );
+            assert_eq!(
+                neon_fp_arrangement(&inst),
+                want,
+                "FP arrangement selector {sel} must decode to {want:?}"
+            );
+        }
+        // The ISel's two named constants, spelled out so a change to either
+        // number has to be made here too.
+        let four_s = mk(
+            AArch64Opcode::NeonFaddV,
+            vec![preg(V0), preg(V1), preg(V2), imm(1)],
+        );
+        let two_d = mk(
+            AArch64Opcode::NeonFaddV,
+            vec![preg(V0), preg(V1), preg(V2), imm(2)],
+        );
+        assert_eq!(neon_fp_arrangement(&four_s), FpVectorArrangement::S4);
+        assert_eq!(neon_fp_arrangement(&two_d), FpVectorArrangement::D2);
+        // And the integer codes are NOT a valid spelling of those widths here:
+        // 5 and 6 mean `4S`/`2D` to `neon_arrangement`, but fall through this
+        // decoder's default. Passing one to an FP opcode is a silent
+        // width error, which is exactly why they must never be reused.
+        let int_2d = mk(
+            AArch64Opcode::NeonFaddV,
+            vec![preg(V0), preg(V1), preg(V2), imm(6)],
+        );
+        assert_ne!(
+            neon_fp_arrangement(&int_2d),
+            FpVectorArrangement::D2,
+            "the integer arrangement code for 2D must not accidentally work here"
+        );
     }
 
     fn preg(r: PReg) -> MachOperand {
@@ -8581,6 +8700,77 @@ mod tests {
         assert_eq!(enc, direct, "STR H0, [X1, X2] = {enc:#010X}");
         assert_eq!((enc >> 30) & 0b11, 0b01, "size must be 01 for Half");
         assert_eq!((enc >> 26) & 1, 1, "V must be 1 for FP");
+    }
+
+    /// A 128-bit register-offset access MUST encode the `Q` form, not the `D`
+    /// form. The access width of a SIMD&FP register-offset load/store is
+    /// `size:opc<1>`, so 16 bytes is `size=0b00` with the HIGH `opc` bit set —
+    /// a width no 3-valued `FpSize` (Half/Single/Double) can express.
+    ///
+    /// This is a MISCOMPILE pin, not a formatting pin: the previous encoder
+    /// derived the size from `fp_size_from_inst`, whose `Fpr128` case fell
+    /// through to `Double`, so `STR Q1, [X13, X11]` was emitted as
+    /// `STR D1, [X13, X11]` — a store that wrote 8 of its 16 bytes and left
+    /// the upper half of every vector at whatever was there before.
+    ///
+    /// Reachable from ordinary C: `addr_mode::form_base_plus_reg` folds
+    /// `ADD Xd, Xn, Xm` + `STR Q, [Xd]` into `StrRO`, which is exactly what a
+    /// `<4 x i32>` store through a two-term address (`&A[i][0]`) produces.
+    #[test]
+    fn register_offset_q_access_encodes_16_bytes_not_8() {
+        for (opcode, opc, what) in [
+            (AArch64Opcode::LdrRO, 0b11u32, "LDR Q0, [X1, X2]"),
+            (AArch64Opcode::StrRO, 0b10u32, "STR Q0, [X1, X2]"),
+        ] {
+            let inst = mk(opcode, vec![preg(V0), preg(X1), preg(X2)]);
+            let enc = encode_instruction(&inst).unwrap();
+            assert_eq!(
+                (enc >> 30) & 0b11,
+                0b00,
+                "{what}: size must be 00 for a 128-bit access, got {enc:#010X}"
+            );
+            assert_eq!((enc >> 26) & 1, 1, "{what}: V must be 1 for SIMD&FP");
+            assert_eq!(
+                (enc >> 22) & 0b11,
+                opc,
+                "{what}: opc must be {opc:#04b} for a 128-bit access, got {enc:#010X}"
+            );
+            assert_eq!((enc >> 21) & 1, 1, "{what}: register-offset marker");
+            // The 64-bit D form (size=0b11, opc=0b00/0b01) is what the defect
+            // emitted; assert we are not it.
+            assert_ne!(
+                (enc >> 30) & 0b11,
+                0b11,
+                "{what}: must not encode the 64-bit D form"
+            );
+        }
+    }
+
+    /// Every FP register-offset width must produce a DISTINCT encoding of the
+    /// `size:opc<1>` pair. A collision means two different access widths
+    /// assemble to the same instruction, which is the shape of the defect
+    /// above (Q collided with D).
+    #[test]
+    fn register_offset_fp_widths_are_all_distinct() {
+        let widths = [
+            (preg(H0), 2usize),
+            (preg(S0), 4),
+            (preg(D0), 8),
+            (preg(V0), 16),
+        ];
+        let mut seen: Vec<(u32, usize)> = Vec::new();
+        for (rt, bytes) in widths {
+            let inst = mk(AArch64Opcode::LdrRO, vec![rt, preg(X1), preg(X2)]);
+            let enc = encode_instruction(&inst).unwrap();
+            // size:opc<1> — the hardware's access-size selector.
+            let key = ((enc >> 30) & 0b11) << 1 | ((enc >> 23) & 1);
+            assert!(
+                !seen.iter().any(|(k, _)| *k == key),
+                "{bytes}-byte FP register-offset access collides with {:?} (size:opc<1> = {key:#b})",
+                seen.iter().find(|(k, _)| *k == key)
+            );
+            seen.push((key, bytes));
+        }
     }
 
     #[test]

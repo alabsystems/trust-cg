@@ -854,6 +854,28 @@ impl<'m> Interpreter<'m> {
                 let b = rhs.as_int()?;
                 Ok(InterpreterValue::Int(normalize_int(a ^ b, ty, int_width)))
             }
+            // Trust: the BOOLEAN connectives (trust-ir 4b06918). Evaluated as the
+            // LOGICAL ops on the 0/1 carrier -- any nonzero operand counts as true --
+            // which is byte-for-byte what `trust_ir::interpret`'s own `BAnd`/`BOr`/
+            // `BXor` arms and `semIntBinOp` in the Lean semantics compute. Written as
+            // `!= 0` rather than `== 1` for exactly that reason: it must stay total on
+            // operands outside {0,1}, or the two interpreters would disagree about the
+            // same program on inputs neither rejects.
+            BinOp::BAnd => {
+                let a = lhs.as_int()?;
+                let b = rhs.as_int()?;
+                Ok(InterpreterValue::Int(i128::from(a != 0 && b != 0)))
+            }
+            BinOp::BOr => {
+                let a = lhs.as_int()?;
+                let b = rhs.as_int()?;
+                Ok(InterpreterValue::Int(i128::from(a != 0 || b != 0)))
+            }
+            BinOp::BXor => {
+                let a = lhs.as_int()?;
+                let b = rhs.as_int()?;
+                Ok(InterpreterValue::Int(i128::from((a != 0) != (b != 0))))
+            }
             BinOp::Shl => {
                 let a = unsigned_bits(lhs.as_int()?, int_width);
                 let b = shift_amount(rhs.as_int()?, int_width);

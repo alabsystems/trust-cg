@@ -126,8 +126,9 @@ pub enum ProofCategory {
     /// Source: `memory_proofs::all_memory_proofs()`.
     Memory,
 
-    /// Load/Store lowering proofs: trust_ir Load/Store -> AArch64 LDR/LDRB/LDRH/STR/STRB/STRH
-    /// (I8/I16/I32/I64 equivalence) plus store-load roundtrip (I32, I64). 10 obligations.
+    /// Load/store lowering proofs: genuine store-load roundtrips for I32 and I64.
+    /// The eight degenerate direct Load/Store -> LDR/STR self-equalities were
+    /// retracted; see `lowering_proof::all_load_store_proofs()`.
     /// Source: `lowering_proof::all_load_store_proofs()`.
     LoadStoreLowering,
 
@@ -530,16 +531,38 @@ pub struct ProofDatabase {
 
 #[inline(never)]
 fn register_arithmetic_proofs(proofs: &mut Vec<CategorizedProof>) {
-    for p in crate::lowering_proof::all_division_proofs() {
+    let division_proofs = crate::lowering_proof::all_division_proofs();
+    let division_by_name: std::collections::HashMap<String, ProofObligation> = division_proofs
+        .iter()
+        .map(|proof| (proof.name.clone(), proof.clone()))
+        .collect();
+    assert_eq!(
+        division_by_name.len(),
+        division_proofs.len(),
+        "division registry contains duplicate static proof names"
+    );
+
+    for p in division_proofs {
         proofs.push(CategorizedProof {
             obligation: p,
             category: ProofCategory::Division,
         });
     }
-    let all_arith = crate::lowering_proof::all_arithmetic_proofs();
-    let div_count = crate::lowering_proof::all_division_proofs().len();
-    let arith_take = all_arith.len().saturating_sub(div_count);
-    for p in all_arith.into_iter().take(arith_take) {
+
+    // `all_arithmetic_proofs` also contains the division subset, but division
+    // is not required to be at the end of that registry. Partition by exact
+    // identity instead of truncating a number of tail entries: positional
+    // truncation duplicated division and silently dropped newly appended I128
+    // proofs.
+    for p in crate::lowering_proof::all_arithmetic_proofs() {
+        if let Some(division) = division_by_name.get(p.name.as_str()) {
+            assert!(
+                &p == division,
+                "arithmetic and division registries reuse a proof name for different obligations: {}",
+                p.name
+            );
+            continue;
+        }
         proofs.push(CategorizedProof {
             obligation: p,
             category: ProofCategory::Arithmetic,
@@ -660,7 +683,30 @@ fn register_analysis_proofs(proofs: &mut Vec<CategorizedProof>) {
             category: ProofCategory::CfgSimplification,
         });
     }
+    // The load/store registry re-exports the I32/I64 roundtrip obligations
+    // from `memory_proofs`. Give those exact obligations their dedicated
+    // category without also counting them a second time under Memory. Proof
+    // names are static proof-gate identities and must resolve to one database
+    // row.
+    let load_store_proofs = crate::lowering_proof::all_load_store_proofs();
+    let load_store_by_name: std::collections::HashMap<String, ProofObligation> = load_store_proofs
+        .iter()
+        .map(|proof| (proof.name.clone(), proof.clone()))
+        .collect();
+    assert_eq!(
+        load_store_by_name.len(),
+        load_store_proofs.len(),
+        "load/store registry contains duplicate static proof names"
+    );
     for p in crate::memory_proofs::all_memory_proofs() {
+        if let Some(load_store) = load_store_by_name.get(p.name.as_str()) {
+            assert!(
+                &p == load_store,
+                "memory and load/store registries reuse a proof name for different obligations: {}",
+                p.name
+            );
+            continue;
+        }
         proofs.push(CategorizedProof {
             obligation: p,
             category: ProofCategory::Memory,
@@ -675,7 +721,7 @@ fn register_analysis_proofs(proofs: &mut Vec<CategorizedProof>) {
             category: ProofCategory::Memory,
         });
     }
-    for p in crate::lowering_proof::all_load_store_proofs() {
+    for p in load_store_proofs {
         proofs.push(CategorizedProof {
             obligation: p,
             category: ProofCategory::LoadStoreLowering,
@@ -2299,6 +2345,44 @@ mod tests {
     }
 
     #[test]
+    fn test_arithmetic_registry_is_partitioned_without_loss_or_duplication() {
+        with_large_stack(|| {
+            use std::collections::HashSet;
+
+            let db = ProofDatabase::new();
+            let division_names: HashSet<String> = crate::lowering_proof::all_division_proofs()
+                .into_iter()
+                .map(|proof| proof.name)
+                .collect();
+
+            for expected in crate::lowering_proof::all_arithmetic_proofs() {
+                let expected_category = if division_names.contains(expected.name.as_str()) {
+                    ProofCategory::Division
+                } else {
+                    ProofCategory::Arithmetic
+                };
+                let registered: Vec<&CategorizedProof> = db
+                    .all()
+                    .iter()
+                    .filter(|proof| proof.obligation.name == expected.name)
+                    .collect();
+
+                assert_eq!(
+                    registered.len(),
+                    1,
+                    "arithmetic registry entry must be registered exactly once: {}",
+                    expected.name
+                );
+                assert_eq!(
+                    registered[0].category, expected_category,
+                    "arithmetic registry entry has the wrong category: {}",
+                    expected.name
+                );
+            }
+        });
+    }
+
+    #[test]
     fn test_fp_lowering_proofs_count() {
         let db = ProofDatabase::new();
         let count = db.count_by_category(ProofCategory::FloatingPoint);
@@ -2457,9 +2541,11 @@ mod tests {
         let db = ProofDatabase::new();
         let count = db.count_by_category(ProofCategory::Memory);
         // Was 68; #62 retracted the 12 degenerate Load_I*/Store_I* [Xn,#imm] X==X,
-        // WriteCombine_I32, and Aligned_ScaledOffset_I32 (14 total), leaving 54
-        // genuine (roundtrip/non-interference/endianness/forwarding/subword/array).
-        assert!(count >= 54, "expected >= 54 memory proofs, got {}", count);
+        // WriteCombine_I32, and Aligned_ScaledOffset_I32 (14 total). The I32/I64
+        // roundtrips live uniquely under LoadStoreLowering, leaving a floor of
+        // 52 genuine Memory rows (roundtrip/non-interference/endianness/
+        // forwarding/subword/array).
+        assert!(count >= 52, "expected >= 52 memory proofs, got {}", count);
     }
 
     #[test]
@@ -2667,7 +2753,12 @@ mod tests {
     #[test]
     fn test_names_count_matches_len() {
         let db = ProofDatabase::new();
-        assert_eq!(db.names().len(), db.len());
+        let names: std::collections::HashSet<&str> = db.names().into_iter().collect();
+        assert_eq!(
+            names.len(),
+            db.len(),
+            "static proof-gate names must be globally unique"
+        );
     }
 
     // =======================================================================

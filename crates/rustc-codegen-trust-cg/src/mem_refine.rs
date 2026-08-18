@@ -7424,7 +7424,7 @@ mod tests {
         base: ValueId,
         off: i128,
     ) -> ValueId {
-        let mut fresh = |next: &mut u32| {
+        let fresh = |next: &mut u32| {
             let v = ValueId::new(*next);
             *next += 1;
             v
@@ -7489,7 +7489,7 @@ mod tests {
     fn rn_emit(cfg: &RnCfg) -> Vec<InstrNode> {
         let mut nodes = Vec::new();
         let mut next = 100u32;
-        let mut fresh = |next: &mut u32| {
+        let fresh = |next: &mut u32| {
             let v = ValueId::new(*next);
             *next += 1;
             v
@@ -8375,7 +8375,7 @@ mod tests {
         idx: ValueId,
         scale: i128,
     ) -> ValueId {
-        let mut fresh = |next: &mut u32| {
+        let fresh = |next: &mut u32| {
             let v = ValueId::new(*next);
             *next += 1;
             v
@@ -8455,7 +8455,7 @@ mod tests {
     fn se_emit(cfg: &SeCfg) -> Vec<InstrNode> {
         let mut nodes = Vec::new();
         let mut next = 100u32;
-        let mut fresh = |next: &mut u32| {
+        let fresh = |next: &mut u32| {
             let v = ValueId::new(*next);
             *next += 1;
             v
@@ -8548,11 +8548,11 @@ mod tests {
         // The EMITTED Select position (for the SELECT-ON-WRONG-FIELD defect it
         // deliberately disagrees with the obligations' layout `niche_at_f0`).
         let emitted_at_f0 = cfg.select_at_f0.unwrap_or(cfg.niche_at_f0);
-        let mut select_into = |nodes: &mut Vec<InstrNode>, next: &mut u32, ptr: ValueId| {
+        let select_into = |nodes: &mut Vec<InstrNode>, next: &mut u32, ptr: ValueId| {
             if cfg.dropped_select {
                 ptr
             } else {
-                let mut fresh = |next: &mut u32| {
+                let fresh = |next: &mut u32| {
                     let v = ValueId::new(*next);
                     *next += 1;
                     v
@@ -8996,7 +8996,7 @@ mod tests {
     /// `emit_ptr_to_int(ptr)`: `Copy(Ptr)` (the `coerce_to_plain_ptr`
     /// normalization) + `Cast PtrToInt`.
     fn si_ptr_to_int(nodes: &mut Vec<InstrNode>, next: &mut u32, ptr: ValueId) -> ValueId {
-        let mut fresh = |next: &mut u32| {
+        let fresh = |next: &mut u32| {
             let v = ValueId::new(*next);
             *next += 1;
             v
@@ -9025,7 +9025,7 @@ mod tests {
     fn si_emit(cfg: &SiCfg) -> Vec<InstrNode> {
         let mut nodes = Vec::new();
         let mut next = 100u32;
-        let mut fresh = |next: &mut u32| {
+        let fresh = |next: &mut u32| {
             let v = ValueId::new(*next);
             *next += 1;
             v
@@ -9630,7 +9630,7 @@ mod tests {
     fn sb_emit(cfg: &SbCfg) -> Vec<InstrNode> {
         let mut nodes = Vec::new();
         let mut next = 300u32;
-        let mut fresh = |next: &mut u32| {
+        let fresh = |next: &mut u32| {
             let v = ValueId::new(*next);
             *next += 1;
             v
@@ -10355,7 +10355,7 @@ mod tests {
     fn sbp_emit(cfg: &SbpCfg) -> Vec<InstrNode> {
         let mut nodes = Vec::new();
         let mut next = 400u32;
-        let mut fresh = |next: &mut u32| {
+        let fresh = |next: &mut u32| {
             let v = ValueId::new(*next);
             *next += 1;
             v
@@ -11009,7 +11009,7 @@ mod tests {
         index: ValueId,
         stride: u64,
     ) -> ValueId {
-        let mut fresh = |next: &mut u32| {
+        let fresh = |next: &mut u32| {
             let v = ValueId::new(*next);
             *next += 1;
             v
@@ -11115,7 +11115,7 @@ mod tests {
     fn sbs_emit(cfg: &SbsCfg) -> Vec<InstrNode> {
         let mut nodes = Vec::new();
         let mut next = 500u32;
-        let mut fresh = |next: &mut u32| {
+        let fresh = |next: &mut u32| {
             let v = ValueId::new(*next);
             *next += 1;
             v

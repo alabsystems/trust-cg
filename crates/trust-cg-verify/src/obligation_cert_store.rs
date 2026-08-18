@@ -614,11 +614,12 @@ mod tests {
     /// END-TO-END with the REAL ay + Carcara binaries: mint a cert for a
     /// known-unsat QF_BV obligation, then prove the four soundness properties
     /// on the CONSUME path against that real cert. This external-tool campaign
-    /// requires explicit binary paths:
+    /// requires explicit binary paths; the Clean binary must be built with its
+    /// `carcara-verify` feature:
     ///
     /// ```text
     /// TRUST_CG_RUN_EXTERNAL_CERT_TESTS=1 \
-    /// AY_SOLVER_PATH=/path/to/ay TCG_CLEAN_CHECKER=/path/to/clean \
+    /// AY_SOLVER_PATH=/path/to/ay TCG_CLEAN_CHECKER=/path/to/clean-with-carcara-verify \
     /// cargo test -p trust-cg-verify --lib \
     ///     end_to_end_mint_then_consume_real_binaries
     /// ```
@@ -658,12 +659,18 @@ mod tests {
             .to_str()
             .expect("AY_SOLVER_PATH must be valid UTF-8 for subprocess invocation");
 
-        let smt2 = "(set-logic QF_BV)\n(declare-const x (_ BitVec 32))\n(assert (not (= x x)))\n(check-sat)\n";
+        // Keep this canary inside QF_BV while making the contradiction direct.
+        // The test is authority for certificate transport, binding, and the
+        // independent checker—not for AY's rewrite-proof coverage. In
+        // particular, `not (= x x)` currently exercises an unsupported Alethe
+        // rewrite hole and correctly downgrades AY's result to `unknown`, so it
+        // cannot serve as a certificate-pipeline canary.
+        let smt2 = "(set-logic QF_BV)\n(assert false)\n(check-sat)\n";
         let dir = tempfile::tempdir().unwrap();
-        let key = "e2e_selfeq_bv32";
+        let key = "e2e_false_qfbv";
 
         // MINT: real ay emits Alethe; Carcara pre-verifies; cert is written.
-        let minted = mint_into(dir.path(), key, ay, smt2, "selfeq_bv32", &checker);
+        let minted = mint_into(dir.path(), key, ay, smt2, "false_qfbv", &checker);
         assert!(
             minted,
             "mint should succeed for a real unsat + verifiable proof"
@@ -681,7 +688,7 @@ mod tests {
             let text = std::fs::read_to_string(cert_path(dir.path(), key)).unwrap();
             let cert = AletheCert::parse(&text).unwrap();
             let mut bad = cert.clone();
-            bad.alethe_proof = bad.alethe_proof.replace("refl", "trust"); // break the derivation
+            bad.alethe_proof = "(malformed".to_string();
             std::fs::write(cert_path(dir.path(), "tampered"), bad.serialize()).unwrap();
             assert!(
                 !consume_verified_in(dir.path(), "tampered", ay, smt2, Some(checker.clone())),

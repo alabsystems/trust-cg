@@ -492,8 +492,9 @@ pub fn parse_cert(text: &str) -> Result<LratCert, String> {
 /// Generate an LRAT/DRAT certificate for a `QF_BV` obligation SMT2 query,
 /// end-to-end:
 ///
-///  1a. `ay solve <smt2> --dump-bv-cnf <cnf>` — bit-blast and dump the CNF
-///      (SMT-LIB mode; AY refuses a non-Alethe `--proof` here).
+///  1a. `ay solve <smt2> --dump-bv-cnf <cnf> --no-proof` — bit-blast and dump
+///      the CNF without producing an unrelated Alethe side artifact (SMT-LIB
+///      mode refuses a non-Alethe `--proof` here).
 ///  1b. `ay solve <cnf> --proof <drat> --no-verify-proof` — refute the dumped
 ///      CNF in DIMACS mode and emit the DRAT (UNSAT is exit 20).
 ///  2.  `drat-trim <cnf> <drat>` — INDEPENDENTLY confirm, else fail.
@@ -656,11 +657,11 @@ pub fn generate_cert_for_smt2(
     // clearing stale artifacts up front. A cert-carried `smt2_sha256` would bind
     // it in the artifact itself; that is a schema change (tcg-lrat-cert-v2 -> v3)
     // and is tracked separately.
-    // `--no-verify-proof` keeps AY from VERIFYING the default Alethe proof it
-    // synthesizes, which trust-cg never consumes. (It does not suppress the
-    // stray `<smt2>.alethe` artifact itself — only `--no-proof` does that — so
-    // callers may still see one in their workdir.) drat-trim below is the
-    // independent check.
+    // `--no-proof` suppresses AY's default Alethe proof. This lane never
+    // consumes that side artifact: it consumes the exact exported CNF and the
+    // independently checked DRAT produced from it below. Using
+    // `--no-verify-proof` here would still write a holey Alethe file and warn
+    // about it even though neither result can contribute authority.
     //
     // SPAWNED, not `output()`, because the provenance check below binds the
     // artifact to THIS child's PID, which requires the handle before the wait.
@@ -669,7 +670,7 @@ pub fn generate_cert_for_smt2(
         .arg(&smt2_path)
         .arg("--dump-bv-cnf")
         .arg(&cnf_path)
-        .arg("--no-verify-proof")
+        .arg("--no-proof")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -1274,6 +1275,10 @@ mod tests {
         let expected_key = crate::ay_bridge::verdict_cache_key_v2(&identity, GOLDEN_SMT2);
         assert_eq!(cert.verdict_key, expected_key);
         assert_eq!(cert.solver_identity, identity);
+        assert!(
+            !dir.join("gen/obligation.smt2.alethe").exists(),
+            "the CNF-export lane must not leave an unrelated Alethe side artifact"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1315,7 +1320,7 @@ mod tests {
                     smt2.display().to_string(),
                     "--dump-bv-cnf".into(),
                     cnf.display().to_string(),
-                    "--no-verify-proof".into(),
+                    "--no-proof".into(),
                 ],
             ),
             (

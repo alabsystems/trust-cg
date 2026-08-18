@@ -73,6 +73,7 @@ use crate::neon_reduce::NeonReducePass;
 use crate::neon_stencil::NeonStencilPass;
 use crate::pass_manager::{MachinePass, PassManager, PassStats};
 use crate::pgo::{PipelineConfig as PgoPipelineConfig, ProfileUsePass};
+use crate::post_index::PostIndexForm;
 use crate::proof_opts::{ProofOptimization, ProofOptimizationMetadata};
 use crate::ptr_iv_sr::PtrIvStrengthReduce;
 use crate::recurrence_store_forward::RecurrenceStoreForward;
@@ -282,10 +283,17 @@ pub struct OptimizationPipelineRunReport {
     pub pipeline_report: OptimizationPipelineReport,
 }
 
-type KernelGate = (
-    trust_cg_ir::DischargedEvidenceTable,
-    std::collections::HashMap<trust_cg_ir::InstId, (u128, Option<u128>)>,
-);
+enum KernelGate {
+    /// Compatibility/test route. Production accepts these public inputs only when the separately
+    /// wired validator authority exists; otherwise [`ProofOptimization`] clears them fail-closed.
+    Raw(
+        trust_cg_ir::DischargedEvidenceTable,
+        std::collections::HashMap<trust_cg_ir::InstId, (u128, Option<u128>)>,
+    ),
+    /// Decidable-lattice route. The opaque object owns evidence reconstructed by exact replay and
+    /// live-carrier binding; no caller-constructible evidence/map crosses this boundary.
+    Lattice(trust_cg_lower::lattice_guard::LatticeGuardReplayAuthority),
+}
 
 /// Optimization pipeline configuration.
 pub struct OptimizationPipeline {
@@ -402,7 +410,16 @@ impl OptimizationPipeline {
         evidence: trust_cg_ir::DischargedEvidenceTable,
         obligations: std::collections::HashMap<trust_cg_ir::InstId, (u128, Option<u128>)>,
     ) -> Self {
-        self.kernel_gate = Some((evidence, obligations));
+        self.kernel_gate = Some(KernelGate::Raw(evidence, obligations));
+        self
+    }
+
+    /// Enable the decidable-lattice guard lane with replay-derived opaque authority.
+    pub fn with_lattice_kernel_gate(
+        mut self,
+        authority: trust_cg_lower::lattice_guard::LatticeGuardReplayAuthority,
+    ) -> Self {
+        self.kernel_gate = Some(KernelGate::Lattice(authority));
         self
     }
 
@@ -410,8 +427,14 @@ impl OptimizationPipeline {
     /// was set. Used at every level so the gate applies uniformly.
     fn proof_optimization_pass(&self) -> Box<dyn MachinePass> {
         let mut pass = ProofOptimization::new();
-        if let Some((evidence, obligations)) = &self.kernel_gate {
-            pass.enable_kernel_gate(evidence.clone(), obligations.clone());
+        match &self.kernel_gate {
+            Some(KernelGate::Raw(evidence, obligations)) => {
+                pass.enable_kernel_gate(evidence.clone(), obligations.clone());
+            }
+            Some(KernelGate::Lattice(authority)) => {
+                pass.enable_lattice_kernel_gate(authority.clone());
+            }
+            None => {}
         }
         Box::new(pass)
     }
@@ -493,6 +516,7 @@ impl OptimizationPipeline {
             .clone()
             .unwrap_or_else(|| pipeline_env_var("TRUST_CG_DISABLE_PASSES").unwrap_or_default());
         let skip_redundancy_elimination = self.skip_redundancy_elimination;
+        let lattice_kernel_gate = matches!(self.kernel_gate, Some(KernelGate::Lattice(_)));
         let is_disabled = |name: &str| -> bool {
             // The opt-in `without_redundancy_elimination()` builder skips the
             // value-preserving redundancy passes (CSE + GVN) for JIT kernels
@@ -520,15 +544,20 @@ impl OptimizationPipeline {
                 // Kill switch: `TRUST_CG_DISABLE_PASSES=declrewrite`.
                 let mut pm = PassManager::new()
                     .with_proof_optimization_metadata(self.proof_metadata.clone());
+                // ProofOptimization (guard elimination) is pure-deletion:
+                // apply_in_bounds/apply_not_null only insert into `to_delete`,
+                // so the exact post-ISel lattice authority can be consumed
+                // before an unrelated transform rewrites its bound function.
+                // The ordinary/raw compatibility pass retains its established
+                // post-DCE placement. Kill switch:
+                // `TRUST_CG_DISABLE_PASSES=proof`.
+                if lattice_kernel_gate && !is_disabled("proof") {
+                    pm = pm.with_pass(self.proof_optimization_pass());
+                }
                 if !is_disabled("dce") {
                     pm = pm.with_pass(self.dce_pass());
                 }
-                // ProofOptimization (guard elimination) is pure-deletion:
-                // apply_in_bounds/apply_not_null only insert into `to_delete`,
-                // so it is O(n) with no analysis dependency and is safe to run
-                // at O1 alongside dce/sroa. Kill switch:
-                // `TRUST_CG_DISABLE_PASSES=proof`.
-                if !is_disabled("proof") {
+                if !lattice_kernel_gate && !is_disabled("proof") {
                     pm = pm.with_pass(self.proof_optimization_pass());
                 }
                 if !is_disabled("declrewrite") {
@@ -612,6 +641,11 @@ impl OptimizationPipeline {
                 // Kill switch: `TRUST_CG_DISABLE_PASSES=declrewrite`.
                 let mut pm = PassManager::new()
                     .with_proof_optimization_metadata(self.proof_metadata.clone());
+                // Consume exact post-ISel replay authority before any pass can
+                // mutate the machine function it is bound to.
+                if lattice_kernel_gate && !is_disabled("proof") {
+                    pm = pm.with_pass(self.proof_optimization_pass());
+                }
                 let profile_use_enabled = !is_disabled("profileuse");
                 let profile_hotness = profile_use_enabled
                     .then(|| self.pgo.profile_hotness())
@@ -649,7 +683,7 @@ impl OptimizationPipeline {
                 if !is_disabled("addrmodeearly") {
                     pm = pm.with_pass(Box::new(AddrModeEarlyFormation));
                 }
-                if !is_disabled("proof") {
+                if !lattice_kernel_gate && !is_disabled("proof") {
                     pm = pm.with_pass(self.proof_optimization_pass());
                 }
                 if !is_disabled("cfold") {
@@ -1223,8 +1257,40 @@ impl OptimizationPipeline {
                 // traces through a sign/zero-extend of a loop-variant index.
                 // Compile-time kill switch: `TCG_NO_PTR_IV_SR`; per-pass
                 // bisect: `TRUST_CG_DISABLE_PASSES=ptrivsr`.
+                // Scalar post-index formation. Runs immediately AFTER ptr-iv-sr
+                // and is disjoint from it by construction: ptr-iv-sr demands a
+                // single-back-edge {header}/{header,latch} body, this one only
+                // needs the load in the header, so a loop either pass rewrote is
+                // no longer in the shape the other recognises. Kill switch
+                // `TCG_NO_POST_INDEX`; bisect `TRUST_CG_DISABLE_PASSES=postindex`.
+                if !is_disabled("postindex") {
+                    pm = pm.with_pass(Box::new(PostIndexForm));
+                }
                 if !is_disabled("ptrivsr") {
                     pm = pm.with_pass(Box::new(PtrIvStrengthReduce));
+                }
+                // Late call-bearing exact-trip FULL unroll: replicate the
+                // body of a proven-constant-trip counted loop whose body
+                // CONTAINS a call, at K = N (the loop control then evaluates
+                // once per entry instead of N times). Runs immediately AFTER
+                // ptr-iv-sr — that ordering IS the pass: unrolling this shape
+                // at the early `unroll` slot deletes the loop before ptr-iv-sr
+                // can reduce it, so each clone keeps the unreduced
+                // `lsl; madd; add; ldr` address chain. Toggling
+                // TCG_NO_PTR_IV_SR around THIS slot reproduces that placement
+                // exactly and prices it: almabench planetpv emits madd 16 /
+                // lsl 9 either way when the order is right, madd 58 / lsl 51
+                // when it is not (+42 = 6 arrays x 7 extra clones), and the
+                // unreduced unroll is a WASH against not unrolling at all
+                // (1.0095 vs 1.0094 PMC cycles) where the reduced one is
+                // 0.9890. Here the clones inherit the walking-pointer body
+                // and the unroll only removes work. Disjoint from
+                // partial-unroll by construction (that tier refuses calls).
+                // Purely structural: trip test, bound, step and exit edge are
+                // untouched, so a mis-modeled trip count can only refuse.
+                // Kill switch: `TCG_NO_CALL_UNROLL`; bisect key `callunroll`.
+                if !is_disabled("callunroll") {
+                    pm = pm.with_pass(Box::new(crate::loop_unroll::CallUnroll::new()));
                 }
                 // Alias-versioned loop-invariant load hoisting (LICM tier c):
                 // versions an inner loop on a RUNTIME byte-range disjointness
@@ -1289,6 +1355,19 @@ impl OptimizationPipeline {
                 if !is_disabled("csincfold") {
                     pm = pm.with_pass(Box::new(CsincFold));
                 }
+                // PARTIAL (factor) unroll: replicate the body of a constant-trip
+                // loop that is TOO LONG for any full unroller (every tier caps
+                // at 4..16 trips) K times, with the `N mod K` remainder peeled
+                // as a prologue. Runs LATE — after every vectorizer and
+                // pattern-specific unroller has had first refusal on the native
+                // counted shape, and before scheduling/mem-pair so the
+                // replicated accesses can still pair. Purely structural: the
+                // trip test, bound, step and exit edge are untouched, so a
+                // mis-modeled trip count can only refuse to fire. Kill switch:
+                // `TCG_NO_PARTIAL_UNROLL`; bisect key `partial_unroll`.
+                if !is_disabled("partial_unroll") {
+                    pm = pm.with_pass(Box::new(crate::loop_unroll::PartialUnroll::new()));
+                }
                 if !is_disabled("sched") {
                     pm = pm.with_pass(Box::new(PressureAwareScheduler));
                 }
@@ -1313,6 +1392,11 @@ impl OptimizationPipeline {
                 // between GVN and VectorizationPass.
                 let mut pm = PassManager::new()
                     .with_proof_optimization_metadata(self.proof_metadata.clone());
+                // Consume exact post-ISel replay authority before any pass can
+                // mutate the machine function it is bound to.
+                if lattice_kernel_gate && !is_disabled("proof") {
+                    pm = pm.with_pass(self.proof_optimization_pass());
+                }
                 let profile_use_enabled = !is_disabled("profileuse");
                 let profile_hotness = profile_use_enabled
                     .then(|| self.pgo.profile_hotness())
@@ -1348,7 +1432,7 @@ impl OptimizationPipeline {
                 if !is_disabled("addrmodeearly") {
                     pm = pm.with_pass(Box::new(AddrModeEarlyFormation));
                 }
-                if !is_disabled("proof") {
+                if !lattice_kernel_gate && !is_disabled("proof") {
                     pm = pm.with_pass(self.proof_optimization_pass());
                 }
                 if !is_disabled("cfold") {
@@ -1796,8 +1880,40 @@ impl OptimizationPipeline {
                 // under fixpoint iteration: a rewritten access is a
                 // zero-offset LdrRI/StrRI (no LdrRO/StrRO left to re-claim),
                 // so the pass reports no change on re-runs.
+                // Scalar post-index formation. Runs immediately AFTER ptr-iv-sr
+                // and is disjoint from it by construction: ptr-iv-sr demands a
+                // single-back-edge {header}/{header,latch} body, this one only
+                // needs the load in the header, so a loop either pass rewrote is
+                // no longer in the shape the other recognises. Kill switch
+                // `TCG_NO_POST_INDEX`; bisect `TRUST_CG_DISABLE_PASSES=postindex`.
+                if !is_disabled("postindex") {
+                    pm = pm.with_pass(Box::new(PostIndexForm));
+                }
                 if !is_disabled("ptrivsr") {
                     pm = pm.with_pass(Box::new(PtrIvStrengthReduce));
+                }
+                // Late call-bearing exact-trip FULL unroll: replicate the
+                // body of a proven-constant-trip counted loop whose body
+                // CONTAINS a call, at K = N (the loop control then evaluates
+                // once per entry instead of N times). Runs immediately AFTER
+                // ptr-iv-sr — that ordering IS the pass: unrolling this shape
+                // at the early `unroll` slot deletes the loop before ptr-iv-sr
+                // can reduce it, so each clone keeps the unreduced
+                // `lsl; madd; add; ldr` address chain. Toggling
+                // TCG_NO_PTR_IV_SR around THIS slot reproduces that placement
+                // exactly and prices it: almabench planetpv emits madd 16 /
+                // lsl 9 either way when the order is right, madd 58 / lsl 51
+                // when it is not (+42 = 6 arrays x 7 extra clones), and the
+                // unreduced unroll is a WASH against not unrolling at all
+                // (1.0095 vs 1.0094 PMC cycles) where the reduced one is
+                // 0.9890. Here the clones inherit the walking-pointer body
+                // and the unroll only removes work. Disjoint from
+                // partial-unroll by construction (that tier refuses calls).
+                // Purely structural: trip test, bound, step and exit edge are
+                // untouched, so a mis-modeled trip count can only refuse.
+                // Kill switch: `TCG_NO_CALL_UNROLL`; bisect key `callunroll`.
+                if !is_disabled("callunroll") {
+                    pm = pm.with_pass(Box::new(crate::loop_unroll::CallUnroll::new()));
                 }
                 // Alias-versioned load hoisting (LICM tier c) — see the O2
                 // comment. Self-limiting under fixpoint: the slow loop's new
@@ -1856,6 +1972,11 @@ impl OptimizationPipeline {
                 // Kill switch: `TRUST_CG_DISABLE_PASSES=csincfold`.
                 if !is_disabled("csincfold") {
                     pm = pm.with_pass(Box::new(CsincFold));
+                }
+                // PARTIAL (factor) unroll — see the O2 comment. Kill switch:
+                // `TCG_NO_PARTIAL_UNROLL`; bisect key `partial_unroll`.
+                if !is_disabled("partial_unroll") {
+                    pm = pm.with_pass(Box::new(crate::loop_unroll::PartialUnroll::new()));
                 }
                 if !is_disabled("sched") {
                     pm = pm.with_pass(Box::new(PressureAwareScheduler));
@@ -2754,7 +2875,14 @@ mod tests {
                         // ptr-iv-sr runs after ext-addr (disabled in this
                         // test); inert on this non-loop store-pair candidate
                         // but executes once.
+                        // post-index is registered immediately before ptr-iv-sr;
+                        // inert on this store-pair candidate.
+                        ("post-index".to_string(), 1),
                         ("ptr-iv-sr".to_string(), 1),
+                        // call-unroll runs immediately after ptr-iv-sr; inert
+                        // on this non-loop store-pair candidate (no counted
+                        // loop, no call) but executes once.
+                        ("call-unroll".to_string(), 1),
                         // mul-shift-reduce runs DEAD LAST (right before the
                         // disabled scheduler); inert on this multiply-free
                         // store-pair candidate but executes once.
@@ -2769,6 +2897,9 @@ mod tests {
                         // csinc-fold runs right after shift-alu-fuse; inert on
                         // this store-pair candidate (no CSEL) but executes once.
                         ("csinc-fold".to_string(), 1),
+                        // partial-unroll runs just before the scheduler; inert
+                        // here (no loops in this candidate) but executes once.
+                        ("partial-unroll".to_string(), 1),
                         // mem-pair-formation runs DEAD LAST; the early addr-mode
                         // pass already paired this candidate, so it is inert here
                         // but executes once.
@@ -2973,8 +3104,8 @@ mod tests {
             // xorshift-demanded-bits + csinc-fold + pressure-aware-scheduler +
             // resid-collapse + sincos-merge + loop-dead-pure-sink + the late
             // (post-unroll) sroa instance + latch-and-split (profile-gated,
-            // inert without a profile).
-            assert_eq!(pm.num_passes(), 70);
+            // inert without a profile) + call-unroll + partial-unroll.
+            assert_eq!(pm.num_passes(), 73);
         });
     }
 
@@ -3609,8 +3740,8 @@ mod tests {
             // + and-cmp-fuse + xorshift-demanded-bits + resid-collapse +
             // sincos-merge + loop-dead-pure-sink + the late (post-unroll) sroa
             // instance + latch-and-split (profile-gated, inert without a
-            // profile).
-            assert_eq!(pipeline.pass_count(), 70);
+            // profile) + call-unroll + partial-unroll.
+            assert_eq!(pipeline.pass_count(), 73);
         });
     }
 
@@ -3832,16 +3963,17 @@ mod tests {
         // ext-addr, ptr-iv-sr, select-fuse, eor-rotate-fuse, mul-shift-reduce,
         // shift-alu-fuse, lsr-and-ubfx, and-cmp-fuse, xorshift-demanded-bits,
         // resid-collapse, sincos-merge, loop-unswitch, and profile-gated
-        // latch-and-split) plus 1 declarative-rewrite pass.
+        // latch-and-split, call-unroll, partial-unroll) plus 1
+        // declarative-rewrite pass.
         with_declarative_rewrite_env(None, None, || {
             let pipeline = OptimizationPipeline::new(OptLevel::O2);
-            assert_eq!(pipeline.pass_count(), 71);
+            assert_eq!(pipeline.pass_count(), 74);
         });
     }
 
     #[test]
     fn declarative_rewrite_kill_switch_o2() {
-        // Kill switch drops back to 70 passes (base O2 incl. SROA,
+        // Kill switch drops back to 72 passes (base O2 incl. SROA,
         // aarch64-bounds-check-elim, strided-store-unroll,
         // closed-form-reduction, neon-reduce, neon-array, neon-minmax,
         // neon-predsum, neon-map, neon-fill, neon-stencil, neon-fmap,
@@ -3851,10 +3983,11 @@ mod tests {
         // shift-alu-fuse, lsr-and-ubfx, and-cmp-fuse,
         // xorshift-demanded-bits, resid-collapse and mac-row-unroll, without
         // the declarative-rewrite pass; sincos-merge, loop-unswitch, and the
-        // profile-gated latch-and-split are still present).
+        // profile-gated latch-and-split are still present; call-unroll and
+        // partial-unroll are present too).
         with_declarative_rewrite_env(None, Some("1"), || {
             let pipeline = OptimizationPipeline::new(OptLevel::O2);
-            assert_eq!(pipeline.pass_count(), 70);
+            assert_eq!(pipeline.pass_count(), 73);
         });
     }
 
@@ -3877,7 +4010,7 @@ mod tests {
         with_declarative_rewrite_env(None, None, || {
             with_disable_passes_env(Some("declrewrite"), || {
                 let pipeline = OptimizationPipeline::new(OptLevel::O2);
-                // Declarative disabled via bisect list → 70 base passes
+                // Declarative disabled via bisect list → 72 base passes
                 // (incl. SROA, early addr-mode, aarch64-bounds-check-elim,
                 // strided-store-unroll, closed-form-reduction,
                 // neon-reduce, neon-array, neon-minmax, neon-predsum, neon-map,
@@ -3888,8 +4021,9 @@ mod tests {
                 // xorshift-demanded-bits, alias-hoist, mac-row-unroll,
                 // resid-collapse, sincos-merge, the late (post-unroll) sroa
                 // instance, loop-dead-pure-sink, loop-unswitch, and the
-                // profile-gated latch-and-split).
-                assert_eq!(pipeline.pass_count(), 70);
+                // profile-gated latch-and-split, call-unroll,
+                // partial-unroll).
+                assert_eq!(pipeline.pass_count(), 73);
             });
         });
     }
@@ -3928,7 +4062,7 @@ mod tests {
         with_declarative_rewrite_env(None, Some("1"), || {
             with_disable_passes_env(Some("sroa"), || {
                 let pipeline = OptimizationPipeline::new(OptLevel::O3);
-                assert_eq!(pipeline.pass_count(), 68);
+                assert_eq!(pipeline.pass_count(), 71);
             });
         });
     }
@@ -3940,7 +4074,7 @@ mod tests {
                 let pipeline = OptimizationPipeline::new(OptLevel::O3);
                 let pm = pipeline.build_pass_manager();
                 let pass_names = pm.pass_names();
-                assert_eq!(pass_names.len(), 67);
+                assert_eq!(pass_names.len(), 70);
                 assert!(!pass_names.contains(&"licm"));
                 assert!(!pass_names.contains(&"if-convert"));
                 assert!(!pass_names.contains(&"pressure-aware-scheduler"));

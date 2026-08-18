@@ -33,7 +33,7 @@
 //       the coverage-error list, not on silence.
 //   (e) The 4 headline coverage numbers are pinned exactly. Every uncovered row
 //       must be an explicit `DeferredUnfaithfulModel`, never a wiring gap.
-//       AArch64 is 155/246 with 91 explicit model gaps; x86-64 is 163/192
+//       AArch64 is 155/248 with 93 explicit model gaps; x86-64 is 163/192
 //       with 29; RISC-V is 14/17 with 3; wasm is 109/111 with 2.
 
 use std::collections::HashSet;
@@ -515,11 +515,14 @@ fn meta_e_headline_coverage_is_pinned_and_honest() {
     // 153/246. Umull then leaves the deferred set (faithful single-form
     // zext64*zext64 widening obligation, proof_umull_rr), yielding 154/246;
     // complete packed-NZCV TST authority then yields 155/246 with 91 RED rows.
+    // StrbRO/StrhRO add two honest memory-effect gaps to the audited universe,
+    // producing the current 155/248 with 93 RED rows.
     let pins = [
         // EorRRLsl/EorRRLsr reached 153/246; the independent UMULL widening
         // theorem and the width-complete packed-NZCV TST theorem each remove
-        // one RED row, yielding the combined 155/246 inventory.
-        (GateArch::AArch64, 246usize, 155usize),
+        // one RED row, yielding 155/246 before the two narrow register-offset
+        // store rows extend the current denominator to 248.
+        (GateArch::AArch64, 248usize, 155usize),
         (GateArch::RiscV, 17usize, 14usize),
         (GateArch::Wasm, 111usize, 109usize),
         // 149 -> 151 (OPT-7): MovRMSib/MovMRSib SIB memory MOVs flip

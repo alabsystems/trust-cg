@@ -504,8 +504,12 @@ pub fn allocate(
             // translation validator. If it errors, that is a pre-existing
             // condition unrelated to AY, so propagate it.
             let mut greedy_func = input.clone();
-            let (greedy, greedy_copies, greedy_traffic) =
-                allocate_core(&mut greedy_func, config, /* use_ay = */ false)?;
+            let (greedy, greedy_copies, greedy_traffic) = allocate_core(
+                &mut greedy_func,
+                config,
+                /* use_ay = */ false,
+                /* force_keep = */ false,
+            )?;
 
             // Candidate: the AY-PBO allocation, also validated by the always-on
             // validator (allocate_core returns Ok only if it passed). Keep it
@@ -519,23 +523,32 @@ pub fn allocate(
             // is never worse than greedy in the traffic currency. If AY bails /
             // is rejected / is not better, greedy is returned. Never a compile
             // failure, never a wrong or worse-than-greedy allocation.
+            // FORCE_KEEP is the explicit execution-evidence / de-risk mode: it
+            // must be able to exercise a validated AY allocation even when AY
+            // is not better than greedy. Pass that intent into the core so the
+            // solver does not install its internal `objective <= G-1` quality
+            // gate; the final keep-better gate below is bypassed for the same
+            // reason. Every legality self-check and the always-on translation
+            // validator remains mandatory.
+            let force_keep = crate::env_lock::var_os("TCG_AY_REGALLOC_FORCE_KEEP").is_some();
             let mut ay_func = input;
             if let Ok((ay, ay_copies, ay_traffic)) =
-                allocate_core(&mut ay_func, config, /* use_ay = */ true)
+                allocate_core(&mut ay_func, config, /* use_ay = */ true, force_keep)
             {
                 let ay_better = ay_traffic < greedy_traffic
                     || (ay_traffic == greedy_traffic && ay_copies < greedy_copies);
                 // `TCG_AY_REGALLOC_FORCE_KEEP` is a MEASUREMENT/DE-RISK lever (off
                 // by default): it keeps the AY allocation whenever it VALIDATES,
-                // bypassing the lexicographic keep-better tiebreak. This lets the
-                // end-to-end differential exercise the split-materialized stream
-                // even when it is not (yet) a spill win, so the mutation pipeline
-                // is proven correct through the actual emitted binary. It can only
-                // ever keep a validated (correct) allocation — `allocate_core`
-                // already ran the always-on translation validator and returned Err
-                // on any rejection — so it is a pure quality knob, never a
-                // correctness one.
-                let force_keep = crate::env_lock::var_os("TCG_AY_REGALLOC_FORCE_KEEP").is_some();
+                // bypassing both the solver's incumbent-improvement admission
+                // bound (above) and this lexicographic keep-better tiebreak. This
+                // lets the end-to-end differential exercise the
+                // split-materialized stream even when it is not (yet) a spill
+                // win, so the mutation pipeline is proven correct through the
+                // actual emitted binary. It can only ever keep a validated
+                // (correct) allocation — `allocate_core` already ran the
+                // always-on translation validator and returned Err on any
+                // rejection — so it is a pure quality knob, never a correctness
+                // one.
                 if crate::env_lock::var_os("TCG_AY_REGALLOC_STATS").is_some() {
                     eprintln!(
                         "[ay-regalloc] keep: fn={} ay_traffic={ay_traffic} \
@@ -562,7 +575,10 @@ pub fn allocate(
             return Ok(greedy);
         }
     }
-    allocate_core(func, config, /* use_ay = */ false).map(|(result, _copies, _traffic)| result)
+    allocate_core(
+        func, config, /* use_ay = */ false, /* force_keep = */ false,
+    )
+    .map(|(result, _copies, _traffic)| result)
 }
 
 /// The recomputed KEEP-METRIC traffic cost of a realized phase-5 allocation —
@@ -647,6 +663,8 @@ pub(crate) fn allocation_traffic_cost(
 
 /// The core allocation pipeline. `use_ay` selects the AY-PBO allocator for
 /// phase 5 (only ever `true` under the `ay-regalloc` feature via [`allocate`]).
+/// `force_keep` suppresses only the internal incumbent-improvement quality
+/// bound; it does not suppress any allocation legality or translation check.
 ///
 /// Returns the allocation result plus the number of surviving copies that
 /// resolve to a real register move under it (the keep-criterion's copy
@@ -657,9 +675,10 @@ fn allocate_core(
     func: &mut RegAllocFunction,
     config: &AllocConfig,
     use_ay: bool,
+    force_keep: bool,
 ) -> Result<(AllocationResult, usize, i128), AllocError> {
     #[cfg(not(feature = "ay-regalloc"))]
-    let _ = use_ay;
+    let _ = (use_ay, force_keep);
 
     // Normalize target-flagged "move-like" instructions (the
     // LoopLatchLayoutCombine hardened `AddRI dst, src, #0` latch guard copies)
@@ -816,13 +835,23 @@ fn allocate_core(
                 baseline_rec.as_ref(),
             );
         }
+        // Normal production passes the baseline record and therefore installs
+        // the hard `objective <= G-1` quality gate. FORCE_KEEP deliberately
+        // passes no incumbent: it requests any independently validated AY
+        // allocation so execution-differential tests can exercise the AY
+        // stream even when the baseline is already better.
+        let admission_incumbent = if force_keep {
+            None
+        } else {
+            baseline_rec.as_ref()
+        };
         match ay_regalloc::try_allocate(
             func,
             &intervals,
             &config.allocatable_regs,
             &reserved_regs,
             &copy_pairs,
-            baseline_rec.as_ref(),
+            admission_incumbent,
         ) {
             Some(tuple) => Some(tuple),
             None => {
@@ -4287,12 +4316,12 @@ mod tests {
             // Greedy baseline.
             let mut fg = make_straight_line(8);
             let (greedy, _greedy_copies, _greedy_traffic) =
-                allocate_core(&mut fg, &config, false).expect("greedy ok");
+                allocate_core(&mut fg, &config, false, false).expect("greedy ok");
 
             // AY path: `allocate_core(.., true)` returns Ok ONLY if AY's
             // allocation passed `regalloc_validator::validate_allocation`.
             let mut fa = make_straight_line(8);
-            let (ay, _ay_copies, _ay_traffic) = allocate_core(&mut fa, &config, true)
+            let (ay, _ay_copies, _ay_traffic) = allocate_core(&mut fa, &config, true, false)
                 .expect("AY allocation must pass the always-on translation validator");
 
             // 8 simultaneously-live vregs, 4 registers => exactly 4 must spill.

@@ -5291,6 +5291,10 @@ fn binop_variant_name(op: BinOp) -> &'static str {
         BinOp::AShr => "AShr",
         BinOp::FMin => "FMin",
         BinOp::FMax => "FMax",
+        // Trust: the BOOLEAN connectives (trust-ir 4b06918).
+        BinOp::BAnd => "BAnd",
+        BinOp::BOr => "BOr",
+        BinOp::BXor => "BXor",
     }
 }
 
