@@ -82,7 +82,7 @@ use trust_cg_ir::{AArch64Opcode, BlockId, InstId, MachFunction, MachInst, MachOp
 use trust_cg_opt::dom::DomTree;
 use trust_cg_opt::loops::LoopAnalysis;
 
-use trust_cg_ir::regs::{X16, X17};
+use trust_cg_ir::regs::{X16, X17, reg_root, regs_overlap};
 
 /// Outcome of one [`form_post_index_loads`] run.
 #[derive(Debug, Default, Clone, Copy)]
@@ -109,11 +109,53 @@ pub struct PostIndexStats {
 /// That slightly BEATS the correctness-checked binary patch that priced the
 /// lever before the pass existed (-105.13M insts, 0.9670/0.9754, 14.9%).
 ///
+/// # The SECOND fold (round loop): instructions real, cycles are a lottery
+///
+/// Re-analysing between folds admits a second loop in `Trial`. Blast radius is
+/// still exactly one program, and instructions drop another **3.91%**. The
+/// cycle effect does NOT survive an R3 control:
+///
+/// | regime | min | trimmed median |
+/// |---|---|---|
+/// | default (ships) | 0.9750 / 0.9741 (repeat) | 0.9823 / 0.9809 |
+/// | `TCG_NO_LOOP_HEAD_ALIGN=1` | **1.0037** | **1.0050** |
+///
+/// Null arm 0.9999/0.9993. Both statistics agree WITHIN each regime and the two
+/// regimes disagree in SIGN, which is the signature of a code-size change
+/// reshuffling loop placement -- not of the fold buying cycles. Consistent with
+/// the free-class list: an `lsl`+`add` feeding an address in a loop that is not
+/// issue-bound costs about nothing. So: do not quote the 2.5% as a mechanism.
+/// It is landed because it is correct, because it removes real instructions, and
+/// because re-analysis replaces a cap that was a symptom-level fix.
+///
 /// Gates with the pass ON: torture_ship exactly on pin (1119 PASS / 332
 /// IMPORT_FAIL / **0 MISCOMPILE**); full SingleSource oracle MATCH 64 /
 /// **DIFFER 0** on stdout+stderr+exit vs clang -O3; 3-compile byte-determinism.
 ///
-/// # Three defects the differential oracle caught while building this
+/// # Where the remaining opportunity is (corpus census, TCG_DUMP_POSTIDX_LATE)
+///
+/// 310 `LdrRO` candidates are examined across SingleSource; today only
+/// Stanford/Puzzle folds. What blocks the rest, in order:
+///
+/// | blocker | n | note |
+/// |---|---|---|
+/// | `idx live after the load` | **150** | broken down below. |
+/// | `no idx def before load in this block` | 81 | the chain sits in a dominating block inside the loop; the search is block-local today. Linpack 20, lpbench 12, oourafft 7. |
+/// | `extend Imm(13)` (SXTW) | 41 | CORRECTLY refused -- sign-extending a loop-variant 32-bit index does not commute with the 64-bit step. Do not "fix" this. |
+/// | chain head `AddRI`/`Madd`/`SubRI` | 29 | straightforward additions to the chain matcher. Madd is 2-D indexing (Stanford ...MM); AddRI is Linpack. |
+/// | `base written in loop` | 8 | genuinely not invariant. |
+///
+/// ★ The 150 were once recorded here as "likely read-modify-write". THEY ARE
+/// NOT, and the dump now names the blocking reader rather than guessing:
+///
+/// | next reader of the index | n | what it means |
+/// |---|---|---|
+/// | `LdrRO` (index operand) | **52** | a SECOND register-offset load sharing one index -- `a[i]` and `b[i]`. The generalisation is N walking pointers replacing one shared `lsl`, which SAVES a register rather than costing one, but it is a different transform. |
+/// | `StrRO` (index operand) | 39 | the actual read-modify-write case, only a quarter of the bucket. |
+/// | `AddRI` (destination) | 17 | the index is itself the IV. |
+/// | `Copy`/`Orr`/`AddRR`/`Cbz` | 42 | miscellaneous reuse. |
+///
+/// # Four defects the differential oracle caught while building this
 ///
 /// Each would have been a silent miscompile; none is obvious from reading:
 ///
@@ -126,18 +168,52 @@ pub struct PostIndexStats {
 ///    RECURSIVE, so the self-call would have destroyed the walking pointer.
 ///    Modelled in [`touches`].
 /// 3. **Two folds in one function collide.** Both park the pointer in `X16`, and
-///    availability is tested BEFORE any rewrite, so each sees it free. Bisected
-///    directly: one fold per function is correct, two miscompiles. Hence
-///    [`MAX_FOLDS_PER_FUNCTION`]; the hot loop is the first plan anyway.
+///    availability was tested BEFORE any rewrite, so each saw it free. Fixed by
+///    re-analysing between folds -- see [`form_post_index_loads`] -- not by
+///    capping the count, which was the first (and merely symptomatic) fix.
+/// 4. **W and X are the same register and different `PReg`s.** See [`reg_file`].
+///    `ldur w16, [x29, #-0x54]` in a loop body destroys a pointer parked in X16,
+///    and every width-blind test in this pass was blind to it. This one was
+///    LATENT IN THE SHIPPED SINGLE-FOLD PASS, not introduced by the round loop:
+///    it happened not to fire only because Puzzle's first foldable loop has no
+///    `w16` write. The same hole covered the base and the IV, where it would
+///    have made a written register look loop-invariant.
 fn disabled() -> bool {
     std::env::var_os("TCG_NO_POST_INDEX_LATE").is_some()
 }
 
-/// See defect 3 in the module docs: every fold parks its pointer in `X16`, and
-/// availability is tested before any rewrite, so a second fold in the same
-/// function clobbers the first. Lifting this needs a second scratch or a
-/// re-test against the rewritten function.
-const MAX_FOLDS_PER_FUNCTION: usize = 1;
+/// Round cap for [`form_post_index_loads`]. Each round re-analyses the rewritten
+/// function and applies at most one fold, so this bounds work rather than
+/// licensing anything: the soundness comes from the re-analysis, not the number.
+/// Corpus-wide the deepest function (Stanford/Puzzle's `Trial`) offers 3.
+const MAX_FOLDS_PER_FUNCTION: usize = 8;
+
+/// ★★ W AND X ARE THE SAME REGISTER, AND THEY ARE DIFFERENT `PReg` VALUES.
+/// `X16` is `PReg(16)`, `W16` is `PReg(48)`, so `X16 == W16` is FALSE while
+/// `ldur w16, [x29, #-0x54]` zero-extends into the top half of X16 and destroys
+/// a 64-bit pointer parked there. Exactly that instruction sits in the body of
+/// Stanford/Puzzle's second foldable loop and turned the walking pointer into a
+/// small integer -- a SIGSEGV, caught by the differential oracle.
+///
+/// The same hazard applies to the base and the IV, not just to the scratch: a
+/// loop that writes `w22` while `x22` is the load's base would pass the
+/// "base is loop-invariant" test and be miscompiled. So every availability,
+/// liveness, def-search and invariance test in this pass compares through
+/// [`regs_overlap`] rather than comparing `PReg`s directly.
+///
+/// [`regs_overlap`] is the CANONICAL authority (`frame.rs`'s scratch discipline
+/// uses it too); this pass deliberately does not carry its own copy, because two
+/// definitions of register aliasing is how one of them ends up wrong.
+///
+/// A hash key that is equal exactly when [`regs_overlap`] is true. `reg_root`
+/// returns `None` only for the system registers, which this pass never handles;
+/// they fall back to their own encoding and so compare only with themselves.
+fn reg_key(reg: PReg) -> (u8, u16) {
+    match reg_root(reg) {
+        Some((n, group)) => (group, n as u16),
+        None => (u8::MAX, reg.encoding()),
+    }
+}
 
 /// Does `inst` read, write, or IMPLICITLY CLOBBER `reg`?
 ///
@@ -148,12 +224,12 @@ const MAX_FOLDS_PER_FUNCTION: usize = 1;
 /// self-call and the loop would read from a garbage address. Caught by the
 /// stdout differential against clang -O3 while building this pass.
 fn touches(inst: &MachInst, reg: PReg) -> bool {
-    if inst.is_call() && (reg == X16 || reg == X17) {
+    if inst.is_call() && (regs_overlap(reg, X16) || regs_overlap(reg, X17)) {
         return true;
     }
     inst.operands
         .iter()
-        .any(|op| matches!(op, MachOperand::PReg(p) if *p == reg))
+        .any(|op| matches!(op, MachOperand::PReg(p) if regs_overlap(*p, reg)))
 }
 
 /// The single physical register defined by `inst` (operand 0), when it has one.
@@ -172,26 +248,51 @@ fn def_preg(func: &MachFunction, inst_id: InstId) -> Option<PReg> {
 }
 
 /// Post-RA scalar post-index formation. Returns how many loads were folded.
+///
+/// ★ ONE FOLD PER ROUND, RE-ANALYSED EACH TIME. Every fold parks its walking
+/// pointer in X16, so folds are not independent: the original pass collected all
+/// plans against the UNMODIFIED function and applied several, and the second one
+/// clobbered the first's live pointer (a bisected miscompile on Stanford/Puzzle).
+///
+/// The fix is not a second scratch -- it is to re-test availability against the
+/// already-rewritten function. That falls out of re-running the analysis, since
+/// every admission test reads `func` directly:
+///
+/// * the `x16_busy` scan sees the previous fold's `LdrPostIndex` (X16 is an
+///   operand of it) and refuses any further fold in that loop;
+/// * `dead_after_in(X16, ..., confine = false)` walks the whole function forward
+///   from the new seed point and refuses if any path reaches a READ of X16
+///   before a redefinition -- which is exactly "the earlier fold's pointer is
+///   still live here". It equally protects the earlier fold from this seed and
+///   this seed from the earlier fold; the relation is symmetric.
+///
+/// So the loop below re-derives the dominator tree and loop forest each round.
+/// That is only paid by functions that actually fold (4 in the whole corpus),
+/// and it is what makes more than one fold sound.
 pub fn form_post_index_loads(func: &mut MachFunction) -> PostIndexStats {
     let mut stats = PostIndexStats::default();
     if disabled() {
         return stats;
     }
-    let dbg = std::env::var_os("TCG_DUMP_POSTIDX_LATE").is_some();
-    // ★ AT MOST ONE FOLD PER FUNCTION. Every fold parks its walking pointer in
-    // X16, and the availability test runs BEFORE any rewrite -- so two loops in
-    // one function each see X16 free, and the second fold then clobbers the
-    // first's live pointer. Bisected directly: one fold per function is correct
-    // on Stanford/Puzzle, two is a MISCOMPILE.
-    //
-    // Lifting this needs either a second scratch or re-testing availability
-    // against the already-rewritten function; neither is worth it until the
-    // single-fold form is measured, since the hot loop is the first plan anyway.
     // `TCG_PIL_MAX` overrides for bisection.
     let max_folds: usize = std::env::var("TCG_PIL_MAX")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(MAX_FOLDS_PER_FUNCTION);
+    for _ in 0..max_folds {
+        let round = form_one_post_index_load(func);
+        if round.folded == 0 {
+            break;
+        }
+        stats.folded += round.folded;
+    }
+    stats
+}
+
+/// One round: analyse the CURRENT `func` and apply at most one fold.
+fn form_one_post_index_load(func: &mut MachFunction) -> PostIndexStats {
+    let mut stats = PostIndexStats::default();
+    let dbg = std::env::var_os("TCG_DUMP_POSTIDX_LATE").is_some();
     let dom = DomTree::compute(func);
     let loops = LoopAnalysis::compute(func, &dom);
 
@@ -241,12 +342,16 @@ pub fn form_post_index_loads(func: &mut MachFunction) -> PostIndexStats {
         }
 
         // (5) the IV: exactly one in-loop def, and it is `AddRI Xk, Xk, #1`.
-        let mut iv_step: HashMap<PReg, usize> = HashMap::new();
-        let mut iv_unit: HashSet<PReg> = HashSet::new();
+        //
+        // Keyed by [`reg_key`], not by `PReg`: a loop that writes `w2` must count
+        // as writing `x2`, or the IV would look single-defined and a base would
+        // look loop-invariant when neither is true.
+        let mut iv_step: HashMap<(u8, u16), usize> = HashMap::new();
+        let mut iv_unit: HashSet<(u8, u16)> = HashSet::new();
         for &b in &lp.body {
             for &i in &func.blocks[b.0 as usize].insts {
                 let Some(d) = def_preg(func, i) else { continue };
-                *iv_step.entry(d).or_default() += 1;
+                *iv_step.entry(reg_key(d)).or_default() += 1;
                 let inst = &func.insts[i.0 as usize];
                 if inst.opcode == AArch64Opcode::AddRI
                     && inst.operands.len() == 3
@@ -254,12 +359,12 @@ pub fn form_post_index_loads(func: &mut MachFunction) -> PostIndexStats {
                     && matches!(inst.operands.get(1), Some(MachOperand::PReg(p)) if *p == d)
                     && matches!(inst.operands.get(2), Some(MachOperand::Imm(1)))
                 {
-                    iv_unit.insert(d);
+                    iv_unit.insert(reg_key(d));
                 }
             }
         }
         // Registers written anywhere in the loop (for the invariance test).
-        let written: HashSet<PReg> = iv_step.keys().copied().collect();
+        let written: HashSet<(u8, u16)> = iv_step.keys().copied().collect();
 
         if dbg {
             let ldr_in: Vec<_> = lp
@@ -332,7 +437,7 @@ pub fn form_post_index_loads(func: &mut MachFunction) -> PostIndexStats {
                 // per its opcode docs), so the transfer width is fixed at 4.
                 let elem: i64 = 4;
                 // (6) base must be loop-invariant
-                if written.contains(&base) {
+                if written.contains(&reg_key(base)) {
                     nope!("base written in loop");
                 }
 
@@ -342,7 +447,11 @@ pub fn form_post_index_loads(func: &mut MachFunction) -> PostIndexStats {
                         .iter()
                         .enumerate()
                         .rev()
-                        .find_map(|(k, &i)| (def_preg(func, i) == Some(reg)).then_some((k, i)))
+                        .find_map(|(k, &i)| {
+                            def_preg(func, i)
+                                .is_some_and(|d| regs_overlap(d, reg))
+                                .then_some((k, i))
+                        })
                 };
                 // Is `reg` DEAD immediately after `from` (block `b0`, index
                 // `at`)? Post-RA the same physical register is reused for
@@ -373,14 +482,17 @@ pub fn form_post_index_loads(func: &mut MachFunction) -> PostIndexStats {
                         for &i in &blk.insts[start.min(blk.insts.len())..] {
                             let inst = &func.insts[i.0 as usize];
                             let d = def_preg(func, i);
+                            let defs_reg = d.is_some_and(|d| regs_overlap(d, reg));
                             let reads = inst.operands.iter().enumerate().any(|(k, op)| {
-                                matches!(op, MachOperand::PReg(p) if *p == reg)
-                                    && !(k == 0 && d == Some(reg))
+                                matches!(op, MachOperand::PReg(p) if regs_overlap(*p, reg))
+                                    && !(k == 0 && defs_reg)
                             });
                             if reads {
                                 return false;
                             }
-                            if d == Some(reg) {
+                            // A W-width def still KILLS the 64-bit value (AArch64
+                            // zero-extends), so an aliasing def settles the path.
+                            if defs_reg {
                                 settled = true;
                                 break;
                             }
@@ -400,7 +512,61 @@ pub fn form_post_index_loads(func: &mut MachFunction) -> PostIndexStats {
                     nope!("no idx def before load in this block");
                 };
                 if !dead_after(idx, host, lpos) {
-                    nope!("idx live after the load");
+                    // R4: name the blocking reader rather than guessing at the
+                    // shape. This walk mirrors `dead_after_in` exactly but
+                    // reports the first instruction that reads `idx`, so the
+                    // census says *why* the index is live instead of only that
+                    // it is. Debug-only -- it never influences a decision.
+                    let blocker = || -> String {
+                        let mut seen: HashSet<BlockId> = HashSet::new();
+                        let mut work = vec![(host, lpos + 1)];
+                        while let Some((b, start)) = work.pop() {
+                            if !lp.body.contains(&b) {
+                                continue;
+                            }
+                            if start == 0 && !seen.insert(b) {
+                                continue;
+                            }
+                            let blk = &func.blocks[b.0 as usize];
+                            let mut settled = false;
+                            for &i in &blk.insts[start.min(blk.insts.len())..] {
+                                let inst = &func.insts[i.0 as usize];
+                                let d = def_preg(func, i);
+                                let defs_idx = d.is_some_and(|d| regs_overlap(d, idx));
+                                let reads = inst.operands.iter().enumerate().any(|(k, op)| {
+                                    matches!(op, MachOperand::PReg(p) if regs_overlap(*p, idx))
+                                        && !(k == 0 && defs_idx)
+                                });
+                                if reads {
+                                    // Which operand slot? Slot 1 of a store is
+                                    // the base, slot 2 the index -- that
+                                    // distinction is the read-modify-write test.
+                                    let slot = inst
+                                        .operands
+                                        .iter()
+                                        .position(|op| {
+                                            matches!(op, MachOperand::PReg(p) if regs_overlap(*p, idx))
+                                        })
+                                        .unwrap_or(0);
+                                    return format!("{:?}@op{}", inst.opcode, slot);
+                                }
+                                if defs_idx {
+                                    settled = true;
+                                    break;
+                                }
+                            }
+                            if !settled {
+                                for &sx in &blk.succs {
+                                    work.push((sx, 0));
+                                }
+                            }
+                        }
+                        "none".to_string()
+                    };
+                    nope!(format!(
+                        "idx live after the load, next reader {}",
+                        blocker()
+                    ));
                 }
                 let idx_inst = func.insts[idx_id.0 as usize].clone();
                 let (carrier, add_id, inv) = match idx_inst.opcode {
@@ -431,7 +597,7 @@ pub fn form_post_index_loads(func: &mut MachFunction) -> PostIndexStats {
                     op => nope!(format!("idx def opcode {:?}", op)),
                 };
                 if let Some((v, _)) = inv
-                    && written.contains(&v)
+                    && written.contains(&reg_key(v))
                 {
                     nope!("invariant addend is written in the loop");
                 }
@@ -462,11 +628,13 @@ pub fn form_post_index_loads(func: &mut MachFunction) -> PostIndexStats {
                     nope!(format!("shift {} vs elem {}", s, elem));
                 }
                 // (5) IV steps by exactly 1, exactly once in the loop
-                if iv_step.get(&iv).copied().unwrap_or(0) != 1 || !iv_unit.contains(&iv) {
+                if iv_step.get(&reg_key(iv)).copied().unwrap_or(0) != 1
+                    || !iv_unit.contains(&reg_key(iv))
+                {
                     nope!(format!(
                         "iv defs={} unit={}",
-                        iv_step.get(&iv).copied().unwrap_or(0),
-                        iv_unit.contains(&iv)
+                        iv_step.get(&reg_key(iv)).copied().unwrap_or(0),
+                        iv_unit.contains(&reg_key(iv))
                     ));
                 }
 
@@ -556,7 +724,7 @@ pub fn form_post_index_loads(func: &mut MachFunction) -> PostIndexStats {
     if dbg {
         eprintln!("PIL {} plans={}", func.name, plans.len());
     }
-    for (pre, load_id, kill, seed) in plans.into_iter().take(max_folds) {
+    for (pre, load_id, kill, seed) in plans.into_iter().take(1) {
         let elem: i64 = 4;
         let dst = match func.insts[load_id.0 as usize].operands.first() {
             Some(MachOperand::PReg(p)) => *p,
@@ -591,4 +759,203 @@ pub fn form_post_index_loads(func: &mut MachFunction) -> PostIndexStats {
         stats.folded += 1;
     }
     stats
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use trust_cg_ir::Signature;
+    use trust_cg_ir::regs::{W16, W22, X0, X1, X2, X3, X20, X22, X29};
+
+    fn inst(f: &mut MachFunction, op: AArch64Opcode, ops: Vec<MachOperand>) -> InstId {
+        f.push_inst(MachInst::new(op, ops))
+    }
+    fn install_edges(f: &mut MachFunction) {
+        let e = crate::pipeline::derive_ir_cfg_edges_from_branch_operands(f);
+        crate::pipeline::install_ir_cfg_edges(f, e);
+    }
+    fn p(r: PReg) -> MachOperand {
+        MachOperand::PReg(r)
+    }
+
+    /// The shape this pass folds, as a hand-built post-RA function:
+    ///
+    /// ```text
+    ///   pre:   mov x2, #0                <- the IV init; see note below
+    ///   head:  lsl x1,x2,#2 ; add x0,x1,x20 ; ldr w3,[x22,x0] ; cbz w3,latch
+    ///   body:  <extra>                       <- caller-supplied, the variable
+    ///   latch: add x2,x2,#1 ; b head
+    /// ```
+    ///
+    /// `head` dominates the only latch and is dominated by the header, so the
+    /// load runs once per iteration and the fold is admissible.
+    fn loop_fixture(extra: Vec<(AArch64Opcode, Vec<MachOperand>)>) -> MachFunction {
+        let mut f = MachFunction::new("t".into(), Signature::new(vec![], vec![]));
+        let pre = f.entry;
+        let head = f.create_block();
+        let body = f.create_block();
+        let latch = f.create_block();
+        let exit = f.create_block();
+
+        // The preheader needs a real (non-terminator) instruction: the seed is
+        // inserted immediately BEFORE the terminator run, and the pass anchors
+        // its X16-liveness check on the instruction preceding that point. A
+        // preheader holding nothing but a branch is refused -- which never
+        // happens in generated code, since a preheader carries the loop setup.
+        let i = inst(
+            &mut f,
+            AArch64Opcode::MovI,
+            vec![p(X2), MachOperand::Imm(0)],
+        );
+        f.append_inst(pre, i);
+        let i = inst(&mut f, AArch64Opcode::B, vec![MachOperand::Block(head)]);
+        f.append_inst(pre, i);
+
+        for (op, ops) in [
+            (
+                AArch64Opcode::LslRI,
+                vec![p(X1), p(X2), MachOperand::Imm(2)],
+            ),
+            (AArch64Opcode::AddRR, vec![p(X0), p(X1), p(X20)]),
+            (AArch64Opcode::LdrRO, vec![p(X3), p(X22), p(X0)]),
+            (AArch64Opcode::BCond, vec![MachOperand::Block(body)]),
+        ] {
+            let i = inst(&mut f, op, ops);
+            f.append_inst(head, i);
+        }
+        for (op, ops) in extra {
+            let i = inst(&mut f, op, ops);
+            f.append_inst(body, i);
+        }
+        let i = inst(&mut f, AArch64Opcode::B, vec![MachOperand::Block(latch)]);
+        f.append_inst(body, i);
+
+        for (op, ops) in [
+            (
+                AArch64Opcode::AddRI,
+                vec![p(X2), p(X2), MachOperand::Imm(1)],
+            ),
+            (AArch64Opcode::B, vec![MachOperand::Block(head)]),
+        ] {
+            let i = inst(&mut f, op, ops);
+            f.append_inst(latch, i);
+        }
+        let i = inst(&mut f, AArch64Opcode::Ret, vec![]);
+        f.append_inst(exit, i);
+        install_edges(&mut f);
+        f
+    }
+
+    fn folds(f: &MachFunction) -> usize {
+        f.blocks
+            .iter()
+            .flat_map(|b| b.insts.iter())
+            .filter(|&&i| f.insts[i.0 as usize].opcode == AArch64Opcode::LdrPostIndex)
+            .count()
+    }
+
+    #[test]
+    fn folds_the_canonical_shape() {
+        let mut f = loop_fixture(vec![]);
+        assert_eq!(form_post_index_loads(&mut f).folded, 1);
+        assert_eq!(folds(&f), 1);
+    }
+
+    /// ★ REGRESSION, and a real miscompile before the fix: the loop body writes
+    /// `w16`, which zero-extends into X16 and destroys the walking pointer this
+    /// pass would park there. `X16` is `PReg(16)` and `W16` is `PReg(48)`, so an
+    /// exact `PReg` comparison sees no conflict at all.
+    ///
+    /// Observed end-to-end: Stanford/Puzzle's second foldable loop contains
+    /// `ldur w16, [x29, #-0x54]`; folding it SIGSEGVs (exit 139) while clang -O3
+    /// and the single-fold build both print the reference output.
+    #[test]
+    fn refuses_when_the_body_writes_the_w_alias_of_the_scratch() {
+        let mut f = loop_fixture(vec![(
+            AArch64Opcode::LdrRI,
+            vec![p(W16), p(X29), MachOperand::Imm(-84)],
+        )]);
+        assert_eq!(
+            form_post_index_loads(&mut f).folded,
+            0,
+            "w16 write must make X16 unavailable"
+        );
+    }
+
+    /// Same aliasing hazard on the BASE: a loop that writes `w22` is writing
+    /// `x22`, so the load's base is not loop-invariant and the pointer would
+    /// drift. Caught by the invariance test only if it normalises widths.
+    #[test]
+    fn refuses_when_the_body_writes_the_w_alias_of_the_base() {
+        let mut f = loop_fixture(vec![(
+            AArch64Opcode::LdrRI,
+            vec![p(W22), p(X29), MachOperand::Imm(-84)],
+        )]);
+        assert_eq!(
+            form_post_index_loads(&mut f).folded,
+            0,
+            "w22 write means x22 is not loop-invariant"
+        );
+    }
+
+    /// And on the IV: `add w2,w2,#1` in the body means X2 has TWO in-loop
+    /// definitions, so it no longer steps exactly once per iteration.
+    #[test]
+    fn refuses_when_the_body_writes_the_w_alias_of_the_iv() {
+        let mut f = loop_fixture(vec![(
+            AArch64Opcode::AddRI,
+            vec![
+                MachOperand::PReg(trust_cg_ir::regs::W2),
+                MachOperand::PReg(trust_cg_ir::regs::W2),
+                MachOperand::Imm(1),
+            ],
+        )]);
+        assert_eq!(
+            form_post_index_loads(&mut f).folded,
+            0,
+            "w2 write is a second definition of the IV"
+        );
+    }
+
+    /// The kill switch is read per call and the suite runs in parallel, so this
+    /// asserts the plumbing rather than mutating the environment: `disabled()`
+    /// gates the whole pass, and with it off the canonical shape folds.
+    #[test]
+    fn kill_switch_is_wired_and_off_by_default() {
+        let mut f = loop_fixture(vec![]);
+        assert!(
+            !disabled(),
+            "TCG_NO_POST_INDEX_LATE must not be set in tests"
+        );
+        assert_eq!(form_post_index_loads(&mut f).folded, 1);
+    }
+
+    /// W and X of the same number alias; different numbers do not; and the FP
+    /// views of one V register alias each other.
+    /// `reg_key` must agree with [`regs_overlap`] on every pair this pass can
+    /// present, or the map-keyed tests (loop-invariance, IV step count) and the
+    /// scan-based tests (availability, liveness) would disagree with each other.
+    #[test]
+    fn reg_key_agrees_with_regs_overlap() {
+        use trust_cg_ir::regs::{D0, D1, S0, V0, W17, X0 as GX0};
+        for (a, b) in [
+            (X16, W16),
+            (W16, X16),
+            (X16, X17),
+            (X16, W17),
+            (V0, D0),
+            (D0, S0),
+            (V0, D1),
+            (GX0, D0),
+        ] {
+            assert_eq!(
+                regs_overlap(a, b),
+                reg_key(a) == reg_key(b),
+                "{a:?} vs {b:?}"
+            );
+        }
+        // Spot-check the direction that matters, so a vacuous helper cannot pass.
+        assert!(regs_overlap(X16, W16));
+        assert!(!regs_overlap(X16, X17));
+    }
 }

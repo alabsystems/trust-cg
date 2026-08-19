@@ -2340,7 +2340,7 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "rayon",
@@ -2355,7 +2355,7 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-codegen"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "num-bigint",
  "num-traits",
@@ -2379,14 +2379,14 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-dialect"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "trust-cg-ir",
 ]
 
 [[package]]
 name = "trust-cg-drat-trim"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cc",
  "tempfile",
@@ -2394,7 +2394,7 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-fuzz"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "libc",
  "serde",
@@ -2410,7 +2410,7 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-gpu"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2423,7 +2423,7 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-ir"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2431,7 +2431,7 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-jit-matrix"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2450,14 +2450,14 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-lift"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "trust-cg-llvm-import"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde_json",
  "thiserror",
@@ -2470,7 +2470,7 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-lower"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "proptest",
  "serde",
@@ -2482,7 +2482,7 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-onnx-import"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2492,7 +2492,7 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-opt"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2504,11 +2504,11 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-process-env"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "trust-cg-regalloc"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ay-pb",
  "ay-sat",
@@ -2519,7 +2519,7 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-sat-host"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bindgen",
  "cc",
@@ -2535,7 +2535,7 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-test"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -2558,7 +2558,7 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-verify"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "proptest",
  "rayon",
@@ -2610,7 +2610,7 @@ dependencies = [
 
 [[package]]
 name = "trust-types"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "twox-hash"

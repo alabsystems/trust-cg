@@ -73,28 +73,14 @@
 use crate::ay_bridge::{AYConfig, AYResult};
 use crate::lowering_proof::ProofObligation;
 
-/// Does an [`AYResult::Unknown`] reason carry one of the three exact
-/// fail-closed CHECKED-AUTHORITY diagnostics `ay_bridge` mints when AY
-/// establishes UNSAT but the independent-certification half of the chain
-/// cannot confirm it? (The wrapped spellings — `"unknown: {…}"` from
-/// `wasm_formal::discharge` / `mir_semantics`, `"solver returned unknown:
-/// {…}"` from `CegisLoop::verify`, `"ay returned unknown: {…}"` from
-/// `fsym_summary` — strip their prefix before calling this.)
-pub fn ay_reason_is_certification_gap(reason: &str) -> bool {
-    reason.starts_with("incomplete AY proof certificate:")
-        || reason.starts_with("unusable AY proof evidence:")
-        || reason.starts_with("AY reported UNSAT but")
-}
-
-/// Does a FRESH-TRANSCRIPT reason carry AY's self-check capability
-/// disclosure — the v0.9.0-era `(:reason-unknown (incomplete
-/// self-check-rejected))`, meaning AY computed the UNSAT verdict and its
-/// mandatory strict self-certification declined the proof on a resource
-/// envelope? Matched ONLY on reason-bearing transcripts (never on the
-/// server-truncated bare `"unknown"`).
-pub fn ay_reason_is_self_check_rejection(reason: &str) -> bool {
-    reason.contains("incomplete self-check-rejected")
-}
+// The two pure string classifiers are promoted to the normally-compiled
+// public [`crate::gap_classify`] module (so the out-of-crate exemption
+// predicates can delegate instead of hand-copying the strings — the copies
+// drifted exactly because these lived in this private test-only module).
+// Re-exported here so the in-crate `crate::formal_gap::…` call sites are
+// unchanged; only the fresh-transcript re-probe machinery below stays
+// test-only.
+pub use crate::gap_classify::{ay_reason_is_certification_gap, ay_reason_is_self_check_rejection};
 
 /// The certification-gap classifier over a live [`AYResult`]: `Some(reason)`
 /// iff `result` is EXACTLY one of the fail-closed certification-gap shapes,

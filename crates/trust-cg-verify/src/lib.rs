@@ -161,6 +161,7 @@ pub mod fsym_summary;
 pub mod fsym_trust_ir;
 pub mod fsym_uaf;
 pub mod function_verifier;
+pub mod gap_classify;
 pub mod gpu_semantics;
 pub mod gvn_proofs;
 pub mod if_convert_proofs;

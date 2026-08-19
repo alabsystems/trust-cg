@@ -802,7 +802,12 @@ pub fn regs_overlap(a: PReg, b: PReg) -> bool {
 }
 
 /// Return the root register number and class group (0=GPR, 1=FPR).
-fn reg_root(reg: PReg) -> Option<(u8, u8)> {
+///
+/// Two registers overlap exactly when their roots are equal, so this doubles as
+/// a HASH KEY for "the same physical register at any width" -- which callers
+/// that bucket registers in a map or set need, and which [`regs_overlap`] alone
+/// cannot give them.
+pub fn reg_root(reg: PReg) -> Option<(u8, u8)> {
     let e = reg.encoding();
     match e {
         0..=31 => Some((e as u8, 0)),            // GPR64

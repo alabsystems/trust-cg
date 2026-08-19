@@ -77,9 +77,10 @@ pub fn alethe_export_gap_blocks_layer_b() -> bool {
 /// Shared probe core: run the exact obligation through the same public
 /// verification chain the pass uses and demand the exact fail-closed
 /// certification-gap diagnostic.
-/// The three exact diagnostics `ay_bridge` mints when AY establishes UNSAT
-/// but the INDEPENDENT-CERTIFICATION half of the chain cannot confirm it,
-/// each wrapped by `CegisLoop::verify` as `"solver returned unknown: {…}"`:
+/// The four exact diagnostics minted when AY establishes UNSAT but the
+/// INDEPENDENT-CERTIFICATION half of the chain cannot confirm it, each
+/// wrapped by `CegisLoop::verify` as `"solver returned unknown: {…}"` (the
+/// raw reason verbatim, so a prefix match is safe):
 /// * `incomplete AY proof certificate: …` — AY's own `ay.proof.certificate`
 ///   disclosure reports `unproved_steps!=0` / `foreign_assumes!=no` /
 ///   `trust_free!=yes` (the honest-`hole` wire encoding);
@@ -88,14 +89,27 @@ pub fn alethe_export_gap_blocks_layer_b() -> bool {
 /// * `AY reported UNSAT but …` — the promotion path could not confirm (no
 ///   readable/non-empty Alethe artifact, no independent Clean/Carcara
 ///   checker installed, or the checker rejected / could not fully verify
-///   the exact proof).
+///   the exact proof);
+/// * `(:reason-unknown (incomplete self-check-rejected)…` — v0.9.0-era
+///   authorities answer larger blasts VERDICTLESS: AY COMPUTES UNSAT and
+///   then its mandatory strict self-certification declines the proof on a
+///   resource envelope (RUP expansion work limit), publishing `unknown`
+///   instead of the verdict (ay 3cb091d23c; canonical classifier:
+///   `trust_cg_verify::gap_classify::ay_reason_is_self_check_rejection`).
+///   Matched only on the reason-bearing transcript — the resident ay server
+///   discards stderr and truncates this shape, and a bare
+///   `"solver returned unknown: unknown"` must keep failing. ay main
+///   build.7534+ publishes `unsat` + the hole disclosure again (accepted by
+///   the first prefix), so this entry self-retires when the installed
+///   authority upgrades.
 /// Any other outcome — `Equivalent`, `NotEquivalent`, `Timeout`, or an
 /// unrelated `Error` — is NOT the certification gap and must fail the
 /// guarded test's original assertions.
-const CERTIFICATION_GAP_PREFIXES: [&str; 3] = [
+const CERTIFICATION_GAP_PREFIXES: [&str; 4] = [
     "solver returned unknown: incomplete AY proof certificate:",
     "solver returned unknown: unusable AY proof evidence:",
     "solver returned unknown: AY reported UNSAT but",
+    "solver returned unknown: (:reason-unknown (incomplete self-check-rejected)",
 ];
 
 fn alethe_export_gap_blocks(src: &SmtExpr, tgt: &SmtExpr, vars: &[(String, u32)]) -> bool {

@@ -292,6 +292,7 @@ pub use crate::aarch64_regs::{
     // Helper functions
     preg_name,
     reg_number,
+    reg_root,
     regs_overlap,
 };
 

@@ -683,7 +683,7 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-codegen"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rayon",
  "serde",
@@ -703,21 +703,21 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-dialect"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "trust-cg-ir",
 ]
 
 [[package]]
 name = "trust-cg-drat-trim"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "trust-cg-ir"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -725,7 +725,7 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-lower"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "thiserror",
@@ -736,7 +736,7 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-opt"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -748,11 +748,11 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-process-env"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "trust-cg-regalloc"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "thiserror",
  "trust-cg-ir",
@@ -760,7 +760,7 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-verify"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rayon",
  "rmp-serde",

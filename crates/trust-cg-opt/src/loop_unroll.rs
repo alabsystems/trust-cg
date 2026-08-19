@@ -4665,6 +4665,72 @@ fn rewrite_branch_target(
 // (exact) / `TCG_PARTIAL_UNROLL_MAX_K` (cap). Dump: `TRUST_CG_DUMP_PARTIAL`.
 // ===========================================================================
 
+/// Runtime-trip partial unroll: OPT-IN, and it stays that way until a gate
+/// separates its wins from its losses. Set `TCG_RUNTIME_PARTIAL_UNROLL=1` to
+/// enable. Unset, the tier is inert and every SingleSource object is
+/// byte-identical to the constant-trip-only build (verified).
+///
+/// # Correct, and NOT enabled — the measurement says why
+///
+/// Correctness is settled. With the tier ON: `torture_ship` exactly on pin
+/// (1119 PASS / 332 IMPORT_FAIL / **0 MISCOMPILE**), and the full SingleSource
+/// differential oracle is **MATCH 17 / DIFFER 0** over the 18 programs it
+/// changes (stdout+stderr+exit vs clang -O3).
+///
+/// Performance is not. Corpus measurement, 13 interleaved reps, PMC, with a
+/// byte-identical null arm, over the 18 programs the tier moves:
+///
+/// | K | geomean min / tmed | both-stat wins | both-stat losses |
+/// |---|---|---|---|
+/// | 4 | 1.0092 / 1.0741 | 1 | 6 |
+/// | **2** | **1.0014 / 1.0002** | **6** | 4 |
+///
+/// `K=4` is a clear net LOSS (flops +6.0%, lists +3.9%, spectral-norm +2.0%)
+/// against a single win. `K=2` halves the code growth and flips it: Shootout
+/// lists 0.9293/0.9338, Stanford/Oscar 0.9678/0.9685, CoyoteBench/huffbench
+/// 0.9847/0.9857 (all with null arms at ~1.00). But it still costs
+/// Misc/ReedSolomon +1.6%, McGill/misr +1.3% and Misc/flops +1.0%, and the
+/// geomean sits inside the ~0.6% cross-session envelope — so there is no corpus
+/// win to claim, only a per-program trade.
+///
+/// The losers share a shape: the unrolled loop is not hot, so the growth buys
+/// nothing and costs fetch. That is the same disease `PARTIAL_MAX_GROWTH_INSTS`
+/// and the function budget were introduced for on the constant tier, and the
+/// same one `pgo_hot_unroll_enabled` addresses with profile data. A hotness (or
+/// better cost) gate is what this tier needs before it can default ON.
+///
+/// ⚠ This tier does NOT reach Stanford/Puzzle, which is what motivated building
+/// it: Puzzle's three hot loops are FOUR-block diamonds and this recognizer
+/// requires the two-block do-while. The 4x-unroll win measured there
+/// (0.9554/0.9568, and 0.9227/0.9279 under the R3 control) still needs a
+/// multi-block tier.
+fn runtime_partial_unroll_enabled() -> bool {
+    std::env::var_os("TCG_RUNTIME_PARTIAL_UNROLL").is_some()
+}
+
+/// Runtime-trip partial unroll: the factor. Unlike the constant tier there is no
+/// trip count to pick against, so this is a fixed factor bounded by code growth.
+///
+/// **MEASURED 2, not 4.** The Stanford/Puzzle source simulation that motivated
+/// this tier used 4, but measured on the loops this tier actually reaches, 4 is
+/// a net loss (1 win / 6 losses) and 2 is a net win (6 wins / 4 losses) -- see
+/// [`runtime_partial_unroll_enabled`]. Do not raise it without re-measuring.
+const RUNTIME_PARTIAL_K: u64 = 2;
+
+/// Runtime-trip partial unroll: largest per-iteration body. The guard and the
+/// cloned remainder loop are fixed overhead, so a body that already amortizes
+/// its own control is not worth either.
+const RUNTIME_PARTIAL_MAX_BODY_INSTS: usize = 16;
+
+/// Runtime-trip partial unroll: factor override for A/B sweeps.
+fn runtime_partial_k() -> u64 {
+    std::env::var("TCG_RUNTIME_PARTIAL_K")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&k| (2..=8).contains(&k))
+        .unwrap_or(RUNTIME_PARTIAL_K)
+}
+
 /// Partial unroll: trip-count simulation cap. The recognizer simulates the IV
 /// one step at a time, so this bounds analysis cost per candidate loop.
 const PARTIAL_SIM_CAP: u64 = 1 << 16;
@@ -4736,9 +4802,39 @@ fn partial_unroll_max_k() -> u64 {
 
 /// A recognized partial-unroll candidate: the importer's 2-block counted
 /// do-while with a proven constant trip count.
+/// What a RUNTIME-trip factor unroll needs beyond the shape that
+/// `analyze_partial_loop` already establishes.
+///
+/// The constant tier splits `N = q*K + r` at compile time and peels `r`. With
+/// `N` unknown that split does not exist, so the leftover iterations must be run
+/// by a REMAINDER loop selected at run time by a guard.
+#[derive(Debug, Clone, Copy)]
+struct RuntimeBound {
+    /// The LOOP-CARRIED IV vreg -- the value live at the top of the header,
+    /// which is what the guard must read.
+    ///
+    /// ★ NOT the compare's IV operand. `analyze_partial_loop` requires
+    /// `in_body(iv.inc_dst)`, i.e. the increment lives in the HEADER BODY, so
+    /// the compare reads `iv + step` while this reads `iv`. Confusing the two
+    /// shifts every test point by one iteration.
+    iv_vreg: VReg,
+    /// The loop-INVARIANT compare operand; every def of it is already proven to
+    /// lie outside the loop body.
+    bound: VReg,
+    /// Relation under which the loop EXITS, oriented IV-on-the-left.
+    exit_rel: Rel,
+    /// The IV's initial value: a NON-NEGATIVE constant. The guard's no-wrap
+    /// induction starts here.
+    init: i128,
+}
+
 struct PartialLoop {
-    /// Proven number of body executions.
+    /// Proven number of body executions. `0` when the bound is a RUNTIME value;
+    /// `runtime` is then `Some`.
     trip_count: u64,
+    /// Set when the trip count is not constant but the loop is otherwise a
+    /// valid factor-unroll candidate.
+    runtime: Option<RuntimeBound>,
     /// Loop header (body + trip test).
     header: BlockId,
     /// Loop latch (loop-carried copies + back edge).
@@ -4790,6 +4886,66 @@ fn call_unroll_cloneable(inst: &MachInst) -> bool {
 /// `cloneable` is the per-tier totality predicate for the body split: the
 /// factor tier passes `partial_cloneable` (no calls), the late call tier passes
 /// `call_unroll_cloneable`.
+/// Collect the extra facts a runtime-trip factor unroll needs, or `None` if the
+/// loop is not admissible for one.
+///
+/// # Which exit relations are admitted, and why
+///
+/// The unrolled header keeps only the LAST of its `K` trip tests. With `v` the
+/// loop-carried IV at header entry and the increment inside the body, the
+/// original tests at `v+1 ..= v+K` and the unrolled one tests only at `v+K`, so
+/// the skipped tests `v+1 ..= v+K-1` must all have said "continue". Under the
+/// guard `bound - v >= K` that holds for:
+///
+/// * `SGe` (continue while `iv < bound`):  need `v+K-1 <  bound`  <=  `>= K`
+/// * `SGt` (continue while `iv <= bound`): need `v+K-1 <= bound`  <=  `>= K-1`
+/// * `Eq`  (continue while `iv != bound`): need `bound` outside `[v+1, v+K-1]`
+///
+/// so one threshold covers all three. Unsigned relations are refused: the guard
+/// subtracts and compares SIGNED, and mixing the two is how an off-by-one
+/// becomes a wrong-length loop.
+fn runtime_bound(
+    iv: &IvInc,
+    op_a: VReg,
+    op_b_vreg: Option<VReg>,
+    op_b_imm: Option<i64>,
+    init_aff: Affine,
+    exit_rel: Rel,
+) -> Option<RuntimeBound> {
+    // The guard subtracts the bound, so it must be a REGISTER. An immediate
+    // bound whose trip is still unprovable means a non-constant init, which the
+    // no-wrap induction below depends on.
+    if op_b_imm.is_some() {
+        return None;
+    }
+    let other = op_b_vreg?;
+    let bound = if iv.is_a { other } else { op_a };
+    if !matches!(exit_rel, Rel::SGe | Rel::SGt | Rel::Eq) {
+        return None;
+    }
+    // The guard advances the IV by exactly `K` per trip, so the step must be a
+    // unit increment. A larger constant step is sound but moves the threshold;
+    // keep the first landing narrow.
+    if iv.int_step != 1 {
+        return None;
+    }
+    // `init` must be a NON-NEGATIVE CONSTANT. This is what makes `bound - v`
+    // provably wrap-free: the guard is reached either from the preheader with
+    // `v = init >= 0`, or from the latch after a trip that required
+    // `bound - v_prev >= K`, where `v = v_prev + K` and so `bound - v >= 0`.
+    // By induction every evaluation is exact, in both directions.
+    let init = match (init_aff.base, init_aff.offset) {
+        (None, off) if off >= 0 => off,
+        _ => return None,
+    };
+    Some(RuntimeBound {
+        iv_vreg: iv.iv_vreg,
+        bound,
+        exit_rel,
+        init,
+    })
+}
+
 fn analyze_partial_loop(
     func: &MachFunction,
     lp: &NaturalLoop,
@@ -4962,14 +5118,28 @@ fn analyze_partial_loop(
     } else {
         negate_rel(rel_xl)
     };
-    let trip_count = simulate_trip(
+    // A constant trip count is the CONSTANT tier's licence. Failing to prove one
+    // does not make the loop unprofitable -- it makes it runtime-bounded, which
+    // the runtime tier handles with a guard plus a remainder loop. Everything
+    // above (shape, control dialect, IV identification, and crucially the
+    // loop-INVARIANCE of both affine bases) is shared and already established.
+    let const_trip = simulate_trip(
         init_aff,
         bound_aff,
         iv.int_step,
         exit_rel,
         width,
         PARTIAL_SIM_CAP,
-    )?;
+    );
+    let runtime = if const_trip.is_some() {
+        None
+    } else {
+        runtime_bound(&iv, op_a, op_b_vreg, op_b_imm, init_aff, exit_rel)
+    };
+    if const_trip.is_none() && runtime.is_none() {
+        return None;
+    }
+    let trip_count = const_trip.unwrap_or(0);
 
     // ---- Body split (total by construction: the control is a suffix) -------
     let header_body: Vec<InstId> = hinsts[..ctrl_start].to_vec();
@@ -5002,12 +5172,177 @@ fn analyze_partial_loop(
 
     Some(PartialLoop {
         trip_count,
+        runtime,
         header,
         latch,
         header_body,
         carry,
         ctrl_start,
     })
+}
+
+/// Apply a RUNTIME-trip factor unroll: guard + unrolled main loop + a verbatim
+/// clone of the original loop as the remainder.
+///
+/// ```text
+///   preheader -> G
+///   G:            rem = bound - iv ; cmp rem, #K ; b.lt R_header  (else fall on)
+///   header:       BODY (CARRY BODY)x(K-1) ; TEST -> exit | latch
+///   latch:        CARRY ; B G                     <- back edge now re-guards
+///   R_header:     verbatim clone of header  (remainder, one iteration a time)
+///   R_latch:      verbatim clone of latch
+/// ```
+///
+/// # Why the guard is `bound - iv >= K`
+///
+/// The increment lives in the HEADER BODY, so with `v` the loop-carried IV at
+/// header entry the original tests at `v+1 ..= v+K` while the unrolled header
+/// keeps only the test at `v+K`. The skipped tests `v+1 ..= v+K-1` must all have
+/// said "continue", which `bound - v >= K` gives for every admitted relation
+/// (see [`runtime_bound`]). The retained test then decides exactly as the
+/// original did, so the loop still exits on the same iteration.
+///
+/// # Why `bound - v` cannot wrap
+///
+/// `G` is reached either from the preheader with `v = init >= 0`, or from the
+/// latch after a trip that required `bound - v_prev >= K`, where `v = v_prev + K`
+/// and hence `bound - v >= 0`. By induction every evaluation is exact.
+///
+/// # Why a verbatim clone IS the remainder
+///
+/// Machine IR here is NOT SSA: loop-carried values are ordinary vregs written by
+/// copies. So a verbatim copy of the two blocks re-executes the same iteration
+/// on the same registers -- the identical argument the constant tier's peel and
+/// `unroll_copy_based` both rely on. No renaming, and the IV flows into the
+/// remainder loop already holding the value the main loop left it at.
+fn runtime_partial_apply(
+    func: &mut MachFunction,
+    lp: &NaturalLoop,
+    pl: &PartialLoop,
+    rb: RuntimeBound,
+    k: u64,
+    mut provenance: Option<&mut ProvenanceMap>,
+) -> bool {
+    let Some(preheader) = lp.preheader else {
+        return false;
+    };
+    let header = pl.header;
+    let latch = pl.latch;
+
+    // The two facts that license the guard, re-stated where they are USED
+    // rather than only where they were checked: the threshold `K` is only
+    // sufficient for continue-while-below relations, and the no-wrap induction
+    // is anchored on a non-negative constant IV init.
+    debug_assert!(
+        matches!(rb.exit_rel, Rel::SGe | Rel::SGt | Rel::Eq),
+        "guard threshold K assumes a continue-while-below relation, got {:?}",
+        rb.exit_rel
+    );
+    debug_assert!(
+        rb.init >= 0,
+        "the `bound - iv` no-wrap induction starts at a non-negative init, got {}",
+        rb.init
+    );
+
+    // ---- 1. Clone {header, latch} verbatim as the remainder loop -----------
+    let r_header = func.create_block();
+    let r_latch = func.create_block();
+    let mut bmap: HashMap<BlockId, BlockId> = HashMap::new();
+    bmap.insert(header, r_header);
+    bmap.insert(latch, r_latch);
+    let vmap: HashMap<VReg, VReg> = HashMap::new();
+    for (src_b, dst_b) in [(header, r_header), (latch, r_latch)] {
+        for iid in func.block(src_b).insts.clone() {
+            let inst = clone_inst_remap(func, iid, &bmap, &vmap);
+            let nid = func.push_inst(inst);
+            func.append_inst(dst_b, nid);
+            if let Some(p) = provenance.as_deref_mut() {
+                p.record_clone(iid, nid, loop_unroll_pass_id());
+            }
+        }
+    }
+    wire_out_edges(func, r_header);
+    wire_out_edges(func, r_latch);
+
+    // ---- 2. Unroll the ORIGINAL header in place: K-1 extra (carry ; body) --
+    let rot_unit: Vec<InstId> = pl
+        .carry
+        .iter()
+        .chain(pl.header_body.iter())
+        .copied()
+        .collect();
+    let mut cloned: Vec<(InstId, InstId)> = Vec::new();
+    for _ in 1..k {
+        for &iid in &rot_unit {
+            let inst = func.inst(iid).clone();
+            let nid = func.push_inst(inst);
+            cloned.push((iid, nid));
+        }
+    }
+    let at = pl.ctrl_start;
+    let ids: Vec<InstId> = cloned.iter().map(|&(_, id)| id).collect();
+    func.block_mut(header).insts.splice(at..at, ids);
+    // Last use of `provenance`, so take it by value -- the guard block below
+    // clones nothing.
+    if let Some(p) = provenance {
+        for (src, dst) in cloned {
+            p.record_clone(src, dst, loop_unroll_pass_id());
+        }
+    }
+
+    // ---- 3. The guard block ------------------------------------------------
+    let g = func.create_block();
+    partial_insert_block_before(func, header, g);
+    let loc = func
+        .block(header)
+        .insts
+        .last()
+        .and_then(|&i| func.inst(i).source_loc);
+    let tmp = VReg::new(func.alloc_vreg(), rb.iv_vreg.class);
+    let push = |func: &mut MachFunction, inst: MachInst| {
+        let mut inst = inst;
+        inst.source_loc = loc;
+        let id = func.push_inst(inst);
+        func.append_inst(g, id);
+    };
+    push(
+        func,
+        MachInst::new(
+            AArch64Opcode::SubRR,
+            vec![
+                MachOperand::VReg(tmp),
+                MachOperand::VReg(rb.bound),
+                MachOperand::VReg(rb.iv_vreg),
+            ],
+        ),
+    );
+    push(
+        func,
+        MachInst::new(
+            AArch64Opcode::CmpRI,
+            vec![MachOperand::VReg(tmp), MachOperand::Imm(k as i64)],
+        ),
+    );
+    // `b.lt R_header` -- fewer than K iterations remain, so run them one at a
+    // time in the remainder loop. 0b1011 is LT (see `cc_from_operand`).
+    push(
+        func,
+        MachInst::new(
+            AArch64Opcode::BCond,
+            vec![MachOperand::Imm(0b1011), MachOperand::Block(r_header)],
+        ),
+    );
+    push(
+        func,
+        MachInst::new(AArch64Opcode::B, vec![MachOperand::Block(header)]),
+    );
+    func.add_edge(g, r_header);
+    func.add_edge(g, header);
+
+    // ---- 4. COMMIT: entry and back edge both go through the guard ----------
+    partial_redirect_all(func, preheader, header, g);
+    partial_redirect_all(func, latch, header, g);
+    true
 }
 
 /// Choose the unroll factor `K`.
@@ -5200,8 +5535,82 @@ impl PartialUnroll {
         let mut spent = 0usize;
         for lp in &innermost {
             let Some(pl) = analyze_partial_loop(func, lp, &def_map, partial_cloneable) else {
+                // Why a loop is NOT RECOGNIZED matters as much as why a
+                // recognized one is declined -- the shape preconditions reject
+                // far more loops than the cost model does, and the dump used to
+                // be silent about every one of them.
+                //
+                // What this immediately showed: every hot loop in
+                // Stanford/Puzzle (Fit, Place, Remove) is a FOUR-block diamond,
+                // because `if (p[i][k]) ...` gives the body an arm. This tier
+                // requires the importer's exact two-block do-while, so it never
+                // even looks at them -- and the only Puzzle loop it does reach
+                // is in the cold once-per-call setup.
+                if dump {
+                    eprintln!(
+                        "[partial-unroll] {}: header={:?} NOT-RECOGNIZED blocks={} \
+                         hsuccs={} hpreds={} preheader={:?} latch={:?}",
+                        func.name,
+                        lp.header,
+                        lp.body.len(),
+                        func.block(lp.header).succs.len(),
+                        func.block(lp.header).preds.len(),
+                        lp.preheader,
+                        lp.latch
+                    );
+                }
                 continue;
             };
+            // Runtime-bounded loops take the guard + remainder path. There is
+            // no trip count to choose a factor against, so the factor is fixed
+            // and the only gate is body size and the function's growth budget.
+            if let Some(_rb) = pl.runtime {
+                if !runtime_partial_unroll_enabled() {
+                    if dump {
+                        eprintln!(
+                            "[partial-unroll] {}: header={:?} body={} RUNTIME-BOUND \
+                             (tier off; set TCG_RUNTIME_PARTIAL_UNROLL=1)",
+                            func.name,
+                            pl.header,
+                            pl.body_len()
+                        );
+                    }
+                    continue;
+                }
+                let body = pl.body_len();
+                if body == 0 || body > RUNTIME_PARTIAL_MAX_BODY_INSTS {
+                    if dump {
+                        eprintln!(
+                            "[partial-unroll] {}: header={:?} body={} RUNTIME DECLINED (body)",
+                            func.name, pl.header, body
+                        );
+                    }
+                    continue;
+                }
+                let k = runtime_partial_k();
+                // Growth: K-1 in-loop copies, plus the cloned remainder loop
+                // (one whole iteration) and the four-instruction guard.
+                let growth = (k as usize - 1) * body + body + 4;
+                if spent + growth > func_budget {
+                    if dump {
+                        eprintln!(
+                            "[partial-unroll] {}: header={:?} body={} RUNTIME DECLINED \
+                             (function growth budget: {} + {} > {})",
+                            func.name, pl.header, body, spent, growth, func_budget
+                        );
+                    }
+                    continue;
+                }
+                spent += growth;
+                if dump {
+                    eprintln!(
+                        "[partial-unroll] {}: header={:?} body={} RUNTIME K={} growth={}",
+                        func.name, pl.header, body, k, growth
+                    );
+                }
+                plans.push(((*lp).clone(), pl, k));
+                continue;
+            }
             let Some(k) = choose_partial_factor(pl.trip_count, pl.body_len()) else {
                 if dump {
                     eprintln!(
@@ -5260,7 +5669,11 @@ impl PartialUnroll {
             {
                 continue;
             }
-            if partial_unroll_apply(func, &lp, &pl, k, provenance.as_deref_mut()) {
+            let applied = match pl.runtime {
+                Some(rb) => runtime_partial_apply(func, &lp, &pl, rb, k, provenance.as_deref_mut()),
+                None => partial_unroll_apply(func, &lp, &pl, k, provenance.as_deref_mut()),
+            };
+            if applied {
                 self.fired += 1;
                 changed = true;
             }

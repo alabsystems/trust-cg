@@ -85008,13 +85008,17 @@ mod tests {
     }
 
     /// True while clean's Alethe reconstruction cannot yet verify ay v0.9.0's
-    /// and_pos-bridged strict surface (ay c74bc60bd1): the cross-check lane
-    /// fail-closes to Unknown instead of confirming the discharge. When
-    /// clean's checker learns the surface, this stops matching and every
-    /// guarded test resumes its original discharge assertion automatically —
-    /// the exemption cannot rot. (Tiny copy of
-    /// `mem_refine::tests::alethe_crosscheck_gap`, matching the raw
-    /// `AYResult` this module sees instead of a `RefinementOutcome`.)
+    /// and_pos-bridged strict surface (ay c74bc60bd1), or while a v0.9.0-era
+    /// authority answers the obligation VERDICTLESS under its strict
+    /// self-certification envelope: the cross-check lane fail-closes to
+    /// Unknown instead of confirming the discharge. When clean's checker
+    /// learns the surface — and once the installed authority upgrades to ay
+    /// main build.7534+, which publishes `unsat` with the hole disclosure
+    /// again (accepted by the established `incomplete AY proof certificate:`
+    /// shape) — this stops matching and every guarded test resumes its
+    /// original discharge assertion automatically — the exemption cannot rot.
+    /// (Tiny copy of `mem_refine::tests::alethe_crosscheck_gap`, matching the
+    /// raw `AYResult` this module sees instead of a `RefinementOutcome`.)
     fn alethe_crosscheck_gap(result: &trust_cg_verify::ay_bridge::AYResult) -> bool {
         matches!(
             result,
@@ -85027,6 +85031,22 @@ mod tests {
                     // "verified MODULO solver", same as the gate's own lanes.
                     || (reason.contains("no solver available")
                         && reason.contains("statistical"))
+                    // Shape 3: v0.9.0-era authorities answer larger blasts
+                    // VERDICTLESS — AY COMPUTES UNSAT and then its mandatory
+                    // strict self-certification declines the proof on a
+                    // resource envelope (RUP expansion work limit),
+                    // publishing `unknown (:reason-unknown (incomplete
+                    // self-check-rejected))` instead of the verdict
+                    // (ay 3cb091d23c). Matched ONLY on the reason-bearing
+                    // transcript, NEVER on a bare "unknown": the resident ay
+                    // server discards stderr and truncates this shape, and a
+                    // bare unknown must keep failing. Delegates the canonical
+                    // phrase to `trust_cg_verify::gap_classify` so this copy
+                    // cannot drift.
+                    || (reason.contains("(:reason-unknown")
+                        && trust_cg_verify::gap_classify::ay_reason_is_self_check_rejection(
+                            reason
+                        ))
         )
     }
 

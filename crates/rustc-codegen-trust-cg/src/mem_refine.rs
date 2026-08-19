@@ -4452,11 +4452,16 @@ mod tests {
     }
 
     /// True while clean's Alethe reconstruction cannot yet verify ay v0.9.0's
-    /// and_pos-bridged strict surface (ay c74bc60bd1): the cross-check lane
-    /// fail-closes to Inconclusive instead of confirming the refutation. When
-    /// clean's checker learns the surface, this stops matching and every
-    /// guarded test resumes its original refutation/discharge assertion
-    /// automatically — the exemption cannot rot.
+    /// and_pos-bridged strict surface (ay c74bc60bd1), or while a v0.9.0-era
+    /// authority answers the obligation VERDICTLESS under its strict
+    /// self-certification envelope: the cross-check lane fail-closes to
+    /// Inconclusive instead of confirming the refutation. When clean's
+    /// checker learns the surface — and once the installed authority upgrades
+    /// to ay main build.7534+, which publishes `unsat` with the hole
+    /// disclosure again (accepted by the established `incomplete AY proof
+    /// certificate:` shape) — this stops matching and every guarded test
+    /// resumes its original refutation/discharge assertion automatically —
+    /// the exemption cannot rot.
     fn alethe_crosscheck_gap(outcome: &RefinementOutcome) -> bool {
         match outcome {
             RefinementOutcome::Inconclusive { reason } => {
@@ -4473,6 +4478,21 @@ mod tests {
                 // applies to its other solver lanes.
                     || (reason.contains("no solver available")
                         && reason.contains("statistical"))
+                // Shape 3: v0.9.0-era authorities answer the larger blasts
+                // VERDICTLESS — AY COMPUTES UNSAT and then its mandatory
+                // strict self-certification declines the proof on a resource
+                // envelope (RUP expansion work limit), publishing
+                // `unknown (:reason-unknown (incomplete self-check-rejected))`
+                // instead of the verdict (ay 3cb091d23c). Matched ONLY on the
+                // reason-bearing transcript, NEVER on a bare
+                // "unknown: unknown": the resident ay server discards stderr
+                // and truncates this shape, and a bare unknown must keep
+                // failing. Delegates the canonical phrase to
+                // `trust_cg_verify::gap_classify` so this copy cannot drift.
+                    || reason.strip_prefix("unknown: ").is_some_and(|s| {
+                        s.contains("(:reason-unknown")
+                            && trust_cg_verify::gap_classify::ay_reason_is_self_check_rejection(s)
+                    })
             }
             _ => false,
         }
