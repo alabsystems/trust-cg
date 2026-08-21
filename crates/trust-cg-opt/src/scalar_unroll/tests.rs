@@ -1600,3 +1600,83 @@ fn full_unroll_gather_bails_on_narrow_row_load() {
         "narrow row: gather refused, 4-wide"
     );
 }
+
+// ---------------------------------------------------------------------------
+// AUDIT: a store whose stored VALUE is the induction variable
+// ---------------------------------------------------------------------------
+
+/// TOP-TESTED loadless single-FP-accumulator SERIAL reduction whose body also
+/// stores `iv` to a loop-invariant address:
+///
+/// ```text
+/// bb0:    v3=Movz#1 v6=Movz#0(iv) v7=Fmov v4(acc); B header
+/// header: CmpRR v6,v1; BCond(LT, latch); B exit
+/// latch:  FaddRR v15,v7,v21 ; StrRI v6,[v30,#0] ; AddRR v16,v6,v3
+///         MovR v6,v16 ; FmovFprFpr v7,v15 ; B header
+/// ```
+///
+/// i.e. `s += c; *r = i; i += 1;`. The ONLY read of `iv` in the body is the
+/// stored VALUE (store operand 0).
+fn audit_build_store_iv_only() -> MachFunction {
+    let mut f = MachFunction::new("store_iv".to_string(), Signature::new(vec![], vec![]));
+    let bb0 = f.entry;
+    let header = f.create_block();
+    let latch = f.create_block();
+    let exit = f.create_block();
+    use AArch64Opcode::*;
+    push(&mut f, bb0, Movz, vec![v32(3), i(1)]);
+    push(&mut f, bb0, Movz, vec![v32(6), i(0)]);
+    push(&mut f, bb0, FmovFprFpr, vec![vf32(7), vf32(4)]);
+    push(&mut f, bb0, B, vec![b(header)]);
+    push(&mut f, header, CmpRR, vec![v32(6), v32(1)]);
+    push(&mut f, header, BCond, vec![i(CC_LT), b(latch)]);
+    push(&mut f, header, B, vec![b(exit)]);
+    push(&mut f, latch, FaddRR, vec![vf32(15), vf32(7), vf32(21)]);
+    push(&mut f, latch, StrRI, vec![v32(6), v64(30), i(0)]);
+    push(&mut f, latch, AddRR, vec![v32(16), v32(6), v32(3)]);
+    push(&mut f, latch, MovR, vec![v32(6), v32(16)]);
+    push(&mut f, latch, FmovFprFpr, vec![vf32(7), vf32(15)]);
+    push(&mut f, latch, B, vec![b(header)]);
+    push(&mut f, exit, MovR, vec![v32(20), v32(6)]);
+    f.add_edge(bb0, header);
+    f.add_edge(header, latch);
+    f.add_edge(header, exit);
+    f.add_edge(latch, header);
+    f
+}
+
+/// A store whose stored VALUE is the induction variable BAILS.
+///
+/// Before the gate this loop was admitted with `body_uses_iv == false` (the
+/// scan skips operand 0, which for a store is a USE), so all four lane clones
+/// were rewritten with the identity map `iv -> iv` and emitted
+/// `str iv,[r]` four times instead of `str iv+k,[r]`. The address is
+/// loop-invariant, so the LAST lane's value is the observable one: for a trip
+/// count that is a multiple of `UNROLL` the non-`header_reentry` guard leaves a
+/// ZERO-iteration scalar tail and `*r` ends up holding `n-4` instead of `n-1`.
+#[test]
+fn store_of_iv_value_bails() {
+    let mut f = audit_build_store_iv_only();
+    assert_eq!(run(&mut f), 0, "store of the induction variable must bail");
+    // The loop is left byte-for-byte alone: still exactly one store.
+    assert_eq!(count(&f, AArch64Opcode::StrRI), 1);
+}
+
+/// Control: the SAME loop with the stored value replaced by a loop-invariant
+/// register still fires, so the gate is narrow (it rejects `iv` only, not
+/// stores generally).
+#[test]
+fn store_of_invariant_value_still_fires() {
+    let mut f = audit_build_store_iv_only();
+    // Rewrite the store's value operand from the iv (v32(6)) to an invariant.
+    for blk in 0..f.blocks.len() {
+        let ids: Vec<InstId> = f.blocks[blk].insts.clone();
+        for id in ids {
+            if f.inst(id).opcode == AArch64Opcode::StrRI {
+                f.inst_mut(id).operands[0] = v32(40);
+            }
+        }
+    }
+    assert_eq!(run(&mut f), 1, "invariant-valued store still admitted");
+    assert_eq!(count(&f, AArch64Opcode::StrRI), 5, "1 scalar + 4 lanes");
+}

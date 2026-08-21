@@ -459,11 +459,18 @@ impl TargetInfo for AArch64Target {
         use AArch64Opcode::*;
         // Must stay in sync with `trust_cg_opt::effects::reads_flags`.
         // - CSEL-family: test NZCV against a condition code immediate.
+        // - FCSEL: the scalar FP conditional select reads NZCV exactly like
+        //   the integer CSEL family (this entry had drifted out of sync with
+        //   `effects::reads_flags`; every scheduling/liveness consumer relies
+        //   on this target model being complete).
         // - ADC/SBC: consume the carry flag for i128 multi-precision
         //   arithmetic. Classifying them here keeps any TargetInfo-based
         //   consumer from reordering/CSE'ing ADC/SBC across a flag writer.
         //   See issue #409.
-        matches!(opcode, CSet | Csel | Csinc | Csinv | Csneg | Adc | Sbc)
+        matches!(
+            opcode,
+            CSet | Csel | Csinc | Csinv | Csneg | FcselRR | Adc | Sbc
+        )
     }
 
     fn is_commutative(opcode: AArch64Opcode) -> bool {

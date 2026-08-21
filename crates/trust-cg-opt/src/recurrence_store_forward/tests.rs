@@ -317,14 +317,36 @@ fn const_reg_bound_fires() {
     assert!(run(&mut func));
 }
 
+/// WRONG-CODE REGRESSION (2026-08-18): a `Trap*` guard carrier standing
+/// BEFORE the first load on the forced first traversal must make this pass
+/// DECLINE.
+///
+/// This test previously asserted the opposite — that the pass FIRES with the
+/// carrier "untouched" — which pinned the unsafe behaviour. The pass's
+/// justification for appending a load to the preheader is "the original
+/// dereferences this address itself on the first traversal". A bounds-check
+/// carrier ahead of the load can ABANDON that traversal, so the original may
+/// never perform the dereference; the hoisted load then runs on a path the
+/// original never took and can fault on an address the bounds check exists
+/// precisely to reject. The trip-count proof does not help: `trip >= 1` shows
+/// only that the header's continue-branch is taken, not that the traversal
+/// reaches the load.
+///
+/// A carrier at or AFTER the first load is still fine (the load is already
+/// reached by then), which is why the gate is position-scoped rather than a
+/// blanket "no traps" rule.
 #[test]
-fn retained_trap_guard_carriers_fire() {
+fn trap_guard_before_first_load_declines() {
     let mut func = build_recurrence(Cfg {
         variant: Variant::WithTrapGuards,
         ..Cfg::default()
     });
-    assert!(run(&mut func));
-    // The guard carrier is untouched.
+    assert!(
+        !run(&mut func),
+        "a trap carrier before the first load can abandon the first traversal, \
+         so forwarding the load into the preheader would introduce a NEW fault"
+    );
+    // Nothing was rewritten: the carrier and the in-loop load both survive.
     assert_eq!(count_op(&func, AArch64Opcode::TrapBoundsCheckExact), 1);
 }
 

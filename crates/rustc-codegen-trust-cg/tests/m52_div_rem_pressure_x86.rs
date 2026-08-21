@@ -1,3 +1,6 @@
+#[path = "support/target_dir.rs"]
+mod target_dir_support;
+
 // Differential regression test for MISCOMPILE #52 (m52): unsigned division/
 // remainder under register pressure, where the live-range splitter's join /
 // edge split-copy placement does not model the fixed-physical-register
@@ -67,9 +70,7 @@ fn pinned_toolchain() -> String {
 
 fn ensure_dylib_built() -> PathBuf {
     let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| crate_dir.join("target"));
+    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
     let candidates = [
         target_dir
             .join("release")

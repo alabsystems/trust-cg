@@ -8,9 +8,9 @@
 //      all covered by the aarch64 Mach-O Certified composition (solver-backed
 //      value-proof lanes + default-Enforce ENC-9 reparse binding): the object
 //      and its proof sidecars are published.
-//   2. The composition stays fail-closed where no lane exists: the aarch64
-//      ELF production registry is empty, so the same modules are rejected at
-//      the object-authority boundary on `--target=aarch64-unknown-linux-gnu`.
+//   2. AArch64 ELF promotes only when its ordinary/TLS value-proof lanes are
+//      composed with the exact per-object reparse binding; withdrawing that
+//      binding fails closed before object or sidecar publication.
 //   3. Omitting the flag keeps ordinary (non-promoting) object emission working.
 //   4. `--help` documents the flag and its fail-closed contract.
 
@@ -224,6 +224,7 @@ fn assert_object_authority_rejection(
     output: &std::process::Output,
     out_path: &std::path::Path,
     proofs_dir: &std::path::Path,
+    expected_reason: &str,
 ) {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -233,8 +234,8 @@ fn assert_object_authority_rejection(
     assert!(
         stderr.contains("proof promotion rejected")
             && stderr.contains("object relocation inventory")
-            && stderr.contains("no object relocation proof is registered"),
-        "rejection must identify the exact object-authority gap. stderr: {stderr}"
+            && stderr.contains(expected_reason),
+        "rejection must identify the exact object-authority gap ({expected_reason}). stderr: {stderr}"
     );
     assert!(
         !out_path.exists(),
@@ -442,16 +443,15 @@ fn cli_sidecar_io_failure_fails_loudly_after_object_promotes() {
 }
 
 // ---------------------------------------------------------------------------
-// Case 4b: the LIVING FAIL-CLOSED CONTROL. The aarch64 ELF production
-// registry is deliberately empty (no ELF-bound aarch64 value-proof lanes
-// yet), so the same modules that promote on the Mach-O path must still hit
-// the object-authority rejection on the ELF path. This keeps
-// `assert_object_authority_rejection` exercised end to end.
+// Case 4b: the aarch64 ELF authority is a two-sided gate. The exact same
+// target/object must reject when the per-object reparse binding is withdrawn
+// and promote under default Enforce. Passing the target explicitly keeps this
+// proof independent of the test host.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn cli_emit_proofs_keeps_uncovered_aarch64_elf_target_fail_closed() {
-    let dir = scratch_dir("keeps_uncovered_aarch64_elf_fail_closed");
+fn cli_emit_proofs_aarch64_elf_requires_reparse_binding() {
+    let dir = scratch_dir("aarch64_elf_requires_reparse_binding");
     let tmbc_path = dir.join("module.tmbc");
     let out_path = dir.join("module.o");
     let proofs_dir = dir.join("proofs");
@@ -468,10 +468,29 @@ fn cli_emit_proofs_keeps_uncovered_aarch64_elf_target_fail_closed() {
         .arg("--opt-level=0")
         .arg(format!("--emit-proofs={}", proofs_dir.display()))
         .arg(&tmbc_path)
+        .env("TCG_NO_ELF_REPARSE", "1")
         .output()
-        .expect("run trust-cg");
+        .expect("run trust-cg with ELF reparse disabled");
 
-    assert_object_authority_rejection(&output, &out_path, &proofs_dir);
+    assert_object_authority_rejection(
+        &output,
+        &out_path,
+        &proofs_dir,
+        "lacks an independent reparse binding",
+    );
+
+    let output = Command::new(trust_cg_bin())
+        .arg("-c")
+        .arg("-o")
+        .arg(&out_path)
+        .arg("--target=aarch64-unknown-linux-gnu")
+        .arg("--opt-level=0")
+        .arg(format!("--emit-proofs={}", proofs_dir.display()))
+        .arg(&tmbc_path)
+        .output()
+        .expect("run trust-cg with default-Enforce ELF reparse");
+
+    assert_object_promotes(&output, &out_path, &proofs_dir);
 
     let _ = std::fs::remove_dir_all(&dir);
 }

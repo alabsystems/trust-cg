@@ -309,14 +309,30 @@ fn run_otool_h(path: &Path) -> Option<String> {
 }
 
 /// Run `nm` on an object file and return stdout.
+///
+/// Returns `None` when the HOST `nm` cannot read the Mach-O object at all
+/// (GNU binutils on Linux: exit failure + "file format not recognized" on
+/// stderr and empty stdout) — the callers then skip their symbol assertions,
+/// exactly like the `has_otool` gates. An nm that PARSES the object but finds
+/// an empty symbol table still returns `Some("")` so those assertions fire.
 fn run_nm(path: &Path) -> Option<String> {
     let output = Command::new("nm")
         .args([path.to_str().unwrap()])
         .output()
         .ok()?;
 
-    // nm may succeed with output or fail (for empty symbol tables)
-    Some(String::from_utf8_lossy(&output.stdout).to_string())
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    if !output.status.success() && stdout.is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+        if stderr.contains("file format not recognized")
+            || stderr.contains("unknown file type")
+            || stderr.contains("unsupported file")
+        {
+            eprintln!("Skipping nm-based checks: host nm cannot read Mach-O objects");
+            return None;
+        }
+    }
+    Some(stdout)
 }
 
 // ---------------------------------------------------------------------------

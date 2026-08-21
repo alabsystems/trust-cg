@@ -37,6 +37,19 @@
 //!      where `T` is `iv` or `iv+1`. Unit stride + these condition codes give a
 //!      finite trip count (`b.EQ`/`b.LT` on a `+1` counter visits `bound` within
 //!      `2^bits` iterations; the monotone `>=` / `<` cases cross any fixed bound).
+//!
+//!    Those trip-count arguments all assume the compare RUNS ONCE PER TRIP and
+//!    that a trip is finite, so two structural conditions are also required:
+//!    * the exiting block **dominates the latch** — otherwise the exit test sits
+//!      on a conditional path, can be skipped forever, and the loop diverges;
+//!    * the body is **acyclic once the `latch -> header` back-edge is removed** —
+//!      otherwise a nested (or irreducible) cycle can spin without ever reaching
+//!      the latch, and the counted IV never advances.
+//!
+//!    For the same reason the step `iv_next = iv + 1` must be defined INSIDE the
+//!    body and dominate the latch. A step computed in the preheader also
+//!    dominates the latch, but then `iv = iv_next` writes the same value every
+//!    trip and the loop is infinite.
 //! 3. **No observable side effect** in ANY body block: every instruction must be
 //!    in a conservative pure whitelist AND independently pass the effect-flag /
 //!    memory-effect model (no store, no load, no call, no atomic, no barrier, no
@@ -60,7 +73,10 @@ use trust_cg_ir::{
 };
 
 use crate::dom::DomTree;
-use crate::effects::{MemoryEffect, opcode_effect};
+use crate::effects::{
+    MemoryEffect, aarch64_for_each_use_position, for_each_inst_def, inst_defines_vreg,
+    opcode_effect,
+};
 use crate::loops::{LoopAnalysis, NaturalLoop};
 use crate::pass_manager::{AnalysisCache, MachinePass};
 
@@ -235,28 +251,26 @@ struct DeadLoopPlan {
 /// Precomputed def / block lookup tables, built once per [`recognize`] call.
 struct Maps {
     /// First (lowest-`InstId`) def per vreg id.
-    def_first: HashMap<u32, InstId>,
+    def_first: HashMap<VReg, InstId>,
     /// Number of defs per vreg id (to detect multi-def, e.g. `Movz;Movk`).
-    def_count: HashMap<u32, u32>,
+    def_count: HashMap<VReg, u32>,
     /// Block containing each instruction (over `block_order`).
     inst_block: HashMap<InstId, BlockId>,
 }
 
 impl Maps {
     fn build(func: &MachFunction) -> Self {
-        let mut def_first: HashMap<u32, InstId> = HashMap::new();
-        let mut def_count: HashMap<u32, u32> = HashMap::new();
+        let mut def_first: HashMap<VReg, InstId> = HashMap::new();
+        let mut def_count: HashMap<VReg, u32> = HashMap::new();
         let mut inst_block: HashMap<InstId, BlockId> = HashMap::new();
         for &bid in &func.block_order {
             for &iid in &func.block(bid).insts {
                 inst_block.insert(iid, bid);
                 let inst = func.inst(iid);
-                if produces_def(inst.opcode)
-                    && let Some(MachOperand::VReg(v)) = inst.operands.first()
-                {
-                    def_first.entry(v.id).or_insert(iid);
-                    *def_count.entry(v.id).or_insert(0) += 1;
-                }
+                for_each_inst_def(inst, |v| {
+                    def_first.entry(v).or_insert(iid);
+                    *def_count.entry(v).or_insert(0) += 1;
+                });
             }
         }
         Self {
@@ -267,7 +281,7 @@ impl Maps {
     }
 
     fn def_block(&self, v: VReg) -> Option<BlockId> {
-        self.inst_block.get(self.def_first.get(&v.id)?).copied()
+        self.inst_block.get(self.def_first.get(&v)?).copied()
     }
 }
 
@@ -336,6 +350,33 @@ fn recognize(
     // loop whose latch is our preheader), redirecting `preheader -> exit` would
     // splice a bogus self-edge on the preheader. Bail (fail-closed).
     if exit == preheader {
+        return None;
+    }
+
+    // (2a) The exit test must be evaluated on EVERY trip. `terminating_cc`
+    // argues termination from "unit stride + condition code", and every one of
+    // those arguments silently assumes the compare runs once per iteration. If
+    // the exiting block sits on a CONDITIONAL path inside the body, the test can
+    // be skipped forever and the loop never terminates.
+    //
+    // Requiring `exiting` to dominate `latch` is exactly that guarantee: the
+    // body is entry-closed (checked above — the header's only external
+    // predecessor is the preheader, and `compute_loop_body` grows backwards from
+    // the latch stopping at the header, so no other body block has an outside
+    // predecessor). So if some body path `header -> latch` avoided `exiting`,
+    // `entry -> preheader -> header -> ... -> latch` would too, contradicting
+    // dominance. Hence every `header -> latch` path runs the exit test.
+    if !dom.dominates(exiting, latch) {
+        return None;
+    }
+
+    // (2b) A single trip must be FINITE. The counted-IV argument only bounds the
+    // number of times the latch executes; it says nothing about a nested (or
+    // irreducible) cycle strictly inside the body, which could spin forever
+    // without ever reaching the latch. Require the body to be acyclic once the
+    // `latch -> header` back-edge is removed, so every trip is a finite path
+    // from the header to the latch or to the exit.
+    if !body_acyclic_without_backedge(func, body, latch, header) {
         return None;
     }
 
@@ -518,12 +559,20 @@ fn find_counted_iv(
         }
         // `iv_next` must be single-def (SSA), and its def dominates the latch, so
         // the write-back always sees exactly `iv + 1`.
-        if maps.def_count.get(&iv_next.id).copied() != Some(1) {
+        if maps.def_count.get(&iv_next).copied() != Some(1) {
             continue;
         }
         let Some(next_block) = maps.def_block(iv_next) else {
             continue;
         };
+        // The step must be RECOMPUTED every trip: its def must live INSIDE the
+        // loop body and dominate the latch. Dominance alone is not enough — a
+        // preheader `iv_next = iv + 1` also dominates the latch, but then the
+        // latch write-back `iv = iv_next` stores the same value on every trip,
+        // so `iv` is constant from iteration 1 on and the loop never terminates.
+        if !body.contains(&next_block) {
+            continue;
+        }
         if !dom.dominates(next_block, latch) {
             continue;
         }
@@ -538,6 +587,59 @@ fn find_counted_iv(
         return Some(IvInfo { iv, test_is_next });
     }
     None
+}
+
+/// True iff the loop body contains NO cycle other than the `latch -> header`
+/// back-edge, i.e. one trip of the loop is a finite path.
+///
+/// Detects cycles by dominator-free colouring (white/grey/black DFS) rather than
+/// by looking for back-edges in the dominator tree, so an IRREDUCIBLE cycle
+/// inside the body — which has no dominator back-edge and which `LoopAnalysis`
+/// therefore never reports as a loop — is caught too. Fail-closed.
+fn body_acyclic_without_backedge(
+    func: &MachFunction,
+    body: &HashSet<BlockId>,
+    latch: BlockId,
+    header: BlockId,
+) -> bool {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Color {
+        White,
+        Grey,
+        Black,
+    }
+    let mut color: HashMap<BlockId, Color> = body.iter().map(|&b| (b, Color::White)).collect();
+    // Iterative DFS: the stack holds (block, index of next successor to visit).
+    let mut stack: Vec<(BlockId, usize)> = Vec::new();
+    for &start in body {
+        if color.get(&start) != Some(&Color::White) {
+            continue;
+        }
+        color.insert(start, Color::Grey);
+        stack.push((start, 0));
+        while let Some((b, idx)) = stack.pop() {
+            let succs = &func.block(b).succs;
+            if idx >= succs.len() {
+                color.insert(b, Color::Black);
+                continue;
+            }
+            let s = succs[idx];
+            stack.push((b, idx + 1));
+            // Leave the body / take the loop's own back-edge: not a body cycle.
+            if !body.contains(&s) || (b == latch && s == header) {
+                continue;
+            }
+            match color.get(&s) {
+                Some(Color::Grey) => return false, // cycle strictly inside the body
+                Some(Color::White) => {
+                    color.insert(s, Color::Grey);
+                    stack.push((s, 0));
+                }
+                _ => {}
+            }
+        }
+    }
+    true
 }
 
 /// Unit-stride + condition-code combinations that give a finite trip count.
@@ -681,15 +783,14 @@ fn rewrite_external_uses(func: &mut MachFunction, body: &[BlockId], old: VReg, n
         }
         let inst_ids: Vec<InstId> = func.block(bid).insts.clone();
         for iid in inst_ids {
-            let produces = inst_produces_value(func.inst(iid));
-            for (idx, op) in func.inst_mut(iid).operands.iter_mut().enumerate() {
-                if produces && idx == 0 {
-                    continue;
+            let inst = func.inst_mut(iid);
+            let opcode = inst.opcode;
+            let operand_count = inst.operands.len();
+            aarch64_for_each_use_position(opcode, operand_count, |pos| {
+                if inst.operands.get(pos).and_then(MachOperand::as_vreg) == Some(old) {
+                    inst.operands[pos] = MachOperand::VReg(new);
                 }
-                if op.as_vreg() == Some(old) {
-                    *op = MachOperand::VReg(new);
-                }
-            }
+            });
         }
     }
 }
@@ -832,7 +933,7 @@ fn copy_like(inst: &MachInst) -> Option<(VReg, VReg)> {
 
 /// `iv_next == iv + 1` (via `AddRI(iv, 1)` or `AddRR(iv, const-1)`).
 fn is_step_one(func: &MachFunction, maps: &Maps, iv_next: VReg, iv: VReg) -> bool {
-    let Some(&id) = maps.def_first.get(&iv_next.id) else {
+    let Some(&id) = maps.def_first.get(&iv_next) else {
         return false;
     };
     let inst = func.inst(id);
@@ -862,10 +963,10 @@ fn is_step_one(func: &MachFunction, maps: &Maps, iv_next: VReg, iv: VReg) -> boo
 fn resolve_const(func: &MachFunction, maps: &Maps, v: VReg) -> Option<i64> {
     let mut cur = v;
     for _ in 0..16 {
-        if maps.def_count.get(&cur.id).copied() != Some(1) {
+        if maps.def_count.get(&cur).copied() != Some(1) {
             return None;
         }
-        let inst = func.inst(*maps.def_first.get(&cur.id)?);
+        let inst = func.inst(*maps.def_first.get(&cur)?);
         match inst.opcode {
             AArch64Opcode::Movz => {
                 let (dst, value) = crate::reaching_const::movz_value(inst)?;
@@ -893,9 +994,7 @@ fn const_iv_init(func: &MachFunction, maps: &Maps, preheader: BlockId, iv: VReg)
     // Find iv's (last) definition within the preheader block, then resolve it.
     for &iid in func.block(preheader).insts.iter().rev() {
         let inst = func.inst(iid);
-        if produces_def(inst.opcode)
-            && matches!(inst.operands.first(), Some(MachOperand::VReg(v)) if *v == iv)
-        {
+        if inst_defines_vreg(inst, iv) {
             return match inst.opcode {
                 AArch64Opcode::Movz => {
                     let (dst, value) = crate::reaching_const::movz_value(inst)?;
@@ -928,9 +1027,7 @@ fn is_loop_invariant(func: &MachFunction, body: &HashSet<BlockId>, bound: &Bound
                 let in_body = body.contains(&bid);
                 for &iid in &func.block(bid).insts {
                     let inst = func.inst(iid);
-                    if produces_def(inst.opcode)
-                        && matches!(inst.operands.first(), Some(MachOperand::VReg(d)) if *d == *v)
-                    {
+                    if inst_defines_vreg(inst, *v) {
                         any = true;
                         if in_body {
                             all_outside = false;
@@ -955,9 +1052,7 @@ fn is_materialized_constant(func: &MachFunction, v: VReg) -> bool {
     for &bid in &func.block_order {
         for &iid in &func.block(bid).insts {
             let inst = func.inst(iid);
-            if !(produces_def(inst.opcode)
-                && matches!(inst.operands.first(), Some(MachOperand::VReg(d)) if *d == v))
-            {
+            if !inst_defines_vreg(inst, v) {
                 continue;
             }
             any = true;
@@ -992,9 +1087,7 @@ fn count_body_defs(func: &MachFunction, body: &HashSet<BlockId>, v: VReg) -> usi
     for &b in body {
         for &iid in &func.block(b).insts {
             let inst = func.inst(iid);
-            if produces_def(inst.opcode)
-                && matches!(inst.operands.first(), Some(MachOperand::VReg(d)) if *d == v)
-            {
+            if inst_defines_vreg(inst, v) {
                 n += 1;
             }
         }
@@ -1008,11 +1101,9 @@ fn collect_body_defs(func: &MachFunction, body: &HashSet<BlockId>) -> HashSet<VR
     for &b in body {
         for &iid in &func.block(b).insts {
             let inst = func.inst(iid);
-            if produces_def(inst.opcode)
-                && let Some(MachOperand::VReg(v)) = inst.operands.first()
-            {
-                defs.insert(*v);
-            }
+            for_each_inst_def(inst, |v| {
+                defs.insert(v);
+            });
         }
     }
     defs
@@ -1031,36 +1122,16 @@ fn collect_liveouts(
         }
         for &iid in &func.block(b).insts {
             let inst = func.inst(iid);
-            let produces = inst_produces_value(inst);
-            for (idx, op) in inst.operands.iter().enumerate() {
-                if produces && idx == 0 {
-                    continue;
-                }
-                if let Some(v) = op.as_vreg()
+            aarch64_for_each_use_position(inst.opcode, inst.operands.len(), |pos| {
+                if let Some(v) = inst.operands.get(pos).and_then(MachOperand::as_vreg)
                     && body_defs.contains(&v)
                 {
                     liveouts.insert(v);
                 }
-            }
+            });
         }
     }
     liveouts
-}
-
-/// Conservative "operand 0 is a written def" predicate. Compares/branches do not
-/// define a register value.
-fn produces_def(op: AArch64Opcode) -> bool {
-    use AArch64Opcode::*;
-    !matches!(
-        op,
-        CmpRR | CmpRI | Tst | BCond | B | Cbz | Cbnz | Tbz | Tbnz
-    )
-}
-
-/// Does this instruction produce a value in operand 0? (Mirror of the effects
-/// helper, kept local to avoid a hard dependency on its exact signature.)
-fn inst_produces_value(inst: &MachInst) -> bool {
-    produces_def(inst.opcode)
 }
 
 #[cfg(test)]
@@ -1248,6 +1319,197 @@ mod tests {
         let mut pass = DeadCountedLoopElimination::new();
         let changed = pass.run(&mut func);
         assert!(!changed, "a non-unit-stride loop must NOT be deleted");
+        assert!(func.block_order.contains(&bb1));
+    }
+
+    /// AUDIT REPRO: the single exiting block sits on a CONDITIONAL path, so the
+    /// exit test is NOT evaluated on every trip. With `cond != 0` the loop never
+    /// reaches bb3 and runs forever — it must NOT be deleted.
+    ///
+    /// ```text
+    ///   bb0 (preheader): iv=0 ; bound=10 ; one=1 ; cond=1 ; B bb1
+    ///   bb1 (header):    cbnz cond, bb2 ; B bb3
+    ///   bb2:             B bb4
+    ///   bb3:             cmp iv,bound ; b.ge bb5 ; B bb4
+    ///   bb4 (latch):     iv1=iv+one ; iv=iv1 ; B bb1
+    ///   bb5 (exit):      ret
+    /// ```
+    #[test]
+    fn audit_guarded_exit_test_loop() {
+        use AArch64Opcode::*;
+        let mut func = new_func();
+        let bb0 = func.entry;
+        let bb1 = func.create_block();
+        let bb2 = func.create_block();
+        let bb3 = func.create_block();
+        let bb4 = func.create_block();
+        let bb5 = func.create_block();
+        let (iv0, iv, bound, one, iv1, cond) = (g64(0), g64(1), g64(2), g64(3), g64(4), g64(5));
+
+        push(&mut func, bb0, Movz, vec![vr(iv0), imm(0)]);
+        push(&mut func, bb0, MovR, vec![vr(iv), vr(iv0)]);
+        push(&mut func, bb0, Movz, vec![vr(bound), imm(10)]);
+        push(&mut func, bb0, Movz, vec![vr(one), imm(1)]);
+        push(&mut func, bb0, Movz, vec![vr(cond), imm(1)]);
+        push(&mut func, bb0, B, vec![blk(bb1)]);
+
+        push(&mut func, bb1, Cbnz, vec![vr(cond), blk(bb2)]);
+        push(&mut func, bb1, B, vec![blk(bb3)]);
+
+        push(&mut func, bb2, B, vec![blk(bb4)]);
+
+        push(&mut func, bb3, CmpRR, vec![vr(iv), vr(bound)]);
+        push(&mut func, bb3, BCond, vec![imm(CC_GE), blk(bb5)]);
+        push(&mut func, bb3, B, vec![blk(bb4)]);
+
+        push(&mut func, bb4, AddRR, vec![vr(iv1), vr(iv), vr(one)]);
+        push(&mut func, bb4, MovR, vec![vr(iv), vr(iv1)]);
+        push(&mut func, bb4, B, vec![blk(bb1)]);
+
+        push(&mut func, bb5, AArch64Opcode::Ret, vec![]);
+
+        func.add_edge(bb0, bb1);
+        func.add_edge(bb1, bb2);
+        func.add_edge(bb1, bb3);
+        func.add_edge(bb2, bb4);
+        func.add_edge(bb3, bb5);
+        func.add_edge(bb3, bb4);
+        func.add_edge(bb4, bb1);
+
+        let mut pass = DeadCountedLoopElimination::new();
+        let changed = pass.run(&mut func);
+        eprintln!(
+            "AUDIT deadloop guarded-exit: changed={} fired={}",
+            changed,
+            pass.fired()
+        );
+        assert!(
+            !changed,
+            "a loop whose exit test is not evaluated every iteration may be \
+             infinite and must NOT be deleted"
+        );
+        assert!(func.block_order.contains(&bb1));
+    }
+
+    /// AUDIT REPRO (variant 2): `iv_next = iv + 1` is computed ONCE in the
+    /// PREHEADER; the latch write-back `iv = iv_next` therefore makes `iv`
+    /// constant from iteration 1 on. `find_counted_iv` only requires
+    /// `iv_next`'s def to DOMINATE the latch, so this passes as "unit stride"
+    /// while the loop is in fact infinite.
+    ///
+    /// ```text
+    ///   bb0 (preheader): iv=0 ; bound=10 ; one=1 ; iv1=iv+one ; B bb1
+    ///   bb1 (header):    cmp iv,bound ; b.ge bb3 ; B bb2
+    ///   bb2 (latch):     iv=iv1 ; B bb1
+    ///   bb3 (exit):      ret
+    /// ```
+    #[test]
+    fn audit_loop_invariant_iv_step() {
+        use AArch64Opcode::*;
+        let mut func = new_func();
+        let bb0 = func.entry;
+        let bb1 = func.create_block();
+        let bb2 = func.create_block();
+        let bb3 = func.create_block();
+        let (iv0, iv, bound, one, iv1) = (g64(0), g64(1), g64(2), g64(3), g64(4));
+
+        push(&mut func, bb0, Movz, vec![vr(iv0), imm(0)]);
+        push(&mut func, bb0, MovR, vec![vr(iv), vr(iv0)]);
+        push(&mut func, bb0, Movz, vec![vr(bound), imm(10)]);
+        push(&mut func, bb0, Movz, vec![vr(one), imm(1)]);
+        push(&mut func, bb0, AddRR, vec![vr(iv1), vr(iv), vr(one)]);
+        push(&mut func, bb0, B, vec![blk(bb1)]);
+
+        push(&mut func, bb1, CmpRR, vec![vr(iv), vr(bound)]);
+        push(&mut func, bb1, BCond, vec![imm(CC_GE), blk(bb3)]);
+        push(&mut func, bb1, B, vec![blk(bb2)]);
+
+        push(&mut func, bb2, MovR, vec![vr(iv), vr(iv1)]);
+        push(&mut func, bb2, B, vec![blk(bb1)]);
+
+        push(&mut func, bb3, AArch64Opcode::Ret, vec![]);
+
+        func.add_edge(bb0, bb1);
+        func.add_edge(bb1, bb3);
+        func.add_edge(bb1, bb2);
+        func.add_edge(bb2, bb1);
+
+        let mut pass = DeadCountedLoopElimination::new();
+        let changed = pass.run(&mut func);
+        eprintln!(
+            "AUDIT deadloop invariant-step: changed={} fired={}",
+            changed,
+            pass.fired()
+        );
+        assert!(
+            !changed,
+            "an IV whose step is computed OUTSIDE the loop is not a unit-stride \
+             counted IV; the loop is infinite and must NOT be deleted"
+        );
+        assert!(func.block_order.contains(&bb1));
+    }
+
+    /// AUDIT REPRO (variant 3): the exit test IS on every path to the latch, but
+    /// a nested pure cycle sits between the header and the latch. One trip can
+    /// spin forever inside it, so the counted-IV argument proves nothing.
+    ///
+    /// ```text
+    ///   bb0 (preheader): iv=0 ; bound=10 ; one=1 ; cond=1 ; B bb1
+    ///   bb1 (header):    cmp iv,bound ; b.ge bb4(exit) ; B bb2
+    ///   bb2:             cbnz cond, bb2 ; B bb3      <-- inner infinite cycle
+    ///   bb3 (latch):     iv1=iv+one ; iv=iv1 ; B bb1
+    ///   bb4 (exit):      ret
+    /// ```
+    #[test]
+    fn audit_nested_cycle_in_body() {
+        use AArch64Opcode::*;
+        let mut func = new_func();
+        let bb0 = func.entry;
+        let bb1 = func.create_block();
+        let bb2 = func.create_block();
+        let bb3 = func.create_block();
+        let bb4 = func.create_block();
+        let (iv0, iv, bound, one, iv1, cond) = (g64(0), g64(1), g64(2), g64(3), g64(4), g64(5));
+
+        push(&mut func, bb0, Movz, vec![vr(iv0), imm(0)]);
+        push(&mut func, bb0, MovR, vec![vr(iv), vr(iv0)]);
+        push(&mut func, bb0, Movz, vec![vr(bound), imm(10)]);
+        push(&mut func, bb0, Movz, vec![vr(one), imm(1)]);
+        push(&mut func, bb0, Movz, vec![vr(cond), imm(1)]);
+        push(&mut func, bb0, B, vec![blk(bb1)]);
+
+        push(&mut func, bb1, CmpRR, vec![vr(iv), vr(bound)]);
+        push(&mut func, bb1, BCond, vec![imm(CC_GE), blk(bb4)]);
+        push(&mut func, bb1, B, vec![blk(bb2)]);
+
+        push(&mut func, bb2, Cbnz, vec![vr(cond), blk(bb2)]);
+        push(&mut func, bb2, B, vec![blk(bb3)]);
+
+        push(&mut func, bb3, AddRR, vec![vr(iv1), vr(iv), vr(one)]);
+        push(&mut func, bb3, MovR, vec![vr(iv), vr(iv1)]);
+        push(&mut func, bb3, B, vec![blk(bb1)]);
+
+        push(&mut func, bb4, AArch64Opcode::Ret, vec![]);
+
+        func.add_edge(bb0, bb1);
+        func.add_edge(bb1, bb4);
+        func.add_edge(bb1, bb2);
+        func.add_edge(bb2, bb2);
+        func.add_edge(bb2, bb3);
+        func.add_edge(bb3, bb1);
+
+        let mut pass = DeadCountedLoopElimination::new();
+        let changed = pass.run(&mut func);
+        eprintln!(
+            "AUDIT deadloop nested-cycle: changed={} fired={}",
+            changed,
+            pass.fired()
+        );
+        assert!(
+            !changed,
+            "a loop whose body contains a nested cycle may spin forever within \
+             one trip and must NOT be deleted"
+        );
         assert!(func.block_order.contains(&bb1));
     }
 

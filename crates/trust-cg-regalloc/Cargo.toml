@@ -39,7 +39,7 @@ thiserror = { workspace = true }
 # points back into trust-cg and would create an AY <-> trust-cg dependency cycle.
 # Local sibling development may use an uncommitted Cargo patch; committed
 # manifests remain identity-bound.
-ay-pb = { version = "0.10.0", git = "https://github.com/alabsystems/ay.git", rev = "ac00c30a825721e7a6dd82043e43d01af35e7b60", default-features = false, optional = true }
+ay-pb = { version = "0.15.0", git = "https://github.com/alabsystems/ay.git", rev = "2df1293ceba3b3c03d93e50ae0efa3720be56a43", default-features = false, optional = true }
 # AY SAT core (UNTRUSTED), declared only to unify one feature. `ay-pb` depends on
 # `ay-sat` through AY's workspace, which sets `default-features = false` and so
 # selects the generic watched-literal BCP. Naming `ay-sat` here turns the
@@ -53,7 +53,7 @@ ay-pb = { version = "0.10.0", git = "https://github.com/alabsystems/ay.git", rev
 # in this graph regardless, via ay-pb -> ay-milp -> ay-dpll/jit; what matters
 # here is that ay-sat's own jit path stays off.)
 # Pinned to the same audited revision as ay-pb; the two must never diverge.
-ay-sat = { version = "0.10.0", git = "https://github.com/alabsystems/ay.git", rev = "ac00c30a825721e7a6dd82043e43d01af35e7b60", default-features = false, features = ["raw-pointer-bcp"], optional = true }
+ay-sat = { version = "0.15.0", git = "https://github.com/alabsystems/ay.git", rev = "2df1293ceba3b3c03d93e50ae0efa3720be56a43", default-features = false, features = ["raw-pointer-bcp"], optional = true }
 
 [lints]
 workspace = true

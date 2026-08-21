@@ -50,12 +50,6 @@ use crate::verify::VerificationStrength;
 /// `ay` solver; see `verdict_db/README.md`), then rebuild + commit.
 const EMBEDDED_TIER0_VDB: &str = include_str!("../verdict_db/tier0.vdb");
 
-/// Crate-visible alias for the committed tier-0 text so sibling tiers (the
-/// canary CERT-SKIP tier, `crate::canary_cert`) can cross-check in their
-/// tests that every committed certificate backs a committed tier-0 row.
-#[cfg(test)]
-pub(crate) const EMBEDDED_TIER0_VDB_TEXT: &str = EMBEDDED_TIER0_VDB;
-
 /// Schema line every tier-0 DB file must start with.
 pub const TIER0_SCHEMA_LINE: &str = "tcg-verdict-db-v1";
 

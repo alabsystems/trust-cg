@@ -18,6 +18,7 @@ extern crate rustc_abi;
 extern crate rustc_ast;
 extern crate rustc_codegen_ssa;
 extern crate rustc_data_structures;
+extern crate rustc_hashes;
 extern crate rustc_hir;
 extern crate rustc_index;
 extern crate rustc_middle;
@@ -138,6 +139,15 @@ impl TrustCgCodegenBackend {
     }
 }
 
+/// Development notes the bridge prints to stderr. OFF by default: they fired
+/// on EVERY compile (two formatted, unbuffered `write(2)`s into every build
+/// log, which the LLVM backend never produces). `TCG_BRIDGE_NOTES=1` restores
+/// them verbatim.
+fn bridge_notes_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("TCG_BRIDGE_NOTES").is_some())
+}
+
 impl CodegenBackend for TrustCgCodegenBackend {
     fn name(&self) -> &'static str {
         "trust-cg"
@@ -221,13 +231,26 @@ impl CodegenBackend for TrustCgCodegenBackend {
             "aarch64" | "arm64" => &["neon", "fp-armv8"],
             _ => &[],
         };
-        let target_features = features
+        let target_features: Vec<_> = features
             .iter()
             .map(|f| rustc_span::Symbol::intern(f))
             .collect();
+        // `unstable_target_features` — NOT a duplicate of the above. rustc's
+        // backend-independent ABI check reads THIS list, so leaving it empty
+        // made every aarch64 compile emit the future-incompat lint "target
+        // feature `neon` must be enabled to ensure that the ABI of the current
+        // target can be implemented correctly" (plus its two notes and a
+        // "1 warning emitted" line) — a fully rendered diagnostic on every
+        // invocation that the LLVM backend never produces, and one rustc says
+        // will become a HARD ERROR in a future release. The same baseline is
+        // correct for both lists: these features are always present for the
+        // default x86_64/aarch64 ABIs (see the reasoning above), and
+        // `cfg!(target_feature = …)` keeps evaluating against `target_features`,
+        // which is unchanged, so no `#[cfg]`-gated branch can move.
+        let unstable_target_features = target_features.clone();
         TargetConfig {
             target_features,
-            unstable_target_features: vec![],
+            unstable_target_features,
             has_reliable_f16: false,
             has_reliable_f16_math: false,
             has_reliable_f128: false,
@@ -1244,10 +1267,12 @@ fn codegen_crate(tcx: TyCtxt<'_>) -> OngoingCodegen {
         });
         // We only reach here with a Rust entry fn, so `entry_sigpipe` is Some.
         let sigpipe = entry_sigpipe.unwrap_or(0);
-        eprintln!(
-            "rustc_codegen_trust_cg: #574 entry wrapper uses lang_start `{lang_start_symbol}` \
-             with Rust main `{rust_main_symbol}` (sigpipe={sigpipe})"
-        );
+        if bridge_notes_enabled() {
+            eprintln!(
+                "rustc_codegen_trust_cg: #574 entry wrapper uses lang_start `{lang_start_symbol}` \
+                 with Rust main `{rust_main_symbol}` (sigpipe={sigpipe})"
+            );
+        }
         modules.insert(
             0,
             compile_entry_call_object(
@@ -1953,7 +1978,9 @@ fn is_dead_std_iterator_reduction_body<'tcx>(tcx: TyCtxt<'tcx>, instance: Instan
     // (see `is_stdlib_precondition_check`); every pattern below is a substring
     // or suffix match, and the full path only adds leading segments. Any
     // theoretical new EXCLUDE match is fail-closed (fewer trap stubs).
-    let p = rustc_middle::ty::print::with_no_trimmed_paths!(tcx.def_path_str(def_id));
+    let p = rustc_middle::ty::print::with_no_visible_paths!(
+        rustc_middle::ty::print::with_no_trimmed_paths!(tcx.def_path_str(def_id))
+    );
     // EXCLUDE `step_by`: its `spec_fold` is NOT intercepted (the routing fails closed
     // on a StepBy chain), so trapping it would turn the clean compile-fail into a
     // runtime SIGILL. Leaving it untrapped keeps step_by reductions fail-closed at
@@ -2109,8 +2136,11 @@ fn is_dead_intercepted_heap_alloc_glue<'tcx>(tcx: TyCtxt<'tcx>, instance: Instan
     if !matches!(tcx.crate_name(def_id.krate).as_str(), "core" | "std" | "alloc") {
         return false;
     }
-    // Untrimmed printer: same rationale as `is_dead_std_iterator_reduction_body`.
-    let p = rustc_middle::ty::print::with_no_trimmed_paths!(tcx.def_path_str(def_id));
+    // Untrimmed/no-visible printer: same rationale as
+    // `is_dead_std_iterator_reduction_body`.
+    let p = rustc_middle::ty::print::with_no_visible_paths!(
+        rustc_middle::ty::print::with_no_trimmed_paths!(tcx.def_path_str(def_id))
+    );
 
     // Whether `self_ty` is one of the collections the bridge INTERCEPTS at drop
     // (its glue lowers to a direct `__rust_dealloc`, never a call to that glue).
@@ -2774,7 +2804,9 @@ fn compile_thread_local_static_object(
 /// nothing — e.g. an upstream allocator dylib, or a no_std/no-alloc program).
 fn build_allocator_shim(tcx: TyCtxt<'_>) -> Option<Result<CompiledModule, String>> {
     let kind = allocator_kind_for_codegen(tcx)?;
-    eprintln!("rustc_codegen_trust_cg: emitting default-allocator shim (kind={kind:?})");
+    if bridge_notes_enabled() {
+        eprintln!("rustc_codegen_trust_cg: emitting default-allocator shim (kind={kind:?})");
+    }
     Some(build_allocator_shim_inner(tcx, kind))
 }
 
@@ -8518,7 +8550,29 @@ fn mir_to_trust_ir<'tcx>(
             func.blocks.push(head);
         }
         let trace = std::env::var_os("TCG_TRACE_TY").is_some();
+        // `TCG_DIAG_STMTS=1`: per-statement/terminator wall marks (>= 0.2 ms)
+        // — the instrument that pinned the 3.4 ms first-item warmup to a
+        // single unsize statement and then to its two query triggers.
+        // OnceLock-cached: the off cost is one branch per block.
+        let diag_stmts = {
+            use std::sync::OnceLock;
+            static ENABLED: OnceLock<bool> = OnceLock::new();
+            *ENABLED.get_or_init(|| std::env::var_os("TCG_DIAG_STMTS").is_some())
+        };
         for statement in &data.statements {
+            if diag_stmts {
+                let t0 = std::time::Instant::now();
+                lower_statement(&mut ctx, body, &mut block, &statement.kind)?;
+                let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                if ms >= 0.2 {
+                    eprintln!(
+                        "TCG_DIAG_STMT {ms:8.2}ms {bb:?} {:?} {}",
+                        statement.kind,
+                        symbol.chars().take(50).collect::<String>()
+                    );
+                }
+                continue;
+            }
             if trace {
                 match lower_statement(&mut ctx, body, &mut block, &statement.kind) {
                     Ok(()) => {}
@@ -8532,7 +8586,18 @@ fn mir_to_trust_ir<'tcx>(
             }
         }
         let terminator = data.terminator();
-        if trace {
+        if diag_stmts {
+            let t0 = std::time::Instant::now();
+            lower_terminator(&mut ctx, body, bb, &mut block, &terminator.kind)?;
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            if ms >= 0.2 {
+                eprintln!(
+                    "TCG_DIAG_TERM {ms:8.2}ms {bb:?} {:?} {}",
+                    terminator.kind,
+                    symbol.chars().take(50).collect::<String>()
+                );
+            }
+        } else if trace {
             match lower_terminator(&mut ctx, body, bb, &mut block, &terminator.kind) {
                 Ok(()) => {}
                 Err(e) => {
@@ -22423,6 +22488,14 @@ fn emit_vtable_ptr_value<'tcx>(
     self_ty: Ty<'tcx>,
     trait_ref: ty::TraitRef<'tcx>,
 ) -> Result<ValueId, String> {
+    // Fully region-erase the query key: the monomorphization collector warms
+    // `vtable_entries` with an ERASED trait_ref, and a key differing only in
+    // free regions is a cache MISS that re-runs full trait resolution —
+    // measured as the entire 3.35 ms first-item lowering warmup (the
+    // `&dyn Fn + Sync + RefUnwindSafe` coercion in lang_start's bb0).
+    // `erase_regions` is idempotent, so an already-erased key is unchanged.
+    let trait_ref = ctx.tcx.erase_and_anonymize_regions(trait_ref);
+    let self_ty = ctx.tcx.erase_and_anonymize_regions(self_ty);
     let vtable_symbol = emit_vtable_global(ctx, self_ty, trait_ref)?;
     let vtable_addr_int = ctx.fresh_value();
     let vtable_global_index = ctx
@@ -22689,12 +22762,14 @@ fn vtable_symbol_name<'tcx>(
     self_ty: Ty<'tcx>,
     trait_ref: ty::TraitRef<'tcx>,
 ) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::Hasher;
-    let mut hasher = DefaultHasher::new();
-    hasher.write(format!("{self_ty:?}|{trait_ref:?}").as_bytes());
+    use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
+    let hash = ctx.tcx.with_stable_hashing_context(|mut hcx| {
+        let mut hasher = StableHasher::new();
+        (self_ty, trait_ref).hash_stable(&mut hcx, &mut hasher);
+        hasher.finish::<rustc_hashes::Hash64>()
+    });
     let owner = ctx.tcx.symbol_name(ctx.instance).name;
-    format!("{owner}.vtable.{:016x}", hasher.finish())
+    format!("{owner}.vtable.{:016x}", hash.as_u64())
 }
 
 // =========================================================================
@@ -54575,7 +54650,16 @@ fn lower_fmt_call<'tcx>(
         return Ok(false);
     }
     let name = ctx.tcx.item_name(def_id).as_str().to_owned();
-    let def_path = ctx.tcx.def_path_str(def_id);
+    // Untrimmed + no-visible printer: this classifier runs for EVERY
+    // core/alloc/std callee, and the default printer's first visible-path
+    // use per compile decodes the visible universe (visible_parent_map +
+    // 399 module_children, ~3.4 ms — the first-item lowering warmup,
+    // gdb-pinned here after the vtable-hash trigger was removed). The two
+    // consumers below are substring/prefix matches on paths whose def and
+    // visible renderings coincide (`Write` via the trait-impl rendering,
+    // `std::io` items defined in std), so the verdicts are unchanged.
+    let def_path =
+        rustc_middle::ty::print::with_no_visible_paths!(ctx.tcx.def_path_str(def_id));
 
     // A call that BUILDS a `core::fmt` plumbing value — `Argument::new_display`,
     // `Arguments::new`, etc. — whose result the `format!`/`write!` interception
@@ -57105,7 +57189,14 @@ fn vec_intoiter_element_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Option<Ty<'
         return None;
     };
     let did = adt.did();
-    let path = tcx.def_path_str(did);
+    // Untrimmed + no-visible printer: this runs per candidate call in the
+    // iterator-chain resolver, and the default printer's first visible-path
+    // use per compile decodes the visible universe (~3.4 ms — the h1-crate
+    // instance of the first-item warmup, gdb-pinned here via
+    // iter_chain_wraps_stepby). Both consumers are substring matches on
+    // module segments (`::vec::`, `deque`) present identically in the DEF
+    // path rendering.
+    let path = rustc_middle::ty::print::with_no_visible_paths!(tcx.def_path_str(did));
     if !(tcx.item_name(did).as_str() == "IntoIter"
         && matches!(tcx.crate_name(did.krate).as_str(), "alloc" | "std")
         && path.contains("::vec::")
@@ -57129,7 +57220,11 @@ fn vec_drain_element_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Option<Ty<'tcx
         return None;
     };
     let did = adt.did();
-    let path = tcx.def_path_str(did);
+    // Untrimmed/no-visible printer: classifier-path rendering must not
+    // trigger the visible-universe decode (~3.4 ms first-use; the first-item
+    // warmup class). All consumers are module-segment substring matches,
+    // identical in the def-path rendering.
+    let path = rustc_middle::ty::print::with_no_visible_paths!(tcx.def_path_str(did));
     if !(tcx.item_name(did).as_str() == "Drain"
         && matches!(tcx.crate_name(did.krate).as_str(), "alloc" | "std")
         && path.contains("::vec::")
@@ -66673,7 +66768,12 @@ fn reduce_ord_minmax_direction<'tcx>(
     // fold segment under `Iterator` — the std-internal `Iterator::max`/`min` =
     // `self.max_by(Ord::cmp)` / `self.min_by(Ord::cmp)` inlining. Any other closure
     // (a user `reduce` lambda) has a different path and falls through.
-    let path = ctx.tcx.def_path_str(*def_id);
+    // Untrimmed/no-visible printer: classifier-path rendering must not
+    // trigger the visible-universe decode (~3.4 ms first-use; the first-item
+    // warmup class). All consumers are module-segment substring matches,
+    // identical in the def-path rendering.
+    let path =
+        rustc_middle::ty::print::with_no_visible_paths!(ctx.tcx.def_path_str(*def_id));
     let is_iterator = path.contains("Iterator::");
     let want_max = if is_iterator && path.contains("max_by::fold") {
         true

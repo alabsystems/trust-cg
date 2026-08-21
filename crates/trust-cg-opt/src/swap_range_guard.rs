@@ -271,27 +271,23 @@ impl Recognized {
         // Def discipline + no-escape (block-resident instructions only; see
         // neon_iota_fill for the ghost-instruction rationale).
         let live_ids: Vec<InstId> = func
-            .blocks
+            .block_order
             .iter()
-            .flat_map(|blk| blk.insts.iter().copied())
+            .flat_map(|&bid| func.block(bid).insts.iter().copied())
             .collect();
         let mut def_counts: HashMap<u32, usize> = HashMap::new();
         for &id in &live_ids {
             let inst = func.inst(id);
-            if produces_def(inst.opcode)
-                && let Some(MachOperand::VReg(v)) = inst.operands.first()
-            {
+            crate::effects::for_each_inst_def(inst, |v| {
                 *def_counts.entry(v.id).or_insert(0) += 1;
-            }
+            });
         }
         let mut body_defs: HashSet<u32> = HashSet::new();
         for &id in &loop_insts {
             let inst = func.inst(id);
-            if produces_def(inst.opcode)
-                && let Some(MachOperand::VReg(v)) = inst.operands.first()
-            {
+            crate::effects::for_each_inst_def(inst, |v| {
                 body_defs.insert(v.id);
-            }
+            });
         }
         for &vid in &body_defs {
             let n = def_counts.get(&vid).copied().unwrap_or(0);
@@ -299,9 +295,7 @@ impl Recognized {
                 let in_loop = live_ids
                     .iter()
                     .filter(|&&id| {
-                        let inst = func.inst(id);
-                        produces_def(inst.opcode)
-                            && inst.operands.first().and_then(vreg_of).map(|v| v.id) == Some(vid)
+                        crate::effects::inst_defines_vreg(func.inst(id), iv)
                             && loop_insts.contains(&id)
                     })
                     .count();
@@ -864,16 +858,14 @@ fn is_loop_invariant(
     v: VReg,
 ) -> bool {
     for &id in loop_insts {
-        let inst = func.inst(id);
-        if produces_def(inst.opcode) && inst.operands.first().and_then(vreg_of) == Some(v) {
+        if crate::effects::inst_defines_vreg(func.inst(id), v) {
             return false;
         }
     }
     let mut any_def = false;
     for &b in &func.block_order {
         for &id in &func.block(b).insts {
-            let inst = func.inst(id);
-            if produces_def(inst.opcode) && inst.operands.first().and_then(vreg_of) == Some(v) {
+            if crate::effects::inst_defines_vreg(func.inst(id), v) {
                 any_def = true;
                 if dom.dominates(b, preheader) {
                     return true;
@@ -1178,8 +1170,7 @@ fn single_def(func: &MachFunction, v: VReg) -> Option<InstId> {
     let mut found: Option<InstId> = None;
     for &b in &func.block_order {
         for &id in &func.block(b).insts {
-            let inst = func.inst(id);
-            if produces_def(inst.opcode) && inst.operands.first().and_then(vreg_of) == Some(v) {
+            if crate::effects::inst_defines_vreg(func.inst(id), v) {
                 if found.is_some() {
                     return None;
                 }
@@ -1209,7 +1200,7 @@ fn const_value(func: &MachFunction, def: &HashMap<u32, InstId>, val: VReg) -> Op
             let mut acc: Option<u64> = None;
             for &pid in insts[..pos].iter() {
                 let pi = func.inst(pid);
-                if pi.operands.first().and_then(vreg_of) != Some(v) {
+                if !crate::effects::inst_defines_vreg(pi, v) {
                     continue;
                 }
                 match pi.opcode {
@@ -1223,8 +1214,7 @@ fn const_value(func: &MachFunction, def: &HashMap<u32, InstId>, val: VReg) -> Op
                     AArch64Opcode::Movk => {
                         acc = Some(crate::reaching_const::apply_movk(pi, v, acc?)?);
                     }
-                    _ if produces_def(pi.opcode) => return None,
-                    _ => {}
+                    _ => return None,
                 }
             }
             let value = crate::reaching_const::apply_movk(inst, v, acc?)?;
@@ -1234,50 +1224,10 @@ fn const_value(func: &MachFunction, def: &HashMap<u32, InstId>, val: VReg) -> Op
     }
 }
 
-fn produces_def(op: AArch64Opcode) -> bool {
-    use AArch64Opcode::*;
-    !matches!(
-        op,
-        CmpRR
-            | CmpRI
-            | BCond
-            | B
-            | Cbz
-            | Cbnz
-            | StrbRI
-            | StrhRI
-            | StrRI
-            | StrRO
-            | StrbRO
-            | StrhRO
-            | TrapBoundsCheckExact
-            | TrapBoundsCheck
-            | TrapOverflow
-            | TrapOverflowExact
-            | TrapNull
-            | TrapNullIfZero
-            | TrapDivZero
-            | TrapDivZeroIfZero
-            | TrapShiftRange
-            | TrapShiftRangeIfOOB
-    )
-}
-
 /// Def map over BLOCK-RESIDENT instructions only (ghost hygiene; see
 /// neon_iota_fill).
 fn build_def_map(func: &MachFunction) -> HashMap<u32, InstId> {
-    let mut map = HashMap::new();
-    for &b in &func.block_order {
-        for &id in &func.block(b).insts {
-            let inst = func.inst(id);
-            if let Some(MachOperand::VReg(v)) = inst.operands.first()
-                && produces_def(inst.opcode)
-            {
-                map.insert(v.id, id);
-            }
-        }
-    }
-    map
+    crate::effects::build_reaching_def_map(func)
 }
 
 fn block_of_inst(func: &MachFunction, target: InstId) -> Option<BlockId> {

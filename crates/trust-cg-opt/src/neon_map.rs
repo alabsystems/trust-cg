@@ -198,6 +198,7 @@ use trust_cg_ir::{
 };
 
 use crate::dom::DomTree;
+use crate::effects::{aarch64_for_each_use_position, for_each_inst_def, inst_defines_vreg};
 use crate::loops::LoopAnalysis;
 use crate::pass_manager::{AnalysisCache, MachinePass};
 
@@ -665,14 +666,12 @@ fn const_signed(
 /// term path require `def_count == 1` before trusting a def-map lookup.
 fn build_def_count(func: &MachFunction) -> HashMap<u32, u32> {
     let mut count: HashMap<u32, u32> = HashMap::new();
-    for block in &func.blocks {
-        for &id in &block.insts {
+    for &block_id in &func.block_order {
+        for &id in &func.block(block_id).insts {
             let inst = func.inst(id);
-            if inst.produces_value()
-                && let Some(MachOperand::VReg(v)) = inst.operands.first()
-            {
+            for_each_inst_def(inst, |v| {
                 *count.entry(v.id).or_insert(0) += 1;
-            }
+            });
         }
     }
     count
@@ -1280,11 +1279,9 @@ fn validate_chain_locality(
     for &blk in body {
         for &id in &func.block(blk).insts {
             let inst = func.inst(id);
-            if inst.produces_value()
-                && let Some(MachOperand::VReg(v)) = inst.operands.first()
-            {
+            for_each_inst_def(inst, |v| {
                 defs.entry(v.id).or_default().push(id);
-            }
+            });
         }
     }
     // Every register id TOUCHED (def or use) by any live instruction OUTSIDE the
@@ -1323,12 +1320,14 @@ fn validate_chain_locality(
                 if def_insts.contains(&id) {
                     continue;
                 }
-                if func
-                    .inst(id)
-                    .operands
-                    .iter()
-                    .any(|op| matches!(op, MachOperand::VReg(v) if v.id == rid))
-                {
+                let inst = func.inst(id);
+                let mut uses_rid = false;
+                aarch64_for_each_use_position(inst.opcode, inst.operands.len(), |pos| {
+                    if matches!(inst.operands.get(pos), Some(MachOperand::VReg(v)) if v.id == rid) {
+                        uses_rid = true;
+                    }
+                });
+                if uses_rid {
                     uses.push(id);
                 }
             }
@@ -1370,10 +1369,14 @@ fn validate_chain_locality(
             };
             // No self-use: `r = op(r, ...)` reads the PREVIOUS iteration's value
             // on every pass but the first — loop-carried state.
-            if func.inst(def_id).operands[1..]
-                .iter()
-                .any(|op| matches!(op, MachOperand::VReg(v) if v.id == rid))
-            {
+            let def_inst = func.inst(def_id);
+            let mut self_use = false;
+            aarch64_for_each_use_position(def_inst.opcode, def_inst.operands.len(), |pos| {
+                if matches!(def_inst.operands.get(pos), Some(MachOperand::VReg(v)) if v.id == rid) {
+                    self_use = true;
+                }
+            });
+            if self_use {
                 return false;
             }
             for use_id in uses_of(rid, &[def_id]) {
@@ -1413,6 +1416,21 @@ fn same_as_iv(func: &MachFunction, def: &HashMap<u32, InstId>, mut v: VReg, iv: 
 /// the multi-def induction.
 fn strip_copies(func: &MachFunction, def: &HashMap<u32, InstId>, mut v: VReg) -> VReg {
     for _ in 0..16 {
+        // A vreg with several live defs has no single reaching definition: the
+        // def map is LAST-WINS over the emitted layout, so it names whichever
+        // def comes last rather than the one that reaches this use. Every
+        // loop-carried variable is multi-def by construction (a preheader copy
+        // and a latch copy into the same vreg), and every `if`/`match` value has
+        // one def per arm — so walking one resolves an induction variable to its
+        // LATCH source, or a merge value to whichever arm came last.
+        //
+        // Confirmed wrong-code from this exact hole in neon_fill, mac_reg_block,
+        // mac_row_unroll, strided_store_unroll, neon_iota_fill and neon_bytesum.
+        // `swap_range_guard::single_def` and `neon_find`'s bound check were the
+        // in-tree precedents for doing it right.
+        if crate::effects::live_def_count(func, v.id) != 1 {
+            return v;
+        }
         let Some(&d) = def.get(&v.id) else {
             return v;
         };
@@ -2598,14 +2616,14 @@ fn recognize_rotated_reverse_header_exit(
         .find(|t| !body.contains(t))?;
     // Recover the initial iv (= count). `iv` is a multi-def loop-carried register;
     // find its definition inside the GUARD and take the copied source.
-    let init_src = func.block(guard).insts.iter().rev().find_map(|&id| {
-        let inst = func.inst(id);
-        if matches!(inst.operands.first(), Some(MachOperand::VReg(d)) if *d == iv) {
-            copy_like(inst).map(|(_, s)| s)
-        } else {
-            None
-        }
-    })?;
+    let init_def = func
+        .block(guard)
+        .insts
+        .iter()
+        .rev()
+        .copied()
+        .find(|&id| inst_defines_vreg(func.inst(id), iv))?;
+    let (_, init_src) = copy_like(func.inst(init_def))?;
     Some((exit, init_src))
 }
 
@@ -3218,8 +3236,19 @@ fn lower(func: &mut MachFunction, ctx: &mut LowerCtx, val: VReg) -> Option<VReg>
             bin(func, ctx, NeonMulV, a, b, true)
         }
         AddRR => {
-            let (a, b) = lower_two(func, ctx, &ops)?;
-            bin(func, ctx, NeonAddV, a, b, true)
+            // Fuse `add(mul(a,b), c)` (either operand order) into MLA when the
+            // mul is a loop-local, single-def, single-use node not already
+            // lowered for another consumer: one vector-ALU op per Q-block
+            // instead of two — LLVM's shape for `x*k + y` map kernels
+            // (v1_saxpy's measured 1.10x came from exactly this pair). A
+            // multi-use or memoized mul falls through to the generic
+            // MUL+ADD, which is always correct.
+            if let Some(d) = try_fuse_add_of_mul_to_mla(func, ctx, &ops) {
+                d
+            } else {
+                let (a, b) = lower_two(func, ctx, &ops)?;
+                bin(func, ctx, NeonAddV, a, b, true)
+            }
         }
         SubRR => {
             let (a, b) = lower_two(func, ctx, &ops)?;
@@ -3267,11 +3296,37 @@ fn lower(func: &mut MachFunction, ctx: &mut LowerCtx, val: VReg) -> Option<VReg>
             d
         }
         Madd => {
-            let a = lower(func, ctx, vreg_of(&ops[1])?)?;
-            let b = lower(func, ctx, vreg_of(&ops[2])?)?;
-            let c = lower(func, ctx, vreg_of(&ops[3])?)?;
-            let m = bin(func, ctx, NeonMulV, a, b, true);
-            bin(func, ctx, NeonAddV, m, c, true)
+            let madd_addend = vreg_of(&ops[3])?;
+            if !addend_safe_for_mla(func, ctx, madd_addend) {
+                // Possible reduction chain: MLA would put its 3-cycle latency
+                // on the loop-carried accumulator (see `addend_safe_for_mla`).
+                let a = lower(func, ctx, vreg_of(&ops[1])?)?;
+                let b = lower(func, ctx, vreg_of(&ops[2])?)?;
+                let c = lower(func, ctx, madd_addend)?;
+                let m = bin(func, ctx, NeonMulV, a, b, true);
+                return_add_of(func, ctx, m, c)
+            } else {
+                let a = lower(func, ctx, vreg_of(&ops[1])?)?;
+                let b = lower(func, ctx, vreg_of(&ops[2])?)?;
+                let c = lower(func, ctx, vreg_of(&ops[3])?)?;
+                // MLA (`acc += a*b`, lane-wise wrapping — identical mod 2^lane to
+                // MUL+ADD) halves the vector-ALU ops for the madd node: LLVM's
+                // kernel for `x*k + y` maps issues one MLA per Q-block where the
+                // old MUL+ADD pair issued two (measured 1.103x on v1_saxpy). The
+                // tied accumulator must be a PRIVATE copy: `c` may be a memoized
+                // node vreg with other readers, and MLA mutates its register in
+                // place. The copy coalesces away in regalloc whenever `c` dies at
+                // this node — the common single-use addend shape.
+                let d = alloc(func, RegClass::Fpr128);
+                emit(func, ctx.vbody, Copy, vec![vreg(d), vreg(c)]);
+                emit(
+                    func,
+                    ctx.vbody,
+                    NeonMlaV,
+                    vec![vreg(d), vreg(a), vreg(b), imm(ctx.arr_code)],
+                );
+                d
+            }
         }
         // CHAIN only: a value-preserving in-loop copy of a SINGLE-def value —
         // lower the source; the copy adds nothing per-lane. Mirrors `node_ok`
@@ -3296,6 +3351,114 @@ fn lower_two(
     let a = lower(func, ctx, vreg_of(ops.get(1)?)?)?;
     let b = lower(func, ctx, vreg_of(ops.get(2)?)?)?;
     Some((a, b))
+}
+
+/// Total operand occurrences of vreg `id` across the scalar loop body, all
+/// positions (defs and uses alike). With `def_count == 1`, a value consumed by
+/// exactly one in-loop instruction occurs exactly twice: once at its def, once
+/// at its single use. Position-blind counting is deliberate — store-style
+/// opcodes carry uses at operand 0, and any miscount can only BLOCK the MLA
+/// fusion (falling back to the always-correct MUL+ADD), never enable it
+/// wrongly.
+fn scalar_occurrences(func: &MachFunction, ctx: &LowerCtx, id: u32) -> u32 {
+    let mut n = 0;
+    for &iid in &ctx.loop_insts {
+        for op in &func.inst(iid).operands {
+            if let MachOperand::VReg(v) = op
+                && v.id == id
+            {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// True when the addend of a candidate MLA fusion is provably NOT part of a
+/// loop-carried dependence chain: a loop-invariant leaf, a recognized
+/// constant, or an in-loop LOAD (the only load shape the recognizer admits is
+/// `LdrRI`). MLA puts a 3-cycle FpAlu latency on the accumulator input, so
+/// fusing a REDUCTION (`acc += x*y`, addend defined by in-loop arithmetic)
+/// stretches the loop-carried chain from the old 1-cycle vector ADD to 3
+/// cycles — measured +4.9% on h2_vec_grow before this guard. Map-shaped
+/// addends (loads/invariants/constants) carry no such chain and keep the
+/// full MUL+ADD -> MLA win (v1_saxpy -11%).
+fn return_add_of(func: &mut MachFunction, ctx: &mut LowerCtx, m: VReg, c: VReg) -> VReg {
+    bin(func, ctx, AArch64Opcode::NeonAddV, m, c, true)
+}
+
+fn addend_safe_for_mla(func: &MachFunction, ctx: &LowerCtx, c: VReg) -> bool {
+    if ctx.inv_leaves.contains(&c.id) {
+        return true;
+    }
+    if const_value(func, &ctx.def, c).is_some() {
+        return true;
+    }
+    if ctx.def_count.get(&c.id).copied() != Some(1) {
+        return false; // multi-def: cannot trust the def map — fail closed.
+    }
+    let Some(&cdef) = ctx.def.get(&c.id) else {
+        return false;
+    };
+    ctx.loop_insts.contains(&cdef) && func.inst(cdef).opcode == AArch64Opcode::LdrRI
+}
+
+/// `add(mul(a,b), c)` -> `copy d, c; mla d, a, b` (see the AddRR arm). Returns
+/// `None` (no emission promised beyond memoized subterm lowering) when the
+/// shape or the single-use precondition does not hold.
+fn try_fuse_add_of_mul_to_mla(
+    func: &mut MachFunction,
+    ctx: &mut LowerCtx,
+    ops: &[MachOperand],
+) -> Option<VReg> {
+    use AArch64Opcode::*;
+    if ctx.is_i64 {
+        return None; // no `.2D` integer multiply — mirrors the MulRR bail.
+    }
+    for (mul_idx, other_idx) in [(1usize, 2usize), (2, 1)] {
+        let mv = vreg_of(ops.get(mul_idx)?)?;
+        if ctx.memo.contains_key(&mv.id) {
+            continue; // already lowered for another consumer — reuse via generic path
+        }
+        if ctx.def_count.get(&mv.id).copied() != Some(1) {
+            continue;
+        }
+        let Some(&mdef) = ctx.def.get(&mv.id) else {
+            continue;
+        };
+        if !ctx.loop_insts.contains(&mdef) {
+            continue;
+        }
+        if func.inst(mdef).opcode != MulRR {
+            continue;
+        }
+        if scalar_occurrences(func, ctx, mv.id) != 2 {
+            continue; // def + exactly one use (this add)
+        }
+        let Some(cv) = vreg_of(ops.get(other_idx)?) else {
+            continue;
+        };
+        if !addend_safe_for_mla(func, ctx, cv) {
+            continue; // possible reduction chain — keep the 1-cycle carried ADD
+        }
+        let mops = func.inst(mdef).operands.clone();
+        let a = lower(func, ctx, vreg_of(mops.get(1)?)?)?;
+        let b = lower(func, ctx, vreg_of(mops.get(2)?)?)?;
+        let c = lower(func, ctx, vreg_of(ops.get(other_idx)?)?)?;
+        // Private tied accumulator: MLA mutates its destination in place, and
+        // `c` may be a memoized node with other readers. The copy coalesces
+        // in regalloc whenever `c` dies here.
+        let d = alloc(func, RegClass::Fpr128);
+        emit(func, ctx.vbody, Copy, vec![vreg(d), vreg(c)]);
+        emit(
+            func,
+            ctx.vbody,
+            NeonMlaV,
+            vec![vreg(d), vreg(a), vreg(b), imm(ctx.arr_code)],
+        );
+        return Some(d);
+    }
+    None
 }
 
 /// Emit a same-shape binary NEON op `d = op(a, b)` in the vector body. `arr`
@@ -3415,15 +3578,7 @@ fn alloc(func: &mut MachFunction, class: RegClass) -> VReg {
 }
 
 fn build_def_map(func: &MachFunction) -> HashMap<u32, InstId> {
-    let mut map = HashMap::new();
-    for (idx, inst) in func.insts.iter().enumerate() {
-        if let Some(MachOperand::VReg(v)) = inst.operands.first()
-            && inst.opcode.produces_value()
-        {
-            map.insert(v.id, InstId(idx as u32));
-        }
-    }
-    map
+    crate::effects::build_reaching_def_map(func)
 }
 
 /// SOUNDNESS for the ROTATED shape (see the identical guard in neon_array):
@@ -3443,10 +3598,7 @@ fn iv_def_dominates_preheader(
             continue;
         }
         for &inst_id in &func.block(block_id).insts {
-            let inst = func.inst(inst_id);
-            if inst.opcode.produces_value()
-                && matches!(inst.operands.first(), Some(MachOperand::VReg(v)) if *v == iv)
-            {
+            if inst_defines_vreg(func.inst(inst_id), iv) {
                 return true;
             }
         }
@@ -4497,13 +4649,17 @@ mod tests {
         assert!(pass.run(&mut func), "matmul row update must vectorize");
         assert_eq!(pass.fired(), 1);
         assert_paired_stores(&func);
+        // The madd node fuses to MLA: one vector-ALU op per Q-block instead
+        // of the old MUL+ADD pair (the accumulate-into-copy shape; the copy
+        // coalesces in regalloc).
         assert!(
-            count(&func, AArch64Opcode::NeonMulV) >= UNROLL,
-            "vector MUL (s*b)"
+            count(&func, AArch64Opcode::NeonMlaV) >= UNROLL,
+            "vector MLA (c += s*b)"
         );
-        assert!(
-            count(&func, AArch64Opcode::NeonAddV) >= UNROLL,
-            "vector ADD (c+prod)"
+        assert_eq!(
+            count(&func, AArch64Opcode::NeonMulV),
+            0,
+            "no unfused vector MUL"
         );
         // Exactly one DUP: the loop-invariant scalar broadcast once.
         assert_eq!(count(&func, AArch64Opcode::NeonDupGen), 1, "one DUP(s)");
@@ -4704,12 +4860,18 @@ mod tests {
         );
         assert_eq!(pass.fired(), 1);
         assert_paired_stores(&func);
-        // mul.4s (a*k) + add.4s (+b), a DUP-broadcast k, and the regime-C
-        // disjointness precheck (2 LS guards for the single distinct base `b`).
+        // The a*k+b pair fuses to mla.4s (one vector-ALU op per Q-block), a
+        // DUP-broadcast k, and the regime-C disjointness precheck (2 LS
+        // guards for the single distinct base `b`).
+        assert_eq!(
+            count(&func, AArch64Opcode::NeonMlaV),
+            UNROLL,
+            "per-lane fused a*k+b"
+        );
         assert_eq!(
             count(&func, AArch64Opcode::NeonMulV),
-            UNROLL,
-            "per-lane a*k"
+            0,
+            "no unfused vector MUL"
         );
         assert!(count(&func, AArch64Opcode::NeonDupGen) >= 1, "k broadcast");
         assert_eq!(

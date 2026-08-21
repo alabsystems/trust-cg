@@ -459,20 +459,50 @@ impl LinearScan {
 
 /// Returns the default allocatable registers for AArch64 (Apple calling convention).
 ///
-/// Caller-saved: X0-X15 (excluding X18 which is reserved on Apple).
+/// Caller-saved: X0-X7, X9-X15 (X8 is the indirect-result register, see below;
+/// X18 is reserved on Apple).
 /// Callee-saved: X19-X28.
 /// X29 = FP, X30 = LR, X31 = SP/ZR — not allocatable.
+///
+/// FAIL-CLOSED ABI INVARIANT: X8 (and its W8 alias) is the AAPCS64 INDIRECT
+/// RESULT LOCATION register. For a function returning an aggregate by memory,
+/// the caller passes the destination pointer in X8, and ISel lowers the return
+/// copy as a store through the *physical* register — `str vN, [X8, #imm]` —
+/// with no entry `vX = copy X8` to give the pointer a virtual live range. X8 is
+/// therefore live from function entry to the last of those stores, but that
+/// lifetime is invisible to interval construction: `reserve_incoming_argument_-
+/// spans` only sees live-in reads that occur in the ENTRY block, and these
+/// stores sit in the return block. With X8 in the pool the allocator sees it as
+/// free and, under enough pressure, colors an unrelated vreg to it (`add x8,
+/// x0, #28`), destroying the incoming sret pointer; the return stores then write
+/// through the clobbered pointer and the real return buffer is never written, so
+/// the caller reads uninitialized stack — a wrong answer that varies run to run.
+/// This is exactly why the canonical [`trust_cg_ir::aarch64_regs::ALLOCATABLE_-
+/// GPRS`] excludes X8; this pool must agree with it (see the pool-agreement
+/// test below). Keeping X8 out of the pool costs one scratch register and makes
+/// the class unreachable rather than relying on the allocator never running out.
 pub fn aarch64_allocatable_regs() -> BTreeMap<RegClass, Vec<PReg>> {
     let mut regs = BTreeMap::new();
 
-    // GPR64: X0-X15, X19-X28 (skip X16-X17 scratch, X18 reserved, X29 FP, X30 LR)
+    // GPR64: X0-X7, X9-X15, X19-X28
+    // (skip X8 indirect-result, X16-X17 scratch, X18 reserved, X29 FP, X30 LR)
     // PReg encoding: X registers are 0..=30
-    let gpr64: Vec<PReg> = (0u16..=15).chain(19u16..=28).map(PReg::new).collect();
+    let gpr64: Vec<PReg> = (0u16..=7)
+        .chain(9u16..=15)
+        .chain(19u16..=28)
+        .map(PReg::new)
+        .collect();
     regs.insert(RegClass::Gpr64, gpr64.clone());
 
-    // GPR32: same set (W registers are the lower 32 bits of X registers).
+    // GPR32: same set (W registers are the lower 32 bits of X registers), so W8
+    // is excluded for the same reason X8 is — it is the same architectural
+    // register and writing W8 zero-extends over the whole sret pointer.
     // PReg encoding: W registers are 32..=62
-    let gpr32: Vec<PReg> = (32u16..=47).chain(51u16..=60).map(PReg::new).collect();
+    let gpr32: Vec<PReg> = (32u16..=39)
+        .chain(41u16..=47)
+        .chain(51u16..=60)
+        .map(PReg::new)
+        .collect();
     regs.insert(RegClass::Gpr32, gpr32);
 
     // FPR scratch aliases V16/V17, D16/D17, S16/S17, and H16/H17 are
@@ -516,12 +546,66 @@ mod tests {
     #[test]
     fn test_aarch64_allocatable_regs() {
         let regs = aarch64_allocatable_regs();
-        // 26 GPRs: X0-X15 (16) + X19-X28 (10) = 26
-        assert_eq!(regs[&RegClass::Gpr64].len(), 26);
+        // 25 GPRs: X0-X7 (8) + X9-X15 (7) + X19-X28 (10) = 25.
+        // X8 is the AAPCS64 indirect-result register and is NOT allocatable.
+        assert_eq!(regs[&RegClass::Gpr64].len(), 25);
         // 30 FPR64 regs: D16/D17 are reserved spill scratches.
         assert_eq!(regs[&RegClass::Fpr64].len(), 30);
         assert!(!regs[&RegClass::Fpr64].contains(&PReg::new(112)));
         assert!(!regs[&RegClass::Fpr64].contains(&PReg::new(113)));
+    }
+
+    /// The GPR pool must agree with the canonical AAPCS64 register-class list in
+    /// `trust-cg-ir`. The two drifted once: `ALLOCATABLE_GPRS` correctly omitted
+    /// X8 (indirect result location) while this pool still contained X8/W8, so
+    /// the allocator colored ordinary vregs to the incoming sret pointer under
+    /// register pressure and the aggregate return value was written through a
+    /// clobbered pointer — a nondeterministic wrong answer, because the real
+    /// return buffer was left holding whatever the stack happened to contain.
+    #[test]
+    fn test_gpr_pool_matches_canonical_aapcs64_allocatable_set() {
+        use trust_cg_ir::aarch64_regs::{ALLOCATABLE_GPRS, W8, X8};
+
+        let regs = aarch64_allocatable_regs();
+        let gpr64 = &regs[&RegClass::Gpr64];
+        let gpr32 = &regs[&RegClass::Gpr32];
+
+        // X8 / W8 are the same architectural register; neither may be handed out.
+        assert!(
+            !gpr64.contains(&PReg::new(X8.encoding())),
+            "X8 (indirect result location) must not be allocatable"
+        );
+        assert!(
+            !gpr32.contains(&PReg::new(W8.encoding())),
+            "W8 (alias of the indirect result location) must not be allocatable"
+        );
+
+        // The 64-bit pool must be exactly the canonical list.
+        let canonical: Vec<u16> = {
+            let mut v: Vec<u16> = ALLOCATABLE_GPRS.iter().map(|p| p.encoding()).collect();
+            v.sort_unstable();
+            v
+        };
+        let pool: Vec<u16> = {
+            let mut v: Vec<u16> = gpr64.iter().map(|p| p.encoding()).collect();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(
+            pool, canonical,
+            "linear_scan GPR64 pool drifted from trust_cg_ir::ALLOCATABLE_GPRS"
+        );
+
+        // The 32-bit pool is the W alias of the same set (W_n = PReg(32 + n)).
+        let pool32: Vec<u16> = {
+            let mut v: Vec<u16> = gpr32.iter().map(|p| p.encoding() - 32).collect();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(
+            pool32, canonical,
+            "linear_scan GPR32 pool is not the W alias of ALLOCATABLE_GPRS"
+        );
     }
 
     #[test]
@@ -1143,8 +1227,10 @@ mod tests {
     #[test]
     fn test_aarch64_regs_gpr32_count() {
         let regs = aarch64_allocatable_regs();
-        // GPR32: W0-W15 (16) + W19-W28 (10) = 26
-        assert_eq!(regs[&RegClass::Gpr32].len(), 26);
+        // GPR32: W0-W7 (8) + W9-W15 (7) + W19-W28 (10) = 25.
+        // W8 is excluded with X8 — the same architectural register, which
+        // AAPCS64 reserves for the indirect result location.
+        assert_eq!(regs[&RegClass::Gpr32].len(), 25);
     }
 
     #[test]

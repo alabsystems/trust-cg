@@ -33,7 +33,8 @@
 //!
 //!  * **Address invariance.** Each hoisted load is a plain `LdrRI dst, base,
 //!    #imm` whose base is loop-invariant and single-def (the `licm` invariance
-//!    engine, reconstructed here).
+//!    engine, reconstructed here — including its refusal of NZCV readers, whose
+//!    flag input is not in the operand list; see [`is_invariance_movable`]).
 //!  * **Speculation / fault safety.** The pass fires only when the preheader
 //!    UNCONDITIONALLY enters the loop (sole successor is the header) and each
 //!    hoisted load's block DOMINATES the latch and every loop-exiting block —
@@ -68,7 +69,10 @@ use trust_cg_ir::{
 };
 
 use crate::dom::DomTree;
-use crate::effects::{opcode_effect, produces_value};
+use crate::effects::{
+    aarch64_for_each_use_position, for_each_inst_def, inst_defines_vreg, opcode_effect,
+    reads_flags, single_inst_def,
+};
 use crate::loops::{LoopAnalysis, NaturalLoop};
 use crate::pass_manager::MachinePass;
 
@@ -426,8 +430,8 @@ fn collect_invariant_slice(
 ) -> Option<Vec<InstId>> {
     let def_map = build_def_map(func);
     let mut order: Vec<InstId> = Vec::new();
-    let mut done: HashSet<u32> = HashSet::new();
-    let mut on_stack: HashSet<u32> = HashSet::new();
+    let mut done: HashSet<VReg> = HashSet::new();
+    let mut on_stack: HashSet<VReg> = HashSet::new();
     for &r in roots {
         visit_slice(
             func,
@@ -449,46 +453,53 @@ fn visit_slice(
     v: VReg,
     body: &HashSet<BlockId>,
     invariant: &HashSet<VReg>,
-    def_map: &HashMap<u32, InstId>,
+    def_map: &HashMap<VReg, InstId>,
     order: &mut Vec<InstId>,
-    done: &mut HashSet<u32>,
-    on_stack: &mut HashSet<u32>,
+    done: &mut HashSet<VReg>,
+    on_stack: &mut HashSet<VReg>,
 ) -> Option<()> {
-    if done.contains(&v.id) {
+    if done.contains(&v) {
         return Some(());
     }
-    let Some(&def_id) = def_map.get(&v.id) else {
+    let Some(&def_id) = def_map.get(&v) else {
         // No tracked def (e.g. an ABI copy) — treat as already available.
-        done.insert(v.id);
+        done.insert(v);
         return Some(());
     };
     let in_body = block_of_inst(func, def_id).is_some_and(|b| body.contains(&b));
     if !in_body {
-        done.insert(v.id); // defined outside the loop — available as-is
+        done.insert(v); // defined outside the loop — available as-is
         return Some(());
     }
     if !invariant.contains(&v) {
         return None; // in-body but not invariant — cannot hoist
     }
-    if on_stack.contains(&v.id) {
+    if on_stack.contains(&v) {
         return None; // cycle among invariants — bail
     }
     let inst = func.inst(def_id);
-    if !opcode_effect(inst.opcode).is_pure()
-        || !produces_value(inst.opcode)
+    // Same movement contract as `compute_invariants` (see
+    // [`is_invariance_movable`]): a flag reader re-materialized here would
+    // execute in the preamble, where NZCV is the ORIGINAL preheader's leftover
+    // state and no compare of its own has run.
+    if !is_invariance_movable(inst)
+        || single_inst_def(inst) != Some(v)
         || inst_touches_fixed_register(inst)
     {
         return None;
     }
-    on_stack.insert(v.id);
-    let operands: Vec<MachOperand> = inst.operands.clone();
-    for op in operands.iter().skip(1) {
-        if let MachOperand::VReg(u) = op {
-            visit_slice(func, *u, body, invariant, def_map, order, done, on_stack)?;
+    on_stack.insert(v);
+    let mut uses = Vec::new();
+    aarch64_for_each_use_position(inst.opcode, inst.operands.len(), |pos| {
+        if let Some(MachOperand::VReg(u)) = inst.operands.get(pos) {
+            uses.push(*u);
         }
+    });
+    for u in uses {
+        visit_slice(func, u, body, invariant, def_map, order, done, on_stack)?;
     }
-    on_stack.remove(&v.id);
-    done.insert(v.id);
+    on_stack.remove(&v);
+    done.insert(v);
     order.push(def_id);
     Some(())
 }
@@ -581,10 +592,7 @@ fn recognize_counted_index(
     for &block_id in &func.block_order {
         for &inst_id in &func.block(block_id).insts {
             let inst = func.inst(inst_id);
-            if !produces_value(inst.opcode) {
-                continue;
-            }
-            if !matches!(inst.operands.first(), Some(MachOperand::VReg(d)) if *d == idx) {
+            if !inst_defines_vreg(inst, idx) {
                 continue;
             }
             if lp.body.contains(&block_id) {
@@ -612,7 +620,7 @@ fn recognize_counted_index(
     // `idx <- copy(step)`  (the loop-carried write in the latch).
     let step = copy_src(func.inst(body_def))?;
     // `step = AddRI(idx, #c)`, c >= 1.
-    let step_def = func.inst(*def_map.get(&step.id)?);
+    let step_def = func.inst(*def_map.get(&step)?);
     if step_def.opcode != AArch64Opcode::AddRI {
         return None;
     }
@@ -664,7 +672,7 @@ fn recognize_counted_index(
                 }
                 let b = vreg_of(cmp.operands.get(1)?)?;
                 // Bound must be invariant and dominate the preheader, or a const.
-                if let Some(&bdef) = def_map.get(&b.id)
+                if let Some(&bdef) = def_map.get(&b)
                     && def_counts.get(&b).copied().unwrap_or(0) == 1
                     && let Some(bblk) = block_of_inst(func, bdef)
                     && !lp.body.contains(&bblk)
@@ -965,6 +973,36 @@ fn clone_body(
 // Invariance / liveness helpers (reconstructing the LICM engine locally)
 // ===========================================================================
 
+/// Machine-MOVEMENT purity, the admission predicate for the invariance engine.
+///
+/// [`opcode_effect`] classifies MEMORY effects only. `Csel`, `CSet`, `Csinc`,
+/// `Csinv`, `Csneg`, `FcselRR`, `Adc` and `Sbc` are all `MemoryEffect::Pure`
+/// yet consume NZCV — an input that is NOT in their explicit operand list — so
+/// the operand-only test in [`compute_invariants`] would certify one as
+/// "loop-invariant" while its value changes with every flag write in the body.
+/// Two things then break at once:
+///
+///  * a hoisted load whose BASE is such a value is not address-invariant at
+///    all, so the fast clone reads iteration 1's address on every iteration
+///    (and a store base likewise makes the disjointness check prove the wrong
+///    range); and
+///  * [`emit_slice`] re-materializes the flag reader in the PREAMBLE, which is
+///    reached from the original preheader — there is no compare there at all,
+///    so it selects on whatever NZCV the caller happened to leave.
+///
+/// `licm.rs` does not have this hole because it admits on
+/// [`crate::interfaces::OpInterfaces::is_pure`], the machine movement contract,
+/// which rejects flag readers and writers; this pass reconstructed the engine
+/// locally on the weaker memory predicate. Flag WRITERS need no gate here: the
+/// slice is only ever COPIED into the preamble (the original stays in the
+/// body, so the loop's own flag sequence is untouched), and nothing the
+/// preamble or the check chain executes reads NZCV before writing it — every
+/// check block opens with its own `CmpRR`. Flag READERS are the whole gap, and
+/// this fails them closed.
+fn is_invariance_movable(inst: &MachInst) -> bool {
+    opcode_effect(inst.opcode).is_pure() && !reads_flags(inst.opcode)
+}
+
 fn compute_invariants(
     func: &MachFunction,
     lp: &NaturalLoop,
@@ -981,13 +1019,13 @@ fn compute_invariants(
             }
             for &inst_id in &func.block(block_id).insts {
                 let inst = func.inst(inst_id);
-                if !produces_value(inst.opcode) || !opcode_effect(inst.opcode).is_pure() {
+                if !is_invariance_movable(inst) {
                     continue;
                 }
                 if inst.is_branch() || inst.is_terminator() || inst.opcode.is_phi() {
                     continue;
                 }
-                let Some(&MachOperand::VReg(def)) = inst.operands.first() else {
+                let Some(def) = single_inst_def(inst) else {
                     continue;
                 };
                 if def_counts.get(&def).copied().unwrap_or(0) != 1 || invariant.contains(&def) {
@@ -996,9 +1034,14 @@ fn compute_invariants(
                 if inst_touches_fixed_register(inst) {
                     continue;
                 }
-                let all_inv = inst.operands[1..]
-                    .iter()
-                    .all(|op| is_operand_invariant(op, loop_defs, &invariant, def_counts));
+                let mut all_inv = true;
+                aarch64_for_each_use_position(inst.opcode, inst.operands.len(), |pos| {
+                    if !inst.operands.get(pos).is_some_and(|op| {
+                        is_operand_invariant(op, loop_defs, &invariant, def_counts)
+                    }) {
+                        all_inv = false;
+                    }
+                });
                 if all_inv {
                     invariant.insert(def);
                     changed = true;
@@ -1071,16 +1114,13 @@ fn body_and_outside_defs(
         let in_body = body.contains(&block_id);
         for &inst_id in &func.block(block_id).insts {
             let inst = func.inst(inst_id);
-            if !produces_value(inst.opcode) {
-                continue;
-            }
-            if let Some(MachOperand::VReg(d)) = inst.operands.first() {
+            for_each_inst_def(inst, |d| {
                 if in_body {
-                    body_defs.insert(*d);
+                    body_defs.insert(d);
                 } else {
-                    outside_defs.insert(*d);
+                    outside_defs.insert(d);
                 }
-            }
+            });
         }
     }
     (body_defs, outside_defs)
@@ -1100,18 +1140,17 @@ fn body_internal_value_is_live_out(
         }
         for &inst_id in &func.block(block_id).insts {
             let inst = func.inst(inst_id);
-            // Skip the def operand; check use operands.
-            for op in inst
-                .operands
-                .iter()
-                .skip(usize::from(produces_value(inst.opcode)))
-            {
-                if let MachOperand::VReg(v) = op
+            let mut live_out = false;
+            aarch64_for_each_use_position(inst.opcode, inst.operands.len(), |pos| {
+                if let Some(MachOperand::VReg(v)) = inst.operands.get(pos)
                     && body_defs.contains(v)
                     && !outside_defs.contains(v)
                 {
-                    return true;
+                    live_out = true;
                 }
+            });
+            if live_out {
+                return true;
             }
         }
     }
@@ -1324,7 +1363,7 @@ fn copy_src(inst: &MachInst) -> Option<VReg> {
 /// idioms and `Movz`.
 fn resolve_const(
     func: &MachFunction,
-    def_map: &HashMap<u32, InstId>,
+    def_map: &HashMap<VReg, InstId>,
     v: VReg,
     inst_id: InstId,
 ) -> Option<i64> {
@@ -1336,14 +1375,18 @@ fn resolve_const(
         return Some(value);
     }
     if let Some(src) = copy_src(inst) {
-        let src_def = *def_map.get(&src.id)?;
+        let src_def = *def_map.get(&src)?;
         return resolve_const(func, def_map, src, src_def);
     }
     None
 }
 
-fn resolve_const_vreg(func: &MachFunction, def_map: &HashMap<u32, InstId>, v: VReg) -> Option<i64> {
-    let def = *def_map.get(&v.id)?;
+fn resolve_const_vreg(
+    func: &MachFunction,
+    def_map: &HashMap<VReg, InstId>,
+    v: VReg,
+) -> Option<i64> {
+    let def = *def_map.get(&v)?;
     resolve_const(func, def_map, v, def)
 }
 
@@ -1397,29 +1440,16 @@ fn build_def_counts(func: &MachFunction) -> HashMap<VReg, usize> {
     for &block_id in &func.block_order {
         for &inst_id in &func.block(block_id).insts {
             let inst = func.inst(inst_id);
-            if produces_value(inst.opcode)
-                && let Some(MachOperand::VReg(def)) = inst.operands.first()
-            {
-                *counts.entry(*def).or_insert(0) += 1;
-            }
+            for_each_inst_def(inst, |def| {
+                *counts.entry(def).or_insert(0) += 1;
+            });
         }
     }
     counts
 }
 
-fn build_def_map(func: &MachFunction) -> HashMap<u32, InstId> {
-    let mut defs: HashMap<u32, InstId> = HashMap::new();
-    for &block_id in &func.block_order {
-        for &inst_id in &func.block(block_id).insts {
-            let inst = func.inst(inst_id);
-            if produces_value(inst.opcode)
-                && let Some(MachOperand::VReg(def)) = inst.operands.first()
-            {
-                defs.insert(def.id, inst_id);
-            }
-        }
-    }
-    defs
+fn build_def_map(func: &MachFunction) -> HashMap<VReg, InstId> {
+    crate::effects::build_reaching_def_map_by_vreg(func)
 }
 
 fn build_loop_defs(func: &MachFunction, body: &HashSet<BlockId>) -> HashMap<VReg, InstId> {
@@ -1430,11 +1460,9 @@ fn build_loop_defs(func: &MachFunction, body: &HashSet<BlockId>) -> HashMap<VReg
         }
         for &inst_id in &func.block(block_id).insts {
             let inst = func.inst(inst_id);
-            if produces_value(inst.opcode)
-                && let Some(MachOperand::VReg(def)) = inst.operands.first()
-            {
-                defs.insert(*def, inst_id);
-            }
+            for_each_inst_def(inst, |def| {
+                defs.insert(def, inst_id);
+            });
         }
     }
     defs

@@ -1160,10 +1160,11 @@ fn try_predcount_diamond(
         if !(succs.len() == 1 && succs[0] == latch) {
             continue;
         }
-        let defines_merge = func.block(b).insts.iter().any(|&id| {
-            let inst = func.inst(id);
-            produces_def(inst.opcode) && inst.operands.first().and_then(vreg_of) == Some(merge)
-        });
+        let defines_merge = func
+            .block(b)
+            .insts
+            .iter()
+            .any(|&id| crate::effects::inst_defines_vreg(func.inst(id), merge));
         if defines_merge {
             arms.push(b);
         }
@@ -1248,13 +1249,14 @@ fn try_predcount_diamond(
         if acc_readers.contains(&id) {
             continue;
         }
-        let inst = func.inst(id);
-        // Operand 0 is a written def for producers; compares/branches read it.
-        let skip = usize::from(produces_def(inst.opcode));
-        for opd in inst.operands.iter().skip(skip) {
-            if vreg_of(opd) == Some(acc) {
-                return None;
+        let mut reads_acc = false;
+        crate::effects::for_each_inst_use(func.inst(id), |used| {
+            if used == acc {
+                reads_acc = true;
             }
+        });
+        if reads_acc {
+            return None;
         }
     }
 
@@ -1274,8 +1276,7 @@ fn classify_predcount_arm(
     // The (unique) def of `merge` in this arm.
     let mut mdef: Option<InstId> = None;
     for &id in &func.block(arm).insts {
-        let inst = func.inst(id);
-        if produces_def(inst.opcode) && inst.operands.first().and_then(vreg_of) == Some(merge) {
+        if crate::effects::inst_defines_vreg(func.inst(id), merge) {
             if mdef.is_some() {
                 return None; // merge defined twice in one arm
             }
@@ -1486,10 +1487,7 @@ fn loop_init_value(
         .iter()
         .rev()
         .copied()
-        .find(|&id| {
-            let inst = func.inst(id);
-            produces_def(inst.opcode) && inst.operands.first().and_then(vreg_of) == Some(iv)
-        })?;
+        .find(|&id| crate::effects::inst_defines_vreg(func.inst(id), iv))?;
     let inst = func.inst(d);
     match inst.opcode {
         AArch64Opcode::Movz => move_wide_seed(inst, iv),
@@ -1588,10 +1586,11 @@ fn try_stencil_diamond(
         if !(succs.len() == 1 && succs[0] == latch) {
             continue;
         }
-        let defines_merge = func.block(b).insts.iter().any(|&id| {
-            let inst = func.inst(id);
-            produces_def(inst.opcode) && inst.operands.first().and_then(vreg_of) == Some(merge)
-        });
+        let defines_merge = func
+            .block(b)
+            .insts
+            .iter()
+            .any(|&id| crate::effects::inst_defines_vreg(func.inst(id), merge));
         if defines_merge {
             arms.push(b);
         }
@@ -1683,12 +1682,14 @@ fn try_stencil_diamond(
         if acc_readers.contains(&id) {
             continue;
         }
-        let inst = func.inst(id);
-        let skip = usize::from(produces_def(inst.opcode));
-        for opd in inst.operands.iter().skip(skip) {
-            if vreg_of(opd) == Some(acc) {
-                return None;
+        let mut reads_acc = false;
+        crate::effects::for_each_inst_use(func.inst(id), |used| {
+            if used == acc {
+                reads_acc = true;
             }
+        });
+        if reads_acc {
+            return None;
         }
     }
 
@@ -1846,7 +1847,7 @@ fn arm_select_const(
     let mut cval = None;
     for &id in &func.block(arm).insts {
         let inst = func.inst(id);
-        if produces_def(inst.opcode) && inst.operands.first().and_then(vreg_of) == Some(sel) {
+        if crate::effects::inst_defines_vreg(inst, sel) {
             if cval.is_some() {
                 return None; // defined twice
             }
@@ -1956,10 +1957,7 @@ fn recognize_select_diamond(
             .block(b)
             .insts
             .iter()
-            .filter(|&&id| {
-                let inst = func.inst(id);
-                produces_def(inst.opcode) && inst.operands.first().and_then(vreg_of) == Some(sel)
-            })
+            .filter(|&&id| crate::effects::inst_defines_vreg(func.inst(id), sel))
             .count();
         if ndefs > 1 {
             return None;
@@ -2213,12 +2211,14 @@ fn try_hexnibble_acc(context: HexNibbleLoop<'_>, acc: VReg, s2: VReg) -> Option<
         if id == sum1_id {
             continue;
         }
-        let inst = func.inst(id);
-        let skip = usize::from(produces_def(inst.opcode));
-        for opd in inst.operands.iter().skip(skip) {
-            if vreg_of(opd) == Some(acc) {
-                return None;
+        let mut reads_acc = false;
+        crate::effects::for_each_inst_use(func.inst(id), |used| {
+            if used == acc {
+                reads_acc = true;
             }
+        });
+        if reads_acc {
+            return None;
         }
     }
 
@@ -2541,6 +2541,21 @@ fn same_as_iv(func: &MachFunction, def: &HashMap<u32, InstId>, v: VReg, iv: VReg
 /// Follow `MovR`/`Copy` chains to the underlying value.
 fn strip_copies(func: &MachFunction, def: &HashMap<u32, InstId>, mut v: VReg) -> VReg {
     for _ in 0..16 {
+        // A vreg with several live defs has no single reaching definition: the
+        // def map is LAST-WINS over the emitted layout, so it names whichever
+        // def comes last rather than the one that reaches this use. Every
+        // loop-carried variable is multi-def by construction (a preheader copy
+        // and a latch copy into the same vreg), and every `if`/`match` value has
+        // one def per arm — so walking one resolves an induction variable to its
+        // LATCH source, or a merge value to whichever arm came last.
+        //
+        // Confirmed wrong-code from this exact hole in neon_fill, mac_reg_block,
+        // mac_row_unroll, strided_store_unroll, neon_iota_fill and neon_bytesum.
+        // `swap_range_guard::single_def` and `neon_find`'s bound check were the
+        // in-tree precedents for doing it right.
+        if crate::effects::live_def_count(func, v.id) != 1 {
+            return v;
+        }
         let Some(&d) = def.get(&v.id) else {
             return v;
         };
@@ -2554,14 +2569,10 @@ fn strip_copies(func: &MachFunction, def: &HashMap<u32, InstId>, mut v: VReg) ->
 
 /// Number of LIVE (attached-to-a-block) defs of `v` in the whole function.
 fn count_live_defs(func: &MachFunction, v: VReg) -> usize {
-    func.blocks
+    func.block_order
         .iter()
-        .flat_map(|b| b.insts.iter().copied())
-        .filter(|&id| {
-            let inst = func.inst(id);
-            produces_def(inst.opcode)
-                && matches!(inst.operands.first(), Some(MachOperand::VReg(d)) if d.id == v.id)
-        })
+        .flat_map(|&bid| func.block(bid).insts.iter().copied())
+        .filter(|&id| crate::effects::inst_defines_vreg(func.inst(id), v))
         .count()
 }
 
@@ -3355,7 +3366,7 @@ fn const_value(func: &MachFunction, def: &HashMap<u32, InstId>, val: VReg) -> Op
             let mut acc: Option<i64> = None;
             for &pid in &insts[..=pos] {
                 let pi = func.inst(pid);
-                if pi.operands.first().and_then(vreg_of) != Some(v) || !produces_def(pi.opcode) {
+                if !crate::effects::inst_defines_vreg(pi, v) {
                     continue;
                 }
                 match pi.opcode {
@@ -3411,58 +3422,6 @@ fn move_wide_patch(inst: &MachInst, dst: VReg) -> Option<(i64, u32)> {
     Some((halfword, shift as u32))
 }
 
-/// Conservative "operand 0 is a written def" predicate. Compares/branches do not
-/// define a register; the guard carriers (`TrapBoundsCheckExact` etc.) take their
-/// checked value as operand 0 but do NOT define a fresh vreg — treating them as a
-/// def would clobber the real producer in the last-write-wins map (e.g. a
-/// `MovR(v, iv)` followed by `Trap(v, v, len)` would map `v` to the trap and
-/// break copy-chain stripping). `Cbz`/`Cbnz` likewise TEST operand 0 (the
-/// count-if predicate value) rather than defining it — mapping them as a def
-/// would shadow the real byte-load producer and break `byte_load_base`. `Movk`
-/// DOES define (in place), so last-write-wins correctly picks the `Movk` over
-/// its base `Movz`.
-fn produces_def(op: AArch64Opcode) -> bool {
-    use AArch64Opcode::*;
-    !matches!(
-        op,
-        CmpRR
-            | CmpRI
-            | BCond
-            | B
-            | Cbz
-            | Cbnz
-            | TrapBoundsCheckExact
-            | TrapBoundsCheck
-            | TrapOverflow
-            | TrapOverflowExact
-            | TrapNull
-            | TrapNullIfZero
-            | TrapDivZero
-            | TrapDivZeroIfZero
-            | TrapShiftRange
-            | TrapShiftRangeIfOOB
-            // Stores READ their operand 0 (the stored value) — they define no
-            // vreg. Mapping one as a def would shadow the stored value's REAL
-            // producer in the last-write-wins map and corrupt the copy-chain /
-            // same-as-iv walks (e.g. the `StrbRI` of an init loop elsewhere in
-            // the function shadowing a value the reduction loop also reads).
-            | StrRI
-            | StrbRI
-            | StrhRI
-            | StrRO
-            | StrbRO
-            | StrhRO
-            | StpRI
-            // Pre/post-index stores also list the stored value first (their
-            // base-pointer writeback is an in-place tie, not an operand-0 def).
-            // Excluding them under-maps at worst — a `def.get` miss makes every
-            // caller bail, the fail-closed direction.
-            | StrPreIndex
-            | StrPostIndex
-            | StpPreIndex
-    )
-}
-
 /// Def map (`vreg id -> defining InstId`) over instructions still ATTACHED to a
 /// block. `func.insts` is an append-only ARENA that also retains instructions a
 /// prior pass DETACHED (e.g. the `TrapBoundsCheckExact` carriers
@@ -3494,22 +3453,7 @@ fn build_def_map(func: &MachFunction) -> HashMap<u32, InstId> {
 }
 
 fn build_def_map_inner(func: &MachFunction) -> HashMap<u32, InstId> {
-    let live: HashSet<InstId> = func
-        .blocks
-        .iter()
-        .flat_map(|b| b.insts.iter().copied())
-        .collect();
-    let mut map = HashMap::new();
-    for (idx, inst) in func.insts.iter().enumerate() {
-        let id = InstId(idx as u32);
-        if live.contains(&id)
-            && let Some(MachOperand::VReg(v)) = inst.operands.first()
-            && produces_def(inst.opcode)
-        {
-            map.insert(v.id, id);
-        }
-    }
-    map
+    crate::effects::build_reaching_def_map(func)
 }
 
 fn block_of_inst(func: &MachFunction, target: InstId) -> Option<BlockId> {

@@ -102,7 +102,9 @@ use trust_cg_lower::dispatch::{
     verify_dispatch_plan_properties,
 };
 use trust_cg_lower::target_analysis::ComputeTarget;
-use trust_cg_lower::{AppleAArch64ABI, ArgLocation, TargetRecommendation, Type as LowerType};
+use trust_cg_lower::{
+    AArch64AbiVariant, AppleAArch64ABI, ArgLocation, TargetRecommendation, Type as LowerType,
+};
 
 use crate::coreml_emitter::{
     CoreMLEmitError, CoreMLEmitter, MilProgram, validate_ane_compatibility,
@@ -134,6 +136,10 @@ pub enum PipelineError {
     OptimizationInvariantViolation { function: String, detail: String },
     #[error("encoding failed: {0}")]
     Encoding(String),
+    #[error("ELF reparse gate: {0}")]
+    ElfReparse(String),
+    #[error("relocation inventory digest mismatch: {0}")]
+    RelocationInventoryDigest(String),
     #[error("unsupported opcode during encoding: {0:?}")]
     UnsupportedOpcode(IrOpcode),
     #[error("branch relaxation failed: {0}")]
@@ -10398,7 +10404,7 @@ fn emit_elf_with_function_symbols(
     func_offsets: &[(String, u64)],
     globals: &[ObjectGlobal],
     text_align_log2: u8,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, PipelineError> {
     use crate::elf::ElfWriter;
 
     let mut writer = ElfWriter::new(machine);
@@ -10419,7 +10425,14 @@ fn emit_elf_with_function_symbols(
         // section=1 (.text), STT_FUNC=2, global=true so the linker can see the symbol.
         writer.add_symbol(name, 1, *offset, size, true, 2);
     }
-    writer.write()
+    // Serialize through the checked funnel: the shared ELF reparse gate
+    // independently re-parses the emitted bytes against intent and (at the
+    // default Enforce) fails the write closed on any mismatch — the
+    // per-object binding half of the relocation inventory's Certified
+    // composition (mirrors the x86-64 ELF arm).
+    writer
+        .write_checked()
+        .map_err(|e| PipelineError::ElfReparse(e.to_string()))
 }
 
 fn aarch64_elf_branch_reloc_kind(
@@ -10545,6 +10558,34 @@ fn aarch64_elf_reloc_kind(
     }
 }
 
+/// Map a raw ELF `r_type` value (parsed back OUT of an emitted object) to its
+/// proof-inventory row. The inverse direction of
+/// [`aarch64_elf_object_relocation_kind`], used by the ARTIFACT-LEVEL digest
+/// cross-check: any relocation record found in the object bytes that the
+/// mirrored inventory did not anticipate maps to a kind the inventory lacks
+/// (unknown values land on `AArch64ElfOther`) and fails the digest closed.
+#[cfg(feature = "verify")]
+pub(crate) fn aarch64_elf_kind_from_r_type(r_type: u32) -> trust_cg_verify::ObjectRelocationKind {
+    use crate::elf::constants as c;
+    use trust_cg_verify::ObjectRelocationKind as O;
+    match r_type {
+        c::R_AARCH64_ABS64 => O::AArch64ElfAbs64,
+        c::R_AARCH64_PREL32 => O::AArch64ElfPrel32,
+        c::R_AARCH64_ADR_PREL_PG_HI21 => O::AArch64ElfAdrPrelPgHi21,
+        c::R_AARCH64_ADD_ABS_LO12_NC => O::AArch64ElfAddAbsLo12Nc,
+        c::R_AARCH64_JUMP26 => O::AArch64ElfJump26,
+        c::R_AARCH64_CALL26 => O::AArch64ElfCall26,
+        c::R_AARCH64_ADR_GOT_PAGE => O::AArch64ElfAdrGotPage,
+        c::R_AARCH64_LD64_GOT_LO12_NC => O::AArch64ElfLd64GotLo12Nc,
+        c::R_AARCH64_TLSIE_ADR_GOTTPREL_PAGE21 => O::AArch64ElfTlsieAdrGottprelPage21,
+        c::R_AARCH64_TLSIE_LD64_GOTTPREL_LO12_NC => O::AArch64ElfTlsieLd64GottprelLo12Nc,
+        c::R_AARCH64_TLSLE_ADD_TPREL_HI12 => O::AArch64ElfTlsleAddTprelHi12,
+        c::R_AARCH64_TLSLE_ADD_TPREL_LO12 => O::AArch64ElfTlsleAddTprelLo12,
+        c::R_AARCH64_TLSLE_ADD_TPREL_LO12_NC => O::AArch64ElfTlsleAddTprelLo12Nc,
+        other => O::AArch64ElfOther(other),
+    }
+}
+
 #[cfg(feature = "verify")]
 fn aarch64_elf_object_relocation_kind(
     reloc: crate::elf::AArch64RelocType,
@@ -10604,18 +10645,32 @@ fn aarch64_elf_relocation_inventory_report(
         emitted.push(aarch64_elf_object_relocation_kind(reloc));
     }
     emitted.extend(additional_rows);
-    // Every AArch64 ELF row stays fail-closed for production Certified output.
-    // TLSLE/TLSIE have strict solver-backed formal obligations and negative
-    // controls (`trust_cg_verify::aarch64_elf_tls_reloc_proofs`), but the
-    // inventory surface cannot yet distinguish Trusted solver evidence from
-    // Certified/kernel authority or bind a solver report to this object.
-    // Ordinary rows lack even those target-specific obligations.
+    // The Certified composition, AArch64 ELF lane (mirroring the x86-64 ELF
+    // arm in `x86_64/pipeline.rs`): registry rows cite the standing
+    // solver-backed value proofs (`trust_cg_verify::aarch64_elf_reloc_proofs`,
+    // registered with negative controls in the proof database); the BINDING
+    // half is the shared ELF reparse gate, which the checked-write funnel
+    // runs at Enforce over the exact bytes of every emitted object (a record
+    // mismatch fails the write closed). If the gate is downgraded
+    // (`TCG_NO_ELF_REPARSE` / warn / off), the binding is absent and every
+    // row reports Unverified — promotion re-fails closed. The four EMITTED
+    // TLSLE/TLSIE kinds are registry rows citing their own value lane
+    // (`aarch64_elf_tls_reloc_proofs`); the never-emitted checked non-NC
+    // TPREL_LO12 stays outside the registry (fail-closed) per its doc.
     let registry = trust_cg_verify::ObjectRelocationProofRegistry::aarch64_elf_production();
+    let binding = if crate::elf::reparse::elf_reparse_mode()
+        == crate::elf::reparse::ElfReparseMode::Enforce
+    {
+        trust_cg_verify::ObjectProofBinding::ElfReparseEnforced
+    } else {
+        trust_cg_verify::ObjectProofBinding::Unbound
+    };
     Ok(
-        trust_cg_verify::ObjectRelocationInventoryReport::from_emitted_kinds_with_registry(
+        trust_cg_verify::ObjectRelocationInventoryReport::from_emitted_kinds_with_registry_and_binding(
             object_name,
             emitted,
             &registry,
+            binding,
         ),
     )
 }
@@ -10814,7 +10869,10 @@ fn emit_aarch64_elf_with_supported_fixups(
         );
     }
 
-    Ok(writer.write())
+    // Checked funnel — see emit_elf_with_function_symbols.
+    writer
+        .write_checked()
+        .map_err(|e| PipelineError::ElfReparse(e.to_string()))
 }
 
 /// Shared fail-closed gates for globals headed to the AArch64 ELF emitters.
@@ -10906,13 +10964,14 @@ fn emit_target_elf_or_reject_fixups(
         .map(Some);
     }
 
-    Ok(Some(emit_elf_with_function_symbols(
+    emit_elf_with_function_symbols(
         machine,
         combined_code,
         func_offsets,
         globals,
         text_align_log2,
-    )))
+    )
+    .map(Some)
 }
 
 /// Emit an AArch64 ELF object with whole-module `.eh_frame` unwind tables
@@ -11434,7 +11493,11 @@ fn emit_aarch64_elf_module_with_unwind(
         );
     }
 
-    Ok(Some(writer.write()))
+    // Checked funnel — see emit_elf_with_function_symbols.
+    writer
+        .write_checked()
+        .map(Some)
+        .map_err(|e| PipelineError::ElfReparse(e.to_string()))
 }
 
 fn emit_single_function_target_elf_if_needed(
@@ -14185,8 +14248,15 @@ impl Pipeline {
     /// TLV descriptors, whole-module compact-unwind / DWARF fallback records,
     /// and ELF FDEs. Certified-object promotion must use this method so an
     /// known object-side row can sit outside the proof authority boundary. This
-    /// pre-emission report is not an exact-object digest binding; all non-empty
-    /// production registries remain fail-closed until such a binding exists.
+    /// pre-emission report MIRRORS the emitters' relocation construction; it
+    /// is not an exact-object digest. The per-object binding half of the
+    /// Certified composition is the shared ELF reparse gate, which the
+    /// checked-write funnel runs over every emitted object's exact bytes (a
+    /// record mismatch fails the write closed, so a promoted-but-unreparsed
+    /// object cannot exist). The residual seam — that this mirror and the
+    /// emitters could diverge on WHICH rows exist — is a recorded follow-up
+    /// (an artifact-level row digest); until then, any new emitter relocation
+    /// must be added to this mirror in the same change.
     #[cfg(feature = "verify")]
     pub fn module_relocation_inventory_report_with_object_state(
         &self,
@@ -15305,6 +15375,13 @@ impl Pipeline {
         };
 
         let mut isel = InstructionSelector::new(input.name.clone(), sig.clone());
+        // Select from the compilation target, not the host. DarwinPCS packs
+        // narrow stack arguments while AAPCS64/ELF gives each an 8-byte slot;
+        // using one convention on the other target is silent cross-boundary
+        // wrong code. Set this before formal arguments or calls are lowered.
+        isel.set_abi_variant(AArch64AbiVariant::from_target_triple(
+            &self.config.target_triple,
+        ));
         if let Some(ctx) = proof_ctx {
             isel.seed_lattice_bounds_capabilities(&ctx.lattice_bounds_capabilities);
         }
@@ -22057,15 +22134,15 @@ mod tests {
                 .count(),
             1
         );
-        assert!(
-            !report.is_promotable(),
-            "ABS64/PREL32 are inventoried but have no AArch64-ELF-specific proof authority"
-        );
+        // ABS64/PREL32 now carry the Certified composition: value-lane
+        // registry rows (aarch64_elf_reloc_proofs) + the shared ELF reparse
+        // binding (default Enforce).
+        assert!(report.is_promotable(), "{report:?}");
         assert!(report.entries.iter().all(|entry| {
             matches!(
                 entry.kind,
                 ObjectRelocationKind::AArch64ElfAbs64 | ObjectRelocationKind::AArch64ElfPrel32
-            ) && entry.status == RelocationInventoryStatus::Unverified
+            ) && entry.status == RelocationInventoryStatus::Verified
         }));
     }
 
@@ -22359,7 +22436,8 @@ mod tests {
                 align: 1,
             }],
             2,
-        );
+        )
+        .expect("checked ELF write should pass the reparse gate");
 
         assert_eq!(&obj[0..4], b"\x7fELF");
         assert_eq!(u16::from_le_bytes([obj[18], obj[19]]), 62);

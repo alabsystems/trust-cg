@@ -7,20 +7,27 @@
 //! (`verdict_db/canary_certs/*.lratcert`), consumed by the per-compile
 //! CERT-SKIP tier (`trust_cg_verify::canary_cert`).
 //!
-//! For each certifiable canary obligation (currently: the popcnt SWAR
-//! width-32 canary — the ~16 s/process live solve) this tool:
+//! For each of the sixteen fixed portable canary obligations this tool either
+//! cryptographically upgrades a query-bound existing proof payload or:
 //!
 //!  1. re-proves the obligation `unsat` with a LIVE run of the real `ay`
 //!     (bit-blasting the exact per-compile SMT2 bytes to a DIMACS CNF),
 //!  2. has ay emit a DRAT refutation of that CNF,
-//!  3. trims the proof to its optimized core (`drat-trim -O -l`), and
+//!  3. trims the proof to its checked dependency core (`drat-trim -l`), and
 //!  4. INDEPENDENTLY re-checks the trimmed proof with the vendored
 //!     `drat-trim` before writing anything.
 //!
-//! Writes NOTHING for an obligation that does not prove + independently
-//! check. After regenerating, rebuild (the certs are embedded via
-//! `include_str!`) and commit the new `.lratcert` files; regen both artifacts
-//! together with `regen_verdict_db` when the solver changes.
+//! An existing payload is reusable only when its producer+exact-current-query
+//! key matches and the current checker replays it. Set
+//! `TCG_CANARY_REGEN_ALL=1` to force all sixteen through the fresh AY path.
+//!
+//! Publishes nothing unless every obligation independently checks and every
+//! distinct staged payload is replayed once more by the exact checker bytes
+//! named in the complete staged manifest. Certificate
+//! files are renamed before the manifest, so an interrupted publication can
+//! only disable consumption. After regenerating, rebuild (the certs are
+//! embedded via `include_str!`) and commit all `.lratcert` files plus
+//! `manifest.v1`.
 //!
 //! Run on a QUIET machine: the recorded SMT2 embeds the pinned 30 s solver
 //! budget, and the offline solve must fit it.
@@ -55,6 +62,7 @@ fn main() {
             );
             eprintln!("  solver: {}", report.solver_path);
             eprintln!("  solver-sha256: {}", report.solver_identity);
+            eprintln!("  drat-trim-sha256: {}", report.checker_identity);
             for (name, len) in &report.certs {
                 eprintln!("  cert: {name} ({len} bytes)");
             }

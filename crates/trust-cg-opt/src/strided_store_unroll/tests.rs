@@ -95,6 +95,10 @@ enum Variant {
     ValueInLoop,
     /// rotated do-while: the `iv < N` continue-test is in the LATCH -> BAIL.
     Rotated,
+    /// the BOUND register is redefined in the body, so it is loop-carried and
+    /// the def map (last-wins over the emitted layout) reports the LATCH value
+    /// instead of the one the entry test used -> BAIL.
+    BoundInLoop,
     /// stride has a SECOND def OUTSIDE the inner body (an enclosing-IV analog: a
     /// later, non-dominating redef) -> still inner-loop-invariant, must FIRE.
     StrideMultiDef,
@@ -194,6 +198,11 @@ fn build_strided(cfg: Cfg) -> MachFunction {
         }
         if cfg.variant == Variant::StrideInLoop {
             push(func, into, Movz, vec![x(2), i(cfg.stride)]); // redefine stride in body
+        }
+        if cfg.variant == Variant::BoundInLoop {
+            // A SECOND, larger value for the bound register. The entry test used
+            // the bb0 `Movz x11, n`; this one wins the def map.
+            push(func, into, Movz, vec![x(11), i(4096)]);
         }
         // next = iv + stride.
         match cfg.variant {
@@ -405,7 +414,13 @@ fn coef(
         .flat_map(|b| b.insts.iter().copied())
         .rfind(|&id| {
             let ins = func.inst(id);
-            produces_def(ins.opcode) && vreg_of(&ins.operands[0]).map(|v| v.id) == Some(reg)
+            let mut defines = false;
+            crate::effects::for_each_inst_def(ins, |v| {
+                if v.id == reg {
+                    defines = true;
+                }
+            });
+            defines
         })?;
     let inst = func.inst(d);
     match inst.opcode {
@@ -665,3 +680,180 @@ fn guard_correctness_structure_n1024_s2_q4() {
 // loop while still MATCHing. The per-pass bisect key
 // (`TRUST_CG_DISABLE_PASSES=strided_store_unroll`) IS unit-tested, via the
 // thread-local override in `pipeline::tests`.
+
+// ---------------------------------------------------------------------------
+// UNCONDITIONAL-STORE GATE (the store's block must dominate the latch)
+// ---------------------------------------------------------------------------
+
+/// Build the strided marking loop with an EXTRA in-body conditional in front of
+/// the store block:
+///
+/// ```text
+/// bb0:    setup; B header
+/// header: iv_c = copy iv; cmp iv_c, Nreg; b.lo chk; B exit
+/// chk:    cmp iv, guard; b.lo st; B <side>
+/// st:     addr = base + iv; *addr = val; B latch
+/// latch:  next = iv + stride; iv = copy next; B header
+/// exit:   ret
+/// ```
+///
+/// * `skip_store == true`  -> `<side>` REJOINS the loop at `latch`, i.e.
+///   `if c { base[iv] = v; }` — the store does NOT dominate the latch.
+/// * `skip_store == false` -> `<side>` LEAVES the loop (the p7 residual
+///   bounds-check shape) — the store block still dominates the latch.
+fn build_guarded_store(skip_store: bool) -> MachFunction {
+    use AArch64Opcode::*;
+    let mut func = MachFunction::new("k".to_string(), Signature::new(vec![], vec![]));
+    let bb0 = func.entry;
+    let header = func.create_block();
+    let chk = func.create_block();
+    let st = func.create_block();
+    let latch = func.create_block();
+    let exit = func.create_block();
+    let side = if skip_store { latch } else { exit };
+
+    let push = |func: &mut MachFunction, blk: BlockId, op, ops| {
+        let id = func.push_inst(MachInst::new(op, ops));
+        func.append_inst(blk, id);
+    };
+
+    push(&mut func, bb0, Copy, vec![x(0), x(0)]); // base
+    push(&mut func, bb0, Copy, vec![x(2), x(2)]); // stride (invariant)
+    push(&mut func, bb0, Movz, vec![w(3), i(1)]); // value
+    push(&mut func, bb0, Movz, vec![x(11), i(1024)]); // N
+    push(&mut func, bb0, Copy, vec![x(14), x(14)]); // opaque guard operand
+    push(&mut func, bb0, Movz, vec![x(10), i(4)]); // iv = q0
+    push(&mut func, bb0, B, vec![bl(header)]);
+
+    push(&mut func, header, MovR, vec![x(12), x(10)]);
+    push(&mut func, header, CmpRR, vec![x(12), x(11)]);
+    push(&mut func, header, BCond, vec![i(CC_LO), bl(chk)]);
+    push(&mut func, header, B, vec![bl(exit)]);
+
+    push(&mut func, chk, CmpRR, vec![x(10), x(14)]);
+    push(&mut func, chk, BCond, vec![i(CC_LO), bl(st)]);
+    push(&mut func, chk, B, vec![bl(side)]);
+
+    push(&mut func, st, AddRR, vec![x(20), x(0), x(10)]);
+    push(&mut func, st, StrbRI, vec![w(3), x(20), i(0)]);
+    push(&mut func, st, B, vec![bl(latch)]);
+
+    push(&mut func, latch, AddRR, vec![x(21), x(10), x(2)]);
+    push(&mut func, latch, MovR, vec![x(10), x(21)]);
+    push(&mut func, latch, B, vec![bl(header)]);
+
+    push(&mut func, exit, Ret, vec![]);
+
+    func.add_edge(bb0, header);
+    func.add_edge(header, chk);
+    func.add_edge(header, exit);
+    func.add_edge(chk, st);
+    func.add_edge(chk, side);
+    func.add_edge(st, latch);
+    func.add_edge(latch, header);
+    func
+}
+
+#[test]
+fn bails_on_conditional_store_that_rejoins_the_latch() {
+    // `while q <u N { if c { base[q] = v; } q += s; }` — the store block does NOT
+    // dominate the latch, so unrolling it would perform writes the source skips.
+    // This is the shape that miscompiled p7-with-an-inner-`if` end-to-end.
+    let mut func = build_guarded_store(true);
+    let before = count_op(&func, AArch64Opcode::StrbRI);
+    let (changed, fired) = run(&mut func);
+    assert!(
+        !changed && fired == 0,
+        "conditional store must NOT be unrolled"
+    );
+    assert_eq!(
+        count_op(&func, AArch64Opcode::StrbRI),
+        before,
+        "no replicated stores emitted"
+    );
+}
+
+#[test]
+fn fires_when_side_edge_leaves_the_loop_and_store_dominates_latch() {
+    // The p7 residual bounds-check shape: the in-body branch's other edge LEAVES
+    // the loop, so the store block still dominates the latch and runs on every
+    // header->latch path. Must still fire (this is the pass's whole target).
+    let mut func = build_guarded_store(false);
+    let (changed, fired) = run(&mut func);
+    assert!(
+        changed && fired == 1,
+        "p7 side-edge shape must still unroll"
+    );
+    assert_eq!(
+        count_op(&func, AArch64Opcode::StrbRI),
+        5,
+        "scalar store + 4 unrolled"
+    );
+}
+
+#[test]
+fn bails_when_the_store_sits_in_the_header() {
+    // A store in the header also runs on the EXITING pass, where `iv >=u N` puts
+    // `base+iv` out of bounds. Reject.
+    use AArch64Opcode::*;
+    let mut func = MachFunction::new("k".to_string(), Signature::new(vec![], vec![]));
+    let bb0 = func.entry;
+    let header = func.create_block();
+    let latch = func.create_block();
+    let exit = func.create_block();
+    let push = |func: &mut MachFunction, blk: BlockId, op, ops| {
+        let id = func.push_inst(MachInst::new(op, ops));
+        func.append_inst(blk, id);
+    };
+    push(&mut func, bb0, Copy, vec![x(0), x(0)]);
+    push(&mut func, bb0, Copy, vec![x(2), x(2)]);
+    push(&mut func, bb0, Movz, vec![w(3), i(1)]);
+    push(&mut func, bb0, Movz, vec![x(11), i(1024)]);
+    push(&mut func, bb0, Movz, vec![x(10), i(4)]);
+    push(&mut func, bb0, B, vec![bl(header)]);
+    // The store lives in the header, BEFORE the exit test.
+    push(&mut func, header, AddRR, vec![x(20), x(0), x(10)]);
+    push(&mut func, header, StrbRI, vec![w(3), x(20), i(0)]);
+    push(&mut func, header, MovR, vec![x(12), x(10)]);
+    push(&mut func, header, CmpRR, vec![x(12), x(11)]);
+    push(&mut func, header, BCond, vec![i(CC_LO), bl(latch)]);
+    push(&mut func, header, B, vec![bl(exit)]);
+    push(&mut func, latch, AddRR, vec![x(21), x(10), x(2)]);
+    push(&mut func, latch, MovR, vec![x(10), x(21)]);
+    push(&mut func, latch, B, vec![bl(header)]);
+    push(&mut func, exit, Ret, vec![]);
+    func.add_edge(bb0, header);
+    func.add_edge(header, latch);
+    func.add_edge(header, exit);
+    func.add_edge(latch, header);
+
+    let before = count_op(&func, AArch64Opcode::StrbRI);
+    let (changed, fired) = run(&mut func);
+    assert!(!changed && fired == 0, "header store must NOT be unrolled");
+    assert_eq!(count_op(&func, AArch64Opcode::StrbRI), before);
+}
+
+/// The bound register must have exactly ONE live def before its constant is
+/// believed. A bound the body REASSIGNS is loop-carried, so the def map — which
+/// is last-wins over the emitted layout — reports the LATCH value, not the one
+/// the entry test actually compared against.
+///
+/// Regression (confirmed miscompile, fixed alongside this test):
+/// ```ignore
+/// let mut lim = 4; let mut q = 8;
+/// while q < lim { buf[q] = 1; q += s; lim = 64; }
+/// ```
+/// `8 < 4` is false, so the loop never runs and the program writes NOTHING. The
+/// bound resolved to 64 and the unrolled loop wrote 56 bytes at indices 8..=63,
+/// past a 16-byte buffer into a separate allocation. End-to-end cover:
+/// `benchmarks/shape-coverage/progs/s16_reassigned_bound.rs`.
+#[test]
+fn bails_on_bound_redefined_in_body() {
+    assert_bails(
+        Cfg {
+            variant: Variant::BoundInLoop,
+            ..Cfg::default()
+        },
+        "the bound register is loop-carried, so its map entry is the latch value",
+    );
+}

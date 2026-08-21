@@ -31,8 +31,19 @@
 //!     `EorRR`), so no cross-block/dominance reasoning is needed;
 //!   * the `RorRI` result `t` is SINGLE-USE across the whole function (its only
 //!     read is this `EorRR`), so folding it and deleting the `RorRI` is safe;
+//!   * the matched `RorRI` is the REACHING definition of `t` at the `EorRR` —
+//!     producer entries are invalidated when any later instruction redefines
+//!     the vreg (a stale entry would fuse against a dead rotate);
+//!   * the rotate SOURCE `s` is not redefined between the `RorRI` and the
+//!     `EorRR` — the fusion moves the read of `s` DOWN to the `EorRR` site;
 //!   * the rotate amount `k` is a real in-register rotate, `k` in `[1, width)`;
 //!   * the operand register classes match (all W or all X).
+//!
+//! The single-use oracle is [`crate::effects::aarch64_for_each_use_position`],
+//! which also counts TIED def-use reads (`Movk`/`Bfm` operand 0). A plain
+//! "skip operand 0 of a `produces_value` opcode" scan would miss those and
+//! overstate single-use in exactly the direction that authorizes deleting a
+//! still-live producer.
 //!
 //! The emitted `EorRRShift` is the VERIFIED opcode
 //! (`lowering_proof::all_eor_ror_shift_proofs`, gate-covered W+X); its encoder is
@@ -82,6 +93,14 @@ fn eor_rotate_fuse_pass_id() -> PassId {
     PassId::new("eor-rotate-fuse")
 }
 
+/// A same-block producer definition: the defining instruction plus its
+/// position in the block walk (for reaching-def / source-redefinition guards).
+#[derive(Clone, Copy)]
+struct ProducerDef {
+    inst: InstId,
+    pos: usize,
+}
+
 fn run_eor_rotate_fuse(
     func: &mut MachFunction,
     mut provenance: Option<&mut ProvenanceMap>,
@@ -92,23 +111,29 @@ fn run_eor_rotate_fuse(
 
     let mut changed = false;
     for block_id in func.block_order.clone() {
-        // RorRI defs seen so far IN THIS BLOCK (VReg -> defining InstId). Only
+        // RorRI defs seen so far IN THIS BLOCK (VReg -> producer). Only
         // same-block defs are eligible (the def precedes the use in program
-        // order because we populate this as we walk).
-        let mut ror_defs: HashMap<VReg, InstId> = HashMap::new();
+        // order because we populate this as we walk), and entries are
+        // INVALIDATED when any later instruction redefines the vreg, so a map
+        // hit is the true reaching definition at the consumer.
+        let mut ror_defs: HashMap<VReg, ProducerDef> = HashMap::new();
+        // Most recent in-block def position of EVERY vreg (any opcode). Guards
+        // the folded SOURCE operand: moving its read down to the consumer is
+        // only sound if no intervening instruction redefined it.
+        let mut last_def_pos: HashMap<VReg, usize> = HashMap::new();
 
-        for inst_id in func.block(block_id).insts.clone() {
+        for (pos, inst_id) in func.block(block_id).insts.clone().into_iter().enumerate() {
             let opcode = func.inst(inst_id).opcode;
             match opcode {
-                AArch64Opcode::RorRI => {
-                    if let Some(MachOperand::VReg(dst)) = func.inst(inst_id).operands.first() {
-                        ror_defs.insert(*dst, inst_id);
-                    }
-                }
                 AArch64Opcode::EorRR => {
-                    if let Some((ror_id, fused)) =
-                        try_fuse_eor(func.inst(inst_id), func, &ror_defs, &read_counts)
-                    {
+                    let result = try_fuse_eor(
+                        func.inst(inst_id),
+                        func,
+                        &ror_defs,
+                        &read_counts,
+                        &last_def_pos,
+                    );
+                    if let Some((ror_id, fused)) = result {
                         // Rewrite the EOR in place, preserving proof/source_loc.
                         let orig = func.inst(inst_id);
                         let mut new_inst = fused;
@@ -131,6 +156,32 @@ fn run_eor_rotate_fuse(
                 }
                 _ => {}
             }
+
+            // Record this instruction's defs (AFTER matching — an instruction
+            // is never its own producer). Any def invalidates a stale producer
+            // entry for that vreg; an eligible RorRI then (re)registers.
+            let mut defs: Vec<VReg> = Vec::new();
+            {
+                let inst = func.inst(inst_id);
+                crate::effects::aarch64_for_each_def_position(
+                    inst.opcode,
+                    inst.operands.len(),
+                    |def_pos| {
+                        if let Some(MachOperand::VReg(v)) = inst.operands.get(def_pos) {
+                            defs.push(*v);
+                        }
+                    },
+                );
+            }
+            for v in defs {
+                ror_defs.remove(&v);
+                last_def_pos.insert(v, pos);
+            }
+            if func.inst(inst_id).opcode == AArch64Opcode::RorRI {
+                if let Some(MachOperand::VReg(dst)) = func.inst(inst_id).operands.first() {
+                    ror_defs.insert(*dst, ProducerDef { inst: inst_id, pos });
+                }
+            }
         }
     }
 
@@ -138,24 +189,25 @@ fn run_eor_rotate_fuse(
 }
 
 /// Count, for every VReg, how many times it appears as a READ operand across the
-/// whole function. A read is any operand position that is NOT the instruction's
-/// value-def (operand[0] of a `produces_value` opcode). This is the single-use
-/// oracle: `read_counts[t] == 1` means the only reader of `t` is the candidate
-/// `EorRR`, so folding it and deleting its `RorRI` def is safe.
+/// whole function, using the shared operand-role oracle (which also counts TIED
+/// def-use reads such as `Movk`/`Bfm` operand 0 — a plain "skip operand 0" scan
+/// would miss those and overstate single-use). This is the single-use oracle:
+/// `read_counts[t] == 1` means the only reader of `t` is the candidate `EorRR`,
+/// so folding it and deleting its `RorRI` def is safe.
 fn count_vreg_reads(func: &MachFunction) -> HashMap<VReg, u32> {
     let mut counts: HashMap<VReg, u32> = HashMap::new();
     for &block_id in &func.block_order {
         for &inst_id in &func.block(block_id).insts {
             let inst = func.inst(inst_id);
-            let def_slot = inst.opcode.produces_value();
-            for (idx, operand) in inst.operands.iter().enumerate() {
-                if def_slot && idx == 0 {
-                    continue; // the value-def, not a read
-                }
-                if let MachOperand::VReg(vreg) = operand {
-                    *counts.entry(*vreg).or_insert(0) += 1;
-                }
-            }
+            crate::effects::aarch64_for_each_use_position(
+                inst.opcode,
+                inst.operands.len(),
+                |pos| {
+                    if let Some(MachOperand::VReg(vreg)) = inst.operands.get(pos) {
+                        *counts.entry(*vreg).or_insert(0) += 1;
+                    }
+                },
+            );
         }
     }
     counts
@@ -167,8 +219,9 @@ fn count_vreg_reads(func: &MachFunction) -> HashMap<VReg, u32> {
 fn try_fuse_eor(
     eor: &MachInst,
     func: &MachFunction,
-    ror_defs: &HashMap<VReg, InstId>,
+    ror_defs: &HashMap<VReg, ProducerDef>,
     read_counts: &HashMap<VReg, u32>,
+    last_def_pos: &HashMap<VReg, usize>,
 ) -> Option<(InstId, MachInst)> {
     if eor.operands.len() != 3 {
         return None;
@@ -182,6 +235,7 @@ fn try_fuse_eor(
         func,
         ror_defs,
         read_counts,
+        last_def_pos,
     )
     .or_else(|| {
         try_fuse_with_rotated(
@@ -191,6 +245,7 @@ fn try_fuse_eor(
             func,
             ror_defs,
             read_counts,
+            last_def_pos,
         )
     })
 }
@@ -204,21 +259,30 @@ fn try_fuse_with_rotated(
     rotated_op: &MachOperand,
     plain_op: &MachOperand,
     func: &MachFunction,
-    ror_defs: &HashMap<VReg, InstId>,
+    ror_defs: &HashMap<VReg, ProducerDef>,
     read_counts: &HashMap<VReg, u32>,
+    last_def_pos: &HashMap<VReg, usize>,
 ) -> Option<(InstId, MachInst)> {
     let t = rotated_op.as_vreg()?;
     // t must be SINGLE-USE (only this EOR reads it) so deleting its RorRI is safe.
     if read_counts.get(&t).copied().unwrap_or(0) != 1 {
         return None;
     }
-    let ror_id = *ror_defs.get(&t)?;
+    let ror_def = *ror_defs.get(&t)?;
+    let ror_id = ror_def.inst;
     let ror = func.inst(ror_id);
     if ror.opcode != AArch64Opcode::RorRI || ror.operands.len() != 3 {
         return None;
     }
     let s = ror.operands[1].as_vreg()?; // rotated SOURCE
     let k = ror.operands[2].as_imm()?; // rotate amount
+
+    // s must not be redefined between the RorRI and the EOR: the fusion moves
+    // the read of s DOWN to the EOR site. A def AT the RorRI position is the
+    // RorRI itself writing s (t == s) — also unsafe, also declined.
+    if last_def_pos.get(&s).is_some_and(|&p| p >= ror_def.pos) {
+        return None;
+    }
 
     // Width match: dst, plain (Rn), s (Rm), t must all be the same GPR width, and
     // the rotate amount must be a real in-register rotate in [1, width).

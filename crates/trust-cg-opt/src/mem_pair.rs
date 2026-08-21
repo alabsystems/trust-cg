@@ -30,7 +30,9 @@
 //! Kill switch: `TCG_NO_MEM_PAIR` (compile-time) / per-pass bisect
 //! `TRUST_CG_DISABLE_PASSES=mempair`.
 
-use crate::effects::{aarch64_for_each_def_position, is_removable, opcode_effect, produces_value};
+use crate::effects::{
+    aarch64_for_each_def_position, inst_defines_vreg, is_removable, opcode_effect,
+};
 use crate::pass_manager::MachinePass;
 use std::collections::HashMap;
 use trust_cg_ir::{AArch64Opcode, InstId, MachFunction, MachInst, MachOperand, RegClass, VReg};
@@ -286,15 +288,6 @@ fn operand_refs(inst: &MachInst, v: VReg) -> bool {
     inst.operands.iter().any(|o| o.as_vreg() == Some(v))
 }
 
-/// The vreg an instruction defines (its operand 0), if it produces a value.
-fn def_of(inst: &MachInst) -> Option<VReg> {
-    if produces_value(inst.opcode) {
-        inst.operands.first().and_then(|o| o.as_vreg())
-    } else {
-        None
-    }
-}
-
 /// Every instruction strictly between positions `i` and `j` (in `old`) must be
 /// safe to hoist the load at `j` above: it must NOT write memory / call (which
 /// could change the loaded slot), NOT redefine the `base` address register, and
@@ -314,7 +307,7 @@ fn gap_is_hoist_safe(
         if opcode_effect(inst.opcode).writes_memory() {
             return false;
         }
-        if def_of(inst) == Some(base) {
+        if inst_defines_vreg(inst, base) {
             return false;
         }
         if operand_refs(inst, moved_dst) {
@@ -353,7 +346,7 @@ fn find_windowed_load_partner(
         }
         // A barrier (store/call) or a base redefinition at `j` means no later
         // instruction can be hoisted over it to `i`; stop scanning.
-        if opcode_effect(inst_j.opcode).writes_memory() || def_of(inst_j) == Some(base) {
+        if opcode_effect(inst_j.opcode).writes_memory() || inst_defines_vreg(inst_j, base) {
             break;
         }
     }

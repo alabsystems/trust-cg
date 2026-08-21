@@ -27,6 +27,50 @@ use trust_ir::{Module as TrustIrModule, Ty};
 use trust_ir_build::ModuleBuilder;
 
 // ---------------------------------------------------------------------------
+// Host-native object support (GB10 re-baseline): these e2e tests emit objects
+// the HOST toolchain links and runs, so emission, magic checks, PIE flags and
+// disassembly must follow the host format — Mach-O on macOS, ELF elsewhere.
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+fn host_aarch64_triple() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "aarch64-apple-darwin"
+    } else {
+        "aarch64-unknown-linux-gnu"
+    }
+}
+
+#[allow(dead_code)]
+fn host_no_pie_flag() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "-Wl,-no_pie"
+    } else {
+        "-no-pie"
+    }
+}
+
+#[allow(dead_code)]
+fn host_object_magic_u32() -> u32 {
+    if cfg!(target_os = "macos") {
+        0xFEED_FACF
+    } else {
+        u32::from_le_bytes([0x7F, b'E', b'L', b'F'])
+    }
+}
+
+#[allow(dead_code)]
+fn assert_host_object_magic_bytes(obj_bytes: &[u8], context: &str) {
+    assert!(obj_bytes.len() >= 4, "{context}: object too small");
+    let expected = host_object_magic_u32().to_le_bytes();
+    assert_eq!(
+        &obj_bytes[0..4],
+        &expected,
+        "{context}: object magic must match the host-native format"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Test infrastructure
 // ---------------------------------------------------------------------------
 
@@ -72,7 +116,8 @@ fn compile_module(module: &TrustIrModule) -> Vec<u8> {
     assert!(obj.len() >= 4, "object code too small for Mach-O header");
     let magic = u32::from_le_bytes([obj[0], obj[1], obj[2], obj[3]]);
     assert_eq!(
-        magic, 0xFEED_FACF,
+        magic,
+        host_object_magic_u32(),
         "expected Mach-O 64-bit magic, got {:#010X}",
         magic
     );
@@ -494,9 +539,11 @@ fn e2e_multiblock_builder_all_opt_levels() {
             let obj = &result.object_code;
             let magic = u32::from_le_bytes([obj[0], obj[1], obj[2], obj[3]]);
             assert_eq!(
-                magic, 0xFEED_FACF,
+                magic,
+                host_object_magic_u32(),
                 "{} at {:?} produced invalid Mach-O",
-                name, opt
+                name,
+                opt
             );
 
             eprintln!(

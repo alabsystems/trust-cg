@@ -27,6 +27,50 @@ use trust_cg_opt::cse::CommonSubexprElim;
 use trust_cg_opt::pass_manager::MachinePass;
 
 // ---------------------------------------------------------------------------
+// Host-native object support (GB10 re-baseline): these e2e tests emit objects
+// the HOST toolchain links and runs, so emission, magic checks, PIE flags and
+// disassembly must follow the host format — Mach-O on macOS, ELF elsewhere.
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+fn host_aarch64_triple() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "aarch64-apple-darwin"
+    } else {
+        "aarch64-unknown-linux-gnu"
+    }
+}
+
+#[allow(dead_code)]
+fn host_no_pie_flag() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "-Wl,-no_pie"
+    } else {
+        "-no-pie"
+    }
+}
+
+#[allow(dead_code)]
+fn host_object_magic_u32() -> u32 {
+    if cfg!(target_os = "macos") {
+        0xFEED_FACF
+    } else {
+        u32::from_le_bytes([0x7F, b'E', b'L', b'F'])
+    }
+}
+
+#[allow(dead_code)]
+fn assert_host_object_magic_bytes(obj_bytes: &[u8], context: &str) {
+    assert!(obj_bytes.len() >= 4, "{context}: object too small");
+    let expected = host_object_magic_u32().to_le_bytes();
+    assert_eq!(
+        &obj_bytes[0..4],
+        &expected,
+        "{context}: object magic must match the host-native format"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Test infrastructure
 // ---------------------------------------------------------------------------
 
@@ -55,13 +99,24 @@ fn write_file(dir: &Path, filename: &str, bytes: &[u8]) -> PathBuf {
     path
 }
 
-fn encode_naked_to_macho(func: &MachFunction) -> Vec<u8> {
+/// Encode a MachFunction into a HOST-native object WITHOUT frame lowering
+/// (naked): Mach-O with underscore symbols on macOS, ELF elsewhere.
+fn encode_naked_to_host_object(func: &MachFunction) -> Vec<u8> {
     let code = encode_function(func).expect("encoding should succeed");
-    let mut writer = MachOWriter::new();
-    writer.add_text_section(&code);
-    let symbol_name = format!("_{}", func.name);
-    writer.add_symbol(&symbol_name, 1, 0, true).unwrap();
-    writer.write().unwrap()
+    if cfg!(target_os = "macos") {
+        let mut writer = MachOWriter::new();
+        writer.add_text_section(&code);
+        let symbol_name = format!("_{}", func.name);
+        writer.add_symbol(&symbol_name, 1, 0, true).unwrap();
+        writer.write().unwrap()
+    } else {
+        let mut writer =
+            trust_cg_codegen::elf::ElfWriter::new(trust_cg_codegen::elf::ElfMachine::AArch64);
+        let text = writer.add_text_section(&code);
+        // STT_FUNC = 2; ELF symbols carry no leading underscore.
+        writer.add_symbol(&func.name, text, 0, code.len() as u64, true, 2);
+        writer.write()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -151,7 +206,7 @@ fn test_e2e_432_pos2_plus_neg3_equals_minus1() {
     let mut cse = CommonSubexprElim;
     let _ = cse.run(&mut func);
 
-    let obj_bytes = encode_naked_to_macho(&func);
+    let obj_bytes = encode_naked_to_host_object(&func);
 
     let dir = make_test_dir("pos2_plus_neg3");
     let obj_path = write_file(&dir, "pos2_plus_neg3.o", &obj_bytes);
@@ -177,7 +232,7 @@ int main(void) {
         .arg(&binary)
         .arg(&driver_path)
         .arg(&obj_path)
-        .arg("-Wl,-no_pie")
+        .arg(host_no_pie_flag())
         .output()
         .expect("cc");
     assert!(

@@ -42,7 +42,8 @@ use trust_cg_ir::{InstFlags, InstId, MachFunction, MachOperand, PassId, Provenan
 
 use crate::cache::StableHasher;
 use crate::effects::{
-    MemoryEffect, aarch64_use_operand_positions, inst_produces_value, is_lse_rmw, opcode_effect,
+    MemoryEffect, aarch64_for_each_def_position, aarch64_for_each_use_position,
+    aarch64_use_operand_positions, opcode_effect, single_inst_def,
 };
 use crate::pass_manager::{
     CertifiedPassCheckerRecord, CertifiedPassRunRecord, CertifiedPassRunStatus, MachinePass,
@@ -472,11 +473,7 @@ fn push_unique_dce_failure(
     }
 }
 
-/// Collect all VRegs that appear as source (non-def) operands.
-///
-/// Convention: operand[0] is the destination (def) for instructions that
-/// produce a value. Operands[1..] are sources (uses). For instructions
-/// that don't produce a value (CMP, STR, branches), all operands are uses.
+/// Collect all VRegs that appear as source operands in the shared role model.
 fn collect_used_vregs(func: &MachFunction) -> HashSet<VReg> {
     let mut used = HashSet::new();
 
@@ -485,29 +482,23 @@ fn collect_used_vregs(func: &MachFunction) -> HashSet<VReg> {
         for &inst_id in &block.insts {
             let inst = func.inst(inst_id);
 
-            // Determine which operands are "uses" vs "defs".
-            let use_start = if inst_produces_value(inst) { 1 } else { 0 };
-
-            for operand in &inst.operands[use_start..] {
-                if let MachOperand::VReg(vreg) = operand {
+            // A removable pure tied instruction (for example `Movk`) must not
+            // keep itself alive solely through its own def-use position. A
+            // side-effecting tied form (for example CAS) still needs its input,
+            // because deleting the producer would change the memory operation.
+            let side_effecting = has_side_effects(inst);
+            let mut def_positions = Vec::new();
+            aarch64_for_each_def_position(inst.opcode, inst.operands.len(), |pos| {
+                def_positions.push(pos);
+            });
+            aarch64_for_each_use_position(inst.opcode, inst.operands.len(), |pos| {
+                if !side_effecting && def_positions.contains(&pos) {
+                    return;
+                }
+                if let Some(MachOperand::VReg(vreg)) = inst.operands.get(pos) {
                     used.insert(*vreg);
                 }
-            }
-
-            // LSE read-modify-write atomics (LDADD/LDSET/SWP/...) break the
-            // "operand[0] is the def" convention: their old-value DEF is
-            // operand 1, and operand 0 is the UPDATE value — a pure USE that the
-            // `use_start = 1` scan above skips. Missing it made the atomic's
-            // update-value vreg look unused, so the copy materializing it (e.g.
-            // an incoming-argument move) was deleted as dead — a silent
-            // miscompile where the atomic read a stale/undefined register.
-            // Record operand 0 as used. (CAS keeps operand[0] as a def-use, so
-            // the generic self-def-use handling is intentionally unchanged.)
-            if is_lse_rmw(inst.opcode)
-                && let Some(MachOperand::VReg(vreg)) = inst.operands.first()
-            {
-                used.insert(*vreg);
-            }
+            });
 
             // Phi nodes: all operands except the first (def) are uses.
             // Already handled by use_start = 1 for Phi.
@@ -517,19 +508,10 @@ fn collect_used_vregs(func: &MachFunction) -> HashSet<VReg> {
     used
 }
 
-/// Returns the VReg defined by this instruction, if any.
-///
-/// Convention: for instructions that produce a value, operand[0] is the
-/// destination register (def).
+/// Returns the sole VReg defined by this instruction, if any.
+/// Multi-def instructions fail closed because this DCE has a one-result model.
 fn get_def_vreg(inst: &trust_cg_ir::MachInst) -> Option<VReg> {
-    if !inst_produces_value(inst) {
-        return None;
-    }
-    if let Some(MachOperand::VReg(vreg)) = inst.operands.first() {
-        Some(*vreg)
-    } else {
-        None
-    }
+    single_inst_def(inst)
 }
 
 /// Returns true if this instruction has side effects that prevent removal.

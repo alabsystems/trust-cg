@@ -1,3 +1,6 @@
+#[path = "support/target_dir.rs"]
+mod target_dir_support;
+
 // Integration test: x86 drop-glue Slice 3 (needs-drop ELEMENTS) — a `Box<T>` /
 // `Vec<T>` whose element `T` has its own `Drop`. The drop glue runs `T`'s
 // `drop_in_place` on each initialized element (in ascending order for a `Vec`),
@@ -51,9 +54,7 @@ fn pinned_toolchain() -> String {
 
 fn ensure_dylib_built() -> PathBuf {
     let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| crate_dir.join("target"));
+    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
     let candidates = [
         target_dir
             .join("release")

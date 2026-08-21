@@ -18,6 +18,16 @@ use trust_cg_llvm_import::import_text;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 
+/// These fixtures parse Mach-O structure (MachOParser sections/relocations),
+/// so pin the aarch64-apple-darwin spec explicitly: `Compiler::new` derives
+/// the object format from the HOST, which on Linux emits ELF and fails the
+/// Mach-O parse. Mach-O byte emission is host-independent.
+fn macho_compiler(config: CompilerConfig) -> Compiler {
+    let spec = trust_cg_codegen::target::TargetSpec::parse("aarch64-apple-darwin")
+        .expect("aarch64-apple-darwin parses");
+    Compiler::new_for_target_spec(config, spec)
+}
+
 const LL_PRINTF_STRING_GLOBAL: &str = r#"
 @.str = private unnamed_addr constant [4 x i8] c"%d\0A\00", align 1
 
@@ -158,7 +168,7 @@ define i32 @main() {
 
 fn compile_to_aarch64_object(src: &str, module_name: &str) -> Vec<u8> {
     let module = import_text(src, module_name).expect("import");
-    let compiler = Compiler::new(CompilerConfig {
+    let compiler = macho_compiler(CompilerConfig {
         opt_level: OptLevel::O0,
         target: Target::Aarch64,
         emit_proofs: false,
@@ -221,7 +231,7 @@ fn describe_status(status: ExitStatus) -> String {
 fn imported_printf_string_global_emits_const_data_and_relocation() {
     let module = import_text(LL_PRINTF_STRING_GLOBAL, "printf_string").expect("import");
     assert_eq!(module.globals[0].align, Some(1));
-    let compiler = Compiler::new(CompilerConfig {
+    let compiler = macho_compiler(CompilerConfig {
         opt_level: OptLevel::O0,
         target: Target::Aarch64,
         emit_proofs: false,

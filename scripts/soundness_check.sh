@@ -63,6 +63,8 @@
 #   scripts/soundness_check.sh --list          # list the gates and exit
 #   scripts/soundness_check.sh --validate-clean-summary <log>
 #                                              # validate one Clean log and exit
+#   scripts/soundness_check.sh --self-test-clean-cargo-command
+#                                              # exercise the stock-Cargo wrapper only
 #   scripts/soundness_check.sh -h | --help
 #
 # Each Cargo, Clean, and Lake workload is limited to 7200 seconds by default.
@@ -91,9 +93,20 @@ BASELINE_LEAN_AXIOM=4    # explicit trusted axioms: srcStep_spec, x86Step_decode
 EXPECTED_RUSTC_VERSION="rustc 1.97.1"
 EXPECTED_CARGO_VERSION="cargo 1.97.1"
 
+# Older Clean development configs carried both the host tune and a Trust-only
+# verifier opt-out in their aarch64 target rustflags. This soundness lane
+# deliberately compiles Clean with a diverse stock toolchain. When that legacy
+# stanza is present on the one host where it applies, validate its complete
+# value before a global RUSTFLAGS replacement removes the Trust-only member and
+# retains the compatible tune. A config with no Trust-only flag is already
+# stock-compatible and must be preserved rather than rejected or overwritten.
+CLEAN_STOCK_AARCH64_RUSTFLAGS="-C target-cpu=native"
+CLEAN_TRUST_AARCH64_CONFIG_RUSTFLAGS='rustflags=["-C","target-cpu=native","-Ztrust-verify=off"]'
+
 export PATH="${HOME}/.cargo/bin:${HOME}/.elan/bin:${PATH}"
 export RUSTUP_TOOLCHAIN="1.97.1"
-unset RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER RUSTFLAGS CARGO_ENCODED_RUSTFLAGS
+unset RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER RUSTFLAGS CARGO_ENCODED_RUSTFLAGS \
+  CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS
 
 # ----------------------------------------------------------------------------
 # Flags.
@@ -102,6 +115,7 @@ MODE_PINNED=0     # --pinned : rev drift is a hard FAIL
 MODE_UPDATE=0     # --update : re-pin lock after a green run
 MODE_LIST=0       # --list   : list gates and exit
 MODE_VALIDATE_CLEAN_SUMMARY=""
+MODE_SELF_TEST_CLEAN_CARGO_COMMAND=0
 
 usage() {
   sed -n '2,80p' "$0" | sed 's/^# \{0,1\}//'
@@ -120,6 +134,9 @@ while [ "$#" -gt 0 ]; do
       MODE_VALIDATE_CLEAN_SUMMARY="$2"
       shift
       ;;
+    --self-test-clean-cargo-command)
+      MODE_SELF_TEST_CLEAN_CARGO_COMMAND=1
+      ;;
     -h|--help) usage; exit 0 ;;
     *) echo "soundness_check.sh: unknown argument: $1" >&2
        echo "  try --help" >&2
@@ -132,8 +149,14 @@ if [ "$MODE_PINNED" -eq 1 ] && [ "$MODE_UPDATE" -eq 1 ]; then
   exit 2
 fi
 if [ -n "$MODE_VALIDATE_CLEAN_SUMMARY" ] && \
-   { [ "$MODE_PINNED" -eq 1 ] || [ "$MODE_UPDATE" -eq 1 ] || [ "$MODE_LIST" -eq 1 ]; }; then
+   { [ "$MODE_PINNED" -eq 1 ] || [ "$MODE_UPDATE" -eq 1 ] || [ "$MODE_LIST" -eq 1 ] || \
+     [ "$MODE_SELF_TEST_CLEAN_CARGO_COMMAND" -eq 1 ]; }; then
   echo "soundness_check.sh: --validate-clean-summary cannot be combined with another mode" >&2
+  exit 2
+fi
+if [ "$MODE_SELF_TEST_CLEAN_CARGO_COMMAND" -eq 1 ] && \
+   { [ "$MODE_PINNED" -eq 1 ] || [ "$MODE_UPDATE" -eq 1 ] || [ "$MODE_LIST" -eq 1 ]; }; then
+  echo "soundness_check.sh: --self-test-clean-cargo-command cannot be combined with another mode" >&2
   exit 2
 fi
 
@@ -383,6 +406,123 @@ run_bounded() {
     "$SOUNDNESS_COMMAND_TIMEOUT_SECONDS" "$@"
 }
 
+clean_stock_aarch64_override_required() {
+  [ "$(uname -s 2>/dev/null)" = "Darwin" ] && \
+    [ "$(uname -m 2>/dev/null)" = "arm64" ]
+}
+
+clean_cargo_config_path() {
+  local toml="$CLEAN_DIR/.cargo/config.toml"
+  local legacy="$CLEAN_DIR/.cargo/config"
+  if [ -f "$toml" ] && [ -f "$legacy" ]; then
+    echo "soundness_check.sh: refusing ambiguous Clean Cargo config: both $toml and $legacy exist" >&2
+    return 1
+  fi
+  if [ -f "$toml" ]; then
+    printf '%s\n' "$toml"
+  elif [ -f "$legacy" ]; then
+    printf '%s\n' "$legacy"
+  fi
+}
+
+clean_aarch64_config_rustflags() {
+  local config
+  config="$(clean_cargo_config_path)" || return 1
+  [ -n "$config" ] || return 0
+  awk '
+    /^\[target\.aarch64-apple-darwin\]$/ { in_target=1; next }
+    in_target && /^[[:space:]]*\[/ { in_target=0 }
+    in_target && /^[[:space:]]*rustflags[[:space:]]*=/ {
+      line=$0
+      gsub(/[[:space:]]/, "", line)
+      print line
+    }
+  ' "$config"
+}
+
+clean_build_config_rustflags() {
+  local config
+  config="$(clean_cargo_config_path)" || return 1
+  [ -n "$config" ] || return 0
+  awk '
+    /^\[build\]$/ { in_build=1; next }
+    in_build && /^[[:space:]]*\[/ { in_build=0 }
+    in_build && /^[[:space:]]*rustflags[[:space:]]*=/ {
+      line=$0
+      gsub(/[[:space:]]/, "", line)
+      print line
+    }
+  ' "$config"
+}
+
+validate_clean_stock_rustflags() {
+  # Cargo concatenates target-specific config/env rustflag arrays; a matching
+  # CARGO_TARGET_* override therefore cannot remove Clean's Trust-only `-Z`.
+  # A global RUSTFLAGS value does replace the target stanza, but is sound here
+  # only while the complete legacy stanza is the audited tune + opt-out pair.
+  # Refuse Trust-only config drift instead of silently dropping a new flag.
+  #
+# A Clean config may already contain no Trust-only flag at all. That state
+# needs no override: preserve Cargo's stock-compatible config exactly.
+  local config
+  local observed build_observed target_rows target_trust_rows build_trust_rows
+  config="$(clean_cargo_config_path)" || return 1
+  # A checkout with no repo-local Cargo config has no repo-local Trust-only
+  # flag to neutralize and is already suitable for the stock lane.
+  [ -n "$config" ] || return 0
+  observed="$(clean_aarch64_config_rustflags)" || return 1
+  build_observed="$(clean_build_config_rustflags)" || return 1
+  target_rows="$(printf '%s\n' "$observed" | awk 'NF { count += 1 } END { print count + 0 }')"
+  target_trust_rows="$(printf '%s\n' "$observed" | awk '/-Ztrust-verify/ { count += 1 } END { print count + 0 }')"
+  build_trust_rows="$(printf '%s\n' "$build_observed" | awk '/-Ztrust-verify/ { count += 1 } END { print count + 0 }')"
+
+  # A build-wide Trust opt-out would remain effective on hosts without an
+  # overriding target stanza. It is never part of the audited exception.
+  if [ "$build_trust_rows" -ne 0 ]; then
+    echo "soundness_check.sh: refusing stock Clean cargo lane: unaudited build rustflags: $build_observed" >&2
+    return 1
+  fi
+
+  # On Darwin/aarch64, Trust-only flags in other explicit target or rustdoc
+  # sections are inert for these cargo build and named-integration-test
+  # commands. Audit only the active target rustflags that global RUSTFLAGS
+  # replaces; current Clean also carries an inactive Linux/aarch64 stanza. On
+  # other hosts no replacement occurs, so Cargo retains their target policy
+  # and fails closed if it is incompatible with the stock toolchain.
+  if [ "$target_trust_rows" -eq 0 ]; then
+    return 0
+  fi
+
+  if [ "$target_trust_rows" -ne 1 ] || [ "$target_rows" -ne 1 ] || \
+     [ "$observed" != "$CLEAN_TRUST_AARCH64_CONFIG_RUSTFLAGS" ]; then
+    echo "soundness_check.sh: refusing stock Clean cargo lane: unaudited aarch64 rustflags: $observed" >&2
+    echo "  expected: $CLEAN_TRUST_AARCH64_CONFIG_RUSTFLAGS" >&2
+    return 1
+  fi
+}
+
+run_clean_cargo_bounded() {
+  # run_clean_cargo_bounded <cargo-subcommand> [args...]
+  #
+  # On arm64 Darwin a global RUSTFLAGS value is required: real Cargo appends a
+  # CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS value to the configured array,
+  # leaving the stock-incompatible `-Z` in place. The validation above makes
+  # this replacement exact and fail-closed. Other hosts do not select Clean's
+  # Trust-only stanza and retain their existing target/build flags unchanged.
+  validate_clean_stock_rustflags || return 2
+  if clean_stock_aarch64_override_required && \
+     [ "$(clean_aarch64_config_rustflags)" = "$CLEAN_TRUST_AARCH64_CONFIG_RUSTFLAGS" ]; then
+    run_bounded "$CLEAN_DIR" \
+      env CARGO_TARGET_DIR="$CLEAN_DIR/target" \
+      RUSTFLAGS="$CLEAN_STOCK_AARCH64_RUSTFLAGS" \
+      cargo "$@"
+  else
+    run_bounded "$CLEAN_DIR" \
+      env CARGO_TARGET_DIR="$CLEAN_DIR/target" \
+      cargo "$@"
+  fi
+}
+
 validate_clean_check_summary() {
   # validate_clean_check_summary <captured-clean-check-log>
   #
@@ -448,12 +588,25 @@ fi
 LOGDIR="$(mktemp -d "${TMPDIR:-/tmp}/soundness_check.XXXXXX")"
 
 run_cargo_gate() {
-  # run_cargo_gate <repo_dir> <pkg> <test_target>
+  # run_cargo_gate <repo_dir> <pkg> <test_target> [repo|clean-stock]
   local dir="$1" pkg="$2" target="$3"
+  local cargo_lane="${4:-repo}"
   local log="${LOGDIR}/cargo_${pkg}_${target}.log"
   local rc summary
-  run_bounded "$dir" \
-    cargo test --locked -p "$pkg" --test "$target" >"$log" 2>&1
+  case "$cargo_lane" in
+    repo)
+      run_bounded "$dir" \
+        cargo test --locked -p "$pkg" --test "$target" >"$log" 2>&1
+      ;;
+    clean-stock)
+      run_clean_cargo_bounded \
+        test --locked -p "$pkg" --test "$target" >"$log" 2>&1
+      ;;
+    *)
+      record "$target" FAIL "unknown cargo lane: $cargo_lane"
+      return 1
+      ;;
+  esac
   rc=$?
   summary="$(grep -E '^test result:' "$log" | tail -1)"
   if [ "$rc" -ne 0 ]; then
@@ -493,9 +646,8 @@ run_cargo_gate() {
 build_clean_binary() {
   local log="${LOGDIR}/clean_release_build.log"
   local rc
-  run_bounded "$CLEAN_DIR" \
-    env CARGO_TARGET_DIR="$CLEAN_DIR/target" \
-    cargo build --locked --release -p clean --bin clean >"$log" 2>&1
+  run_clean_cargo_bounded \
+    build --locked --release -p clean --bin clean >"$log" 2>&1
   rc=$?
   if [ "$rc" -ne 0 ] || [ ! -x "$CLEAN_BIN" ]; then
     if [ "$rc" -eq 124 ]; then
@@ -510,6 +662,14 @@ build_clean_binary() {
   record "Clean release binary matches checkout" PASS "$CLEAN_BIN"
   return 0
 }
+
+if [ "$MODE_SELF_TEST_CLEAN_CARGO_COMMAND" -eq 1 ]; then
+  validate_clean_stock_rustflags || exit 1
+  build_clean_binary
+  run_cargo_gate "$CLEAN_DIR" clean-kernel micro_diversity_gate clean-stock
+  [ "$FAIL_COUNT" -eq 0 ]
+  exit $?
+fi
 
 run_clean_check() {
   # run_clean_check <lean_stem>
@@ -781,7 +941,7 @@ for f in "${CLEAN_LEAN[@]}"; do
 done
 
 section "Clean checkout: kernel diversity gate"
-run_cargo_gate "$CLEAN_DIR" clean-kernel micro_diversity_gate
+run_cargo_gate "$CLEAN_DIR" clean-kernel micro_diversity_gate clean-stock
 
 section "formal/lean forward-sim (ENC-1: lake build + sorry/axiom ratchet)"
 run_lean_formal_gate

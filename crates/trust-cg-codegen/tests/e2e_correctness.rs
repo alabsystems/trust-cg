@@ -37,6 +37,50 @@ use trust_ir::{
 };
 
 // ---------------------------------------------------------------------------
+// Host-native object support (GB10 re-baseline): these e2e tests emit objects
+// the HOST toolchain links and runs, so emission, magic checks, PIE flags and
+// disassembly must follow the host format — Mach-O on macOS, ELF elsewhere.
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+fn host_aarch64_triple() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "aarch64-apple-darwin"
+    } else {
+        "aarch64-unknown-linux-gnu"
+    }
+}
+
+#[allow(dead_code)]
+fn host_no_pie_flag() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "-Wl,-no_pie"
+    } else {
+        "-no-pie"
+    }
+}
+
+#[allow(dead_code)]
+fn host_object_magic_u32() -> u32 {
+    if cfg!(target_os = "macos") {
+        0xFEED_FACF
+    } else {
+        u32::from_le_bytes([0x7F, b'E', b'L', b'F'])
+    }
+}
+
+#[allow(dead_code)]
+fn assert_host_object_magic_bytes(obj_bytes: &[u8], context: &str) {
+    assert!(obj_bytes.len() >= 4, "{context}: object too small");
+    let expected = host_object_magic_u32().to_le_bytes();
+    assert_eq!(
+        &obj_bytes[0..4],
+        &expected,
+        "{context}: object magic must match the host-native format"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Test infrastructure
 // ---------------------------------------------------------------------------
 
@@ -78,7 +122,7 @@ fn link_with_cc(dir: &Path, driver_c: &Path, obj: &Path, output_name: &str) -> P
         .arg(&binary)
         .arg(driver_c)
         .arg(obj)
-        .arg("-Wl,-no_pie")
+        .arg(host_no_pie_flag())
         .output()
         .expect("run cc");
 
@@ -120,14 +164,25 @@ fn cleanup(dir: &Path) {
     let _ = fs::remove_dir_all(dir);
 }
 
-/// Encode a MachFunction into Mach-O WITHOUT frame lowering (naked).
-fn encode_naked_to_macho(func: &MachFunction) -> Vec<u8> {
+/// Encode a MachFunction into a HOST-native object WITHOUT frame lowering
+/// (naked): Mach-O with underscore symbols on macOS, ELF elsewhere — the host
+/// `cc` links the result against the C drivers below.
+fn encode_naked_to_host_object(func: &MachFunction) -> Vec<u8> {
     let code = encode_function(func).expect("encoding should succeed");
-    let mut writer = MachOWriter::new();
-    writer.add_text_section(&code);
-    let symbol_name = format!("_{}", func.name);
-    writer.add_symbol(&symbol_name, 1, 0, true).unwrap();
-    writer.write().unwrap()
+    if cfg!(target_os = "macos") {
+        let mut writer = MachOWriter::new();
+        writer.add_text_section(&code);
+        let symbol_name = format!("_{}", func.name);
+        writer.add_symbol(&symbol_name, 1, 0, true).unwrap();
+        writer.write().unwrap()
+    } else {
+        let mut writer =
+            trust_cg_codegen::elf::ElfWriter::new(trust_cg_codegen::elf::ElfMachine::AArch64);
+        let text = writer.add_text_section(&code);
+        // STT_FUNC = 2; ELF symbols carry no leading underscore.
+        writer.add_symbol(&func.name, text, 0, code.len() as u64, true, 2);
+        writer.write()
+    }
 }
 
 // ===========================================================================
@@ -306,7 +361,7 @@ fn test_correctness_fibonacci_machir() {
     let dir = make_test_dir("fibonacci_machir");
 
     let func = build_fibonacci_machir();
-    let obj_bytes = encode_naked_to_macho(&func);
+    let obj_bytes = encode_naked_to_host_object(&func);
     let obj_path = write_object_file(&dir, "fibonacci.o", &obj_bytes);
 
     // C driver that checks all fibonacci values and prints diagnostics.
@@ -552,7 +607,7 @@ fn test_correctness_fibonacci_trust_ir_compiler() {
         result.object_code[2],
         result.object_code[3],
     ]);
-    assert_eq!(magic, 0xFEED_FACF, "valid Mach-O magic");
+    assert_eq!(magic, host_object_magic_u32(), "valid Mach-O magic");
     assert_eq!(result.metrics.function_count, 1);
 
     eprintln!(
@@ -565,15 +620,22 @@ fn test_correctness_fibonacci_trust_ir_compiler() {
     let dir = make_test_dir("fibonacci_trust_ir_compiler");
     let obj_path = write_object_file(&dir, "fibonacci_trust_ir.o", &result.object_code);
 
-    // Disassemble for inspection.
-    let otool = Command::new("otool")
-        .args(["-tv", obj_path.to_str().unwrap()])
-        .output()
-        .expect("otool");
-    eprintln!(
-        "fibonacci_trust_ir disassembly:\n{}",
-        String::from_utf8_lossy(&otool.stdout)
-    );
+    // Disassemble for inspection (host-native tool; output is advisory).
+    let disassembler = if cfg!(target_os = "macos") {
+        Command::new("otool")
+            .args(["-tv", obj_path.to_str().unwrap()])
+            .output()
+    } else {
+        Command::new("objdump")
+            .args(["-d", obj_path.to_str().unwrap()])
+            .output()
+    };
+    if let Ok(output) = disassembler {
+        eprintln!(
+            "fibonacci_trust_ir disassembly:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
 
     // C driver with comprehensive fibonacci checks.
     let driver_src = r#"
@@ -668,7 +730,7 @@ long fibonacci_clang(long n) {
 
     // Step 2: Build the Trust Codegen-compiled fibonacci (hand-coded MachIR).
     let func = build_fibonacci_machir();
-    let trust_cg_obj_bytes = encode_naked_to_macho(&func);
+    let trust_cg_obj_bytes = encode_naked_to_host_object(&func);
     let trust_cg_obj = write_object_file(&dir, "fib_trust-cg.o", &trust_cg_obj_bytes);
 
     // Step 3: Write a comparator driver that calls both and checks agreement.
@@ -704,7 +766,7 @@ int main(void) {
         .arg(&driver_path)
         .arg(&trust_cg_obj)
         .arg(&clang_obj)
-        .arg("-Wl,-no_pie")
+        .arg(host_no_pie_flag())
         .output()
         .expect("run cc for golden truth link");
 
@@ -858,7 +920,7 @@ fn test_correctness_sum_1_to_n() {
     let dir = make_test_dir("sum_1_to_n");
 
     let func = build_sum_1_to_n_machir();
-    let obj_bytes = encode_naked_to_macho(&func);
+    let obj_bytes = encode_naked_to_host_object(&func);
     let obj_path = write_object_file(&dir, "sum_1_to_n.o", &obj_bytes);
 
     let driver_src = r#"

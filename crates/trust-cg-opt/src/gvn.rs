@@ -549,8 +549,8 @@ fn run_gvn(
     // this lazily: any vreg without a value number gets a fresh one when
     // first encountered as a source operand (see operand_vn + fallback below).
 
-    // Walk dominator tree in preorder using a recursive-style iterative
-    // traversal that pushes/pops scopes.
+    // Walk the dominator tree in preorder using an explicit stack that
+    // preserves the recursive algorithm's scope boundaries.
     dom_walk_gvn(
         func,
         dom,
@@ -684,11 +684,14 @@ fn has_non_primary_def(inst: &MachInst) -> bool {
     explicit_def_positions(inst).into_iter().any(|idx| idx != 0)
 }
 
-/// Recursive dominator-tree walk with scope push/pop.
+/// Value-number one dominator-tree node.
+///
+/// Kept separate from [`dom_walk_gvn`] so the tree walk can use an explicit
+/// stack. A dominator chain is common in MIR because every call terminates a
+/// block; recursing once per block exhausted rustc's stack on long functions.
 #[allow(clippy::too_many_arguments)]
-fn dom_walk_gvn(
+fn gvn_process_block(
     func: &MachFunction,
-    dom: &DomTree,
     block_id: BlockId,
     table: &mut ScopedValueTable,
     alloc: &mut ValNumAllocator,
@@ -701,9 +704,6 @@ fn dom_walk_gvn(
     proof_merges: &mut Vec<(InstId, Option<ProofAnnotation>)>,
     proof_dependent_load_eliminations: &mut Vec<ProofDependentLoadElimination>,
 ) {
-    table.push_scope();
-    let outer_load_table = std::mem::take(&mut table.load_table);
-
     let block = func.block(block_id);
     for &inst_id in &block.insts {
         let inst = func.inst(inst_id);
@@ -850,29 +850,67 @@ fn dom_walk_gvn(
     // not enough to prove memory availability at CFG merges: a sibling branch
     // may store to the same address before control reaches the merge block.
     table.load_table.clear();
+}
 
-    // Recurse into dominator-tree children.
-    for &child in dom.children(block_id) {
-        dom_walk_gvn(
-            func,
-            dom,
-            child,
-            table,
-            alloc,
-            def_counts,
-            imm_vns,
-            fimm_vns,
-            replacements,
-            dead_insts,
-            eliminated_merges,
-            proof_merges,
-            proof_dependent_load_eliminations,
-        );
+/// Iterative dominator-tree walk with scope push/pop.
+///
+/// An `Exit` marker follows each node's children on the explicit LIFO stack,
+/// preserving the recursive traversal's scope lifetime and child order. The
+/// load table saved by the old stack frame travels on that marker.
+#[allow(clippy::too_many_arguments)]
+fn dom_walk_gvn(
+    func: &MachFunction,
+    dom: &DomTree,
+    block_id: BlockId,
+    table: &mut ScopedValueTable,
+    alloc: &mut ValNumAllocator,
+    def_counts: &HashMap<VReg, u32>,
+    imm_vns: &mut HashMap<i64, ValNum>,
+    fimm_vns: &mut HashMap<u64, ValNum>,
+    replacements: &mut HashMap<VReg, VReg>,
+    dead_insts: &mut Vec<InstId>,
+    eliminated_merges: &mut Vec<(InstId, InstId)>,
+    proof_merges: &mut Vec<(InstId, Option<ProofAnnotation>)>,
+    proof_dependent_load_eliminations: &mut Vec<ProofDependentLoadElimination>,
+) {
+    enum Step {
+        Enter(BlockId),
+        Exit(HashMap<LoadKey, LoadEntry>),
     }
 
-    table.load_table.clear();
-    table.pop_scope();
-    table.load_table = outer_load_table;
+    let mut work = vec![Step::Enter(block_id)];
+    while let Some(step) = work.pop() {
+        match step {
+            Step::Enter(block_id) => {
+                table.push_scope();
+                let outer_load_table = std::mem::take(&mut table.load_table);
+                gvn_process_block(
+                    func,
+                    block_id,
+                    table,
+                    alloc,
+                    def_counts,
+                    imm_vns,
+                    fimm_vns,
+                    replacements,
+                    dead_insts,
+                    eliminated_merges,
+                    proof_merges,
+                    proof_dependent_load_eliminations,
+                );
+
+                work.push(Step::Exit(outer_load_table));
+                for &child in dom.children(block_id).iter().rev() {
+                    work.push(Step::Enter(child));
+                }
+            }
+            Step::Exit(outer_load_table) => {
+                table.load_table.clear();
+                table.pop_scope();
+                table.load_table = outer_load_table;
+            }
+        }
+    }
 }
 
 /// Build a value-numbered expression key for a pure instruction.
@@ -3050,5 +3088,55 @@ mod tests {
             sbc_count, 2,
             "GVN merged two SBCs across different flag writers — #409 regression"
         );
+    }
+
+    /// A dominator chain deep enough to overflow the old recursive walk must
+    /// remain ordinary data for the iterative implementation.
+    #[test]
+    fn dom_chain_of_50k_blocks_does_not_overflow_the_stack() {
+        const N: u32 = 50_000;
+        let mut func =
+            MachFunction::new("test_gvn_chain".to_string(), Signature::new(vec![], vec![]));
+
+        let entry = func.entry;
+        let head = func.push_inst(MachInst::new(
+            AArch64Opcode::AddRR,
+            vec![vreg(2), vreg(0), vreg(1)],
+        ));
+        func.append_inst(entry, head);
+
+        let mut previous = entry;
+        let mut blocks = Vec::with_capacity(N as usize);
+        for index in 0..N {
+            let next = func.create_block();
+            let branch = func.push_inst(MachInst::new(
+                AArch64Opcode::B,
+                vec![MachOperand::Block(next)],
+            ));
+            func.append_inst(previous, branch);
+            func.add_edge(previous, next);
+            let add = func.push_inst(MachInst::new(
+                AArch64Opcode::AddRR,
+                vec![vreg(100 + index), vreg(0), vreg(1)],
+            ));
+            func.append_inst(next, add);
+            blocks.push(next);
+            previous = next;
+        }
+        let ret = func.push_inst(MachInst::new(AArch64Opcode::Ret, vec![]));
+        func.append_inst(previous, ret);
+
+        let mut gvn = GlobalValueNumbering;
+        assert!(gvn.run(&mut func));
+        for block in blocks {
+            assert!(
+                !func
+                    .block(block)
+                    .insts
+                    .iter()
+                    .any(|&id| func.inst(id).opcode == AArch64Opcode::AddRR),
+                "redundant add survived in {block:?}",
+            );
+        }
     }
 }

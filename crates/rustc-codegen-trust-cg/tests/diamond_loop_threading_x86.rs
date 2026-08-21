@@ -1,3 +1,6 @@
+#[path = "support/target_dir.rs"]
+mod target_dir_support;
+
 // crates/rustc-codegen-trust-cg/tests/diamond_loop_threading_x86.rs
 //
 // #84 (proof-gap program) — DIAMOND-BODY loop back-edge threading VC e2e.
@@ -129,9 +132,7 @@ fn dylib_name() -> String {
 
 fn ensure_dylib_built() -> PathBuf {
     let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| crate_dir.join("target"));
+    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
     let name = dylib_name();
     let candidates = [
         target_dir.join("release").join(&name),

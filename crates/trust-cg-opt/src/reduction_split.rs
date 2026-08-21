@@ -140,7 +140,10 @@ use trust_cg_ir::{
 };
 
 use crate::dom::DomTree;
-use crate::effects::{MemoryEffect, inst_produces_value, opcode_effect};
+use crate::effects::{
+    MemoryEffect, aarch64_for_each_def_position, aarch64_for_each_use_position, for_each_inst_def,
+    inst_defines_vreg, opcode_effect,
+};
 use crate::loops::{LoopAnalysis, NaturalLoop};
 use crate::pass_manager::{AnalysisCache, MachinePass};
 
@@ -512,7 +515,6 @@ fn recognize(func: &MachFunction, lp: &NaturalLoop) -> Option<SplitPlan> {
             }
         }
     }
-
     // -- Loop-carried variables via latch writebacks. --
     let preheader_defs = block_value_defs(func, preheader);
     // (dst, src, writeback-inst)
@@ -630,17 +632,13 @@ fn recognize(func: &MachFunction, lp: &NaturalLoop) -> Option<SplitPlan> {
             if iid == reduction_inst {
                 continue; // the reduction is the one allowed reader of `acc`.
             }
-            let inst = func.inst(iid);
-            let produces = inst_produces_value(inst);
-            for (idx, operand) in inst.operands.iter().enumerate() {
-                if produces && idx == 0 {
-                    continue; // def slot is not a read.
-                }
-                if operand.as_vreg() == Some(acc) {
-                    return None;
-                }
+            if inst_uses_vreg(func.inst(iid), acc) {
+                return None;
             }
         }
+    }
+    if !accumulator_liveout_scope_is_closed(func, lp, preheader, exit, acc) {
+        return None;
     }
 
     // -- Term computation: latch minus control/writeback/reduction/inc. --
@@ -670,17 +668,18 @@ fn recognize(func: &MachFunction, lp: &NaturalLoop) -> Option<SplitPlan> {
     let mut term_defs: HashSet<VReg> = HashSet::new();
     for &iid in &term_insts {
         let inst = func.inst(iid);
-        if !inst_produces_value(inst) {
-            return None;
-        }
-        let def = inst.operands.first().and_then(|o| o.as_vreg())?;
-        for operand in inst.operands.iter().skip(1) {
-            if let Some(v) = operand.as_vreg() {
+        let def = simple_term_def(inst)?;
+        let mut valid_sources = true;
+        aarch64_for_each_use_position(inst.opcode, inst.operands.len(), |pos| {
+            if let Some(v) = inst.operands.get(pos).and_then(MachOperand::as_vreg) {
                 let ok = v == iv || term_defs.contains(&v) || !body_defs.contains(&v);
                 if !ok {
-                    return None;
+                    valid_sources = false;
                 }
             }
+        });
+        if !valid_sources {
+            return None;
         }
         term_defs.insert(def);
     }
@@ -880,6 +879,51 @@ fn validate_header(
     Some((limit_kind, cc))
 }
 
+/// Whether `inst` reads `v` at any modeled use position.
+fn inst_uses_vreg(inst: &MachInst, v: VReg) -> bool {
+    let mut found = false;
+    aarch64_for_each_use_position(inst.opcode, inst.operands.len(), |pos| {
+        if inst.operands.get(pos).and_then(MachOperand::as_vreg) == Some(v) {
+            found = true;
+        }
+    });
+    found
+}
+
+/// The sole untied operand-0 definition supported by the term cloner.
+///
+/// Term cloning has a one-result representation. Multi/nonzero definitions and
+/// tied accumulators cannot be represented by its fresh-destination rewrite,
+/// so recognition must decline them before mutation.
+fn simple_term_def(inst: &MachInst) -> Option<VReg> {
+    let mut defs = Vec::new();
+    aarch64_for_each_def_position(inst.opcode, inst.operands.len(), |pos| defs.push(pos));
+    if defs.as_slice() != [0] {
+        return None;
+    }
+    let mut tied = false;
+    aarch64_for_each_use_position(inst.opcode, inst.operands.len(), |pos| {
+        if pos == 0 {
+            tied = true;
+        }
+    });
+    if tied {
+        return None;
+    }
+    inst.operands.first().and_then(MachOperand::as_vreg)
+}
+
+/// Rewrite exactly the modeled reads of `old`, leaving unrelated defs intact.
+fn rewrite_vreg_uses(inst: &mut MachInst, old: VReg, new: VReg) {
+    let opcode = inst.opcode;
+    let operand_count = inst.operands.len();
+    aarch64_for_each_use_position(opcode, operand_count, |pos| {
+        if inst.operands.get(pos).and_then(MachOperand::as_vreg) == Some(old) {
+            inst.operands[pos] = MachOperand::VReg(new);
+        }
+    });
+}
+
 /// Resolve a vreg to a constant by folding the `Movz` / `Movk` / `MovI`
 /// sequence that defines it in blocks OUTSIDE the loop body.
 fn resolve_const(func: &MachFunction, lp: &NaturalLoop, v: VReg) -> Option<i64> {
@@ -891,7 +935,7 @@ fn resolve_const(func: &MachFunction, lp: &NaturalLoop, v: VReg) -> Option<i64> 
         }
         for &iid in &func.block(bid).insts {
             let inst = func.inst(iid);
-            if inst.operands.first().and_then(|o| o.as_vreg()) != Some(v) {
+            if !inst_defines_vreg(inst, v) {
                 continue;
             }
             match inst.opcode {
@@ -916,11 +960,10 @@ fn resolve_const(func: &MachFunction, lp: &NaturalLoop, v: VReg) -> Option<i64> 
                     val = Some((cur & !(0xFFFFu64 << shift)) | (imm << shift));
                     saw_def = true;
                 }
-                _ if inst_produces_value(inst) => {
+                _ => {
                     // Some other definition of `v` — cannot resolve to a constant.
                     return None;
                 }
-                _ => {}
             }
         }
     }
@@ -933,7 +976,7 @@ fn latch_unique_def(func: &MachFunction, block: BlockId, v: VReg) -> Option<Inst
     let mut found: Option<InstId> = None;
     for &iid in &func.block(block).insts {
         let inst = func.inst(iid);
-        if inst_produces_value(inst) && inst.operands.first().and_then(|o| o.as_vreg()) == Some(v) {
+        if inst_defines_vreg(inst, v) {
             if found.is_some() {
                 return None;
             }
@@ -947,23 +990,21 @@ fn count_defs_in_block(func: &MachFunction, block: BlockId, v: VReg) -> usize {
     let mut n = 0;
     for &iid in &func.block(block).insts {
         let inst = func.inst(iid);
-        if inst_produces_value(inst) && inst.operands.first().and_then(|o| o.as_vreg()) == Some(v) {
+        if inst_defines_vreg(inst, v) {
             n += 1;
         }
     }
     n
 }
 
-/// The set of vregs defined (operand 0 of a value producer) in `block`.
+/// The set of vregs defined at any modeled def position in `block`.
 fn block_value_defs(func: &MachFunction, block: BlockId) -> HashSet<VReg> {
     let mut defs = HashSet::new();
     for &iid in &func.block(block).insts {
         let inst = func.inst(iid);
-        if inst_produces_value(inst)
-            && let Some(v) = inst.operands.first().and_then(|o| o.as_vreg())
-        {
+        for_each_inst_def(inst, |v| {
             defs.insert(v);
-        }
+        });
     }
     defs
 }
@@ -977,14 +1018,48 @@ fn collect_body_defs(func: &MachFunction, lp: &NaturalLoop) -> HashSet<VReg> {
         }
         for &iid in &func.block(bid).insts {
             let inst = func.inst(iid);
-            if inst_produces_value(inst)
-                && let Some(v) = inst.operands.first().and_then(|o| o.as_vreg())
-            {
+            for_each_inst_def(inst, |v| {
                 defs.insert(v);
-            }
+            });
         }
     }
     defs
+}
+
+/// Prove that a whole-function liveout rename of `acc` is scoped to values
+/// produced by this loop.
+///
+/// The preheader initialization and latch writeback are the only permitted
+/// definitions. Every external read must be in a block dominated by the loop's
+/// unique exit; otherwise rewriting it to the post-loop combined value could
+/// create a use-before-def on an entry-side path. Tied external def-use forms
+/// fail closed through the definition check.
+fn accumulator_liveout_scope_is_closed(
+    func: &MachFunction,
+    lp: &NaturalLoop,
+    preheader: BlockId,
+    exit: BlockId,
+    acc: VReg,
+) -> bool {
+    if count_defs_in_block(func, preheader, acc) != 1 {
+        return false;
+    }
+    let dom = DomTree::compute(func);
+    for &bid in &func.block_order {
+        if lp.body.contains(&bid) {
+            continue;
+        }
+        for &iid in &func.block(bid).insts {
+            let inst = func.inst(iid);
+            if inst_defines_vreg(inst, acc) && bid != preheader {
+                return false;
+            }
+            if inst_uses_vreg(inst, acc) && (bid == preheader || !dom.dominates(exit, bid)) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -1231,14 +1306,14 @@ fn analyze_poly_term(
         if coeffs.contains_key(&def) {
             continue; // polynomial def — not opaque, not emitted.
         }
-        for o in inst.operands.iter().skip(1) {
-            if let Some(v) = o.as_vreg()
+        aarch64_for_each_use_position(inst.opcode, inst.operands.len(), |pos| {
+            if let Some(v) = inst.operands.get(pos).and_then(MachOperand::as_vreg)
                 && coeffs.contains_key(&v)
                 && seen.insert(v)
             {
                 boundaries.push(v);
             }
-        }
+        });
     }
     for &r in red_inputs {
         if coeffs.contains_key(&r) && seen.insert(r) {
@@ -2168,6 +2243,7 @@ fn apply_runtime(
     //     construction) are excluded; every other read of acc0 is a liveout and
     //     becomes acc_final, which after the tail holds the fully-reduced value.
     let mut exclude: HashSet<BlockId> = HashSet::new();
+    exclude.insert(plan.preheader);
     exclude.insert(plan.header);
     exclude.insert(plan.latch);
     exclude.insert(combine);
@@ -2182,15 +2258,7 @@ fn apply_runtime(
         }
         let inst_ids: Vec<InstId> = func.block(bid).insts.clone();
         for iid in inst_ids {
-            let produces = inst_produces_value(func.inst(iid));
-            for (idx, op) in func.inst_mut(iid).operands.iter_mut().enumerate() {
-                if produces && idx == 0 {
-                    continue;
-                }
-                if op.as_vreg() == Some(plan.acc) {
-                    *op = MachOperand::VReg(acc_final);
-                }
-            }
+            rewrite_vreg_uses(func.inst_mut(iid), plan.acc, acc_final);
         }
     }
 
@@ -2411,23 +2479,14 @@ fn build_combine_and_rewire(
     // the combine block, whose combine ops legitimately read acc0..accN-1).
     let blocks: Vec<BlockId> = func.block_order.clone();
     for bid in blocks {
-        if plan.header == bid || plan.latch == bid || bid == combine {
+        if plan.preheader == bid || plan.header == bid || plan.latch == bid || bid == combine {
             continue;
         }
         let inst_ids: Vec<InstId> = func.block(bid).insts.clone();
         for iid in inst_ids {
-            // Rewrite only READS of acc0. Operand 0 of a value producer is the
-            // DEF slot (e.g. acc0's own preheader init `MovR acc, #0`) and must
-            // never be rewritten — doing so would leave acc0 uninitialised.
-            let produces = inst_produces_value(func.inst(iid));
-            for (idx, op) in func.inst_mut(iid).operands.iter_mut().enumerate() {
-                if produces && idx == 0 {
-                    continue;
-                }
-                if op.as_vreg() == Some(plan.acc) {
-                    *op = MachOperand::VReg(acc_final);
-                }
-            }
+            // Rewrite only modeled reads of acc0. Its preheader definition must
+            // remain under the original name or the scalar loop is uninitialised.
+            rewrite_vreg_uses(func.inst_mut(iid), plan.acc, acc_final);
         }
     }
 
@@ -2729,17 +2788,13 @@ fn recognize_closed_form(func: &MachFunction, lp: &NaturalLoop) -> Option<Closed
             if iid == reduction_inst {
                 continue;
             }
-            let inst = func.inst(iid);
-            let produces = inst_produces_value(inst);
-            for (idx, operand) in inst.operands.iter().enumerate() {
-                if produces && idx == 0 {
-                    continue;
-                }
-                if operand.as_vreg() == Some(acc) {
-                    return None;
-                }
+            if inst_uses_vreg(func.inst(iid), acc) {
+                return None;
             }
         }
+    }
+    if !accumulator_liveout_scope_is_closed(func, lp, preheader, exit, acc) {
+        return None;
     }
 
     // -- Constant, non-negative start. --
@@ -2784,16 +2839,17 @@ fn recognize_closed_form(func: &MachFunction, lp: &NaturalLoop) -> Option<Closed
     let mut term_defs: HashSet<VReg> = HashSet::new();
     for &iid in &term_insts {
         let inst = func.inst(iid);
-        if !inst_produces_value(inst) {
-            return None;
-        }
-        let def = inst.operands.first().and_then(|o| o.as_vreg())?;
-        for operand in inst.operands.iter().skip(1) {
-            if let Some(v) = operand.as_vreg()
+        let def = simple_term_def(inst)?;
+        let mut valid_sources = true;
+        aarch64_for_each_use_position(inst.opcode, inst.operands.len(), |pos| {
+            if let Some(v) = inst.operands.get(pos).and_then(MachOperand::as_vreg)
                 && !(v == iv || term_defs.contains(&v) || !body_defs.contains(&v))
             {
-                return None;
+                valid_sources = false;
             }
+        });
+        if !valid_sources {
+            return None;
         }
         term_defs.insert(def);
     }
@@ -3289,15 +3345,7 @@ fn apply_closed_form(
         }
         let inst_ids: Vec<InstId> = func.block(bid).insts.clone();
         for iid in inst_ids {
-            let produces = inst_produces_value(func.inst(iid));
-            for (idx, op) in func.inst_mut(iid).operands.iter_mut().enumerate() {
-                if produces && idx == 0 {
-                    continue;
-                }
-                if op.as_vreg() == Some(cf.acc) {
-                    *op = vr(result);
-                }
-            }
+            rewrite_vreg_uses(func.inst_mut(iid), cf.acc, result);
         }
     }
 
@@ -3479,6 +3527,72 @@ mod tests {
     }
 
     #[test]
+    fn term_and_liveout_helpers_follow_nonzero_and_tied_roles() {
+        let ordinary = MachInst::new(AArch64Opcode::AddRR, vec![vreg(9), vreg(3), vreg(2)]);
+        assert_eq!(
+            simple_term_def(&ordinary),
+            Some(VReg::new(9, RegClass::Gpr64))
+        );
+
+        let tied = MachInst::new(AArch64Opcode::Movk, vec![vreg(9), imm(1), imm(16)]);
+        assert_eq!(simple_term_def(&tied), None);
+
+        let nonzero_def = MachInst::new(AArch64Opcode::Ldadd, vec![vreg(4), vreg(9), vreg(8)]);
+        assert_eq!(simple_term_def(&nonzero_def), None);
+
+        let old = VReg::new(4, RegClass::Gpr64);
+        let new = VReg::new(40, RegClass::Gpr64);
+        let result = VReg::new(9, RegClass::Gpr64);
+        let address = VReg::new(8, RegClass::Gpr64);
+        let mut atomic = MachInst::new(
+            AArch64Opcode::Ldadd,
+            vec![
+                MachOperand::VReg(old),
+                MachOperand::VReg(result),
+                MachOperand::VReg(address),
+            ],
+        );
+        rewrite_vreg_uses(&mut atomic, old, new);
+        assert_eq!(atomic.operands[0].as_vreg(), Some(new));
+        assert_eq!(atomic.operands[1].as_vreg(), Some(result));
+    }
+
+    #[test]
+    fn split_declines_nonzero_constant_redefinition() {
+        let mut func = make_reduction_loop(100, sumsq_body);
+        let preheader = func.entry;
+        let branch_pos = func.block(preheader).insts.len() - 1;
+        let redefine = func.push_inst(MachInst::new(
+            AArch64Opcode::Ldadd,
+            vec![vreg(30), vreg(1), vreg(31)],
+        ));
+        func.block_mut(preheader).insts.insert(branch_pos, redefine);
+
+        let mut pass = ReductionSplit;
+        assert!(
+            !pass.run(&mut func),
+            "an operand-1 atomic def must invalidate the stale IV-init constant"
+        );
+    }
+
+    #[test]
+    fn split_declines_tied_liveout_redefinition() {
+        let mut func = make_reduction_loop(100, sumsq_body);
+        let exit = BlockId(2);
+        let movk = func.push_inst(MachInst::new(
+            AArch64Opcode::Movk,
+            vec![vreg(4), imm(0x1234), imm(16)],
+        ));
+        func.block_mut(exit).insts.insert(0, movk);
+
+        let mut pass = ReductionSplit;
+        assert!(
+            !pass.run(&mut func),
+            "an external tied def-use is not a plain post-loop liveout"
+        );
+    }
+
+    #[test]
     fn test_fires_and_widens_accumulators() {
         let mut func = make_reduction_loop(100, sumsq_body);
         let blocks_before = func.block_order.len();
@@ -3542,9 +3656,7 @@ mod tests {
         let acc0 = VReg::new(4, RegClass::Gpr64);
         let exit_uses_v4 = func.block(BlockId(2)).insts.iter().any(|&i| {
             let inst = func.inst(i);
-            inst.operands.iter().enumerate().any(|(idx, o)| {
-                !(inst_produces_value(inst) && idx == 0) && o.as_vreg() == Some(acc0)
-            })
+            inst_uses_vreg(inst, acc0)
         });
         assert!(!exit_uses_v4, "exit liveout must be rewired to acc_final");
     }

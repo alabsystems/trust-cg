@@ -60,6 +60,41 @@ Set `TRUST_CG_AY_TIMEOUT_MS=<milliseconds>` to raise the external solver budget;
 `0` means no timeout. Solver availability never causes the strict gate to
 downgrade silently to statistical evaluation.
 
+## The independent Alethe checker (required to promote UNSAT)
+
+An AY `unsat` is a solver verdict, not a proof. Before it becomes `Verified`,
+the Alethe proof AY emits is re-checked by an **independent** checker — Carcara,
+invoked as `clean cert verify-external <cert.json> --verbose`. Without a usable
+checker, UNSAT stays `Unknown` and the whole solver lane reports itself
+unavailable rather than pretending to authority it does not have.
+
+Resolution order: `$TCG_CLEAN_CHECKER`, else `~/Clean/target/release/clean`.
+
+**The checker must be built with the `carcara-verify` cargo feature:**
+
+```sh
+cargo build --locked --release -p clean --features carcara-verify
+```
+
+That feature is **not** in Clean's default set, and the reason is licensing, not
+build cost: it pulls `carcara -> rug -> gmp-mpfr-sys`, which statically links
+LGPL-3.0-or-later GMP and requires a C toolchain. A plain `cargo build --release`
+therefore produces a `clean` that answers **every** Alethe request with
+`carcara-verify feature required for tier 1 verification` — a refusal that does
+not depend on the proof at all.
+
+Because such a binary rejects valid and invalid proofs identically, trust-cg
+does not take its word for anything. On first use it **probes** the resolved
+checker with a known-good control refutation (a propositional contradiction and
+its one-step Alethe resolution proof). A checker that cannot verify the control
+is treated as ABSENT and announced once on stderr with the build line above,
+instead of being consulted and silently disbelieved. See
+`obligation_cert_store::clean_checker_path`.
+
+This is worth stating plainly because the silent version of this failure was
+expensive: a checker built without the feature cost 22 of 54 compile-gate
+outcomes on one box with no diagnostic of any kind.
+
 ## Coverage boundaries
 
 `ProofDatabase` contains obligations across arithmetic, flags, comparisons,

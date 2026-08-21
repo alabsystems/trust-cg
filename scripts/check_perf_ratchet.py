@@ -279,10 +279,12 @@ def _badge_block(ledger):
         "",
         "> Badge reflects the latest row only. A gate is headline-valid solely on an "
         "`evidence: YES` row (quiet machine, clean tree, default N=3/5, 0 MISMATCH — "
-        "contract §8). On this host every row is `-dirty` because the required LOCAL-ONLY "
-        "`.cargo/config.toml` trust-ir path patch shows as a tracked modification, so a "
-        "literal `evidence: YES` row awaits a clean-tree build path (see the report / "
-        "roadmap BENCH-10).",
+        "contract §8). The first such row was minted 2026-08-20 (`19489f3a2`). The "
+        "long-standing `-dirty` blocker is GONE: the local trust-ir redirect moved out of "
+        "the tracked `.cargo/config.toml` into the gitignored `.cargo/local-siblings.toml` "
+        "(applied via `scripts/use-local-siblings`), so a clean-tree build path exists and "
+        "BENCH-10 is closed. Note `untracked_count` is recorded separately from "
+        "`git_dirty`, so untracked files do not disqualify a row.",
         "",
     ]
     return lines

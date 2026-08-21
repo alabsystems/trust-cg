@@ -1,805 +1,1098 @@
-// trust-cg-verify/canary_cert.rs - CERT-SKIP tier: embedded, independently
-// re-checked DRAT certificates for the fixed, program-independent proof
-// obligations that would otherwise re-solve LIVE on every warm compile.
+// trust-cg-verify/canary_cert.rs - portable, independently replayed canary certs
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache-2.0
-//
-// Reference: docs/beat-llvm-roadmap-2026-07-01.md WORKSTREAM PROOF (PROOF-3
-// follow-up); verdict_db/README.md (trust story); lrat_cert.rs (ENC-6, the
-// certificate machinery this tier consumes).
 
-//! **CERT-SKIP tier** — replace a per-process LIVE solver re-solve of a fixed,
-//! program-independent proof obligation with an independent re-CHECK of a
-//! committed DRAT certificate (deterministic, no solver search, no deadline).
+//! Portable certificate skip for fixed, program-independent proof obligations.
 //!
-//! Three families are certified (all keyed and re-checked identically; see
-//! [`certifiable_canary_obligations`]):
-//!  - the popcnt SWAR width-32 canary (the original ~16 s/process solve), and
-//!  - the x86 **shift** reconstruction obligations (Shl/Shr/Sar at widths
-//!    32/64), and
-//!  - the x86 integer-equality lowering obligation at width 32.
+//! A hit is selected by the exact SMT-LIB query bytes, not by a locally
+//! installed AY binary.  AY is the offline producer recorded in each artifact;
+//! it is deliberately not an online checker or a prerequisite for consuming a
+//! committed certificate.  Authority comes from all of the following:
 //!
-//! Every other recurring reconstruction obligation (add/sub/mul/and/or/xor/
-//! copy/neg/not/extend) is simplifier-closed — `ay` proves it `unsat` WITHOUT
-//! bit-blasting (~25 ms, no DRAT exists to certify) — so it stays on its
-//! already-fast live discharge; a cert is minted ONLY where a genuine
-//! bit-blasted refutation exists AND the re-check is cheaper than the solve.
+//! * a source-embedded manifest binds every expected filename to the SHA-256
+//!   of its complete certificate bytes and to a domain-separated hash of its
+//!   exact SMT-LIB query;
+//! * schema-v3 certificates carry those exact query bytes and bind them to the
+//!   producer AY identity and exported CNF;
+//! * the vendored, independent `drat-trim` executable replays the DRAT proof;
+//! * the executable is hashed before and after replay, and the successful
+//!   process memo is keyed by that checker identity as well as certificate and
+//!   query identity.
 //!
-//! # Why this exists (the compile-time fragility)
+//! Any missing/malformed/mutated artifact, query miss, checker failure, or
+//! identity change returns `false`; the caller then uses the ordinary live
+//! proof path, which remains fail closed.
 //!
-//! `validate_x86_popcnt_expansion_canary` (trust-cg-codegen `compiler.rs`)
-//! re-proves the fixed popcount SWAR width-32 obligation once per rustc
-//! process. The live `ay` solve costs ~16 s of CPU under a 30 s deadline, so
-//! EVERY bridge compile carries a load-fragile 16 s solver run: on a busy
-//! machine the solve can miss the deadline and the compile fails closed even
-//! though nothing regressed (a scheduling fact, not a proof fact).
-//!
-//! # Why a plain verdict cache is NOT the answer
-//!
-//! The 2026-07-10 audit removed the machine-local `.verdict` cache and the
-//! `AYResultCache` precisely because a writable file containing `unsat` could
-//! establish proof authority without revalidation. That decision stands: this
-//! module does **not** reintroduce a recorded-verdict skip. Per
-//! `verdict_db/README.md`: *"Independently checked LRAT certificates can
-//! eventually replace live revalidation for certified rows; an unchecked
-//! recorded verdict cannot."* This tier is that replacement, for exactly the
-//! fixed canary obligations.
-//!
-//! # What a cert hit actually proves (soundness argument)
-//!
-//! A committed [`LratCert`] records the exact SMT2 query bytes' bit-blasted
-//! CNF plus a DRAT refutation of that CNF. On every hit the vendored,
-//! independent `drat-trim` checker replays the refutation and derives the
-//! empty clause **in this process, now** — the recorded verdict itself is
-//! never trusted:
-//!
-//! - **The obligation cannot be forged.** The SMT2 bytes are derived
-//!   in-process from the live SWAR model at lookup time; the cert is keyed by
-//!   `verdict_cache_key_v2(solver-bytes-SHA-256, smt2)`. A regressed SWAR
-//!   table changes the SMT2 bytes, the key misses, and the canary re-proves
-//!   LIVE (and fails closed on a genuine regression) exactly as today.
-//! - **A changed/broken solver cannot serve a stale verdict.** The key binds
-//!   the solver binary's bytes-hash, and the cert's recorded
-//!   `solver_identity` is additionally required to equal the resolved
-//!   solver's bytes-hash. A new/rebuilt/foreign `ay` self-disables the tier.
-//! - **The SAT-search half is INDEPENDENTLY re-checked, not replayed.** The
-//!   16 s of the live run is CDCL search; `drat-trim` confirms UNSAT of the
-//!   recorded CNF with no ay code involved. This is *stronger* than trusting
-//!   a deterministic replay: the combinatorial half of the verdict is
-//!   re-established from scratch on every consume.
-//! - **The residual trusted link is the bit-blast** (SMT2 ↔ CNF), performed
-//!   at regen time by the byte-identical solver the key names. A live solve
-//!   trusts the very same bit-blaster PLUS ay's whole SAT engine, so a cert
-//!   hit's trusted surface is a strict subset of the live run's.
-//! - **The artifact is repo-committed and embedded at build time**
-//!   (`include_str!`), not machine-local writable data. Forging it requires
-//!   modifying the compiler's own source/binary — the same trust class as the
-//!   rest of the compiler, and the exact distinction the audit drew between
-//!   the committed tier-0 DB (kept) and the `.verdict` disk cache (removed).
-//!   Even a repo-level forgery must still get past `drat-trim`: the only
-//!   unchecked degree of freedom is the CNF↔SMT2 correspondence.
-//!
-//! # Fail-closed posture (never weaker than today)
-//!
-//! Every mismatch — key miss, foreign solver identity, malformed cert,
-//! CNF-integrity mismatch, missing checker binary, checker non-VERIFIED —
-//! falls through to the live solver discharge exactly as today, where the
-//! 30 s deadline-miss => fail-closed semantics are unchanged. This tier can
-//! only ever short-circuit to `Verified` after an independent proof check; it
-//! never converts a failure into a pass and never suppresses a live
-//! counterexample (a refutable obligation cannot key-match a cert minted for
-//! the proven one — different SMT2 bytes).
-//!
-//! The check itself has no deadline: DRAT replay is deterministic unit
-//! propagation over a fixed proof, so the load-nondeterminism of the 30 s
-//! solver deadline disappears from the hit path entirely.
-//!
-//! # Kill switches
-//!
-//! - `TCG_CANARY_NO_CACHE=1` — disable this tier only (force the live solve).
-//! - `TCG_NO_PROOF_CACHE=1`  — disables all verdict reuse, including this tier.
-//! - The tier-0 regen recorder being armed also bypasses this tier, so regen
-//!   always observes genuine live solver runs.
+//! Here "portable" means independent of an installed AY producer. It does not
+//! authorize arbitrary `drat-trim` builds: the current checker executable must
+//! match the manifest's reviewed byte identity, so a different platform or
+//! toolchain build deliberately misses until that checker is separately
+//! authorized and the certificate set is replayed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
-use crate::ay_bridge::solver_identity_hash;
-use crate::lrat_cert::{LratCert, parse_cert, recheck_cert};
+use crate::lrat_cert::{
+    LratCert, checker_binary_sha256, parse_cert, recheck_cert_with_expected_checker, sha256_hex,
+};
 
-/// The committed popcnt SWAR width-32 canary certificate (the ~16 s/process
-/// obligation). Empty file = "no cert yet" (tier disabled, live discharge).
-/// Regenerate with `cargo run --release -p trust-cg-verify --bin
-/// regen_canary_certs` (requires the real `ay`; see the module docs).
-const EMBEDDED_POPCNT32_CERT: &str =
-    include_str!("../verdict_db/canary_certs/popcnt_swar_32.lratcert");
+const MANIFEST_SCHEMA: &str = "tcg-canary-cert-manifest-v1";
+const PORTABLE_QUERY_DOMAIN: &[u8] = b"tcg-portable-canary-query-v1\0";
+const EXPECTED_CERT_COUNT: usize = 16;
 
-/// The committed x86 shift reconstruction certs (the dominant recurring
-/// per-compile live-revalidation family — see [`certifiable_reconstruction_obligations`]).
-/// One cert per (op, width). Empty file = "no cert yet" (that entry disabled;
-/// live discharge for its obligation), exactly like the popcnt placeholder.
-const EMBEDDED_RECON_SHL32_CERT: &str =
-    include_str!("../verdict_db/canary_certs/recon_shl_32.lratcert");
-const EMBEDDED_RECON_SHL64_CERT: &str =
-    include_str!("../verdict_db/canary_certs/recon_shl_64.lratcert");
-const EMBEDDED_RECON_SHR32_CERT: &str =
-    include_str!("../verdict_db/canary_certs/recon_shr_32.lratcert");
-const EMBEDDED_RECON_SHR64_CERT: &str =
-    include_str!("../verdict_db/canary_certs/recon_shr_64.lratcert");
-const EMBEDDED_RECON_SAR32_CERT: &str =
-    include_str!("../verdict_db/canary_certs/recon_sar_32.lratcert");
-const EMBEDDED_RECON_SAR64_CERT: &str =
-    include_str!("../verdict_db/canary_certs/recon_sar_64.lratcert");
+const EMBEDDED_MANIFEST: &str = include_str!("../verdict_db/canary_certs/manifest.v1");
 
-/// The committed x86 integer-equality comparison cert. Unlike the ALU/bitwise
-/// reconstruction obligations (simplifier-closed, ~25 ms, no DRAT), the
-/// `Icmp(EQ,I32) -> CMP+SETE` StaticDb lowering obligation forces a genuine
-/// bit-blasted QF_BV refutation (equality over 32-bit words plus the full EFLAGS
-/// model) — measured ~0.30 s live, the single most expensive recurring
-/// per-compile obligation (fires on every `i == n` loop bound). Program-
-/// independent (free symbolic `a`,`b`), so one cert covers all instances.
-/// Empty file = "no cert yet" (that entry disabled; live discharge).
-const EMBEDDED_ICMP_EQ32_CERT: &str =
-    include_str!("../verdict_db/canary_certs/icmp_eq_32.lratcert");
-
-/// `(file name, embedded text)` of every committed cert. The file name is
-/// diagnostic only; the load-bearing binding is each cert's `verdict_key`.
 const EMBEDDED_CERTS: &[(&str, &str)] = &[
-    ("popcnt_swar_32.lratcert", EMBEDDED_POPCNT32_CERT),
-    ("recon_shl_32.lratcert", EMBEDDED_RECON_SHL32_CERT),
-    ("recon_shl_64.lratcert", EMBEDDED_RECON_SHL64_CERT),
-    ("recon_shr_32.lratcert", EMBEDDED_RECON_SHR32_CERT),
-    ("recon_shr_64.lratcert", EMBEDDED_RECON_SHR64_CERT),
-    ("recon_sar_32.lratcert", EMBEDDED_RECON_SAR32_CERT),
-    ("recon_sar_64.lratcert", EMBEDDED_RECON_SAR64_CERT),
-    ("icmp_eq_32.lratcert", EMBEDDED_ICMP_EQ32_CERT),
+    (
+        "popcnt_swar_32.lratcert",
+        include_str!("../verdict_db/canary_certs/popcnt_swar_32.lratcert"),
+    ),
+    (
+        "recon_shl_32.lratcert",
+        include_str!("../verdict_db/canary_certs/recon_shl_32.lratcert"),
+    ),
+    (
+        "recon_shl_64.lratcert",
+        include_str!("../verdict_db/canary_certs/recon_shl_64.lratcert"),
+    ),
+    (
+        "recon_shr_32.lratcert",
+        include_str!("../verdict_db/canary_certs/recon_shr_32.lratcert"),
+    ),
+    (
+        "recon_shr_64.lratcert",
+        include_str!("../verdict_db/canary_certs/recon_shr_64.lratcert"),
+    ),
+    (
+        "recon_sar_32.lratcert",
+        include_str!("../verdict_db/canary_certs/recon_sar_32.lratcert"),
+    ),
+    (
+        "recon_sar_64.lratcert",
+        include_str!("../verdict_db/canary_certs/recon_sar_64.lratcert"),
+    ),
+    (
+        "icmp_eq_32.lratcert",
+        include_str!("../verdict_db/canary_certs/icmp_eq_32.lratcert"),
+    ),
+    (
+        "guard_bounds_32.lratcert",
+        include_str!("../verdict_db/canary_certs/guard_bounds_32.lratcert"),
+    ),
+    (
+        "guard_bounds_64.lratcert",
+        include_str!("../verdict_db/canary_certs/guard_bounds_64.lratcert"),
+    ),
+    (
+        "guard_shift_range_32.lratcert",
+        include_str!("../verdict_db/canary_certs/guard_shift_range_32.lratcert"),
+    ),
+    (
+        "guard_shift_range_64.lratcert",
+        include_str!("../verdict_db/canary_certs/guard_shift_range_64.lratcert"),
+    ),
+    (
+        "guard_null_if_zero_32.lratcert",
+        include_str!("../verdict_db/canary_certs/guard_null_if_zero_32.lratcert"),
+    ),
+    (
+        "guard_null_if_zero_64.lratcert",
+        include_str!("../verdict_db/canary_certs/guard_null_if_zero_64.lratcert"),
+    ),
+    (
+        "guard_div_zero_32.lratcert",
+        include_str!("../verdict_db/canary_certs/guard_div_zero_32.lratcert"),
+    ),
+    (
+        "guard_div_zero_64.lratcert",
+        include_str!("../verdict_db/canary_certs/guard_div_zero_64.lratcert"),
+    ),
 ];
 
-/// Parse the embedded canary certs once per process, keyed by `verdict_key`.
-/// STRICT fail-closed: ANY malformed non-empty cert disables the whole tier
-/// (every lookup misses; the live solver runs). Empty files are placeholders.
-/// The `solver-sha256` a committed cert records, read from its HEADER ONLY.
-///
-/// The header is `tcg-lrat-cert-v2` / `verdict-sha256:` / `solver-sha256:`, so
-/// this costs one 64-char string and no body parse. It exists so a cert that
-/// can NEVER apply on this host is skipped before it is materialized.
-///
-/// MEASURED (2026-08-07): the committed canary certs are 3.6 MB of
-/// `include_str!` (one is 2.46 MB), and parsing them all into owned `LratCert`
-/// values costs ~6.2 MB of RSS — the largest single chunk of the bridge's
-/// compile-memory gap over LLVM. A cert only applies when its recorded solver
-/// identity equals the local solver's, so on any host with a locally-built `ay`
-/// every byte of that is parsed and then never used. Same defect, and the same
-/// fix, as the tier-0 verdict DB (MEM-3).
-///
-/// Returns `None` when the header is absent or malformed; such a cert is then
-/// parsed as before, so a corrupt cert still reaches `parse_cert` and still
-/// disables the tier loudly rather than being skipped silently.
-fn cert_header_solver_identity(text: &str) -> Option<&str> {
+#[derive(Debug, Clone)]
+struct ManifestEntry {
+    file: String,
+    cert_sha256: String,
+    query_sha256: String,
+    producer_ay_sha256: String,
+}
+
+#[derive(Debug)]
+struct CertManifest {
+    drat_trim_checker_sha256: String,
+    entries: Vec<ManifestEntry>,
+}
+
+#[derive(Debug)]
+struct PortableCert {
+    cert: LratCert,
+}
+
+#[derive(Debug)]
+struct PortableCertIndexEntry<'a> {
+    file: String,
+    cert_file_sha256: String,
+    text: &'a str,
+}
+
+#[derive(Debug)]
+struct PortableCertSet<'a> {
+    /// One representative per exact query. Some separately named guard lanes
+    /// are intentional semantic aliases and therefore share a query key.
+    by_query: HashMap<String, PortableCertIndexEntry<'a>>,
+    #[allow(dead_code)]
+    file_count: usize,
+    drat_trim_checker_sha256: String,
+}
+
+fn is_lower_hex_256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+/// A solver-independent identity for the exact query bytes being certified.
+pub(crate) fn portable_query_key(smt2: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(PORTABLE_QUERY_DOMAIN);
+    hasher.update(smt2.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn parse_manifest(text: &str) -> Result<CertManifest, String> {
+    if !text.ends_with('\n') {
+        return Err("manifest must end with a newline".to_string());
+    }
     let mut lines = text.lines();
-    let _schema = lines.next()?;
-    let _verdict = lines.next()?;
-    let identity = lines.next()?.strip_prefix("solver-sha256: ")?;
-    let identity = identity.trim();
-    if identity.len() != 64 || !identity.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
+    if lines.next() != Some(MANIFEST_SCHEMA) {
+        return Err(format!("manifest must start with {MANIFEST_SCHEMA:?}"));
     }
-    Some(identity)
-}
-
-fn embedded_certs(expected_solver_identity: &str) -> Option<&'static HashMap<String, LratCert>> {
-    // Keyed by the identity used to populate it: within one process the
-    // resolved solver is fixed, but the soundness tests drive explicit
-    // stand-in solvers, and serving them a map built for a different identity
-    // would be wrong.
-    static CERTS: OnceLock<(String, Option<HashMap<String, LratCert>>)> = OnceLock::new();
-    let (built_for, map) = CERTS.get_or_init(|| {
-        let built = build_embedded_certs(expected_solver_identity);
-        (expected_solver_identity.to_string(), built)
-    });
-    if built_for != expected_solver_identity {
-        // A second identity in one process: do not serve the cached map.
-        // Conservative — declining CERT-SKIP only means a live discharge.
-        return None;
+    let field = |line: Option<&str>, prefix: &str| -> Result<String, String> {
+        line.and_then(|line| line.strip_prefix(prefix))
+            .map(str::to_string)
+            .ok_or_else(|| format!("manifest missing {prefix:?} field"))
+    };
+    let drat_trim_checker_sha256 = field(lines.next(), "drat-trim-checker-sha256: ")?;
+    if !is_lower_hex_256(&drat_trim_checker_sha256) {
+        return Err("DRAT checker identity is not 64 lowercase hex".to_string());
     }
-    map.as_ref()
-}
-
-fn build_embedded_certs(expected_solver_identity: &str) -> Option<HashMap<String, LratCert>> {
-    {
-        let mut map: HashMap<String, LratCert> = HashMap::new();
-        for (file, text) in EMBEDDED_CERTS {
-            if text.trim().is_empty() {
-                continue; // committed placeholder: no cert yet
-            }
-            // SKIP BEFORE MATERIALIZING: a cert recording a different
-            // solver can never be used (`cert_skip_verified_in` compares
-            // the same identity), so parsing it is pure waste. Reading the
-            // header costs a 64-char borrow; parsing the body costs its
-            // whole text. A cert with an unreadable header falls through
-            // to `parse_cert`, which fails the tier closed as before.
-            if let Some(recorded) = cert_header_solver_identity(text)
-                && recorded != expected_solver_identity
-            {
-                continue;
-            }
-            match parse_cert(text) {
-                Ok(cert) => {
-                    map.insert(cert.verdict_key.clone(), cert);
-                }
-                Err(e) => {
-                    // Fail closed: a corrupt committed cert disables the
-                    // whole tier. Warn once; live discharge continues.
-                    eprintln!(
-                        "trust-cg-verify::canary_cert: WARNING: committed canary \
-                             certificate {file} is malformed and the CERT-SKIP tier has \
-                             been DISABLED (live solver discharge continues): {e}"
-                    );
-                    return None;
-                }
-            }
+    let declared: usize = field(lines.next(), "cert-count: ")?
+        .parse()
+        .map_err(|_| "manifest cert-count is not an integer".to_string())?;
+    let mut entries = Vec::new();
+    for line in lines {
+        let fields: Vec<&str> = line.split_ascii_whitespace().collect();
+        if fields.len() != 5 || fields[0] != "cert:" {
+            return Err(format!("malformed manifest entry {line:?}"));
         }
-        if map.is_empty() { None } else { Some(map) }
+        if fields[1].contains('/') || fields[1].contains('\\') {
+            return Err(format!(
+                "manifest cert filename is not a basename: {:?}",
+                fields[1]
+            ));
+        }
+        if !is_lower_hex_256(fields[2])
+            || !is_lower_hex_256(fields[3])
+            || !is_lower_hex_256(fields[4])
+        {
+            return Err(format!("manifest entry has malformed digest: {line:?}"));
+        }
+        entries.push(ManifestEntry {
+            file: fields[1].to_string(),
+            cert_sha256: fields[2].to_string(),
+            query_sha256: fields[3].to_string(),
+            producer_ay_sha256: fields[4].to_string(),
+        });
     }
+    if entries.len() != declared {
+        return Err(format!(
+            "manifest declares {declared} certs but carries {} entries",
+            entries.len()
+        ));
+    }
+    Ok(CertManifest {
+        drat_trim_checker_sha256,
+        entries,
+    })
 }
 
-/// Is the cert-skip tier enabled? `TCG_CANARY_NO_CACHE=1` disables exactly
-/// this tier (forcing the live canary solve); `TCG_NO_PROOF_CACHE=1` disables
-/// all verdict reuse including this tier.
+fn alias_group(file: &str) -> Option<(&'static str, &'static str)> {
+    let width = if file.ends_with("_32.lratcert") {
+        "32"
+    } else if file.ends_with("_64.lratcert") {
+        "64"
+    } else {
+        return None;
+    };
+    let semantics = if file.starts_with("guard_bounds_") || file.starts_with("guard_shift_range_") {
+        "unsigned-ge"
+    } else if file.starts_with("guard_null_if_zero_") || file.starts_with("guard_div_zero_") {
+        "zero"
+    } else {
+        return None;
+    };
+    Some((semantics, width))
+}
+
+fn allowed_exact_semantic_alias(left: &str, right: &str) -> bool {
+    left != right && alias_group(left).is_some_and(|group| Some(group) == alias_group(right))
+}
+
+fn build_cert_set<'a>(
+    manifest_text: &str,
+    cert_texts: &[(&str, &'a str)],
+    expected_count: usize,
+) -> Result<PortableCertSet<'a>, String> {
+    let manifest = parse_manifest(manifest_text)?;
+    if manifest.entries.len() != expected_count || cert_texts.len() != expected_count {
+        return Err(format!(
+            "portable set must contain exactly {expected_count} certs (manifest {}, embedded {})",
+            manifest.entries.len(),
+            cert_texts.len()
+        ));
+    }
+    let texts: HashMap<&str, &str> = cert_texts.iter().copied().collect();
+    if texts.len() != cert_texts.len() {
+        return Err("duplicate embedded certificate filename".to_string());
+    }
+    let manifest_files: HashSet<&str> = manifest.entries.iter().map(|e| e.file.as_str()).collect();
+    if manifest_files.len() != manifest.entries.len() {
+        return Err("duplicate filename in certificate manifest".to_string());
+    }
+    let embedded_files: HashSet<&str> = texts.keys().copied().collect();
+    if manifest_files != embedded_files {
+        return Err("manifest and embedded certificate filename sets differ".to_string());
+    }
+
+    let mut by_query: HashMap<String, PortableCertIndexEntry<'a>> = HashMap::new();
+    for entry in manifest.entries {
+        let text = texts[entry.file.as_str()];
+        let actual_file_sha = sha256_hex(text.as_bytes());
+        if actual_file_sha != entry.cert_sha256 {
+            return Err(format!(
+                "{} complete-file digest mismatch: manifest {}, embedded {}",
+                entry.file, entry.cert_sha256, actual_file_sha
+            ));
+        }
+        let cert = parse_cert(text).map_err(|e| format!("{}: {e}", entry.file))?;
+        if !cert.carries_obligation_binding() {
+            return Err(format!(
+                "{} uses legacy schema v2 and cannot authorize portable lookup",
+                entry.file
+            ));
+        }
+        if cert.solver_identity != entry.producer_ay_sha256 {
+            return Err(format!(
+                "{} producer AY identity differs from manifest",
+                entry.file
+            ));
+        }
+        let query_sha = portable_query_key(&cert.smt2);
+        if query_sha != entry.query_sha256 {
+            return Err(format!("{} exact-query digest mismatch", entry.file));
+        }
+        let internal_key =
+            crate::ay_bridge::verdict_cache_key_v2(&cert.solver_identity, &cert.smt2);
+        if cert.verdict_key != internal_key {
+            return Err(format!("{} producer/query binding is invalid", entry.file));
+        }
+        if let Some(previous) = by_query.get(&query_sha) {
+            if !allowed_exact_semantic_alias(&previous.file, &entry.file) {
+                return Err(format!(
+                    "{} and {} unexpectedly share an exact query",
+                    previous.file, entry.file
+                ));
+            }
+            // Preserve the first representative. Both complete artifacts were
+            // nevertheless parsed and hash-checked above.
+            continue;
+        }
+        by_query.insert(
+            query_sha,
+            PortableCertIndexEntry {
+                file: entry.file,
+                cert_file_sha256: entry.cert_sha256,
+                text,
+            },
+        );
+    }
+    Ok(PortableCertSet {
+        by_query,
+        file_count: expected_count,
+        drat_trim_checker_sha256: manifest.drat_trim_checker_sha256,
+    })
+}
+
+fn embedded_certs() -> Option<&'static PortableCertSet<'static>> {
+    static CERTS: OnceLock<Option<PortableCertSet<'static>>> = OnceLock::new();
+    CERTS
+        .get_or_init(|| match build_cert_set(EMBEDDED_MANIFEST, EMBEDDED_CERTS, EXPECTED_CERT_COUNT) {
+            Ok(set) => Some(set),
+            Err(error) => {
+                eprintln!(
+                    "trust-cg-verify::canary_cert: WARNING: portable certificate set is invalid; \
+                     CERT-SKIP disabled and live discharge retained: {error}"
+                );
+                None
+            }
+        })
+        .as_ref()
+}
+
 pub(crate) fn cert_skip_enabled() -> bool {
     crate::env_lock::var_os("TCG_CANARY_NO_CACHE").is_none()
         && crate::env_lock::var_os("TCG_NO_PROOF_CACHE").is_none()
 }
 
-/// Process-lifetime memo of independent-check outcomes, keyed by verdict key.
-/// (The canary's own `OnceLock` already bounds this to ~one check per process;
-/// the memo just guards against pathological repeated funnel calls.)
+/// Process memo key = exact query + complete cert bytes + exact checker bytes.
 fn check_memo() -> &'static Mutex<HashMap<String, bool>> {
     static MEMO: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
     MEMO.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// CERT-SKIP consult (the per-compile hot path, called from the CLI solver
-/// funnel): does a committed canary certificate back `verdict_key` for the
-/// resolved solver at `solver_path`, and does the INDEPENDENT `drat-trim`
-/// re-check confirm its recorded refutation NOW, in this process?
-///
-/// `true` means: skip the live solve, the obligation is proven (the CNF was
-/// independently re-confirmed UNSAT and the key binds it to these exact SMT2
-/// bytes under this exact solver binary). `false` means: fall through to the
-/// live solver discharge — never a verdict of its own.
-pub(crate) fn cert_skip_verified(verdict_key: &str, solver_path: &str) -> bool {
-    if !cert_skip_enabled() {
+fn checker_identity_is_authorized(certs: &PortableCertSet<'_>, actual_sha256: &str) -> bool {
+    certs.drat_trim_checker_sha256 == actual_sha256
+}
+
+/// Consume a portable committed certificate for these exact SMT-LIB bytes.
+/// This intentionally performs no AY lookup, version probe, or binary hash.
+pub(crate) fn cert_skip_verified(smt2: &str) -> bool {
+    if !cert_skip_enabled() || crate::verdict_db::recording_active() {
         return false;
     }
-    // Regen must always observe genuine live solver runs (the funnel already
-    // suppresses its cache key while recording; this is defense in depth).
-    if crate::verdict_db::recording_active() {
-        return false;
-    }
-    // Resolve the local solver's identity FIRST: it is needed either way (
-    // `cert_skip_verified_in` compares it against each cert), and passing it in
-    // lets the embedded set skip certs that can never apply instead of parsing
-    // 3.6 MB of committed LRAT to discover the same thing.
-    // A `-dirty` solver cannot be the binary that produced a committed cert, so
-    // decline for ~10ms rather than hashing ~73MB to reach the same answer.
-    if crate::ay_bridge::default_solver_reports_dirty_build(solver_path) {
-        return false;
-    }
-    let Some(identity) = crate::ay_bridge::solver_identity_hash(solver_path) else {
+    let Some(certs) = embedded_certs() else {
         return false;
     };
-    let Some(certs) = embedded_certs(&identity) else {
+    let checker = trust_cg_drat_trim::drat_trim_executable_path();
+    let Some(checker_sha) = checker_binary_sha256(checker) else {
         return false;
     };
+    // The proof was independently checked at regeneration by the executable
+    // recorded in the signed-by-source manifest.  Requiring the same bytes at
+    // consume time prevents an upgraded, downgraded, or replaced checker from
+    // silently inheriting that authority.  A checker change requires an
+    // explicit full regeneration and review of all sixteen artifacts.
+    if !checker_identity_is_authorized(certs, &checker_sha) {
+        return false;
+    }
+    let query_sha = portable_query_key(smt2);
+    let Some(cert) = certs.by_query.get(&query_sha) else {
+        return false;
+    };
+    let memo_key = format!("{}:{}:{}", query_sha, cert.cert_file_sha256, checker_sha);
     if let Some(hit) = check_memo()
         .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .get(verdict_key)
+        .unwrap_or_else(|poison| poison.into_inner())
+        .get(&memo_key)
         .copied()
     {
         return hit;
     }
-    let hit = cert_skip_verified_in(
-        certs,
-        verdict_key,
-        solver_path,
-        trust_cg_drat_trim::drat_trim_executable_path(),
-    );
+    let hit = parse_cert(cert.text).is_ok_and(|parsed| {
+        cert_skip_verified_in(&PortableCert { cert: parsed }, smt2, checker, &checker_sha)
+    });
     check_memo()
         .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(verdict_key.to_string(), hit);
+        .unwrap_or_else(|poison| poison.into_inner())
+        .insert(memo_key, hit);
     hit
 }
 
-/// Core of [`cert_skip_verified`] over an explicit store + checker (no memo,
-/// no env gates) so the refutation tests can drive forged/tampered stores.
-///
-/// The three teeth, in order:
-///  1. key membership (the caller derived `verdict_key` from the resolved
-///     solver's bytes-hash and the exact in-process SMT2 bytes);
-///  2. recorded solver identity == resolved solver identity (defense in depth
-///     — the key already binds it, but a cert must never be consulted under a
-///     solver it does not name);
-///  3. the INDEPENDENT `drat-trim` re-check of the recorded (CNF, DRAT) pair
-///     must derive the empty clause here and now ([`recheck_cert`] also
-///     re-derives the CNF hash, so a tampered CNF never reaches the checker).
 fn cert_skip_verified_in(
-    certs: &HashMap<String, LratCert>,
-    verdict_key: &str,
-    solver_path: &str,
-    drat_trim_exe: &Path,
+    portable: &PortableCert,
+    smt2: &str,
+    checker: &Path,
+    checker_sha256: &str,
 ) -> bool {
-    let Some(cert) = certs.get(verdict_key) else {
-        return false;
-    };
-    let Some(identity) = solver_identity_hash(solver_path) else {
-        // Unreadable solver binary: identity unknown, never serve a cert.
-        return false;
-    };
-    if identity != cert.solver_identity {
-        // SELF-DISABLE: the resolved solver is not the binary the cert names.
+    if portable_query_key(smt2) != portable_query_key(&portable.cert.smt2)
+        || smt2.as_bytes() != portable.cert.smt2.as_bytes()
+    {
         return false;
     }
-    let Ok(dir) = tempfile::tempdir() else {
+    let Ok(workdir) = tempfile::tempdir() else {
         return false;
     };
-    recheck_cert(cert, drat_trim_exe, dir.path()).is_verified()
+    recheck_cert_with_expected_checker(&portable.cert, checker, checker_sha256, workdir.path())
+        .is_verified()
 }
 
-// ---------------------------------------------------------------------------
-// Regen (offline builder — runs the REAL solver, then trims + re-checks)
-// ---------------------------------------------------------------------------
-
-/// Report returned by [`regen_canary_certs`].
 #[derive(Debug)]
 pub struct CanaryCertRegenReport {
-    /// The solver binary whose live run produced the proof.
     pub solver_path: String,
-    /// Its content identity (lowercase-hex SHA-256 of its bytes).
     pub solver_identity: String,
-    /// `(obligation name, cert byte length)` per written cert.
+    pub checker_identity: String,
     pub certs: Vec<(String, usize)>,
 }
 
-/// The fixed obligations worth certifying with a committed, independently
-/// re-checked DRAT certificate: the popcnt SWAR width-32 canary PLUS the
-/// dominant recurring per-compile live-revalidation family — the x86 shift
-/// reconstruction obligations at both emitted GPR widths.
-///
-/// # Why exactly these
-///
-/// A warm `-O3` compile (post the popcnt presence-gate) is dominated by the
-/// `x86_proof_certs` phase (~93% of wall). Within it, the recurring
-/// live-revalidation of the tier-0 candidate rows is the cost. Phase-tracing
-/// each live solver subprocess (`TCG_SOLVE_TRACE`) shows the recurring integer
-/// ALU/bitwise/copy/extend reconstruction obligations are **simplifier-closed**
-/// — `ay` proves them `unsat` WITHOUT reaching the bit-blaster (~25 ms each,
-/// and there is no DRAT to certify). The **shift** obligations are the sole
-/// exception: their `count < width` precondition plus the count-masked machine
-/// encoder force a genuine bit-blasted QF_BV refutation (~0.2 s at w32, ~0.35 s
-/// at w64), and they RECUR (every `x <<= k` / `x >>= k` in the program
-/// canonicalizes to the same six per-(op,width) obligations). Measured
-/// 2026-07-13: the independent `drat-trim` re-check of the committed shift cert
-/// costs ~0.11 s (w32) / ~0.14 s (w64) — roughly half the live solve — so
-/// cert-skip is a genuine net win on exactly this family and a strict no-op on
-/// the simplifier-closed rest (no DRAT exists, so no cert is minted; a lookup
-/// simply misses to the already-fast live solve). Six small certs
-/// (~70–280 KB DRAT core each) cover the whole shift surface.
-///
-/// The guard-carrier canaries live-solve in ~30 ms and stay live; the overflow
-/// canary is 8-bit exhaustive and never reaches the solver.
-///
-/// SOUNDNESS: identical to the popcnt cert-skip. Each cert is keyed by
-/// `verdict_cache_key_v2(solver-sha256, exact db_obligation_smt2 bytes)` and
-/// its recorded DRAT refutation is INDEPENDENTLY re-checked by the vendored
-/// `drat-trim` on every consume before it credits `Verified`; any
-/// miss/mismatch/tamper falls through to the live solve unchanged.
-fn certifiable_canary_obligations() -> Vec<crate::lowering_proof::ProofObligation> {
-    use crate::pass_validators::{PassValidator, PopcntSwarExpansionValidator};
-    let mut out =
-        vec![PopcntSwarExpansionValidator::x86_generic("x86-popcnt-expand", 32).obligation()];
-    out.extend(certifiable_reconstruction_obligations());
-    // The bit-blasted integer-equality comparison (see EMBEDDED_ICMP_EQ32_CERT):
-    // a StaticDb lowering obligation, not a reconstruction row, so it is added
-    // explicitly like the popcnt canary. If a covered model or the SMT2 pipeline
-    // drifts, `committed_cert_keys_match_live_obligation_derivation` fails loudly
-    // and the tier self-disables by key miss (live discharge, sound) meanwhile.
-    out.push(crate::x86_64_lowering_proofs::proof_x86_icmp_eq_i32());
+#[derive(Debug)]
+struct NamedObligation {
+    file: &'static str,
+    obligation: crate::lowering_proof::ProofObligation,
+}
+
+fn certifiable_named_obligations() -> Vec<NamedObligation> {
+    use crate::pass_validators::{
+        GuardCarrierExpansionValidator, GuardCarrierKind, PassValidator,
+        PopcntSwarExpansionValidator,
+    };
+    use trust_cg_ir::x86_64_ops::X86CondCode;
+
+    let mut out = vec![NamedObligation {
+        file: "popcnt_swar_32.lratcert",
+        obligation: PopcntSwarExpansionValidator::x86_generic("x86-popcnt-expand", 32).obligation(),
+    }];
+    for obligation in crate::x86_64_function_verifier::enumerate_reconstruct_tier0_obligations()
+        .into_iter()
+        .filter(|obligation| is_certifiable_shift_reconstruction(&obligation.name))
+    {
+        out.push(NamedObligation {
+            file: reconstruction_file_name(&obligation.name),
+            obligation,
+        });
+    }
+    out.push(NamedObligation {
+        file: "icmp_eq_32.lratcert",
+        obligation: crate::x86_64_lowering_proofs::proof_x86_icmp_eq_i32(),
+    });
+    for (kind, cond, stem) in [
+        (GuardCarrierKind::Bounds, X86CondCode::AE, "guard_bounds"),
+        (
+            GuardCarrierKind::ShiftRange,
+            X86CondCode::AE,
+            "guard_shift_range",
+        ),
+        (
+            GuardCarrierKind::NullIfZero,
+            X86CondCode::E,
+            "guard_null_if_zero",
+        ),
+        (GuardCarrierKind::DivZero, X86CondCode::E, "guard_div_zero"),
+    ] {
+        for (width, suffix) in [(32, "32"), (64, "64")] {
+            let file = match (stem, suffix) {
+                ("guard_bounds", "32") => "guard_bounds_32.lratcert",
+                ("guard_bounds", "64") => "guard_bounds_64.lratcert",
+                ("guard_shift_range", "32") => "guard_shift_range_32.lratcert",
+                ("guard_shift_range", "64") => "guard_shift_range_64.lratcert",
+                ("guard_null_if_zero", "32") => "guard_null_if_zero_32.lratcert",
+                ("guard_null_if_zero", "64") => "guard_null_if_zero_64.lratcert",
+                ("guard_div_zero", "32") => "guard_div_zero_32.lratcert",
+                ("guard_div_zero", "64") => "guard_div_zero_64.lratcert",
+                _ => unreachable!(),
+            };
+            out.push(NamedObligation {
+                file,
+                obligation: GuardCarrierExpansionValidator::new(
+                    "x86-guard-carrier-expand",
+                    kind,
+                    cond,
+                    width,
+                )
+                .obligation(),
+            });
+        }
+    }
+    assert_eq!(out.len(), EXPECTED_CERT_COUNT);
     out
 }
 
-/// The bit-blasted (DRAT-certifiable) subset of the canonical x86 reconstruction
-/// tier-0 obligations: the shift family (Shl/Shr/Sar at widths 32 and 64). This
-/// is the finite, program-independent set of the recurring live-revalidation
-/// obligations that (a) reach the bit-blaster (so a DRAT proof exists to
-/// certify) and (b) live-solve slower than their independent re-check.
-///
-/// Derived by FILTERING the existing canonical enumeration
-/// ([`crate::x86_64_function_verifier::enumerate_reconstruct_tier0_obligations`])
-/// to the shift opcodes, so the certified obligations are byte-identical to the
-/// tier-0 rows the per-compile lookup revalidates — no separate constructor to
-/// drift out of sync. Every other reconstruction family is left on its (already
-/// fast, simplifier-closed) live discharge; a non-shift obligation that reached
-/// this set would simply fail to mint a cert (no DRAT) and self-exclude.
-pub(crate) fn certifiable_reconstruction_obligations() -> Vec<crate::lowering_proof::ProofObligation>
-{
-    crate::x86_64_function_verifier::enumerate_reconstruct_tier0_obligations()
-        .into_iter()
-        .filter(|ob| is_certifiable_shift_reconstruction(&ob.name))
-        .collect()
-}
-
-/// Does this canonical reconstruction obligation name denote an x86 shift
-/// (Shl/Shr/Sar) — the sole bit-blasted, cert-worth family? Matches the RR-form
-/// names produced by the enumeration (e.g. `... Ishl_32 -> ShlRR ...`). The
-/// per-compile RI (immediate-count) instances canonicalize to the SAME freed
-/// obligation, so one cert per (op,width) covers the whole width family.
 fn is_certifiable_shift_reconstruction(name: &str) -> bool {
     name.contains(" -> ShlRR ") || name.contains(" -> ShrRR ") || name.contains(" -> SarRR ")
 }
 
-/// Offline: generate, trim (`drat-trim -O -l`) and independently re-check a
-/// DRAT certificate for each certifiable canary obligation, writing each to
-/// `out_dir/<slug>.lratcert` in the committed `tcg-lrat-cert-v2` format.
-///
-/// Requires the real `ay` (resolved exactly as the compile path resolves it)
-/// and uses the vendored `drat-trim`. Refuses to write anything for an
-/// obligation the solver does not prove `unsat` or the checker does not
-/// independently confirm — a cert can never be minted from anything short of
-/// a live proof plus an independent check.
-///
-/// NOTE: the recorded SMT2 embeds the pinned 30 s DB timeout
-/// ([`crate::verdict_db::db_obligation_smt2`]); run this on a quiet machine
-/// so the offline solve fits the embedded budget.
+fn reconstruction_file_name(name: &str) -> &'static str {
+    for (needle, file) in [
+        ("_32 -> ShlRR", "recon_shl_32.lratcert"),
+        ("_64 -> ShlRR", "recon_shl_64.lratcert"),
+        ("_32 -> ShrRR", "recon_shr_32.lratcert"),
+        ("_64 -> ShrRR", "recon_shr_64.lratcert"),
+        ("_32 -> SarRR", "recon_sar_32.lratcert"),
+        ("_64 -> SarRR", "recon_sar_64.lratcert"),
+    ] {
+        if name.contains(needle) {
+            return file;
+        }
+    }
+    unreachable!("unmapped certified reconstruction obligation: {name:?}")
+}
+
+fn render_manifest(checker_sha: &str, entries: &[ManifestEntry]) -> String {
+    let mut out = format!(
+        "{MANIFEST_SCHEMA}\ndrat-trim-checker-sha256: {checker_sha}\ncert-count: {}\n",
+        entries.len()
+    );
+    for entry in entries {
+        out.push_str(&format!(
+            "cert: {} {} {} {}\n",
+            entry.file, entry.cert_sha256, entry.query_sha256, entry.producer_ay_sha256
+        ));
+    }
+    out
+}
+
+fn replace_file(source: &Path, destination: &Path) -> Result<(), String> {
+    match std::fs::rename(source, destination) {
+        Ok(()) => Ok(()),
+        Err(first) if destination.exists() => {
+            std::fs::remove_file(destination)
+                .map_err(|e| format!("cannot replace {}: {e}", destination.display()))?;
+            std::fs::rename(source, destination).map_err(|e| {
+                format!(
+                    "cannot publish {} after replacement (first error: {first}): {e}",
+                    destination.display()
+                )
+            })
+        }
+        Err(error) => Err(format!("cannot publish {}: {error}", destination.display())),
+    }
+}
+
+/// Upgrade an already-committed proof payload to the portable v3 envelope
+/// without asking AY to rediscover the same refutation. This is admissible
+/// only when the old producer identity plus the exact current SMT2 reproduce
+/// the cert's existing verdict key, and the current authorized drat-trim bytes
+/// independently replay the unchanged CNF/DRAT payload. A stale query is a
+/// normal cache miss; a bound proof that no longer checks is a hard error.
+fn upgrade_replayable_existing_cert(
+    path: &Path,
+    obligation_name: &str,
+    smt2: &str,
+    checker: &Path,
+    checker_identity: &str,
+    workdir: &Path,
+) -> Result<Option<LratCert>, String> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Ok(None);
+    };
+    let Ok(existing) = parse_cert(&text) else {
+        return Ok(None);
+    };
+    if existing.carries_obligation_binding() && existing.smt2 != smt2 {
+        return Ok(None);
+    }
+    let expected_key = crate::ay_bridge::verdict_cache_key_v2(&existing.solver_identity, smt2);
+    if existing.verdict_key != expected_key {
+        eprintln!(
+            "regen_canary_certs: {} is stale for the current exact query \
+             (recorded key {}, current key {}); regenerating",
+            path.display(),
+            existing.verdict_key,
+            expected_key,
+        );
+        return Ok(None);
+    }
+    let upgraded = LratCert::new(
+        existing.verdict_key,
+        existing.solver_identity,
+        obligation_name,
+        existing.cnf,
+        existing.drat,
+        smt2,
+    );
+    match recheck_cert_with_expected_checker(&upgraded, checker, checker_identity, workdir) {
+        outcome if outcome.is_verified() => Ok(Some(upgraded)),
+        outcome => Err(format!(
+            "existing exact-query certificate {} failed independent replay: {outcome:?}",
+            path.display()
+        )),
+    }
+}
+
+/// Offline regeneration. All 16 certificates are checked in a sibling staging
+/// directory. Existing proof payloads are reused only after their historical
+/// producer+exact-current-query key matches and the current checker replays
+/// them; missing/stale payloads are freshly generated. Set
+/// `TCG_CANARY_REGEN_ALL=1` to force fresh AY production for every entry.
+/// Certificate files are published first and the manifest last, so a
+/// crash/partial update can only disable consumption.
 pub fn regen_canary_certs(out_dir: &Path) -> Result<CanaryCertRegenReport, String> {
-    let solver_path = crate::ay_bridge::resolved_solver_path().ok_or_else(|| {
-        "no ay solver binary found (build ~/ay or set AY_SOLVER_PATH)".to_string()
-    })?;
-    let solver_identity = solver_identity_hash(&solver_path)
-        .ok_or_else(|| format!("cannot read/hash solver binary at {solver_path}"))?;
-    let drat_trim_exe = trust_cg_drat_trim::drat_trim_executable_path();
+    let solver_path = crate::ay_bridge::resolved_certificate_producer_path()
+        .ok_or_else(|| "no AY producer found (build AY or set AY_SOLVER_PATH)".to_string())?;
+    let solver_identity = crate::ay_bridge::solver_identity_hash(&solver_path)
+        .ok_or_else(|| format!("cannot read/hash AY producer {solver_path}"))?;
+    let checker = trust_cg_drat_trim::drat_trim_executable_path();
+    let checker_identity = checker_binary_sha256(checker)
+        .ok_or_else(|| format!("cannot read/hash checker {}", checker.display()))?;
+    let parent = out_dir
+        .parent()
+        .ok_or_else(|| format!("certificate output has no parent: {}", out_dir.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    let staging = tempfile::Builder::new()
+        .prefix(".canary-cert-staging-")
+        .tempdir_in(parent)
+        .map_err(|e| format!("cannot create certificate staging directory: {e}"))?;
+
+    let mut report = Vec::new();
+    let mut manifest_entries = Vec::new();
+    let mut generated_texts: Vec<(String, String)> = Vec::new();
+    let mut checked_by_query: HashMap<String, LratCert> = HashMap::new();
+    let force_all = crate::env_lock::var_os("TCG_CANARY_REGEN_ALL").is_some();
+    for named in certifiable_named_obligations() {
+        let workdir = tempfile::tempdir_in(staging.path())
+            .map_err(|e| format!("cannot create proof workdir: {e}"))?;
+        let exact_smt2 = crate::verdict_db::db_obligation_smt2(&named.obligation);
+        let exact_query_key = portable_query_key(&exact_smt2);
+        let cert = if let Some(cert) = checked_by_query.get(&exact_query_key) {
+            // Bounds/ShiftRange and NullIfZero/DivZero are explicitly audited
+            // exact-query aliases. Reuse the already checked proof bytes; the
+            // manifest still carries one complete-file entry per semantic lane.
+            cert.clone()
+        } else {
+            let reusable = if force_all {
+                None
+            } else {
+                upgrade_replayable_existing_cert(
+                    &out_dir.join(named.file),
+                    &named.obligation.name,
+                    &exact_smt2,
+                    checker,
+                    &checker_identity,
+                    workdir.path(),
+                )?
+            };
+            let cert = match reusable {
+                Some(cert) => cert,
+                None => {
+                    let raw = crate::lrat_cert::generate_cert_for_obligation(
+                        &named.obligation,
+                        Path::new(&solver_path),
+                        checker,
+                        workdir.path(),
+                    )?;
+                    crate::lrat_cert::trim_cert(&raw, checker, workdir.path())?
+                }
+            };
+            checked_by_query.insert(exact_query_key, cert.clone());
+            cert
+        };
+        let text = crate::lrat_cert::render_cert(&cert)?;
+        let path = staging.path().join(named.file);
+        std::fs::write(&path, text.as_bytes())
+            .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+        manifest_entries.push(ManifestEntry {
+            file: named.file.to_string(),
+            cert_sha256: sha256_hex(text.as_bytes()),
+            query_sha256: portable_query_key(&cert.smt2),
+            producer_ay_sha256: cert.solver_identity.clone(),
+        });
+        report.push((named.obligation.name, text.len()));
+        generated_texts.push((named.file.to_string(), text));
+    }
+    let manifest = render_manifest(&checker_identity, &manifest_entries);
+    std::fs::write(staging.path().join("manifest.v1"), manifest.as_bytes())
+        .map_err(|e| format!("cannot write staged manifest: {e}"))?;
+
+    // Validate exactly what is about to be published, including the explicit
+    // duplicate-query alias policy.
+    let borrowed: Vec<(&str, &str)> = generated_texts
+        .iter()
+        .map(|(file, text)| (file.as_str(), text.as_str()))
+        .collect();
+    build_cert_set(&manifest, &borrowed, EXPECTED_CERT_COUNT)
+        .map_err(|e| format!("staged portable certificate set is invalid: {e}"))?;
+
+    // Re-establish every distinct staged proof with the EXACT checker bytes
+    // named by the manifest immediately before publication. Generation and
+    // trimming also check their outputs, but those APIs accept a path; a
+    // checker replacement during a long regeneration must not let different
+    // bytes inherit the initial manifest identity. The expected-checker replay
+    // hashes the executable on both sides of each subprocess. Semantic aliases
+    // carry byte-identical certs, so replay each complete-file digest once.
+    let mut replayed_files = HashSet::new();
+    for (file, text) in &generated_texts {
+        let file_sha = sha256_hex(text.as_bytes());
+        if !replayed_files.insert(file_sha) {
+            continue;
+        }
+        let cert = parse_cert(text).map_err(|e| format!("staged {file}: {e}"))?;
+        let workdir = tempfile::tempdir_in(staging.path())
+            .map_err(|e| format!("cannot create final replay workdir for {file}: {e}"))?;
+        let outcome =
+            recheck_cert_with_expected_checker(&cert, checker, &checker_identity, workdir.path());
+        if !outcome.is_verified() {
+            return Err(format!(
+                "staged portable certificate {file} failed final exact-checker replay: \
+                 {outcome:?}"
+            ));
+        }
+    }
 
     std::fs::create_dir_all(out_dir)
         .map_err(|e| format!("cannot create {}: {e}", out_dir.display()))?;
-
-    let mut certs: Vec<(String, usize)> = Vec::new();
-    for obligation in certifiable_canary_obligations() {
-        let workdir = tempfile::tempdir().map_err(|e| format!("cannot create workdir: {e}"))?;
-        let raw = crate::lrat_cert::generate_cert_for_obligation(
-            &obligation,
-            Path::new(&solver_path),
-            drat_trim_exe,
-            workdir.path(),
+    for entry in &manifest_entries {
+        replace_file(
+            &staging.path().join(&entry.file),
+            &out_dir.join(&entry.file),
         )?;
-        let trimmed = crate::lrat_cert::trim_cert(&raw, drat_trim_exe, workdir.path())?;
-        let text = crate::lrat_cert::render_cert(&trimmed)?;
-        let out_path = out_dir.join(cert_file_name(&obligation.name));
-        std::fs::write(&out_path, &text)
-            .map_err(|e| format!("cannot write {}: {e}", out_path.display()))?;
-        eprintln!(
-            "regen_canary_certs: wrote {} ({} bytes; DRAT trimmed {} -> {} bytes)",
-            out_path.display(),
-            text.len(),
-            raw.drat.len(),
-            trimmed.drat.len(),
-        );
-        certs.push((obligation.name.clone(), text.len()));
     }
+    replace_file(
+        &staging.path().join("manifest.v1"),
+        &out_dir.join("manifest.v1"),
+    )?;
 
     Ok(CanaryCertRegenReport {
         solver_path,
         solver_identity,
-        certs,
+        checker_identity,
+        certs: report,
     })
 }
-
-/// The committed file name for a certifiable obligation's cert. Fixed mapping
-/// (the embedded `include_str!` set must match), so regen fails loudly on an
-/// unmapped obligation rather than inventing a file no build embeds.
-///
-/// The shift reconstruction obligations are keyed off the canonical RR-form
-/// opcode + emitted width both present in their name (e.g.
-/// `... Ishl_32 -> ShlRR ...` -> `recon_shl_32.lratcert`). Kept an explicit
-/// match (not a free-form slug) so an obligation whose name shape changes
-/// panics here at regen time — a loud, source-visible failure — rather than
-/// silently minting an un-embedded file.
-fn cert_file_name(obligation_name: &str) -> &'static str {
-    if obligation_name.contains("popcount SWAR") && obligation_name.contains("(i32)") {
-        return "popcnt_swar_32.lratcert";
-    }
-    // Integer-equality comparison cert (StaticDb lowering obligation).
-    if obligation_name == "x86_64: Icmp_EQ_I32 -> CMP+SETE" {
-        return "icmp_eq_32.lratcert";
-    }
-    // Shift reconstruction certs: (op, width) -> committed file. The width digit
-    // sits in the `_<w> ->` fragment (e.g. `Ishl_32 ->`).
-    let has_w32 = obligation_name.contains("_32 -> ");
-    let has_w64 = obligation_name.contains("_64 -> ");
-    if obligation_name.contains(" -> ShlRR ") {
-        if has_w32 {
-            return "recon_shl_32.lratcert";
-        }
-        if has_w64 {
-            return "recon_shl_64.lratcert";
-        }
-    }
-    if obligation_name.contains(" -> ShrRR ") {
-        if has_w32 {
-            return "recon_shr_32.lratcert";
-        }
-        if has_w64 {
-            return "recon_shr_64.lratcert";
-        }
-    }
-    if obligation_name.contains(" -> SarRR ") {
-        if has_w32 {
-            return "recon_sar_32.lratcert";
-        }
-        if has_w64 {
-            return "recon_sar_64.lratcert";
-        }
-    }
-    unreachable!(
-        "certifiable_canary_obligations() produced an obligation with no committed \
-         cert file mapping: {obligation_name:?}"
-    )
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ay_bridge::verdict_cache_key_v2;
-    use crate::lrat_cert::sha256_hex;
 
-    // The lrat_cert golden fixtures: a REAL ay-produced bit-blast + DRAT proof
-    // of an UNSAT QF_BV obligation. Reused here so the refutation tests run
-    // hermetically (no solver needed — only the vendored drat-trim).
     const GOLDEN_CNF: &str = include_str!("../lrat_fixtures/repr_qfbv.cnf");
     const GOLDEN_DRAT: &str = include_str!("../lrat_fixtures/repr_qfbv.drat");
     const GOLDEN_SMT2: &str = include_str!("../lrat_fixtures/repr_qfbv.smt2");
 
-    fn temp_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "tcg_canary_cert_test_{tag}_{}_{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    fn drat_trim() -> &'static Path {
-        trust_cg_drat_trim::drat_trim_executable_path()
-    }
-
-    /// A fake solver binary on disk (so `solver_identity_hash` works) plus a
-    /// cert minted under its identity for the golden obligation.
-    fn fake_solver_with_cert(
-        dir: &Path,
-        solver_bytes: &[u8],
-    ) -> (String, String, LratCert, String) {
-        let path = dir.join(format!("fake_ay_{}", solver_bytes.len()));
-        std::fs::write(&path, solver_bytes).unwrap();
-        let path = path.to_str().unwrap().to_string();
-        let identity = solver_identity_hash(&path).unwrap();
-        let key = verdict_cache_key_v2(&identity, GOLDEN_SMT2);
+    fn golden_portable(_file: &str) -> PortableCert {
+        let producer = "11".repeat(32);
+        let key = crate::ay_bridge::verdict_cache_key_v2(&producer, GOLDEN_SMT2);
         let cert = LratCert::new(
-            key.clone(),
-            identity.clone(),
-            "canary cert-skip test obligation",
+            key,
+            producer,
+            "portable golden",
             GOLDEN_CNF,
             GOLDEN_DRAT,
             GOLDEN_SMT2,
         );
-        (path, identity, cert, key)
+        PortableCert { cert }
     }
 
-    fn store_of(cert: &LratCert) -> HashMap<String, LratCert> {
-        let mut map = HashMap::new();
-        map.insert(cert.verdict_key.clone(), cert.clone());
-        map
+    fn render_legacy_v2(cert: &LratCert) -> String {
+        format!(
+            "{}\nverdict-sha256: {}\nsolver-sha256: {}\ncnf-sha256: {}\n\
+             obligation: {}\ncnf {}\n{}\ndrat {}\n{}\n",
+            crate::lrat_cert::LRAT_CERT_SCHEMA_LINE_V2,
+            cert.verdict_key,
+            cert.solver_identity,
+            cert.cnf_sha256,
+            cert.obligation_name,
+            cert.cnf.len(),
+            cert.cnf,
+            cert.drat.len(),
+            cert.drat,
+        )
     }
 
-    /// HAPPY PATH: a genuine cert under the resolved solver's identity, whose
-    /// key matches the in-process derivation, passes the independent re-check
-    /// and authorizes the skip.
     #[test]
-    fn cert_skip_hits_on_genuine_cert() {
-        let dir = temp_dir("hit");
-        let (solver, _identity, cert, key) = fake_solver_with_cert(&dir, b"canary fake ay A");
-        assert!(cert_skip_verified_in(
-            &store_of(&cert),
-            &key,
-            &solver,
-            drat_trim()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
+    fn legacy_upgrade_requires_exact_query_key_and_independent_replay() {
+        let portable = golden_portable("golden.lratcert");
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("golden.lratcert");
+        std::fs::write(&cert_path, render_legacy_v2(&portable.cert)).unwrap();
+        let checker = trust_cg_drat_trim::drat_trim_executable_path();
+        let checker_sha = checker_binary_sha256(checker).unwrap();
+        let replay_dir = tempfile::tempdir().unwrap();
+        let upgraded = upgrade_replayable_existing_cert(
+            &cert_path,
+            "portable golden",
+            GOLDEN_SMT2,
+            checker,
+            &checker_sha,
+            replay_dir.path(),
+        )
+        .unwrap()
+        .expect("exact legacy cert upgrades");
+        assert!(upgraded.carries_obligation_binding());
+        assert_eq!(upgraded.smt2, GOLDEN_SMT2);
 
-    /// REFUTATION (cold cache): an absent key never skips — the caller falls
-    /// through to the live solver discharge.
-    #[test]
-    fn cert_skip_misses_on_unknown_key() {
-        let dir = temp_dir("cold");
-        let (solver, identity, cert, _key) = fake_solver_with_cert(&dir, b"canary fake ay B");
-        let other_key = verdict_cache_key_v2(&identity, "(assert false)");
-        assert!(!cert_skip_verified_in(
-            &store_of(&cert),
-            &other_key,
-            &solver,
-            drat_trim()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// REFUTATION (poisoned solver identity): a cert consulted under a solver
-    /// binary whose bytes-hash differs from the recorded identity is REFUSED
-    /// even when the lookup key was forged to match — the canary revalidates
-    /// live under a new/rebuilt/foreign solver.
-    #[test]
-    fn cert_skip_self_disables_on_solver_identity_mismatch() {
-        let dir = temp_dir("identity");
-        let (_solver_a, _ida, cert, key) = fake_solver_with_cert(&dir, b"canary fake ay C");
-        // A DIFFERENT solver binary at consume time.
-        let other = dir.join("fake_ay_other");
-        std::fs::write(&other, b"canary fake ay D (a new ay build)").unwrap();
-        let other = other.to_str().unwrap().to_string();
-        assert!(!cert_skip_verified_in(
-            &store_of(&cert),
-            &key,
-            &other,
-            drat_trim()
-        ));
-        // Unreadable solver path: identity unknown, never skip.
-        assert!(!cert_skip_verified_in(
-            &store_of(&cert),
-            &key,
-            "/nonexistent/solver/binary",
-            drat_trim()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// REFUTATION (corrupt verdict content, CNF): flipping CNF bytes while
-    /// keeping the recorded hash is caught by the integrity binding BEFORE the
-    /// checker runs; re-hashing the tampered CNF still fails the check itself
-    /// (the recorded DRAT no longer refutes it). Either way: live revalidation.
-    #[test]
-    fn cert_skip_rejects_tampered_cnf() {
-        let dir = temp_dir("cnf_tamper");
-        let (solver, _identity, cert, key) = fake_solver_with_cert(&dir, b"canary fake ay E");
-
-        // (a) Tampered CNF, stale recorded hash -> integrity mismatch.
-        let mut stale = cert.clone();
-        stale.cnf = stale.cnf.replacen("\n9 0\n", "\n8 0\n", 1);
-        assert_ne!(sha256_hex(stale.cnf.as_bytes()), stale.cnf_sha256);
-        assert!(!cert_skip_verified_in(
-            &store_of(&stale),
-            &key,
-            &solver,
-            drat_trim()
-        ));
-
-        // (b) Tampered CNF re-hashed to look consistent: a satisfiable CNF can
-        // never be "confirmed UNSAT" by the independent checker.
-        let consistent = LratCert::new(
-            cert.verdict_key.clone(),
-            cert.solver_identity.clone(),
-            cert.obligation_name.clone(),
-            "p cnf 1 1\n1 0\n",
-            cert.drat.clone(),
-            cert.smt2.clone(),
+        let replay_dir = tempfile::tempdir().unwrap();
+        assert!(
+            upgrade_replayable_existing_cert(
+                &cert_path,
+                "portable golden",
+                &format!("{GOLDEN_SMT2}\n; mutation"),
+                checker,
+                &checker_sha,
+                replay_dir.path(),
+            )
+            .unwrap()
+            .is_none(),
+            "a changed exact query must regenerate rather than inherit the old proof"
         );
-        assert!(!cert_skip_verified_in(
-            &store_of(&consistent),
-            &key,
-            &solver,
-            drat_trim()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut bad = portable.cert;
+        bad.drat.clear();
+        std::fs::write(&cert_path, render_legacy_v2(&bad)).unwrap();
+        let replay_dir = tempfile::tempdir().unwrap();
+        assert!(
+            upgrade_replayable_existing_cert(
+                &cert_path,
+                "portable golden",
+                GOLDEN_SMT2,
+                checker,
+                &checker_sha,
+                replay_dir.path(),
+            )
+            .is_err(),
+            "a bound but invalid proof is a hard regeneration error"
+        );
     }
 
-    /// REFUTATION (corrupt verdict content, proof): a cert whose DRAT was
-    /// stripped of its refutation (or replaced with garbage lemmas) fails the
-    /// independent re-check — a recorded "unsat" claim with no checkable proof
-    /// never skips the live solve.
-    /// The header-only identity read must agree with the full parse, and must
-    /// reject a malformed header rather than guessing.
-    ///
-    /// `embedded_certs` now skips any cert whose recorded solver identity
-    /// differs from the local solver's BEFORE parsing it (3.6 MB of committed
-    /// LRAT, ~6.2 MB parsed). If this read disagreed with `parse_cert`, a host
-    /// could skip a cert it should have used, or parse one it need not have.
     #[test]
-    fn cert_header_identity_agrees_with_the_full_parse() {
+    fn portable_key_is_solver_independent_and_content_sensitive() {
+        assert_eq!(
+            portable_query_key(GOLDEN_SMT2),
+            portable_query_key(GOLDEN_SMT2)
+        );
+        assert_ne!(
+            portable_query_key(GOLDEN_SMT2),
+            portable_query_key(&format!("{GOLDEN_SMT2}\n; mutation"))
+        );
+    }
+
+    #[test]
+    fn exact_query_hit_needs_no_ay_but_replays_checker() {
+        let cert = golden_portable("golden.lratcert");
+        let checker = trust_cg_drat_trim::drat_trim_executable_path();
+        let checker_sha = checker_binary_sha256(checker).unwrap();
+        assert!(cert_skip_verified_in(
+            &cert,
+            GOLDEN_SMT2,
+            checker,
+            &checker_sha
+        ));
+        assert!(!cert_skip_verified_in(
+            &cert,
+            &format!("{GOLDEN_SMT2}\n; mutation"),
+            checker,
+            &checker_sha
+        ));
+    }
+
+    #[test]
+    fn checker_identity_and_proof_mutations_fail_closed() {
+        let mut cert = golden_portable("golden.lratcert");
+        let checker = trust_cg_drat_trim::drat_trim_executable_path();
+        assert!(!cert_skip_verified_in(
+            &cert,
+            GOLDEN_SMT2,
+            checker,
+            &"00".repeat(32)
+        ));
+        cert.cert.drat.clear();
+        let checker_sha = checker_binary_sha256(checker).unwrap();
+        assert!(!cert_skip_verified_in(
+            &cert,
+            GOLDEN_SMT2,
+            checker,
+            &checker_sha
+        ));
+    }
+
+    #[test]
+    fn producer_identity_is_provenance_and_cannot_replace_authority_bindings() {
+        let mut portable = golden_portable("golden.lratcert");
+        // Change producer provenance consistently, including the legacy
+        // producer/query key. No live AY identity participates in replay.
+        portable.cert.solver_identity = "99".repeat(32);
+        portable.cert.verdict_key = crate::ay_bridge::verdict_cache_key_v2(
+            &portable.cert.solver_identity,
+            &portable.cert.smt2,
+        );
+        let checker = trust_cg_drat_trim::drat_trim_executable_path();
+        let checker_sha = checker_binary_sha256(checker).unwrap();
+        assert!(cert_skip_verified_in(
+            &portable,
+            GOLDEN_SMT2,
+            checker,
+            &checker_sha,
+        ));
+
+        // That provenance edit grants no authority: it cannot compensate for
+        // a changed query, a missing proof, or different checker bytes.
+        assert!(!cert_skip_verified_in(
+            &portable,
+            &format!("{GOLDEN_SMT2}\n; different query"),
+            checker,
+            &checker_sha,
+        ));
+        portable.cert.drat.clear();
+        assert!(!cert_skip_verified_in(
+            &portable,
+            GOLDEN_SMT2,
+            checker,
+            &checker_sha,
+        ));
+        assert!(!cert_skip_verified_in(
+            &portable,
+            GOLDEN_SMT2,
+            checker,
+            &"88".repeat(32),
+        ));
+    }
+
+    #[test]
+    fn manifest_rejects_file_query_and_producer_mutations() {
+        let portable = golden_portable("golden.lratcert");
+        let text = crate::lrat_cert::render_cert(&portable.cert).unwrap();
+        let producer = portable.cert.solver_identity.clone();
+        let checker = "22".repeat(32);
+        let entry = ManifestEntry {
+            file: "golden.lratcert".to_string(),
+            cert_sha256: sha256_hex(text.as_bytes()),
+            query_sha256: portable_query_key(GOLDEN_SMT2),
+            producer_ay_sha256: producer.clone(),
+        };
+        let manifest = render_manifest(&checker, std::slice::from_ref(&entry));
+        assert!(build_cert_set(&manifest, &[("golden.lratcert", &text)], 1).is_ok());
+
+        let file_tamper = format!("{text}\n");
+        assert!(build_cert_set(&manifest, &[("golden.lratcert", &file_tamper)], 1).is_err());
+
+        let bad_query = manifest.replace(&entry.query_sha256, &"33".repeat(32));
+        assert!(build_cert_set(&bad_query, &[("golden.lratcert", &text)], 1).is_err());
+
+        let bad_producer = manifest.replace(&producer, &"44".repeat(32));
+        assert!(build_cert_set(&bad_producer, &[("golden.lratcert", &text)], 1).is_err());
+    }
+
+    #[test]
+    fn committed_set_binds_the_exact_runtime_checker_bytes() {
+        let set = build_cert_set(EMBEDDED_MANIFEST, EMBEDDED_CERTS, EXPECTED_CERT_COUNT)
+            .expect("committed portable certificate set");
+        let checker = trust_cg_drat_trim::drat_trim_executable_path();
+        let checker_sha = checker_binary_sha256(checker).expect("hash vendored checker");
+        assert_eq!(
+            set.drat_trim_checker_sha256, checker_sha,
+            "checker-byte drift must disable the portable set until full regeneration"
+        );
+
+        let drifted_manifest = EMBEDDED_MANIFEST.replacen(
+            &format!("drat-trim-checker-sha256: {checker_sha}"),
+            &format!("drat-trim-checker-sha256: {}", "77".repeat(32)),
+            1,
+        );
+        let drifted = build_cert_set(&drifted_manifest, EMBEDDED_CERTS, EXPECTED_CERT_COUNT)
+            .expect("a well-formed manifest can describe a different checker build");
+        assert!(checker_identity_is_authorized(&set, &checker_sha));
+        assert!(
+            !checker_identity_is_authorized(&drifted, &checker_sha),
+            "checker SHA drift must be a portable-cache miss"
+        );
+    }
+
+    #[test]
+    fn only_declared_guard_aliases_may_share_an_exact_query() {
+        assert!(allowed_exact_semantic_alias(
+            "guard_bounds_32.lratcert",
+            "guard_shift_range_32.lratcert"
+        ));
+        assert!(allowed_exact_semantic_alias(
+            "guard_null_if_zero_64.lratcert",
+            "guard_div_zero_64.lratcert"
+        ));
+        assert!(!allowed_exact_semantic_alias(
+            "guard_bounds_32.lratcert",
+            "guard_shift_range_64.lratcert"
+        ));
+        assert!(!allowed_exact_semantic_alias(
+            "recon_shl_32.lratcert",
+            "recon_shr_32.lratcert"
+        ));
+    }
+
+    #[test]
+    fn store_enforces_alias_policy_instead_of_overwriting_duplicate_queries() {
+        let first = golden_portable("guard_bounds_32.lratcert");
+        let mut second_cert = first.cert.clone();
+        second_cert.obligation_name = "same semantics, separately named lane".to_string();
+        let first_text = crate::lrat_cert::render_cert(&first.cert).unwrap();
+        let second_text = crate::lrat_cert::render_cert(&second_cert).unwrap();
+        let entries = [
+            ManifestEntry {
+                file: "guard_bounds_32.lratcert".to_string(),
+                cert_sha256: sha256_hex(first_text.as_bytes()),
+                query_sha256: portable_query_key(GOLDEN_SMT2),
+                producer_ay_sha256: first.cert.solver_identity.clone(),
+            },
+            ManifestEntry {
+                file: "guard_shift_range_32.lratcert".to_string(),
+                cert_sha256: sha256_hex(second_text.as_bytes()),
+                query_sha256: portable_query_key(GOLDEN_SMT2),
+                producer_ay_sha256: second_cert.solver_identity.clone(),
+            },
+        ];
+        let manifest = render_manifest(&"22".repeat(32), &entries);
+        assert!(
+            build_cert_set(
+                &manifest,
+                &[
+                    ("guard_bounds_32.lratcert", &first_text),
+                    ("guard_shift_range_32.lratcert", &second_text),
+                ],
+                2,
+            )
+            .is_ok()
+        );
+
+        let forbidden = manifest
+            .replace("guard_bounds_32", "recon_shl_32")
+            .replace("guard_shift_range_32", "recon_shr_32");
+        assert!(
+            build_cert_set(
+                &forbidden,
+                &[
+                    ("recon_shl_32.lratcert", &first_text),
+                    ("recon_shr_32.lratcert", &second_text),
+                ],
+                2,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn committed_set_is_exactly_sixteen_v3_certs_and_rechecks() {
+        let set = build_cert_set(EMBEDDED_MANIFEST, EMBEDDED_CERTS, EXPECTED_CERT_COUNT)
+            .expect("committed portable certificate set");
+        assert_eq!(set.file_count, EXPECTED_CERT_COUNT);
+        let checker = trust_cg_drat_trim::drat_trim_executable_path();
+        let checker_sha = checker_binary_sha256(checker).unwrap();
         for (file, text) in EMBEDDED_CERTS {
-            if text.trim().is_empty() {
-                continue;
-            }
-            let quick = cert_header_solver_identity(text);
-            match parse_cert(text) {
-                Ok(cert) => assert_eq!(
-                    quick,
-                    Some(cert.solver_identity.as_str()),
-                    "{file}: header-only identity must equal the parsed one"
-                ),
-                // A cert that does not parse must not have its header trusted
-                // either — it has to reach `parse_cert` so the tier fails closed.
-                Err(_) => assert!(
-                    quick.is_none(),
-                    "{file}: unparseable cert must not report a header identity"
-                ),
-            }
+            let cert = parse_cert(text).unwrap_or_else(|e| panic!("{file}: {e}"));
+            assert!(
+                cert.carries_obligation_binding(),
+                "{file} must be schema v3"
+            );
+            let portable = PortableCert { cert: cert.clone() };
+            assert!(
+                cert_skip_verified_in(&portable, &cert.smt2, checker, &checker_sha),
+                "{file} failed independent replay"
+            );
         }
     }
 
-    /// A cert recording a DIFFERENT solver must be skipped, and one recording
-    /// the local solver must still be found.
     #[test]
-    fn embedded_certs_skips_foreign_solver_identities() {
-        let foreign = "0".repeat(64);
-        assert!(
-            embedded_certs(&foreign).is_none(),
-            "no committed cert records an all-zero solver identity, so the set \
-             must be empty rather than parsed"
-        );
+    fn committed_queries_match_all_current_obligations() {
+        let expected: HashMap<&str, String> = certifiable_named_obligations()
+            .iter()
+            .map(|named| {
+                (
+                    named.file,
+                    crate::verdict_db::db_obligation_smt2(&named.obligation),
+                )
+            })
+            .collect();
+        assert_eq!(expected.len(), EXPECTED_CERT_COUNT);
+        for (file, text) in EMBEDDED_CERTS {
+            let cert = parse_cert(text).unwrap();
+            assert_eq!(
+                cert.smt2, expected[*file],
+                "{file} does not bind the current live query"
+            );
+        }
     }
 
     #[test]
-    fn cert_skip_rejects_withheld_or_bogus_proof() {
-        let dir = temp_dir("proof_tamper");
-        let (solver, _identity, cert, key) = fake_solver_with_cert(&dir, b"canary fake ay F");
-
-        let mut withheld = cert.clone();
-        withheld.drat = String::new();
-        assert!(!cert_skip_verified_in(
-            &store_of(&withheld),
-            &key,
-            &solver,
-            drat_trim()
-        ));
-
-        let mut bogus = cert.clone();
-        bogus.drat = "1 2 0\n".to_string();
-        assert!(!cert_skip_verified_in(
-            &store_of(&bogus),
-            &key,
-            &solver,
-            drat_trim()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// REFUTATION (missing checker): with no drat-trim binary the tier can
-    /// never authorize a skip (Error is a non-credit), so the caller live-solves.
-    #[test]
-    fn cert_skip_refuses_without_checker() {
-        let dir = temp_dir("no_checker");
-        let (solver, _identity, cert, key) = fake_solver_with_cert(&dir, b"canary fake ay G");
-        assert!(!cert_skip_verified_in(
-            &store_of(&cert),
-            &key,
-            &solver,
-            Path::new("/nonexistent/drat-trim"),
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Kill switches: `TCG_CANARY_NO_CACHE=1` (this tier only) and
-    /// `TCG_NO_PROOF_CACHE=1` (all reuse) both force the live solve.
-    ///
-    /// Uses thread-local overrides so sibling environment tests remain isolated.
-    #[test]
-    fn cert_skip_env_kill_switches() {
-        // Every thread-local override is restored on scope exit, even on panic.
+    fn kill_switches_disable_portable_reuse() {
         crate::env_lock::with_env_edits(|env| {
             env.set("TCG_CANARY_NO_CACHE", "1");
             assert!(!cert_skip_enabled());
@@ -809,282 +1102,5 @@ mod tests {
             env.remove("TCG_NO_PROOF_CACHE");
             assert!(cert_skip_enabled());
         });
-    }
-
-    /// The COMMITTED cert artifact must never be in the "malformed" state:
-    /// either it is empty (tier disabled quietly) or it parses strictly AND
-    /// its independent re-check passes with the vendored drat-trim — a
-    /// committed cert that no longer verifies would silently disable the tier
-    /// at best and must be caught in CI instead.
-    #[test]
-    fn committed_certs_parse_and_recheck() {
-        for (file, text) in EMBEDDED_CERTS {
-            if text.trim().is_empty() {
-                continue;
-            }
-            let cert = parse_cert(text)
-                .unwrap_or_else(|e| panic!("committed canary cert {file} is malformed: {e}"));
-            let dir = temp_dir("committed_recheck");
-            let outcome = recheck_cert(&cert, drat_trim(), &dir);
-            assert!(
-                outcome.is_verified(),
-                "committed canary cert {file} fails its independent re-check: {outcome:?}"
-            );
-            let _ = std::fs::remove_dir_all(&dir);
-        }
-    }
-
-    /// DRIFT GUARD: each committed cert's `verdict_key` must be re-derivable
-    /// from its recorded solver identity plus the CURRENT in-process SMT2
-    /// derivation of the OBLIGATION IT CERTIFIES (matched by committed file
-    /// name). If any covered model (the SWAR table, a shift encoder) or the
-    /// SMT2 pipeline changes, that cert's key stops matching and this test FAILS
-    /// loudly — demanding a regen — instead of the tier silently never hitting
-    /// (and silently re-paying the live solve). Covers the popcnt canary AND
-    /// every shift reconstruction cert.
-    #[test]
-    fn committed_cert_keys_match_live_obligation_derivation() {
-        // Map each certifiable obligation to (committed file name, its exact
-        // db-lookup SMT2 bytes). A committed cert must match the SAME-named
-        // obligation's derivation, not just popcnt's.
-        let smt2_by_file: HashMap<&'static str, String> = certifiable_canary_obligations()
-            .iter()
-            .map(|ob| {
-                (
-                    cert_file_name(&ob.name),
-                    crate::verdict_db::db_obligation_smt2(ob),
-                )
-            })
-            .collect();
-        let obligation_by_file: HashMap<&'static str, crate::lowering_proof::ProofObligation> =
-            certifiable_canary_obligations()
-                .into_iter()
-                .map(|ob| (cert_file_name(&ob.name), ob))
-                .collect();
-        for (file, text) in EMBEDDED_CERTS {
-            if text.trim().is_empty() {
-                continue;
-            }
-            let cert = parse_cert(text).expect("checked by committed_certs_parse_and_recheck");
-            let smt2 = smt2_by_file.get(file).unwrap_or_else(|| {
-                panic!(
-                    "committed cert {file} has no certifiable obligation mapping to it \
-                     (certifiable_canary_obligations()/cert_file_name drifted from EMBEDDED_CERTS)"
-                )
-            });
-            let expected = verdict_cache_key_v2(&cert.solver_identity, smt2);
-            // Certification-gap guard (crate::formal_gap): the 0cceae8f
-            // checked-authority commit re-laid-out the SMT2 query, re-keying
-            // every committed cert — the regen this drift alarm demands is
-            // currently IMPOSSIBLE, because the v0.9.0-era authorities answer
-            // these bit-blast obligations `unknown (:reason-unknown
-            // (incomplete self-check-rejected))` (regen_canary_certs: "ay did
-            // not report unsat … stdout: unknown") and a cert can never be
-            // minted from anything short of a live proof. Skip the mismatch
-            // LOUDLY only while a LIVE fresh discharge of this cert's exact
-            // obligation confirms that gap; the moment an authority proves it
-            // again this alarm re-arms and demands the (then possible) regen.
-            // The consume tier self-disables by key miss meanwhile (live
-            // discharge, sound). Without a solver the alarm behaves exactly
-            // as before.
-            if cert.verdict_key != expected && crate::ay_bridge::z3_available() {
-                let obligation = obligation_by_file
-                    .get(file)
-                    .unwrap_or_else(|| panic!("committed cert {file} lost its obligation mapping"));
-                let config = crate::ay_bridge::AYConfig::default()
-                    .with_timeout(crate::verdict_db::DB_VERDICT_TIMEOUT_MS);
-                let live =
-                    crate::ay_bridge::verify_fresh_transcript_for_gap_probe(obligation, &config);
-                if let Some(reason) =
-                    crate::formal_gap::confirmed_certification_gap(obligation, &config, &live)
-                {
-                    crate::formal_gap::print_gap_skip(
-                        &format!("committed canary cert {file} (stale key; regen gap-blocked)"),
-                        &reason,
-                    );
-                    continue;
-                }
-            }
-            assert_eq!(
-                cert.verdict_key, expected,
-                "committed cert {file} does not back the CURRENT derivation of the \
-                 obligation it certifies — a covered model or the SMT2 pipeline changed; run \
-                 `cargo run --release -p trust-cg-verify --bin regen_canary_certs` \
-                 (the tier self-disables by key miss meanwhile: live discharge, sound)"
-            );
-        }
-    }
-
-    /// PER-FAMILY POISONING TRIPLET (shift reconstruction certs): drive a REAL
-    /// committed shift cert through the corruption teeth over
-    /// [`cert_skip_verified_in`] — the same consume path the compile funnel
-    /// uses — and assert each poisoning REVALIDATES-live (returns `false`,
-    /// i.e. never authorizes a skip). This proves the generalization did not
-    /// widen the trusted surface: a committed shift cert is exactly as
-    /// unforgeable as the popcnt cert.
-    ///
-    /// (1) key poisoning — a lookup under a DIFFERENT key never serves the cert;
-    /// (2) solver-identity poisoning — a cert consulted under a foreign solver
-    ///     binary is refused even when the key was made to match;
-    /// (3) cert-content poisoning — a stripped DRAT proof fails the independent
-    ///     re-check.
-    #[test]
-    fn shift_cert_poisoning_triplet_revalidates_live() {
-        // Pick the first committed, non-empty shift cert.
-        let Some((file, text)) = EMBEDDED_CERTS
-            .iter()
-            .find(|(f, t)| f.starts_with("recon_") && !t.trim().is_empty())
-        else {
-            eprintln!("shift_cert_poisoning_triplet: no committed shift cert; skipping");
-            return;
-        };
-        let cert = parse_cert(text).unwrap_or_else(|e| panic!("committed {file} malformed: {e}"));
-
-        // A fake solver binary whose bytes-hash EQUALS the cert's recorded
-        // solver identity is not constructible (we cannot invert SHA-256), so
-        // the happy-path cannot be re-created hermetically here; instead we
-        // assert the THREE poisonings each refuse. Use a fake solver whose
-        // identity we control for teeth (2)/(3), and the cert's own key so teeth
-        // (1) is a genuine key MISS, not a solver mismatch.
-        let dir = temp_dir("shift_poison");
-        let fake_solver = dir.join("fake_ay_shift");
-        std::fs::write(&fake_solver, b"fake ay for shift cert poisoning").unwrap();
-        let fake_solver = fake_solver.to_str().unwrap().to_string();
-        let fake_identity = solver_identity_hash(&fake_solver).unwrap();
-
-        // (1) KEY poisoning: an unrelated key never serves the committed cert.
-        let wrong_key = verdict_cache_key_v2(&fake_identity, "(assert false)");
-        assert!(
-            !cert_skip_verified_in(&store_of(&cert), &wrong_key, &fake_solver, drat_trim()),
-            "a committed shift cert must never be served under an unrelated key"
-        );
-
-        // (2) SOLVER-IDENTITY poisoning: mint a cert under the fake solver's
-        // identity + the golden obligation, then consult it under a DIFFERENT
-        // solver binary with the matching key — must self-disable.
-        let (solver_a, _ida, golden_cert, golden_key) =
-            fake_solver_with_cert(&dir, b"shift poison solver A");
-        let other = dir.join("shift_other_ay");
-        std::fs::write(&other, b"a different ay build").unwrap();
-        let other = other.to_str().unwrap().to_string();
-        let _ = solver_a; // the cert names solver A; we consult under `other`.
-        assert!(
-            !cert_skip_verified_in(&store_of(&golden_cert), &golden_key, &other, drat_trim()),
-            "a cert consulted under a solver it does not name must self-disable"
-        );
-
-        // (3) CONTENT poisoning: strip the committed shift cert's DRAT proof and
-        // consult it under its own key + a solver whose identity matches the
-        // cert's recorded identity is impossible to fake, so drive the tamper
-        // through the golden cert (same mechanism) to prove a withheld proof
-        // fails the independent re-check.
-        let mut withheld = golden_cert.clone();
-        withheld.drat = String::new();
-        assert!(
-            !cert_skip_verified_in(&store_of(&withheld), &golden_key, &solver_a, drat_trim()),
-            "a cert with a stripped DRAT proof must fail the independent re-check"
-        );
-
-        // And directly on the committed shift cert: a tampered CNF (stale hash)
-        // is rejected by the integrity binding before the checker even runs.
-        let mut cnf_tampered = cert.clone();
-        cnf_tampered.cnf.push_str("\nc poison\n");
-        assert_ne!(
-            sha256_hex(cnf_tampered.cnf.as_bytes()),
-            cnf_tampered.cnf_sha256
-        );
-        assert!(
-            !cert_skip_verified_in(
-                &store_of(&cnf_tampered),
-                &cert.verdict_key,
-                &fake_solver,
-                drat_trim()
-            ),
-            "a committed shift cert with a tampered CNF must be rejected (integrity binding)"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// FUNNEL-BYTES DRIFT GUARD: the compile path discharges each certifiable
-    /// obligation through the CLI solver funnel; the cert is recorded/looked-up
-    /// over [`crate::verdict_db::db_obligation_smt2`] (pinned 30 s config).
-    /// These must be byte-identical per obligation or the cert never hits.
-    ///
-    /// `db_obligation_smt2` already routes a simplifier-closed obligation to the
-    /// RAW generator and a genuine solver obligation to the normal one — the
-    /// SAME split `verify_with_ay` performs — so it is the faithful compile-path
-    /// query for BOTH the popcnt canary (genuine solver) and each shift
-    /// reconstruction obligation (also a genuine bit-blasted solver obligation).
-    /// (Holds when `TRUST_CG_AY_TIMEOUT_MS` is unset — a custom deadline changes
-    /// the query bytes and soundly misses to a live solve at that deadline, by
-    /// design: the deadline is part of the key.)
-    #[test]
-    fn funnel_bytes_match_cert_recording_bytes() {
-        if crate::env_lock::var_os("TRUST_CG_AY_TIMEOUT_MS").is_some() {
-            eprintln!("funnel_bytes_match_cert_recording_bytes: custom timeout set; skipping");
-            return;
-        }
-        // The db config the compile-path revalidation actually uses (matches
-        // `verdict_db::db_verdict_config` — solver_path does not affect bytes).
-        let db_cfg = crate::ay_bridge::AYConfig {
-            solver_path: None,
-            timeout_ms: crate::verdict_db::DB_VERDICT_TIMEOUT_MS,
-            produce_models: true,
-        };
-        for ob in certifiable_canary_obligations() {
-            // Every certified obligation must be a GENUINE solver obligation
-            // (structurally distinct sides). If the simplifier alone closed it,
-            // it would produce no DRAT and no cert would be minted — but assert
-            // it here so a regression that collapses one side is caught loudly.
-            assert!(
-                !crate::ay_bridge::simplifier_alone_proved_unsat(&ob),
-                "certifiable obligation {:?} must be a genuine solver obligation \
-                 (structurally distinct sides); if the simplifier closes it there is no \
-                 DRAT to certify and the cert recording branch must be revisited",
-                ob.name
-            );
-            let funnel = crate::ay_bridge::generate_smt2_query(&ob, &db_cfg);
-            let recorded = crate::verdict_db::db_obligation_smt2(&ob);
-            assert_eq!(
-                funnel, recorded,
-                "the compile-path funnel SMT2 bytes must equal the cert recording bytes for \
-                 {:?} (else the cert-skip tier never hits)",
-                ob.name
-            );
-        }
-    }
-
-    /// TIER CONSISTENCY: when a committed cert and the committed tier-0 DB
-    /// name the same solver identity, the cert must back a row tier-0 also
-    /// carries (the cert is the checkable strengthening of that row, not a
-    /// side channel for un-recorded obligations).
-    #[test]
-    fn committed_certs_back_committed_tier0_rows() {
-        let Some(tier0) =
-            crate::verdict_db::parse_tier0_text(crate::verdict_db::EMBEDDED_TIER0_VDB_TEXT)
-                .ok()
-                .flatten()
-        else {
-            return; // no tier-0 DB committed: nothing to cross-check
-        };
-        let tier0_keys: std::collections::HashSet<String> = tier0
-            .entries
-            .iter()
-            .map(|e| verdict_cache_key_v2(&tier0.solver_identity, &e.smt2))
-            .collect();
-        for (file, text) in EMBEDDED_CERTS {
-            if text.trim().is_empty() {
-                continue;
-            }
-            let cert = parse_cert(text).expect("checked by committed_certs_parse_and_recheck");
-            if cert.solver_identity != tier0.solver_identity {
-                continue; // different regen generations; the key binding still protects
-            }
-            assert!(
-                tier0_keys.contains(&cert.verdict_key),
-                "committed canary cert {file} backs no committed tier-0 row — regen both \
-                 artifacts together (regen_verdict_db + regen_canary_certs)"
-            );
-        }
     }
 }

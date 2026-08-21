@@ -274,6 +274,33 @@ impl LiveSet {
     }
 }
 
+/// The linear instruction numbering, WITHOUT the rest of liveness.
+///
+/// [`compute_live_intervals`] derives this in its Step 1 as a single walk of
+/// `block_order x block.insts` and then goes on to do the expensive part: the
+/// dense-bitset live-in/live-out dataflow fixpoint, interval construction, and
+/// spill-weight computation.
+///
+/// Callers that need ONLY the numbering must not pay for that. `coalesce` used
+/// to open with `compute_live_intervals(func).inst_numbering`, discarding
+/// `.intervals` — a second full liveness pass per function, on top of the one
+/// its caller had already computed and was still holding.
+///
+/// Produces exactly the same map as `compute_live_intervals(func).inst_numbering`
+/// for the same `func`; `numbering_matches_full_liveness` pins that.
+pub fn number_insts(func: &MachFunction) -> BTreeMap<InstId, u32> {
+    let mut inst_numbering: BTreeMap<InstId, u32> = BTreeMap::new();
+    let mut idx: u32 = 0;
+    for &block_id in &func.block_order {
+        let block = &func.blocks[block_id.0 as usize];
+        for &inst_id in &block.insts {
+            inst_numbering.insert(inst_id, idx);
+            idx += 1;
+        }
+    }
+    inst_numbering
+}
+
 pub fn compute_live_intervals(func: &MachFunction) -> LivenessResult {
     let mut inst_loop_depths: Vec<u32> = Vec::new();
     let vreg_classes = collect_vreg_classes(func);

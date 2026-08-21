@@ -225,6 +225,7 @@ fn read_u32_le(bytes: &[u8], offset: usize, context: &str) -> u32 {
     ])
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn assert_macho64_object(bytes: &[u8], expected_cputype: u32, context: &str) {
     assert_eq!(
         read_u32_le(bytes, 0, context),
@@ -271,6 +272,37 @@ fn assert_elf64_x86_64_object(bytes: &[u8], context: &str) {
     );
 }
 
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+fn assert_elf64_aarch64_object(bytes: &[u8], context: &str) {
+    assert!(
+        bytes.len() >= 20,
+        "{} too small for ELF64 header: {} bytes",
+        context,
+        bytes.len()
+    );
+    assert_eq!(
+        &bytes[..4],
+        b"\x7FELF",
+        "{} should have ELF magic on this host",
+        context
+    );
+    assert_eq!(bytes[4], 2, "{} should be ELFCLASS64", context);
+    assert_eq!(bytes[5], 1, "{} should be little-endian ELF", context);
+    assert_eq!(
+        read_u16_le(bytes, 18, context),
+        183,
+        "{} should have EM_AARCH64 e_machine",
+        context
+    );
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -287,7 +319,19 @@ fn test_abi_dual_target_compiles() {
     let aarch64_obj = compile_for(Target::Aarch64, &module);
     let x86_obj = compile_for(Target::X86_64, &module);
 
+    // The AArch64 half likewise emits the HOST-native format (see the x86
+    // comment below): Mach-O on macOS, ELF on Linux/BSD hosts.
+    #[cfg(target_os = "macos")]
     assert_macho64_object(&aarch64_obj, 0x0100_000C, "AArch64 object");
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))]
+    assert_elf64_aarch64_object(&aarch64_obj, "AArch64 object");
 
     // x86-64 public AOT emits the host-native object format: ELF on Linux/BSD
     // hosts and Mach-O on macOS. Keep Mach-O cputype checks in the Mach-O

@@ -49,9 +49,14 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed={}", src.display());
 
-    // Discover the C compiler Cargo would use. `Build::get_compiler()`
-    // honours `CC`, target triples, and cross-compilation toolchains.
-    let tool = cc::Build::new().get_compiler();
+    // Discover the C compiler Cargo would use. Pin the options that affect
+    // executable bytes before asking `cc` for its command: otherwise Cargo's
+    // debug/release profile leaks `-g` and differing optimization defaults
+    // into two checkers built from the same source, defeating the exact binary
+    // identity carried by portable-certificate manifests.
+    let mut build = cc::Build::new();
+    build.opt_level(2).debug(false);
+    let tool = build.get_compiler();
 
     let mut cmd = tool.to_command();
     if tool.is_like_msvc() {
@@ -85,12 +90,21 @@ fn main() {
             .arg(format!("-Fe:{}", exe_path.display()))
             .arg(format!("-Fo:{}", out_dir.join("drat-trim.obj").display()));
     } else {
-        // Mirror upstream's Makefile: `-std=c99 -O2`.
+        // Mirror upstream's Makefile: `-std=c99 -O2`. Strict C99 hides the
+        // POSIX `getc_unlocked` on glibc (`__STRICT_ANSI__` gates it; Darwin
+        // declares it regardless, which is why only Linux ever missed it), so
+        // re-expose the POSIX surface with a feature macro instead of touching
+        // the pristine vendored source — the same keep-the-source-verbatim
+        // move as the MSVC `-D` redirect above.
         cmd.arg("-std=c99")
+            .arg("-D_DEFAULT_SOURCE")
             .arg("-O2")
-            .arg(&src)
-            .arg("-o")
-            .arg(&exe_path);
+            .arg(&src);
+        // Apple's linker derives LC_UUID from content by default. Preserve it:
+        // current macOS rejects linker-signed executables with no LC_UUID. The
+        // stable basename plus normalized compiler options above make both the
+        // UUID and ad-hoc code signature reproducible across OUT_DIR/profile.
+        cmd.arg("-o").arg(&exe_path);
     }
 
     let status = cmd

@@ -207,7 +207,7 @@ trust-cg-verify|lib-memory-atomic|-p trust-cg-verify --lib|memory_proofs:: atomi
 trust-cg-verify|lib-synthesis|-p trust-cg-verify --lib|unified_synthesis:: cegis:: cegis_pass:: rule_discovery:: proof_database:: proof_certificate:: function_verifier::|Synthesis / CEGIS / proof-database — medium-weight.
 trust-cg-verify|lib-neon-vec|-p trust-cg-verify --lib|neon_encoding_proofs:: neon_lowering_proofs:: vectorization_proofs::|NEON encoding / lowering / vectorization proofs (each ~60-75s).
 trust-cg-verify|lib-other|-p trust-cg-verify --lib|--skip verification_runner:: --skip memory_proofs:: --skip atomic_proofs:: --skip addr_mode_proofs:: --skip unified_synthesis:: --skip cegis:: --skip cegis_pass:: --skip rule_discovery:: --skip proof_database:: --skip proof_certificate:: --skip function_verifier:: --skip neon_encoding_proofs:: --skip neon_lowering_proofs:: --skip vectorization_proofs::|Everything else in the trust-cg-verify library (arithmetic, peephole, CFG, DCE, GVN, LICM, and related modules).
-trust-cg-verify|integration|-p trust-cg-verify --tests||Integration tests under crates/trust-cg-verify/tests/ (cegis_pass, full_proof_suite, ay_prove_smoke).
+trust-cg-verify|integration|-p trust-cg-verify --tests||All integration targets under crates/trust-cg-verify/tests/; Cargo metadata and validate_shard_policy keep the denominator complete.
 trust-cg-cli|all|-p trust-cg-cli||
 trust-cg-codegen|lib|-p trust-cg-codegen --lib||
 trust-cg-codegen|integration-aarch64|-p trust-cg-codegen --test aarch64_encoding --test aarch64_incoming_arg_zero_offset_load --test aarch64_msub_mneg_encode --test aarch64_petri_o2_o3_incoming_arg_canary --test compact_unwind_integration --test e2e_aarch64_link||

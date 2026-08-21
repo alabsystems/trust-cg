@@ -372,7 +372,11 @@ pub fn compatible(source: OpClass, emitted: OpClass) -> bool {
             FpConvert | FpArith | FpCmp | IntAdd | IntSub | Shift | Bitwise | Select | VecBitwise
         ),
         VecInt | VecFp => !matches!(emitted, IntDiv),
-        AddrCalc => matches!(emitted, IntAdd | IntMul | Shift),
+        // IntSub belongs here for the same reason it is in the MemLoad/MemStore
+        // rows: a StackAddr materializes as FP MINUS offset (`SubRI`) whenever
+        // the slot sits below the frame pointer, so a subtract is a legitimate
+        // address-calculation lowering, not a misattribution.
+        AddrCalc => matches!(emitted, IntAdd | IntSub | IntMul | Shift),
         MemLoad | MemStore => matches!(
             emitted,
             IntAdd | IntSub | IntMul | Shift | Bitwise | VecInt | VecBitwise | VecFp

@@ -27,6 +27,16 @@ use trust_ir::{
     Inst, InstrNode, Linkage, Module as TrustIrModule, Ty, ValueId,
 };
 
+/// These fixtures parse Mach-O structure (unwind/LSDA sections), so pin the
+/// aarch64-apple-darwin spec explicitly: `Compiler::new` derives the object
+/// format from the HOST, which on Linux emits ELF and breaks every Mach-O
+/// header parse below. Mach-O byte emission itself is host-independent.
+fn macho_compiler(config: CompilerConfig) -> Compiler {
+    let spec = trust_cg_codegen::target::TargetSpec::parse("aarch64-apple-darwin")
+        .expect("aarch64-apple-darwin parses");
+    Compiler::new_for_target_spec(config, spec)
+}
+
 const ANSWER: i128 = 16963; // 0x4243
 
 fn can_link_and_run_aarch64_macho() -> bool {
@@ -108,7 +118,7 @@ fn build_data_reloc_module() -> TrustIrModule {
 #[test]
 fn aarch64_data_reloc_module_compiles() {
     let module = build_data_reloc_module();
-    let compiler = Compiler::new(CompilerConfig {
+    let compiler = macho_compiler(CompilerConfig {
         opt_level: OptLevel::O0,
         ..CompilerConfig::default()
     });
@@ -138,7 +148,7 @@ fn aarch64_data_reloc_links_runs_and_calls_through_pointer() {
     }
 
     let module = build_data_reloc_module();
-    let compiler = Compiler::new(CompilerConfig {
+    let compiler = macho_compiler(CompilerConfig {
         opt_level: OptLevel::O0,
         ..CompilerConfig::default()
     });

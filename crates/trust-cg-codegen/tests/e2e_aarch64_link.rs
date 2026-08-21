@@ -27,6 +27,19 @@ use trust_ir::{BlockId, FuncId, ValueId};
 // Helper: write bytes to a temp file and return the path
 // =============================================================================
 
+/// These e2e fixtures assert Mach-O bytes (and, on macOS hosts, feed them to
+/// otool/nm/ld). `Compiler::new` derives the object format from the HOST
+/// (`TargetSpec::default_for_architecture`), which on a Linux host emits ELF
+/// and fails every Mach-O assertion below — so pin the historical
+/// aarch64-apple-darwin spec explicitly. Object emission is pure byte
+/// generation and host-independent; the link-and-run tests keep their
+/// existing macOS host gates.
+fn macho_compiler(config: CompilerConfig) -> Compiler {
+    let spec = trust_cg_codegen::target::TargetSpec::parse("aarch64-apple-darwin")
+        .expect("aarch64-apple-darwin parses");
+    Compiler::new_for_target_spec(config, spec)
+}
+
 fn write_temp_file(name: &str, suffix: &str, contents: &[u8]) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join("trust_cg_e2e_tests");
     fs::create_dir_all(&dir).expect("create temp dir");
@@ -199,7 +212,7 @@ fn build_trust_ir_sub_module() -> TrustIrModule {
 #[test]
 fn e2e_aarch64_trust_ir_module_to_object_code() {
     let module = build_trust_ir_add_module();
-    let compiler = Compiler::new(CompilerConfig {
+    let compiler = macho_compiler(CompilerConfig {
         opt_level: OptLevel::O0,
         trace_level: CompilerTraceLevel::Full,
         ..CompilerConfig::default()
@@ -240,7 +253,7 @@ fn e2e_aarch64_trust_ir_module_to_object_code() {
 #[test]
 fn e2e_aarch64_macho_magic_number() {
     let module = build_trust_ir_add_module();
-    let compiler = Compiler::default_o2();
+    let compiler = macho_compiler(CompilerConfig::default());
     let result = compiler
         .compile(&module)
         .expect("compilation should succeed");
@@ -271,7 +284,7 @@ fn e2e_aarch64_macho_magic_number() {
 #[test]
 fn e2e_aarch64_otool_disassembly() {
     let module = build_trust_ir_add_module();
-    let compiler = Compiler::default_o2();
+    let compiler = macho_compiler(CompilerConfig::default());
     let result = compiler
         .compile(&module)
         .expect("compilation should succeed");
@@ -316,7 +329,7 @@ fn e2e_aarch64_link_and_run() {
     }
 
     let module = build_trust_ir_add_module();
-    let compiler = Compiler::new(CompilerConfig {
+    let compiler = macho_compiler(CompilerConfig {
         opt_level: OptLevel::O0,
         ..CompilerConfig::default()
     });
@@ -428,7 +441,7 @@ int main() {
 #[test]
 fn e2e_aarch64_ir_function_compile() {
     let mut ir_func = pipeline::build_add_test_function();
-    let compiler = Compiler::default_o2();
+    let compiler = macho_compiler(CompilerConfig::default());
     let result = compiler
         .compile_ir_function(&mut ir_func)
         .expect("compile_ir_function should succeed");
@@ -460,7 +473,7 @@ fn e2e_aarch64_ir_link_and_run() {
     }
 
     let mut ir_func = pipeline::build_add_test_function();
-    let compiler = Compiler::new(CompilerConfig {
+    let compiler = macho_compiler(CompilerConfig {
         opt_level: OptLevel::O0,
         ..CompilerConfig::default()
     });
@@ -547,7 +560,7 @@ int main() {
 #[test]
 fn e2e_aarch64_trust_ir_const_to_object() {
     let module = build_trust_ir_const_module();
-    let compiler = Compiler::default_o2();
+    let compiler = macho_compiler(CompilerConfig::default());
     let result = compiler
         .compile(&module)
         .expect("const compilation should succeed");
@@ -573,7 +586,7 @@ fn e2e_aarch64_trust_ir_const_to_object() {
 #[test]
 fn e2e_aarch64_trust_ir_sub_to_object() {
     let module = build_trust_ir_sub_module();
-    let compiler = Compiler::default_o2();
+    let compiler = macho_compiler(CompilerConfig::default());
     let result = compiler
         .compile(&module)
         .expect("sub compilation should succeed");
@@ -601,7 +614,7 @@ fn e2e_aarch64_all_opt_levels() {
     let module = build_trust_ir_add_module();
 
     for opt in &[OptLevel::O0, OptLevel::O1, OptLevel::O2, OptLevel::O3] {
-        let compiler = Compiler::new(CompilerConfig {
+        let compiler = macho_compiler(CompilerConfig {
             opt_level: *opt,
             ..CompilerConfig::default()
         });
@@ -633,7 +646,7 @@ fn e2e_aarch64_all_opt_levels() {
 #[test]
 fn e2e_aarch64_nm_symbol_check() {
     let module = build_trust_ir_add_module();
-    let compiler = Compiler::default_o2();
+    let compiler = macho_compiler(CompilerConfig::default());
     let result = compiler
         .compile(&module)
         .expect("compilation should succeed");
@@ -676,7 +689,7 @@ fn make_test_dir(test_name: &str) -> std::path::PathBuf {
 }
 
 fn compile_trust_ir_module_to_obj(module: &TrustIrModule) -> Vec<u8> {
-    let compiler = Compiler::new(CompilerConfig {
+    let compiler = macho_compiler(CompilerConfig {
         opt_level: OptLevel::O0,
         ..CompilerConfig::default()
     });
@@ -1171,7 +1184,7 @@ fn build_trust_ir_sum_1_to_n_module() -> TrustIrModule {
 #[test]
 fn e2e_aarch64_max_val_compile() {
     let module = build_trust_ir_max_module();
-    let compiler = Compiler::new(CompilerConfig {
+    let compiler = macho_compiler(CompilerConfig {
         opt_level: OptLevel::O0,
         trace_level: CompilerTraceLevel::Full,
         ..CompilerConfig::default()
@@ -1249,7 +1262,7 @@ int main(void) {
 #[test]
 fn e2e_aarch64_abs_val_compile() {
     let module = build_trust_ir_abs_module();
-    let compiler = Compiler::new(CompilerConfig {
+    let compiler = macho_compiler(CompilerConfig {
         opt_level: OptLevel::O0,
         ..CompilerConfig::default()
     });
@@ -1324,7 +1337,7 @@ int main(void) {
 #[test]
 fn e2e_aarch64_fibonacci_compile() {
     let module = build_trust_ir_fibonacci_module();
-    let compiler = Compiler::new(CompilerConfig {
+    let compiler = macho_compiler(CompilerConfig {
         opt_level: OptLevel::O0,
         trace_level: CompilerTraceLevel::Full,
         ..CompilerConfig::default()
@@ -1412,7 +1425,7 @@ int main(void) {
 #[test]
 fn e2e_aarch64_sum_1_to_n_compile() {
     let module = build_trust_ir_sum_1_to_n_module();
-    let compiler = Compiler::new(CompilerConfig {
+    let compiler = macho_compiler(CompilerConfig {
         opt_level: OptLevel::O0,
         ..CompilerConfig::default()
     });
@@ -1496,7 +1509,7 @@ fn e2e_aarch64_multiblock_all_opt_levels() {
 
     for (name, module) in modules {
         for opt in &[OptLevel::O0, OptLevel::O1, OptLevel::O2, OptLevel::O3] {
-            let compiler = Compiler::new(CompilerConfig {
+            let compiler = macho_compiler(CompilerConfig {
                 opt_level: *opt,
                 ..CompilerConfig::default()
             });
@@ -1610,7 +1623,7 @@ fn build_trust_ir_cross_call_module() -> TrustIrModule {
 #[test]
 fn e2e_aarch64_cross_call_compile() {
     let module = build_trust_ir_cross_call_module();
-    let compiler = Compiler::new(CompilerConfig {
+    let compiler = macho_compiler(CompilerConfig {
         opt_level: OptLevel::O0,
         trace_level: CompilerTraceLevel::Full,
         ..CompilerConfig::default()
@@ -1961,7 +1974,7 @@ fn build_trust_ir_tla_record_cross_call_module() -> TrustIrModule {
 #[test]
 fn e2e_aarch64_tla_record_cross_call_compile() {
     let module = build_trust_ir_tla_record_cross_call_module();
-    let compiler = Compiler::new(CompilerConfig {
+    let compiler = macho_compiler(CompilerConfig {
         opt_level: OptLevel::O0,
         trace_level: CompilerTraceLevel::Full,
         ..CompilerConfig::default()
@@ -2560,7 +2573,7 @@ fn build_trust_ir_factorial_module() -> TrustIrModule {
 #[test]
 fn e2e_aarch64_classify_compile() {
     let module = build_trust_ir_classify_module();
-    let compiler = Compiler::new(CompilerConfig {
+    let compiler = macho_compiler(CompilerConfig {
         opt_level: OptLevel::O0,
         trace_level: CompilerTraceLevel::Full,
         ..CompilerConfig::default()
@@ -2637,7 +2650,7 @@ int main(void) {
 #[test]
 fn e2e_aarch64_sum_to_n_compile() {
     let module = build_trust_ir_sum_to_n_module();
-    let compiler = Compiler::new(CompilerConfig {
+    let compiler = macho_compiler(CompilerConfig {
         opt_level: OptLevel::O0,
         ..CompilerConfig::default()
     });
@@ -2711,7 +2724,7 @@ int main(void) {
 #[test]
 fn e2e_aarch64_clamp_compile() {
     let module = build_trust_ir_clamp_module();
-    let compiler = Compiler::new(CompilerConfig {
+    let compiler = macho_compiler(CompilerConfig {
         opt_level: OptLevel::O0,
         trace_level: CompilerTraceLevel::Full,
         ..CompilerConfig::default()
@@ -2795,7 +2808,7 @@ int main(void) {
 #[test]
 fn e2e_aarch64_factorial_compile() {
     let module = build_trust_ir_factorial_module();
-    let compiler = Compiler::new(CompilerConfig {
+    let compiler = macho_compiler(CompilerConfig {
         opt_level: OptLevel::O0,
         trace_level: CompilerTraceLevel::Full,
         ..CompilerConfig::default()
@@ -2894,7 +2907,7 @@ fn e2e_aarch64_new_multiblock_all_opt_levels() {
 
     for (name, module) in modules {
         for opt in &[OptLevel::O0, OptLevel::O1, OptLevel::O2, OptLevel::O3] {
-            let compiler = Compiler::new(CompilerConfig {
+            let compiler = macho_compiler(CompilerConfig {
                 opt_level: *opt,
                 ..CompilerConfig::default()
             });
@@ -3054,7 +3067,7 @@ fn e2e_aarch64_thread_local_read_is_correct_and_per_thread() {
     }
 
     let module = build_trust_ir_thread_local_module();
-    let compiler = Compiler::new(CompilerConfig {
+    let compiler = macho_compiler(CompilerConfig {
         opt_level: OptLevel::O0,
         ..CompilerConfig::default()
     });

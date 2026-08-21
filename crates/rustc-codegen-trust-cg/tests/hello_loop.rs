@@ -1,3 +1,6 @@
+#[path = "support/target_dir.rs"]
+mod target_dir_support;
+
 // Integration test for the rustc_codegen_trust_cg M1 hello-loop path.
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
@@ -58,9 +61,7 @@ fn ensure_dylib_built() -> PathBuf {
     // of `cargo test`. cargo's `tests/*.rs` integration tests already
     // build the crate's `cdylib` / `dylib` artifacts, so the binary is
     // guaranteed to be fresh.
-    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| crate_dir.join("target"));
+    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
 
     // `cargo test` in release mode puts the artifact under
     // `target/release/`; in debug mode under `target/debug/`.
@@ -144,12 +145,32 @@ fn m1_hello_loop_compiles_and_runs_until_killed() {
         s
     };
     let toolchain = pinned_toolchain();
+    // ASK for the bridge notes; do not hope the environment carries them.
+    // The success path below asserts on the "#574 entry wrapper uses lang_start"
+    // line, and 13989b40 moved every such note behind `bridge_notes_enabled()`
+    // — i.e. behind `TCG_BRIDGE_NOTES` being set — because they fired on every
+    // compile into every build log. The assertion therefore only held on a
+    // developer shell that happened to export the variable, and could never
+    // hold in a clean one. The publication gate runs the anonymous clone with a
+    // scrubbed environment (PATH, LANG/LC_*, TZ, RUSTUP_HOME, SSL_CERT_* and
+    // nothing else), so it stripped the variable and this test failed there
+    // with an EMPTY stderr and a rustc that had exited 0.
+    //
+    // The staleness was invisible until now: while lowering `lang_start`'s
+    // closure was still fail-closed, this test always took the early-return
+    // skip branch above, whose diagnostics come from `tcx.dcx().fatal(...)` and
+    // are never gated. Lowering landed, the success path ran for the first
+    // time, and the latent coupling surfaced as a release-gate failure.
+    //
+    // Setting it on the child makes the observation hermetic — the test now
+    // depends on what the backend DOES, not on what the ambient shell exports.
     let output = Command::new("rustup")
         .args(["run", toolchain.as_str(), "rustc", "--edition=2021"])
         .arg(&backend_arg)
         .arg("-o")
         .arg(&out_bin)
         .arg(&src_path)
+        .env("TCG_BRIDGE_NOTES", "1")
         .output()
         .expect("failed to spawn rustc via rustup");
 

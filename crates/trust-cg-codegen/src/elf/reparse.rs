@@ -551,6 +551,29 @@ fn intent_symbol_order(intent: &ElfObjectIntent) -> Vec<usize> {
 /// Compare a reparsed object against its intent. Returns the FIRST
 /// disagreement as an `Err` (used for enforce mode and the mutation negative
 /// controls); a faithful object returns `Ok(())`. Pure and mode-agnostic.
+/// ARTIFACT-LEVEL relocation-row digest: the sorted multiset of relocation
+/// type values parsed from the EMITTED OBJECT BYTES themselves (every
+/// `SHT_RELA` record's `r_type`, all sections).
+///
+/// This is the independent half of the proof-inventory cross-check. The
+/// inventory is constructed by MIRRORING emitter bookkeeping (the fixup list
+/// plus the expected writer-internal rows such as `.eh_frame` FDE pointers),
+/// and the reparse gate proves only `bytes == writer intent` — so a
+/// writer-side relocation the bookkeeping never anticipated would pass the
+/// gate while shipping uninventoried. Digesting the artifact and requiring
+/// the inventory to match it closes that seam (the recorded pre-emission
+/// mirror follow-up).
+pub fn reloc_type_digest(bytes: &[u8]) -> Result<Vec<u32>, ElfReparseError> {
+    let po = parse_elf(bytes)?;
+    let mut digest: Vec<u32> = po
+        .rela_sections
+        .iter()
+        .flat_map(|(_, _, recs)| recs.iter().map(|r| r.reloc_type))
+        .collect();
+    digest.sort_unstable();
+    Ok(digest)
+}
+
 pub fn check_object(intent: &ElfObjectIntent, bytes: &[u8]) -> Result<(), ElfReparseError> {
     let po = parse_elf(bytes)?;
 

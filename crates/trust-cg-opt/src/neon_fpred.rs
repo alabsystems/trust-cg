@@ -13,7 +13,7 @@
 //! acc = 0.0;  for i in [i0, n):  acc += f(i)
 //! ```
 //!
-//! where `f(i)` is a tree of `fadd / fsub / fmul / fdiv / fneg` and the FUSED
+//! where `f(i)` is a tree of `fadd / fsub / fmul / fdiv` and the FUSED
 //! `fmadd / fmsub` (`llvm.fmuladd`) over the leaves `(double)i` (from
 //! `UCVTF/SCVTF` of the integer induction) and **loop-invariant** `f64` scalars
 //! (hoisted coefficients, parameters), and the reduction combines EITHER with a
@@ -76,10 +76,16 @@
 //! the true loop exit instead of falling into the do-while (the remainder-0
 //! hazard, see [`crate::neon_array`]).
 //!
+//! An in-loop `FNEG` in the term is NOT one of them and is REJECTED: there is no
+//! `.2D` FNEG opcode here, and the `0.0 - x` stand-in this pass used to emit is
+//! not bit-exact (it disagrees with FNEG on `x = +0.0` and on NaN — see the
+//! comment on the missing `FnegRR` arm in [`lower`]).
+//!
 //! If ANY precondition fails — an `f32` accumulator or leaf, a non-unit step, a
-//! store / call / unrecognized op, a term leaf that is neither the induction nor
-//! a loop-invariant `f64`, a fused accumulate whose accumulator is a MULTIPLICAND
-//! rather than the addend (`acc = fmadd(acc, _, _)`, a rounding-sensitive
+//! store / call / unrecognized op, an in-loop `fneg`, a term leaf that is
+//! neither the induction nor a loop-invariant `f64`, a fused accumulate whose
+//! accumulator is a MULTIPLICAND rather than the addend
+//! (`acc = fmadd(acc, _, _)`, a rounding-sensitive
 //! multiply-recurrence), an extra live-out — the loop is left ENTIRELY to the
 //! scalar path (`scalar_unroll`'s order-preserving SERIAL unroll is the
 //! fallback). Fail-closed beats miscompile.
@@ -657,13 +663,14 @@ impl Recognized {
                     _ => false,
                 }
             }
-            FnegRR => {
-                let a = match vreg_of(&inst.operands[1]) {
-                    Some(v) => v,
-                    None => return false,
-                };
-                self.node_ok(func, a, seen, saw_signed, saw_unsigned)
-            }
+            // FnegRR is deliberately ABSENT (fail-closed, see the `lower`
+            // comment): there is no `.2D` FNEG in this backend's opcode set and
+            // the `0.0 - x` substitution that used to stand in for one is NOT
+            // bit-exact — it differs from FNEG on x = +0.0 (FNEG gives -0.0,
+            // `0.0 - 0.0` gives +0.0 under RNE) and on x = NaN (FNEG flips the
+            // sign bit, FSUB returns the quieted operand with its sign kept).
+            // A term containing an in-loop negation is therefore left ENTIRELY
+            // to the scalar path.
             _ => false,
         }
     }
@@ -673,11 +680,9 @@ fn collect_body_defs(func: &MachFunction, loop_insts: &HashSet<InstId>) -> HashS
     let mut defs = HashSet::new();
     for &id in loop_insts {
         let inst = func.inst(id);
-        if produces_def(inst.opcode)
-            && let Some(v) = inst.operands.first().and_then(vreg_of)
-        {
+        crate::effects::for_each_inst_def(inst, |v| {
             defs.insert(v.id);
-        }
+        });
     }
     defs
 }
@@ -1242,12 +1247,21 @@ fn lower(func: &mut MachFunction, ctx: &mut LowerCtx, val: VReg) -> Option<VReg>
                 vd
             }
         }
-        FnegRR => {
-            // -x per lane = 0.0 - x  (FSUB from a zeroed vector; bit-exact fneg).
-            let a = lower(func, ctx, vreg_of(&ops[1])?)?;
-            let z = zero_vec(func, ctx);
-            fbin(func, ctx, NeonFsubV, z, a)
-        }
+        // NO `FnegRR` ARM. This used to lower `-x` per lane as `0.0 - x`
+        // (`NeonMovi Vz,#0` + `NeonFsubV Vd, Vz, Vx`) on the claim that it was a
+        // "bit-exact fneg". IT IS NOT — `0.0 - x == -x` fails in IEEE-754 for two
+        // operand classes `node_ok` freely admitted:
+        //
+        //   * x = +0.0 — `FNEG` yields -0.0, but `(+0.0) - (+0.0)` yields +0.0
+        //     under round-to-nearest (a zero difference is +0 unless the rounding
+        //     mode is toward -inf). The sign of a zero is observable: `1.0/(-0.0)`
+        //     is -inf while `1.0/(+0.0)` is +inf.
+        //   * x = NaN — `FNEG` is a pure sign-bit flip, while `FSUB` returns the
+        //     (quieted) NaN operand with its ORIGINAL sign.
+        //
+        // There is no `.2D` FNEG opcode in this backend to substitute, so the
+        // shape is now rejected in `node_ok` and the loop is left to the scalar
+        // path. This arm is kept absent so `lower` and `node_ok` stay mirrored.
         _ => return None,
     };
     ctx.memo.insert(val.id, result);
@@ -1290,22 +1304,6 @@ fn broadcast(func: &mut MachFunction, ctx: &mut LowerCtx, val: VReg) -> VReg {
         vec![vreg(d), vreg(val), imm(0), imm(ELEM_D)],
     );
     ctx.broadcast_cache.insert(val.id, d);
-    d
-}
-
-/// A `.2D` all-zeros vector (for `fneg = 0 - x`), materialized once.
-fn zero_vec(func: &mut MachFunction, ctx: &mut LowerCtx) -> VReg {
-    if let Some(&v) = ctx.broadcast_cache.get(&u32::MAX) {
-        return v;
-    }
-    let d = alloc(func, RegClass::Fpr128);
-    emit_before(
-        func,
-        ctx.preheader_term,
-        AArch64Opcode::NeonMovi,
-        vec![vreg(d), imm(0)],
-    );
-    ctx.broadcast_cache.insert(u32::MAX, d);
     d
 }
 
@@ -1394,22 +1392,7 @@ fn alloc(func: &mut MachFunction, class: RegClass) -> VReg {
 }
 
 fn build_def_map(func: &MachFunction) -> HashMap<u32, InstId> {
-    let mut map = HashMap::new();
-    for (idx, inst) in func.insts.iter().enumerate() {
-        if let Some(MachOperand::VReg(v)) = inst.operands.first()
-            && produces_def(inst.opcode)
-        {
-            map.insert(v.id, InstId(idx as u32));
-        }
-    }
-    map
-}
-
-/// Conservative "operand 0 is a written def" predicate for the opcodes this pass
-/// reasons about (compares/branches do not define a register value).
-fn produces_def(op: AArch64Opcode) -> bool {
-    use AArch64Opcode::*;
-    !matches!(op, CmpRR | CmpRI | BCond | B)
+    crate::effects::build_reaching_def_map(func)
 }
 
 fn branch_targets(inst: &MachInst) -> Vec<BlockId> {

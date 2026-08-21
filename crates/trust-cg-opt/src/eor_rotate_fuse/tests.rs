@@ -206,3 +206,138 @@ fn fuse_salsa_arx_triple() {
     assert_eq!(fused.operands[2], vreg(20)); // Rm = add result
     assert_eq!(fused.operands[3], MachOperand::Imm(25));
 }
+
+// ---------------------------------------------------------------------------
+// Reaching-definition guards (audit regressions).
+//
+// The fusion MOVES the read of the rotate source `s` forward from the `RorRI`
+// position to the `EorRR` position, and it deletes the `RorRI`. Both are only
+// sound when the matched `RorRI` is the REACHING def of `t` at the `EorRR` and
+// `s` is unchanged across the window. Before these guards the pass tracked no
+// def positions at all and never invalidated `ror_defs`, so both shapes fused.
+// ---------------------------------------------------------------------------
+
+/// `s` (v0) is redefined between the `RorRI` and the `EorRR`. Fusing computes
+/// `x ^ ROR(NEW s, k)` instead of `x ^ ROR(OLD s, k)`.
+#[test]
+fn no_fuse_when_rotate_source_redefined_before_consumer() {
+    let (mut func, entry) = single_block_func(vec![
+        MachInst::new(
+            AArch64Opcode::RorRI,
+            vec![vreg(2), vreg(0), MachOperand::Imm(7)],
+        ),
+        MachInst::new(AArch64Opcode::MovI, vec![vreg(0), MachOperand::Imm(1)]),
+        MachInst::new(AArch64Opcode::EorRR, vec![vreg(3), vreg(1), vreg(2)]),
+        consume(vreg(3)),
+        consume(vreg(0)),
+    ]);
+    let mut pass = EorRotateFuse;
+    assert!(!pass.run(&mut func));
+    assert_eq!(
+        func.inst(func.block(entry).insts[0]).opcode,
+        AArch64Opcode::RorRI
+    );
+    assert_eq!(
+        func.inst(func.block(entry).insts[2]).opcode,
+        AArch64Opcode::EorRR
+    );
+}
+
+/// `t` (v2) is redefined by a later `MovI`, so the `RorRI` is DEAD and the
+/// reaching def of `t` at the `EorRR` is the `MovI`. Fusing against the stale
+/// entry computes `x ^ ROR(s, k)` instead of `x ^ 5`.
+#[test]
+fn no_fuse_against_stale_rotate_def() {
+    let (mut func, entry) = single_block_func(vec![
+        MachInst::new(
+            AArch64Opcode::RorRI,
+            vec![vreg(2), vreg(0), MachOperand::Imm(7)],
+        ),
+        MachInst::new(AArch64Opcode::MovI, vec![vreg(2), MachOperand::Imm(5)]),
+        MachInst::new(AArch64Opcode::EorRR, vec![vreg(3), vreg(1), vreg(2)]),
+        consume(vreg(3)),
+    ]);
+    let mut pass = EorRotateFuse;
+    assert!(!pass.run(&mut func));
+    assert_eq!(
+        func.inst(func.block(entry).insts[0]).opcode,
+        AArch64Opcode::RorRI
+    );
+}
+
+/// `t` (v2) is read by `Movk`'s TIED def-use operand 0. The old
+/// `produces_value() && idx == 0` oracle skipped that position and reported
+/// `t` single-use, authorizing deletion of a still-read `RorRI`; the shared
+/// `effects::aarch64_for_each_use_position` oracle counts it.
+#[test]
+fn no_fuse_when_tied_def_use_still_reads_rotate_result() {
+    let (mut func, entry) = single_block_func(vec![
+        MachInst::new(
+            AArch64Opcode::RorRI,
+            vec![vreg(2), vreg(0), MachOperand::Imm(7)],
+        ),
+        MachInst::new(AArch64Opcode::EorRR, vec![vreg(3), vreg(1), vreg(2)]),
+        MachInst::new(
+            AArch64Opcode::Movk,
+            vec![vreg(2), MachOperand::Imm(9), MachOperand::Imm(16)],
+        ),
+        consume(vreg(3)),
+    ]);
+    let mut pass = EorRotateFuse;
+    assert!(!pass.run(&mut func));
+    assert_eq!(
+        func.inst(func.block(entry).insts[0]).opcode,
+        AArch64Opcode::RorRI
+    );
+}
+
+/// A def of `s` BEFORE the `RorRI` is fine — only a def in the window between
+/// the producer and the consumer moves the read past a write.
+#[test]
+fn fuse_when_source_defined_before_the_rotate() {
+    let (mut func, entry) = single_block_func(vec![
+        MachInst::new(AArch64Opcode::MovI, vec![vreg(0), MachOperand::Imm(3)]),
+        MachInst::new(
+            AArch64Opcode::RorRI,
+            vec![vreg(2), vreg(0), MachOperand::Imm(7)],
+        ),
+        MachInst::new(AArch64Opcode::EorRR, vec![vreg(3), vreg(1), vreg(2)]),
+        consume(vreg(3)),
+    ]);
+    let mut pass = EorRotateFuse;
+    assert!(pass.run(&mut func));
+    assert_eq!(
+        func.inst(func.block(entry).insts[2]).opcode,
+        AArch64Opcode::EorRRShift
+    );
+}
+
+/// Sibling controls: `shift-alu-fuse` already declines both shapes, which is
+/// what made the absence in this pass an anomaly rather than a design choice.
+#[test]
+fn sibling_shift_alu_fuse_declines_the_same_shapes() {
+    use crate::shift_alu_fuse::ShiftAluFuse;
+
+    let (mut redefined, _) = single_block_func(vec![
+        MachInst::new(
+            AArch64Opcode::LslRI,
+            vec![vreg(2), vreg(0), MachOperand::Imm(7)],
+        ),
+        MachInst::new(AArch64Opcode::MovI, vec![vreg(0), MachOperand::Imm(1)]),
+        MachInst::new(AArch64Opcode::AddRR, vec![vreg(3), vreg(1), vreg(2)]),
+        consume(vreg(3)),
+        consume(vreg(0)),
+    ]);
+    assert!(!ShiftAluFuse.run(&mut redefined));
+
+    let (mut stale, _) = single_block_func(vec![
+        MachInst::new(
+            AArch64Opcode::LslRI,
+            vec![vreg(2), vreg(0), MachOperand::Imm(7)],
+        ),
+        MachInst::new(AArch64Opcode::MovI, vec![vreg(2), MachOperand::Imm(5)]),
+        MachInst::new(AArch64Opcode::AddRR, vec![vreg(3), vreg(1), vreg(2)]),
+        consume(vreg(3)),
+    ]);
+    assert!(!ShiftAluFuse.run(&mut stale));
+}

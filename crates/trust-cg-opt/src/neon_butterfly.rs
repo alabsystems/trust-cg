@@ -119,7 +119,7 @@ use trust_cg_ir::{
 };
 
 use crate::dom::DomTree;
-use crate::effects;
+use crate::effects::{self, for_each_inst_def, inst_defines_vreg};
 use crate::loops::LoopAnalysis;
 use crate::pass_manager::{AnalysisCache, MachinePass};
 
@@ -362,11 +362,9 @@ impl RecognizedButterfly {
         let mut loop_defs: HashSet<u32> = HashSet::new();
         for &id in &loop_insts {
             let inst = func.inst(id);
-            if inst.opcode.produces_value()
-                && let Some(MachOperand::VReg(d)) = inst.operands.first()
-            {
+            for_each_inst_def(inst, |d| {
                 loop_defs.insert(d.id);
-            }
+            });
         }
 
         // (R2) latch = EXACTLY the induction writeback + `B -> header`.
@@ -586,11 +584,11 @@ impl RecognizedButterfly {
         // sound only if the `Movz(8)` is the register's ONLY def anywhere.
         {
             let mut es_defs = 0usize;
-            for inst in &func.insts {
-                if inst.opcode.produces_value()
-                    && matches!(inst.operands.first(), Some(MachOperand::VReg(d)) if d.id == es.id)
-                {
-                    es_defs += 1;
+            for &block_id in &func.block_order {
+                for &inst_id in &func.block(block_id).insts {
+                    if inst_defines_vreg(func.inst(inst_id), es) {
+                        es_defs += 1;
+                    }
                 }
             }
             if es_defs != 1 {
@@ -975,10 +973,7 @@ fn iv_def_dominates_preheader(
             continue;
         }
         for &inst_id in &func.block(block_id).insts {
-            let inst = func.inst(inst_id);
-            if inst.opcode.produces_value()
-                && matches!(inst.operands.first(), Some(MachOperand::VReg(v)) if *v == iv)
-            {
+            if inst_defines_vreg(func.inst(inst_id), iv) {
                 return true;
             }
         }
@@ -1358,15 +1353,7 @@ fn alloc(func: &mut MachFunction, class: RegClass) -> VReg {
 }
 
 fn build_def_map(func: &MachFunction) -> HashMap<u32, InstId> {
-    let mut map = HashMap::new();
-    for (idx, inst) in func.insts.iter().enumerate() {
-        if let Some(MachOperand::VReg(v)) = inst.operands.first()
-            && inst.opcode.produces_value()
-        {
-            map.insert(v.id, InstId(idx as u32));
-        }
-    }
-    map
+    crate::effects::build_reaching_def_map(func)
 }
 
 fn block_of_inst(func: &MachFunction, target: InstId) -> Option<BlockId> {

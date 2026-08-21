@@ -432,6 +432,60 @@ fn bails_on_extra_liveout() {
     assert_eq!(count(&func, AArch64Opcode::NeonUcvtfV), 0);
 }
 
+/// Splice `f(23) = FNEG f(22)` into the loop header and feed the plain-fadd
+/// accumulate from it, i.e. `acc' = acc + (-t)` with the negation IN THE LOOP.
+fn negate_term_in_loop(func: &mut MachFunction) {
+    let (blk, pos) = func
+        .blocks
+        .iter()
+        .enumerate()
+        .find_map(|(bidx, blk)| {
+            blk.insts
+                .iter()
+                .position(|&id| func.inst(id).opcode == AArch64Opcode::FaddRR)
+                .map(|p| (BlockId(bidx as u32), p))
+        })
+        .expect("the plain-fadd accumulate root");
+    let neg = func.push_inst(MachInst::new(AArch64Opcode::FnegRR, vec![f(23), f(22)]));
+    func.block_mut(blk).insts.insert(pos, neg);
+    let add = func.block(blk).insts[pos + 1];
+    func.inst_mut(add).operands[2] = f(23);
+}
+
+/// An IN-LOOP `FNEG` anywhere in the term DAG must fail CLOSED.
+///
+/// The lowering has no `.2D` FNEG opcode; it used to substitute
+/// `NeonMovi Vz,#0` + `NeonFsubV Vd, Vz, Vx` ("0.0 - x"), which is NOT bit-exact
+/// fneg: for `x = +0.0` FNEG gives -0.0 while `0.0 - 0.0` gives +0.0 under RNE,
+/// and for `x = NaN` FNEG flips the sign bit while FSUB keeps the operand's sign.
+/// `node_ok` used to recurse straight through `FnegRR` without requiring the
+/// operand to be non-zero/non-NaN, so the substitution shipped. Differentially
+/// reproduced against the LLVM backend with `acc += one / (-(one / z))`,
+/// `z = +inf` (-inf vs +inf) and `acc += -(one / z)`, `z = one = 0.0`
+/// (-NaN vs +NaN) — no passes disabled.
+#[test]
+fn bails_on_in_loop_fneg_in_term() {
+    let mut func = build_loop(1, Accum::PlainFadd, false, false);
+    negate_term_in_loop(&mut func);
+    let mut pass = NeonFPRedPass::new();
+    assert!(
+        !pass.run(&mut func),
+        "must BAIL on an in-loop FNEG in the term (0.0 - x is not fneg for +0.0/NaN)"
+    );
+    assert_eq!(pass.fired(), 0);
+    assert_eq!(
+        count(&func, AArch64Opcode::NeonUcvtfV),
+        0,
+        "no NEON emitted"
+    );
+    assert_eq!(
+        count(&func, AArch64Opcode::NeonFsubV),
+        0,
+        "no `0.0 - x` fneg substitution emitted"
+    );
+    assert_eq!(count(&func, AArch64Opcode::NeonMovi), 0, "no zero vector");
+}
+
 /// Recognize the built loop and apply with an explicit `pressure_tune` flag
 /// (race-free alternative to toggling `TRUST_CG_DISABLE_FPRED_PRESSURE_TUNE`).
 fn apply_with_tune(func: &mut MachFunction, pressure_tune: bool) -> bool {

@@ -1091,12 +1091,40 @@ fn same_as_iv(func: &MachFunction, def: &HashMap<u32, InstId>, mut v: VReg, iv: 
 /// Follow value-preserving copy chains (`MovR`/`Copy`/`AddRI(_,0)`) to the
 /// underlying value (bounded). Used only on single-def limit registers, never on
 /// the multi-def induction. Mirrors `neon_map::strip_copies`.
-fn strip_copies(func: &MachFunction, def: &HashMap<u32, InstId>, mut v: VReg) -> VReg {
+/// Resolve a register READ inside the loop to a LOOP-INVARIANT register whose
+/// value at loop entry equals the in-loop-observed value on EVERY iteration —
+/// the register the vector preheader may read.
+///
+/// A register whose defs ALL lie outside the loop body is invariant across the
+/// loop, and because the ORIGINAL loop reads it (directly or through the copy
+/// chain below) on every iteration, its reaching value at the preheader IS the
+/// value every in-loop read observes — no single-def-dominates-preheader
+/// requirement (which FAILS for merged variables like a Vec length carried
+/// through a preceding growth loop: multiple defs, each on its own path, none
+/// dominating). Otherwise the register must have exactly ONE def anywhere — an
+/// in-loop value-preserving copy — and the walk steps to its source. Anything
+/// else (an in-loop non-copy def, several defs with any inside the loop)
+/// returns None: fail-closed to the scalar loop.
+/// Step a register through GLOBALLY-SINGLE-DEF value-preserving copies only,
+/// returning the first register that is not one (multi-def, def-less past the
+/// first step, or defined by a non-copy). Unlike [`strip_copies`], this NEVER
+/// consults the last-def-wins def map on a multi-def register — the map entry
+/// there is an ARBITRARY def, and resolving through it let a foreign value
+/// masquerade as the loop bound (review repro: a merged multi-def `N` whose
+/// stale map entry aliased a different length register). Multi-def registers
+/// TERMINATE the walk and are compared by identity only.
+fn strict_copy_root(func: &MachFunction, mut v: VReg) -> VReg {
     for _ in 0..16 {
-        let Some(&d) = def.get(&v.id) else {
+        let defs: Vec<InstId> = func
+            .blocks
+            .iter()
+            .flat_map(|b| b.insts.iter().copied())
+            .filter(|&id| inst_defines(func.inst(id), v.id))
+            .collect();
+        let [d] = defs.as_slice() else {
             return v;
         };
-        match copy_like(func.inst(d)) {
+        match copy_like(func.inst(*d)) {
             Some((dst, src)) if dst == v => v = src,
             _ => return v,
         }
@@ -1104,35 +1132,64 @@ fn strip_copies(func: &MachFunction, def: &HashMap<u32, InstId>, mut v: VReg) ->
     v
 }
 
-/// Two limit registers agree iff they are the SAME register (after copy
-/// stripping) or resolve to the SAME constant. Mirrors `neon_map::bound_agrees`.
-fn bound_agrees(func: &MachFunction, def: &HashMap<u32, InstId>, a: VReg, b: VReg) -> bool {
-    if strip_copies(func, def, a) == strip_copies(func, def, b) {
-        return true;
-    }
-    matches!(
-        (const_value(func, def, a), const_value(func, def, b)),
-        (Some(x), Some(y)) if x == y
-    )
-}
-
-/// SINGLE-N agreement for two [`ChainBound`]s: two constants agree iff equal; two
-/// registers via [`bound_agrees`]; a register and a constant iff the register
-/// resolves to that constant. Any disagreement BAILS the chain (a guard against a
-/// different limit proves nothing about the vector range for that array).
-fn chain_bound_agrees(
+/// STRICT [`ChainBound`] agreement for the forward chain: registers agree iff
+/// their [`strict_copy_root`]s are IDENTICAL; a register agrees with a constant
+/// iff its root is globally single-def and that def materializes exactly that
+/// constant. Never resolves through a multi-def register's arbitrary def-map
+/// entry (the review-demonstrated foreign-length hazard).
+fn strict_chain_bound_agrees(
     func: &MachFunction,
     def: &HashMap<u32, InstId>,
     a: ChainBound,
     b: ChainBound,
 ) -> bool {
+    let single_def_const = |r: VReg, k: i64| {
+        let root = strict_copy_root(func, r);
+        let ndefs = func
+            .blocks
+            .iter()
+            .flat_map(|blk| blk.insts.iter().copied())
+            .filter(|&id| inst_defines(func.inst(id), root.id))
+            .count();
+        ndefs == 1 && const_value(func, def, root) == Some(k)
+    };
     match (a, b) {
         (ChainBound::Const(x), ChainBound::Const(y)) => x == y,
-        (ChainBound::Reg(x), ChainBound::Reg(y)) => bound_agrees(func, def, x, y),
+        (ChainBound::Reg(x), ChainBound::Reg(y)) => {
+            strict_copy_root(func, x) == strict_copy_root(func, y)
+        }
         (ChainBound::Reg(r), ChainBound::Const(k)) | (ChainBound::Const(k), ChainBound::Reg(r)) => {
-            const_value(func, def, r) == Some(k)
+            single_def_const(r, k)
         }
     }
+}
+
+fn resolve_loop_invariant(
+    func: &MachFunction,
+    loop_insts: &HashSet<InstId>,
+    mut v: VReg,
+) -> Option<VReg> {
+    for _ in 0..16 {
+        let defs: Vec<InstId> = func
+            .blocks
+            .iter()
+            .flat_map(|b| b.insts.iter().copied())
+            .filter(|&id| inst_defines(func.inst(id), v.id))
+            .collect();
+        if defs.iter().all(|id| !loop_insts.contains(id)) {
+            // Invariant (a def-less register — e.g. a parameter — is trivially
+            // so).
+            return Some(v);
+        }
+        let [d] = defs.as_slice() else {
+            return None;
+        };
+        match copy_like(func.inst(*d)) {
+            Some((dst, src)) if dst == v => v = src,
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// The recognized loop SHAPE, produced by [`Recognized::two_block_shape`] /
@@ -1406,9 +1463,15 @@ impl Recognized {
     /// a SUBSET of the indices the scalar chain reads at the SAME addresses — and
     /// the untouched scalar chain finishes the `[V, N)` tail. Because the reduction
     /// target is a REGISTER `acc` (not memory), read/read aliasing of the input
-    /// streams is benign — no versioning is needed. Any surviving
-    /// `TrapBoundsCheckExact` carrier is NOT in `allowed_loop_op`, so it BAILS the
-    /// whole loop (strictly more conservative than neon_map's carrier admission).
+    /// streams is benign — no versioning is needed. A surviving
+    /// `TrapBoundsCheckExact` carrier is admitted by the CHAIN path ONLY under
+    /// validation (the register analogue of neon_bytesum's carrier arm): its
+    /// index must be the iv through value-preserving copies and its length must
+    /// join the single-N agreement — so the carrier is exactly this loop's own
+    /// `a[iv]` guard against the SAME `N` the vector header re-proves
+    /// (`iv+width-1 < N` ⊇ each lane's `idx < N`), and it survives untouched in
+    /// the scalar tail. A carrier over ANY other index or length is evidence of
+    /// an access the vector plan does not model and BAILS the whole loop.
     /// Fail-closed on ANY deviation.
     fn recognize_forward_chain(
         func: &MachFunction,
@@ -1420,11 +1483,21 @@ impl Recognized {
     ) -> Option<Self> {
         // Whitelist every opcode across EVERY body block (mirror neon_map:635) —
         // a hidden second store / foreign load / call / div in a MIDDLE block
-        // still BAILS.
+        // still BAILS. The CHAIN path additionally admits `TrapBoundsCheckExact`
+        // carriers (collected here, validated STRICTLY against the iv and the
+        // single N once the walk resolves the bound) — the TWO-BLOCK recognizer
+        // deliberately does not (its latch/guard shapes were never audited for
+        // them; fail-closed there). At this stage the slice load is still the
+        // FORM 1 `Madd`+`LdrRI` pair (`ext_addr` fuses `LdrRO` only later), so
+        // no scaled register-offset admission is needed.
         let mut loop_insts = HashSet::new();
+        let mut carriers: Vec<InstId> = Vec::new();
         for &b in body {
             for &id in &func.block(b).insts {
-                if !allowed_loop_op(func.inst(id).opcode) {
+                let op = func.inst(id).opcode;
+                if op == AArch64Opcode::TrapBoundsCheckExact {
+                    carriers.push(id);
+                } else if !allowed_loop_op(op) {
                     return None;
                 }
                 loop_insts.insert(id);
@@ -1542,7 +1615,7 @@ impl Recognized {
                         return None;
                     }
                     match bound {
-                        Some(b) if !chain_bound_agrees(func, &def, b, n) => return None,
+                        Some(b) if !strict_chain_bound_agrees(func, &def, b, n) => return None,
                         None => {
                             bound = Some(n);
                             header_cmp = Some(cmp_id);
@@ -1589,6 +1662,47 @@ impl Recognized {
             return None; // some body block is not on the header->latch chain
         }
         let bound = bound?; // the header's loop-continue guard established it
+
+        // Every `TrapBoundsCheckExact` carrier in the body must be THIS loop's
+        // own `a[iv]` guard against the SAME single N: `[base, index, len]`
+        // with index == iv (through value-preserving copies) and len joining
+        // the single-N agreement — the register analogue of neon_bytesum's
+        // carrier arm. The vector header re-proves `iv+width-1 <u N`, a
+        // superset of each lane's `idx <u N`, so the carrier's condition holds
+        // for every vector access and the carrier itself survives untouched in
+        // the scalar tail. Any other index/length BAILS.
+        // STRICT resolution only (review repro): `strip_copies`/`same_as_iv`
+        // ride the last-def-wins def map, whose entry for a MULTI-DEF register
+        // is arbitrary — and merged multi-def bounds are exactly what
+        // `resolve_loop_invariant` newly admits. Every register consulted here
+        // steps only through globally-single-def copies (`strict_copy_root`);
+        // multi-def registers terminate the walk and compare by IDENTITY, so a
+        // foreign length can never masquerade as the loop bound.
+        for &cid in &carriers {
+            let cinst = func.inst(cid);
+            if cinst.operands.len() != 3 {
+                return None;
+            }
+            let index = vreg_of(&cinst.operands[1])?;
+            if strict_copy_root(func, index) != iv {
+                return None;
+            }
+            match (bound, &cinst.operands[2]) {
+                (ChainBound::Reg(b), MachOperand::VReg(l)) => {
+                    if strict_copy_root(func, *l) != strict_copy_root(func, b) {
+                        return None;
+                    }
+                }
+                (ChainBound::Const(k), MachOperand::Imm(v)) => {
+                    if *v != k {
+                        return None;
+                    }
+                }
+                // Register-vs-constant agreement would need const resolution
+                // through the multi-def-hazardous map — fail closed.
+                _ => return None,
+            }
+        }
 
         // Resolve the bound. A CONSTANT limit (`CmpRI`, d09's `[i32; 2048]`) is
         // validated to `[1, i32::MAX]` EXACTLY like `reconstruct_const_bound` and
@@ -1656,6 +1770,8 @@ impl Recognized {
             preheader_term: vec_preheader_term,
             abs_diamond,
         } = shape;
+        // `bound` may be re-rooted below through value-preserving copies.
+        let mut bound = bound;
 
         // (R3) step: iv_src = AddRR(iv, +1)  (or AddRI(iv, 1)).
         if !is_increment_by_one(func, &def, iv_src, iv) {
@@ -1785,7 +1901,24 @@ impl Recognized {
             let bound_def = *def.get(&bound.id)?;
             let bound_block = block_of_inst(func, bound_def)?;
             if !dom.dominates(bound_block, vec_preheader) {
-                bound_const = Some(reconstruct_const_bound(func, bound_cmp)?);
+                // The guard may compare against an IN-LOOP COPY of the
+                // invariant limit (the bounds-guarded chain re-copies `len`
+                // every iteration: `MovR t, len; CmpRR iv, t`). Re-root
+                // through the loop's own value-preserving copies to a
+                // LOOP-INVARIANT register (`resolve_loop_invariant`): all its
+                // defs lie outside the body, so its loop-entry value is
+                // exactly what the guard compares on every iteration and the
+                // vector preheader may read it — this deliberately does NOT
+                // require a single def dominating the preheader, which fails
+                // for merged variables (a Vec length carried through a
+                // preceding growth loop). Fall back to the constant
+                // reconstruction; bail if neither holds (fail-closed).
+                match resolve_loop_invariant(func, &loop_insts, bound) {
+                    Some(root) if root.class == bound.class => bound = root,
+                    _ => {
+                        bound_const = Some(reconstruct_const_bound(func, bound_cmp)?);
+                    }
+                }
             }
         }
 
@@ -1944,14 +2077,15 @@ impl Recognized {
     ///   `k = 4`.
     /// * i64 path: `dst` is `Gpr64`, `idx = iv` **directly** (already 64-bit, no
     ///   sign extension), `k = 8`.
-    fn load_base(&self, func: &MachFunction, dom: &DomTree, dst: VReg) -> Option<VReg> {
+    fn load_base(&self, func: &MachFunction, _dom: &DomTree, dst: VReg) -> Option<VReg> {
         let (want_class, elem_bytes) = if self.is_i64 {
             (RegClass::Gpr64, ELEM_BYTES_I64)
         } else {
             (RegClass::Gpr32, ELEM_BYTES)
         };
-        // The load itself: LdrRI(dst[want_class], addr[Gpr64], Imm(0)).
         let load = func.inst(*self.def.get(&dst.id)?);
+
+        // FORM 1: LdrRI(dst[want_class], addr[Gpr64], Imm(0)).
         if load.opcode != AArch64Opcode::LdrRI
             || load.operands.len() != 3
             || dst.class != want_class
@@ -1967,7 +2101,15 @@ impl Recognized {
         }
         let f1 = vreg_of(&madd.operands[1])?;
         let f2 = vreg_of(&madd.operands[2])?;
-        let base = vreg_of(&madd.operands[3])?;
+        // Resolve the base through the loop's value-preserving copies to its
+        // LOOP-INVARIANT root: the bounds-guarded chain re-copies the slice
+        // base every iteration, and a merged base (a Vec pointer carried
+        // through a preceding growth loop) has no single def dominating the
+        // preheader — invariance (all defs outside the body) is the sound
+        // criterion, and copies cannot change the address, so the vector
+        // preheader reading the root loads the SAME addresses the scalar
+        // loop does.
+        let base = resolve_loop_invariant(func, &self.loop_insts, vreg_of(&madd.operands[3])?)?;
         // One factor is the index (`sext(iv)` for i32, `iv` itself for i64), the
         // other is the constant element size (4 for i32, 8 for i64).
         let idx_ok = |factor: VReg| {
@@ -1989,13 +2131,7 @@ impl Recognized {
         if !((idx_ok(f1) && es_ok(f2)) || (idx_ok(f2) && es_ok(f1))) {
             return None;
         }
-        // `base` must be loop-invariant: its def dominates the preheader (so it
-        // is not written in the loop and reaches the vector loop).
-        let base_def = *self.def.get(&base.id)?;
-        let base_block = block_of_inst(func, base_def)?;
-        if !dom.dominates(base_block, self.preheader) {
-            return None;
-        }
+        // Invariance established by `resolve_loop_invariant` above.
         Some(base)
     }
 
@@ -5134,10 +5270,7 @@ fn iv_def_dominates_preheader(
             continue;
         }
         for &inst_id in &func.block(block_id).insts {
-            let inst = func.inst(inst_id);
-            if produces_def(inst.opcode)
-                && matches!(inst.operands.first(), Some(MachOperand::VReg(v)) if *v == iv)
-            {
+            if crate::effects::inst_defines_vreg(func.inst(inst_id), iv) {
                 return true;
             }
         }
@@ -5163,40 +5296,7 @@ pub(crate) static BDM_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 pub(crate) static BDM_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn build_def_map_inner(func: &MachFunction) -> HashMap<u32, InstId> {
-    // Only instructions still ATTACHED TO A BLOCK define anything. `func.insts` is
-    // an append-only ARENA that also retains instructions a prior pass DETACHED
-    // (e.g. the `TrapBoundsCheckExact` carriers `aarch64-bounds-check-elim` strips
-    // once a dominating guard subsumes them). A stale carrier
-    // `TrapBoundsCheckExact[x, x, N]` — whose operand 0 is a live vreg it only
-    // READS — would otherwise shadow that vreg's REAL (earlier, in-block) def in
-    // the map, breaking `same_as_iv`/`strip_copies` copy-chain resolution (e.g. the
-    // forward-chain's `a[i]` index, a pass-through COPY of the iv). Restricting to
-    // live in-block instructions keeps the map to actual reaching defs.
-    let live: HashSet<InstId> = func
-        .blocks
-        .iter()
-        .flat_map(|b| b.insts.iter().copied())
-        .collect();
-    let mut map = HashMap::new();
-    for (idx, inst) in func.insts.iter().enumerate() {
-        let id = InstId(idx as u32);
-        if live.contains(&id)
-            && let Some(MachOperand::VReg(v)) = inst.operands.first()
-            && produces_def(inst.opcode)
-        {
-            map.insert(v.id, id);
-        }
-    }
-    map
-}
-
-/// Conservative "operand 0 is a written def" predicate for the opcodes this pass
-/// reasons about. Compares/branches do not define a register value; nor does the
-/// side-effect-only `TrapBoundsCheckExact` bounds-check carrier (its operand 0 is
-/// the checked index — a READ) or a store (operand 0 is the stored VALUE).
-fn produces_def(op: AArch64Opcode) -> bool {
-    use AArch64Opcode::*;
-    !matches!(op, CmpRR | CmpRI | BCond | B | TrapBoundsCheckExact | StrRI)
+    crate::effects::build_reaching_def_map(func)
 }
 
 /// True iff `inst` DEFINES vreg id `id` at any def or def-use operand position,
@@ -5220,11 +5320,7 @@ fn inst_defines(inst: &MachInst, id: u32) -> bool {
 /// than one def cannot be resolved to its reaching definition by the map, so
 /// TRACK D's loop-invariant leaf check demands exactly one.
 fn count_defs_global(func: &MachFunction, id: u32) -> usize {
-    func.blocks
-        .iter()
-        .flat_map(|blk| blk.insts.iter())
-        .filter(|&&i| inst_defines(func.inst(i), id))
-        .count()
+    crate::effects::live_def_count(func, id)
 }
 
 /// DIAGNOSTIC (default off): accumulated nanoseconds and call count inside
@@ -7064,5 +7160,168 @@ mod tests {
         assert_eq!(pass.fired(), 0);
         assert_eq!(count(&func, AArch64Opcode::NeonAbsV), 0);
         assert_eq!(count(&func, AArch64Opcode::NeonLdpQPost), 0);
+    }
+    /// i64 forward chain `while k <u N { carrier(w,k,lenB); acc += a[k]; k+=1 }`
+    /// where N is a MERGED register: bbA writes `N = lenA` (Movz 8), bbB writes
+    /// `N = lenB` (Movz 3), joining before the loop. The carrier's length is
+    /// `lenB` — NOT the loop bound on the runtime path through bbA (N=8, carrier
+    /// traps at k=3). The last-wins def map records bbB's `MovR N, lenB`, so
+    /// `strip_copies(N) == lenB` and `chain_bound_agrees` SPURIOUSLY accepts it.
+    ///
+    /// carrier_len: 0 => carrier bound = lenB (the exploit); 1 => carrier
+    /// bound = N itself (genuine agreement); 2 => no carrier at all.
+    fn build_merged_bound_carrier_loop(carrier_len: u8) -> MachFunction {
+        let mut func = MachFunction::new("k".to_string(), Signature::new(vec![], vec![]));
+        let bb0 = func.entry;
+        let bb_a = func.create_block();
+        let bb_b = func.create_block();
+        let pre = func.create_block();
+        let header = func.create_block();
+        let gblk = func.create_block();
+        let latch = func.create_block();
+        let exit = func.create_block();
+        let push = |func: &mut MachFunction, blk: BlockId, op, ops| {
+            let id = func.push_inst(MachInst::new(op, ops));
+            func.append_inst(blk, id);
+        };
+        use AArch64Opcode::*;
+        push(&mut func, bb0, Copy, vec![v64(0), v64(0)]); // base_a (param placeholder)
+        push(&mut func, bb0, Copy, vec![v64(2), v64(2)]); // wbase (carrier base)
+        push(&mut func, bb0, Movz, vec![v64(3), i(8)]); // lenA = 8
+        push(&mut func, bb0, Movz, vec![v64(4), i(3)]); // lenB = 3
+        push(&mut func, bb0, Movz, vec![v64(41), i(8)]); // es = 8
+        push(&mut func, bb0, CmpRI, vec![v64(3), i(0)]);
+        push(&mut func, bb0, BCond, vec![i(CC_EQ), b(bb_b)]);
+        push(&mut func, bb0, B, vec![b(bb_a)]);
+        // bbA first, bbB second: bbB's `MovR N, lenB` is later in arena order and
+        // wins the last-wins def map entry for N.
+        push(&mut func, bb_a, MovR, vec![v64(5), v64(3)]);
+        push(&mut func, bb_a, B, vec![b(pre)]);
+        push(&mut func, bb_b, MovR, vec![v64(5), v64(4)]);
+        push(&mut func, bb_b, B, vec![b(pre)]);
+        push(&mut func, pre, Movz, vec![v64(59), i(0)]);
+        push(&mut func, pre, Movz, vec![v64(60), i(0)]);
+        push(&mut func, pre, B, vec![b(header)]);
+        push(&mut func, header, CmpRR, vec![v64(59), v64(5)]);
+        push(&mut func, header, BCond, vec![i(CC_LO), b(gblk)]);
+        push(&mut func, header, B, vec![b(exit)]);
+        match carrier_len {
+            0 => push(
+                &mut func,
+                gblk,
+                TrapBoundsCheckExact,
+                vec![v64(2), v64(59), v64(4)],
+            ),
+            1 => push(
+                &mut func,
+                gblk,
+                TrapBoundsCheckExact,
+                vec![v64(2), v64(59), v64(5)],
+            ),
+            _ => {}
+        }
+        push(
+            &mut func,
+            gblk,
+            Madd,
+            vec![v64(66), v64(59), v64(41), v64(0)],
+        );
+        push(&mut func, gblk, LdrRI, vec![v64(67), v64(66), i(0)]);
+        push(&mut func, gblk, B, vec![b(latch)]);
+        push(&mut func, latch, AddRR, vec![v64(71), v64(60), v64(67)]);
+        push(&mut func, latch, AddRI, vec![v64(72), v64(59), i(1)]);
+        push(&mut func, latch, MovR, vec![v64(60), v64(71)]);
+        push(&mut func, latch, MovR, vec![v64(59), v64(72)]);
+        push(&mut func, latch, B, vec![b(header)]);
+        push(&mut func, exit, MovR, vec![v64(80), v64(60)]);
+        push(&mut func, exit, Ret, vec![]);
+        func.add_edge(bb0, bb_a);
+        func.add_edge(bb0, bb_b);
+        func.add_edge(bb_a, pre);
+        func.add_edge(bb_b, pre);
+        func.add_edge(pre, header);
+        func.add_edge(header, gblk);
+        func.add_edge(header, exit);
+        func.add_edge(gblk, latch);
+        func.add_edge(latch, header);
+        func.next_vreg = 512;
+        func
+    }
+
+    #[test]
+    fn adv_merged_bound_no_carrier_fires() {
+        let mut func = build_merged_bound_carrier_loop(2);
+        let mut pass = NeonArrayPass::new();
+        assert!(pass.run(&mut func), "merged-bound chain (no carrier) fires");
+    }
+
+    #[test]
+    fn adv_carrier_same_n_fires() {
+        let mut func = build_merged_bound_carrier_loop(1);
+        let mut pass = NeonArrayPass::new();
+        assert!(pass.run(&mut func), "carrier over N itself fires");
+    }
+
+    #[test]
+    fn adv_carrier_foreign_len_must_bail() {
+        // REVIEW REPRO (2026-08-17): with map-based agreement this FIRED and
+        // erased a guaranteed bounds trap. Original program: traps (BRK) at k=3 on the bbA path
+        // (N=8, carrier `3 <u 3` fails). Transformed program (observed dump):
+        // vector guard N>=8 -> vector loop consumes k=0..8 with NO carrier ->
+        // scalar header entered at k=8 -> exits immediately -> returns normally.
+        let mut func = build_merged_bound_carrier_loop(0);
+        let mut pass = NeonArrayPass::new();
+        assert!(
+            !pass.run(&mut func),
+            "a carrier whose length register is NOT the loop bound must BAIL \
+         (review repro: merged multi-def N with a stale last-def map entry \
+         aliasing the foreign length; strict_copy_root terminates at the \
+         multi-def N and the identity compare rejects lenB)"
+        );
+    }
+
+    /// The LdrRO slice-sum shape (post-`ext_addr` fusion) must BAIL: the
+    /// recognizer runs BEFORE addr-mode fusion, sees only FORM 1
+    /// `Madd`+`LdrRI`, and deliberately keeps `LdrRO` OFF the chain
+    /// whitelist (a FORM 2 arm added for it was dead code — `node_ok`
+    /// routes only `LdrRI` leaves — and was removed by review).
+    #[test]
+    fn chain_bails_on_ldro_load() {
+        let mut func = MachFunction::new("k".to_string(), Signature::new(vec![], vec![]));
+        let bb0 = func.entry;
+        let header = func.create_block();
+        let gblk = func.create_block();
+        let latch = func.create_block();
+        let exit = func.create_block();
+        let push = |func: &mut MachFunction, blk: BlockId, op, ops| {
+            let id = func.push_inst(MachInst::new(op, ops));
+            func.append_inst(blk, id);
+        };
+        use AArch64Opcode::*;
+        push(&mut func, bb0, Copy, vec![v64(0), v64(0)]);
+        push(&mut func, bb0, Copy, vec![v64(5), v64(5)]);
+        push(&mut func, bb0, Movz, vec![v64(59), i(0)]);
+        push(&mut func, bb0, Movz, vec![v64(60), i(0)]);
+        push(&mut func, bb0, B, vec![b(header)]);
+        push(&mut func, header, CmpRR, vec![v64(59), v64(5)]);
+        push(&mut func, header, BCond, vec![i(CC_LO), b(gblk)]);
+        push(&mut func, header, B, vec![b(exit)]);
+        push(&mut func, gblk, LdrRO, vec![v64(67), v64(0), v64(59), i(7)]);
+        push(&mut func, gblk, B, vec![b(latch)]);
+        push(&mut func, latch, AddRR, vec![v64(71), v64(60), v64(67)]);
+        push(&mut func, latch, AddRI, vec![v64(72), v64(59), i(1)]);
+        push(&mut func, latch, MovR, vec![v64(60), v64(71)]);
+        push(&mut func, latch, MovR, vec![v64(59), v64(72)]);
+        push(&mut func, latch, B, vec![b(header)]);
+        push(&mut func, exit, MovR, vec![v64(80), v64(60)]);
+        push(&mut func, exit, Ret, vec![]);
+        func.add_edge(bb0, header);
+        func.add_edge(header, gblk);
+        func.add_edge(header, exit);
+        func.add_edge(gblk, latch);
+        func.add_edge(latch, header);
+        func.next_vreg = 512;
+        let mut pass = NeonArrayPass::new();
+        assert!(!pass.run(&mut func), "LdrRO in the body must fail closed");
     }
 }

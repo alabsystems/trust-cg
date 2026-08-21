@@ -31,6 +31,50 @@ use trust_ir::{
 use trust_ir::{BlockId, FuncId, Ty, ValueId};
 
 // ---------------------------------------------------------------------------
+// Host-native object support (GB10 re-baseline): these e2e tests emit objects
+// the HOST toolchain links and runs, so emission, magic checks, PIE flags and
+// disassembly must follow the host format — Mach-O on macOS, ELF elsewhere.
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+fn host_aarch64_triple() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "aarch64-apple-darwin"
+    } else {
+        "aarch64-unknown-linux-gnu"
+    }
+}
+
+#[allow(dead_code)]
+fn host_no_pie_flag() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "-Wl,-no_pie"
+    } else {
+        "-no-pie"
+    }
+}
+
+#[allow(dead_code)]
+fn host_object_magic_u32() -> u32 {
+    if cfg!(target_os = "macos") {
+        0xFEED_FACF
+    } else {
+        u32::from_le_bytes([0x7F, b'E', b'L', b'F'])
+    }
+}
+
+#[allow(dead_code)]
+fn assert_host_object_magic_bytes(obj_bytes: &[u8], context: &str) {
+    assert!(obj_bytes.len() >= 4, "{context}: object too small");
+    let expected = host_object_magic_u32().to_le_bytes();
+    assert_eq!(
+        &obj_bytes[0..4],
+        &expected,
+        "{context}: object magic must match the host-native format"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -80,7 +124,7 @@ fn link_with_cc(dir: &Path, driver_c: &Path, obj: &Path, output_name: &str) -> P
         .arg(&binary)
         .arg(driver_c)
         .arg(obj)
-        .arg("-Wl,-no_pie")
+        .arg(host_no_pie_flag())
         .output()
         .expect("run cc");
     if !result.status.success() {
@@ -121,6 +165,7 @@ fn compile_trust_ir(
     let (lir_func, _proof_ctx) = trust_cg_lower::translate_function(trust_ir_func, module)
         .map_err(|e| format!("adapter: {}", e))?;
     let config = PipelineConfig {
+        target_triple: host_aarch64_triple().to_string(),
         opt_level,
         emit_debug: false,
         ..Default::default()
@@ -140,8 +185,8 @@ fn assert_valid_macho(bytes: &[u8], ctx: &str) {
     );
     assert_eq!(
         &bytes[0..4],
-        &[0xCF, 0xFA, 0xED, 0xFE],
-        "{}: invalid Mach-O magic",
+        &host_object_magic_u32().to_le_bytes(),
+        "{}: invalid host object magic",
         ctx
     );
 }

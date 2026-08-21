@@ -68,6 +68,7 @@ use trust_cg_ir::{
 };
 
 use crate::cache::StableHasher;
+use crate::effects::for_each_inst_def;
 use crate::pass_manager::{
     CertifiedPassCheckerRecord, CertifiedPassRunRecord, CertifiedPassRunStatus, MachinePass,
 };
@@ -391,11 +392,9 @@ fn run_impl(
             // 3. Invalidate: if this instruction defines a vreg and
             //    we didn't fold or track it, the stale constant
             //    entry (if any) is no longer valid.
-            if inst.produces_value()
-                && let Some(MachOperand::VReg(dst)) = inst.operands.first()
-            {
-                constants.remove(dst);
-            }
+            for_each_inst_def(inst, |dst| {
+                constants.remove(&dst);
+            });
 
             new_insts.push(inst_id);
         }

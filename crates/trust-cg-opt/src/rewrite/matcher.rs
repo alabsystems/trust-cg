@@ -191,11 +191,9 @@ mod tests {
         let ids = func.block(block_id).insts.clone();
         for &inst_id in ids.iter().take(up_to_exclusive) {
             let inst = func.inst(inst_id);
-            if inst.opcode.produces_value()
-                && let Some(MachOperand::VReg(dst)) = inst.operands.first()
-            {
-                map.insert(*dst, inst_id);
-            }
+            crate::effects::for_each_inst_def(inst, |dst| {
+                map.insert(dst, inst_id);
+            });
         }
         map
     }

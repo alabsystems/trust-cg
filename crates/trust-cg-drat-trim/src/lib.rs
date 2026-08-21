@@ -77,6 +77,24 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn executable_has_required_content_derived_macho_uuid() {
+        let out = Command::new("otool")
+            .arg("-l")
+            .arg(drat_trim_executable_path())
+            .output()
+            .expect("run otool over vendored checker");
+        assert!(out.status.success(), "otool must inspect vendored checker");
+        let load_commands = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            load_commands
+                .lines()
+                .any(|line| line.trim() == "cmd LC_UUID"),
+            "linker-signed checker must retain the content-derived Mach-O UUID required by dyld"
+        );
+    }
+
     /// End-to-end: hand drat-trim a trivially-unsatisfiable CNF and an
     /// empty (just the empty clause) DRAT proof, and require
     /// acceptance.

@@ -483,16 +483,72 @@ impl ObjectRelocationProofRegistry {
 
     /// Production proof-authority registry for AArch64 ELF relocations.
     ///
-    /// This is intentionally empty. The five TLSLE/TLSIE obligations in
-    /// [`crate::aarch64_elf_tls_reloc_proofs`] have a strict solver-backed
-    /// formal lane with negative controls, but AY is in that lane's trusted
-    /// computing base. The production inventory currently has only a binary
-    /// `Verified` bit, which downstream treats as Certified output; it cannot
-    /// represent solver-backed Trusted evidence or bind a solver identity and
-    /// gate report to the emitted object. Until that authority distinction is
-    /// explicit, neither TLS nor ordinary AArch64 ELF rows may enter this set.
+    /// Each row cites the standing solver-backed value-proof lane for its
+    /// kind ([`crate::aarch64_elf_reloc_proofs`]), registered in the
+    /// [`crate::proof_database`] object-emission family; the lane's six
+    /// refutable negative controls are asserted Invalid by its own
+    /// `verify_by_evaluation` tests (controls are never DB-registered,
+    /// matching every precedent lane). The lane models the AArch64 psABI Rela semantics —
+    /// explicit `r_addend`, `P` = `r_offset`, linker-resolved `S`/`G` — so a
+    /// wrong pc-relativity, page mask, or low-12 recomposition refutes. As
+    /// on the x86-64 ELF side, a registry row alone still reports
+    /// `Unverified`: promotion additionally requires the report to be built
+    /// with [`ObjectProofBinding::ElfReparseEnforced`] — the shared
+    /// per-object ELF reparse gate — which is what upgrades Trusted formula
+    /// evidence into an object-bound Certified verdict. (The historical
+    /// emptiness rationale — "the inventory cannot bind a gate report to the
+    /// object" — is exactly the composition `ObjectProofBinding` now
+    /// provides, the same one the x86-64 ELF rows entered under.)
+    ///
+    /// The four EMITTED TLSLE/TLSIE kinds cite their own value lane
+    /// ([`crate::aarch64_elf_tls_reloc_proofs`], DB-registered in the same
+    /// object-emission family). Their ABI range constraints are modeled
+    /// INSIDE the obligations as preconditions (e.g. the TPREL `0 <= X <
+    /// 2^24` window carried by `preconditions: vec![in_range]`), each with a
+    /// paired DROP-the-precondition negative control that REFUTES — so the
+    /// registry row does not need to express them, exactly as the ordinary
+    /// rows do not express CALL26's ±128MiB window. In both cases the
+    /// psABI makes the LINKER's overflow check discharge the precondition at
+    /// resolution time; the reparse-enforced binding pins what the emitter
+    /// wrote. (An earlier revision kept these rows out on the belief the
+    /// registry had to carry the range preconditions itself — inherited
+    /// caution, retired when the obligations landed them internally.)
+    ///
+    /// The FIFTH named TLS kind — the checked non-NC
+    /// `R_AARCH64_TLSLE_ADD_TPREL_LO12` — stays OUT: never emitted, and the
+    /// lane carries NO obligation for it (its own doc says so). A row for it
+    /// would be authority backed by zero proofs.
     pub fn aarch64_elf_production() -> Self {
-        Self::empty()
+        const LANE: &str = "trust_cg_verify::aarch64_elf_reloc_proofs";
+        const TLS_LANE: &str = "trust_cg_verify::aarch64_elf_tls_reloc_proofs";
+        let mut verified = std::collections::BTreeMap::new();
+        verified.insert(ObjectRelocationKind::AArch64ElfCall26, LANE);
+        verified.insert(ObjectRelocationKind::AArch64ElfJump26, LANE);
+        verified.insert(ObjectRelocationKind::AArch64ElfPrel32, LANE);
+        verified.insert(ObjectRelocationKind::AArch64ElfAbs64, LANE);
+        verified.insert(ObjectRelocationKind::AArch64ElfAdrPrelPgHi21, LANE);
+        verified.insert(ObjectRelocationKind::AArch64ElfAddAbsLo12Nc, LANE);
+        verified.insert(ObjectRelocationKind::AArch64ElfAdrGotPage, LANE);
+        verified.insert(ObjectRelocationKind::AArch64ElfLd64GotLo12Nc, LANE);
+        verified.insert(
+            ObjectRelocationKind::AArch64ElfTlsieAdrGottprelPage21,
+            TLS_LANE,
+        );
+        verified.insert(
+            ObjectRelocationKind::AArch64ElfTlsieLd64GottprelLo12Nc,
+            TLS_LANE,
+        );
+        verified.insert(ObjectRelocationKind::AArch64ElfTlsleAddTprelHi12, TLS_LANE);
+        // The CHECKED (non-NC) R_AARCH64_TLSLE_ADD_TPREL_LO12 stays OUT: the
+        // backend never emits it and `aarch64_elf_tls_reloc_proofs` carries NO
+        // obligation for it — a registry row would be Certified authority
+        // backed by zero proofs (review finding). It fails closed even with
+        // the reparse binding.
+        verified.insert(
+            ObjectRelocationKind::AArch64ElfTlsleAddTprelLo12Nc,
+            TLS_LANE,
+        );
+        Self { verified }
     }
 
     /// Production proof-authority registry for AArch64 Mach-O relocations.
@@ -855,28 +911,58 @@ mod tests {
     }
 
     #[test]
-    fn aarch64_elf_registry_does_not_promote_named_but_unproven_non_tls_rows() {
+    fn aarch64_elf_registry_covers_non_tls_rows_but_binds_them_fail_closed() {
         let registry = ObjectRelocationProofRegistry::aarch64_elf_production();
         assert_eq!(
             ObjectRelocationKind::aarch64_elf_named_non_tls_rows().len(),
             8,
             "ordinary AArch64 ELF row inventory changed; audit its proof authority"
         );
+        // Every ordinary row cites the aarch64_elf_reloc_proofs value lane…
         for kind in ObjectRelocationKind::aarch64_elf_named_non_tls_rows() {
             assert!(
-                !registry.contains(*kind),
-                "implemented but unproven AArch64 ELF row {kind} must stay fail-closed"
+                registry.contains(*kind),
+                "AArch64 ELF row {kind} must cite its solver-backed value lane"
             );
         }
+        // …but a registry row alone NEVER promotes: without the per-object
+        // ELF reparse binding every row stays Unverified (fail-closed).
+        let unbound = ObjectRelocationInventoryReport::from_emitted_kinds_with_registry(
+            "aarch64-linux-unbound.o",
+            ObjectRelocationKind::aarch64_elf_named_non_tls_rows()
+                .iter()
+                .copied(),
+            &registry,
+        );
+        assert!(!unbound.is_promotable());
+        // With the shared ELF reparse binding, the Certified composition holds.
+        let bound = ObjectRelocationInventoryReport::from_emitted_kinds_with_registry_and_binding(
+            "aarch64-linux-bound.o",
+            ObjectRelocationKind::aarch64_elf_named_non_tls_rows()
+                .iter()
+                .copied(),
+            &registry,
+            ObjectProofBinding::ElfReparseEnforced,
+        );
+        assert!(bound.is_promotable());
 
         assert!(
             !registry.contains(ObjectRelocationKind::AArch64ElfOther(0xdead)),
             "unnamed/future relocation rows must stay fail-closed"
         );
+        // The four EMITTED TLS kinds carry the same contract through their own
+        // value lane (per-mode binding behavior pinned by
+        // `relocation_inventory_certifies_tls{le,ie}_rows_only_with_reparse_binding`);
+        // the never-emitted checked TPREL_LO12 has no obligation and stays out
+        // (`checked_tprel_lo12_row_rejects_even_with_reparse_binding`).
         for kind in ObjectRelocationKind::aarch64_elf_named_tls_rows() {
+            if *kind == ObjectRelocationKind::AArch64ElfTlsleAddTprelLo12 {
+                assert!(!registry.contains(*kind));
+                continue;
+            }
             assert!(
-                !registry.contains(*kind),
-                "AArch64 ELF TLS row {kind} must stay fail-closed without Certified authority"
+                registry.contains(*kind),
+                "AArch64 ELF TLS row {kind} must cite the TLS value lane"
             );
         }
     }
@@ -924,85 +1010,166 @@ mod tests {
     }
 
     #[test]
-    fn relocation_inventory_rejects_named_aarch64_elf_tls_rows() {
+    fn relocation_inventory_rejects_unbound_aarch64_elf_tls_rows() {
+        // The four emitted TLS kinds cite their value lane, but a registry
+        // row alone NEVER promotes: without the per-object ELF reparse
+        // binding the whole TLS sweep stays fail-closed.
         let registry = ObjectRelocationProofRegistry::aarch64_elf_production();
+        let registered_tls = [
+            ObjectRelocationKind::AArch64ElfTlsieAdrGottprelPage21,
+            ObjectRelocationKind::AArch64ElfTlsieLd64GottprelLo12Nc,
+            ObjectRelocationKind::AArch64ElfTlsleAddTprelHi12,
+            ObjectRelocationKind::AArch64ElfTlsleAddTprelLo12Nc,
+        ];
         let report = ObjectRelocationInventoryReport::from_emitted_kinds_with_registry(
             "module.o",
-            ObjectRelocationKind::aarch64_elf_named_tls_rows()
-                .iter()
-                .copied(),
+            registered_tls,
             &registry,
         );
 
         assert!(!report.is_promotable());
-        assert_eq!(
-            report.uncovered_relocations().len(),
-            ObjectRelocationKind::aarch64_elf_named_tls_rows().len()
-        );
         let reason = report
             .promotion_rejection_reason()
-            .expect("named TLS relocation rows should reject promotion");
-        assert!(reason.contains("R_AARCH64_TLSIE_ADR_GOTTPREL_PAGE21"));
+            .expect("unbound TLS relocation rows should reject promotion");
+        assert!(reason.contains("lacks an independent reparse binding"));
+    }
+
+    #[test]
+    fn checked_tprel_lo12_row_rejects_even_with_reparse_binding() {
+        // The checked non-NC R_AARCH64_TLSLE_ADD_TPREL_LO12 has NO obligation
+        // in the TLS lane and no emitter: it must fail closed even under the
+        // full Certified composition, and the report must name it.
+        let registry = ObjectRelocationProofRegistry::aarch64_elf_production();
+        assert!(
+            !registry.contains(ObjectRelocationKind::AArch64ElfTlsleAddTprelLo12),
+            "a registry row for the unproven checked TPREL_LO12 would be \
+             Certified authority backed by zero proofs"
+        );
+        let report = ObjectRelocationInventoryReport::from_emitted_kinds_with_registry_and_binding(
+            "aarch64-linux-tls-checked-lo12.o",
+            [ObjectRelocationKind::AArch64ElfTlsleAddTprelLo12],
+            &registry,
+            ObjectProofBinding::ElfReparseEnforced,
+        );
+        assert!(!report.is_promotable(), "{report:?}");
+        let reason = report
+            .promotion_rejection_reason()
+            .expect("unproven TLS row must reject promotion");
+        assert!(reason.contains("R_AARCH64_TLSLE_ADD_TPREL_LO12"));
         assert!(reason.contains("no object relocation proof is registered"));
     }
 
     #[test]
-    fn aarch64_elf_production_registry_has_no_certified_rows() {
+    fn aarch64_elf_production_registry_has_exactly_the_named_rows() {
         let registry = ObjectRelocationProofRegistry::aarch64_elf_production();
-        assert_eq!(registry.verified_kinds().count(), 0);
+        assert_eq!(registry.verified_kinds().count(), 12);
 
-        for kind in ObjectRelocationKind::aarch64_elf_named_non_tls_rows()
-            .iter()
-            .chain(ObjectRelocationKind::aarch64_elf_named_tls_rows())
-        {
+        for kind in ObjectRelocationKind::aarch64_elf_named_non_tls_rows() {
             assert!(
-                !registry.contains(*kind),
-                "AArch64 ELF row {kind} must not collapse Trusted solver evidence \
-                 into production Certified authority"
+                registry.contains(*kind),
+                "AArch64 ELF row {kind} must cite its value lane"
+            );
+            assert_eq!(
+                registry.lane(*kind),
+                Some("trust_cg_verify::aarch64_elf_reloc_proofs"),
+                "AArch64 ELF row {kind} must cite the ordinary relocation lane"
+            );
+        }
+        // The four EMITTED TLS kinds cite their OWN lane: the ABI range
+        // constraints ride the obligations as preconditions (with
+        // drop-refutes controls), so the rows promote through the same
+        // value-lane + reparse-enforced-binding composition as the ordinary
+        // eight — never through inherited credit. The checked non-NC
+        // TPREL_LO12 has NO obligation in that lane and must stay OUT
+        // (`checked_tprel_lo12_row_rejects_even_with_reparse_binding`).
+        for kind in ObjectRelocationKind::aarch64_elf_named_tls_rows() {
+            if *kind == ObjectRelocationKind::AArch64ElfTlsleAddTprelLo12 {
+                assert!(
+                    !registry.contains(*kind),
+                    "the unproven checked TPREL_LO12 must stay fail-closed"
+                );
+                continue;
+            }
+            assert_eq!(
+                registry.lane(*kind),
+                Some("trust_cg_verify::aarch64_elf_tls_reloc_proofs"),
+                "AArch64 ELF TLS row {kind} must cite the TLS relocation lane"
             );
         }
     }
 
     #[test]
-    fn relocation_inventory_rejects_solver_backed_tlsle_rows_for_certified_output() {
+    fn relocation_inventory_certifies_tlsle_rows_only_with_reparse_binding() {
         let registry = ObjectRelocationProofRegistry::aarch64_elf_production();
-        let report = ObjectRelocationInventoryReport::from_emitted_kinds_with_registry(
+        let rows = [
+            ObjectRelocationKind::AArch64ElfTlsleAddTprelHi12,
+            ObjectRelocationKind::AArch64ElfTlsleAddTprelLo12Nc,
+        ];
+
+        // Solver evidence WITHOUT the per-object binding: fail-closed. The
+        // registry row (the TLS value lane) alone never certifies output.
+        let unbound = ObjectRelocationInventoryReport::from_emitted_kinds_with_registry(
             "aarch64-linux-tls-localexec.o",
-            [
-                ObjectRelocationKind::AArch64ElfTlsleAddTprelHi12,
-                ObjectRelocationKind::AArch64ElfTlsleAddTprelLo12Nc,
-            ],
+            rows,
             &registry,
         );
+        assert!(!unbound.is_promotable(), "{unbound:?}");
+        assert!(
+            unbound
+                .promotion_rejection_reason()
+                .is_some_and(|r| r.contains("lacks an independent reparse binding"))
+        );
 
-        assert!(!report.is_promotable());
-        assert_eq!(report.uncovered_relocations().len(), 2);
-        let reason = report
-            .promotion_rejection_reason()
-            .expect("solver-backed TLSLE evidence must not certify production output");
-        assert!(reason.contains("R_AARCH64_TLSLE_ADD_TPREL_HI12"));
-        assert!(reason.contains("no object relocation proof is registered"));
+        // Value lane + the ELF reparse-enforced binding: promotable — the
+        // same composition the ordinary eight rows entered under. The TPREL
+        // range constraints ride the obligations as preconditions with
+        // drop-refutes controls (`aarch64_elf_tls_reloc_proofs`).
+        let bound = ObjectRelocationInventoryReport::from_emitted_kinds_with_registry_and_binding(
+            "aarch64-linux-tls-localexec.o",
+            rows,
+            &registry,
+            ObjectProofBinding::ElfReparseEnforced,
+        );
+        assert!(bound.is_promotable(), "{bound:?}");
+        assert!(bound.promotion_rejection_reason().is_none());
+        for entry in &bound.entries {
+            assert_eq!(entry.status, RelocationInventoryStatus::Verified);
+            assert!(entry.detail.contains("ELF reparse-enforced"));
+        }
     }
 
     #[test]
-    fn relocation_inventory_rejects_solver_backed_tlsie_rows_for_certified_output() {
+    fn relocation_inventory_certifies_tlsie_rows_only_with_reparse_binding() {
         let registry = ObjectRelocationProofRegistry::aarch64_elf_production();
-        let report = ObjectRelocationInventoryReport::from_emitted_kinds_with_registry(
+        let rows = [
+            ObjectRelocationKind::AArch64ElfTlsieAdrGottprelPage21,
+            ObjectRelocationKind::AArch64ElfTlsieLd64GottprelLo12Nc,
+        ];
+
+        let unbound = ObjectRelocationInventoryReport::from_emitted_kinds_with_registry(
             "aarch64-linux-tls-initialexec.o",
-            [
-                ObjectRelocationKind::AArch64ElfTlsieAdrGottprelPage21,
-                ObjectRelocationKind::AArch64ElfTlsieLd64GottprelLo12Nc,
-            ],
+            rows,
             &registry,
         );
+        assert!(!unbound.is_promotable(), "{unbound:?}");
+        assert!(
+            unbound
+                .promotion_rejection_reason()
+                .is_some_and(|r| r.contains("lacks an independent reparse binding"))
+        );
 
-        assert!(!report.is_promotable());
-        assert_eq!(report.uncovered_relocations().len(), 2);
-        let reason = report
-            .promotion_rejection_reason()
-            .expect("solver-backed TLSIE evidence must not certify production output");
-        assert!(reason.contains("R_AARCH64_TLSIE_ADR_GOTTPREL_PAGE21"));
-        assert!(reason.contains("no object relocation proof is registered"));
+        let bound = ObjectRelocationInventoryReport::from_emitted_kinds_with_registry_and_binding(
+            "aarch64-linux-tls-initialexec.o",
+            rows,
+            &registry,
+            ObjectProofBinding::ElfReparseEnforced,
+        );
+        assert!(bound.is_promotable(), "{bound:?}");
+        assert!(bound.promotion_rejection_reason().is_none());
+        for entry in &bound.entries {
+            assert_eq!(entry.status, RelocationInventoryStatus::Verified);
+            assert!(entry.detail.contains("ELF reparse-enforced"));
+        }
     }
 
     #[test]
@@ -1075,6 +1242,7 @@ mod tests {
                 "x86_64-macho.o" => 9,
                 "aarch64-macho.o" => 9,
                 "x86_64-elf.o" => 4,
+                "aarch64-elf.o" => 12,
                 _ => 0,
             };
             assert_eq!(

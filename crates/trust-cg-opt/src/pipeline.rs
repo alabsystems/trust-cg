@@ -2007,14 +2007,38 @@ impl OptimizationPipeline {
                 // No-op, return empty stats.
                 PassStats::default()
             }
-            OptLevel::O1 | OptLevel::O2 | OptLevel::Os => pm.run_once_with_stats(func),
+            OptLevel::O1 | OptLevel::O2 | OptLevel::Os => {
+                let stats = pm.run_once_with_stats(func);
+                self.run_post_convergence(func, None);
+                stats
+            }
             OptLevel::O3 => {
                 // Iterate to fixed point (max 4 iterations to bound compile time).
                 // The analysis cache in PassManager avoids redundant domtree
                 // recomputation within each iteration.
-                pm.run_to_fixpoint(func, 4)
+                let stats = pm.run_to_fixpoint(func, 4);
+                self.run_post_convergence(func, None);
+                stats
             }
         }
+    }
+
+    /// Single-shot passes that must see the CONVERGED function and whose
+    /// output must never feed back into the iterative pipeline. Currently:
+    /// the extended loop rotation — rotating a while-loop moves the natural
+    /// loop's header off its test block, a shape the vectorizers' NATIVE
+    /// classifiers must never observe mid-convergence (the 2026-08-13
+    /// v2_memfill wrong-abort class).
+    fn run_post_convergence(
+        &self,
+        func: &mut MachFunction,
+        provenance: Option<&mut ProvenanceMap>,
+    ) {
+        let disabled = std::env::var("TRUST_CG_DISABLE_PASSES").unwrap_or_default();
+        if disabled.split(',').any(|d| d.trim() == "looplatch") {
+            return;
+        }
+        crate::loop_latch_layout::run_extended_loop_rotation(func, provenance);
     }
 
     fn run_pass_manager_with_provenance(
@@ -2026,9 +2050,15 @@ impl OptimizationPipeline {
         match self.level {
             OptLevel::O0 => PassStats::default(),
             OptLevel::O1 | OptLevel::O2 | OptLevel::Os => {
-                pm.run_once_with_stats_and_provenance(func, provenance)
+                let stats = pm.run_once_with_stats_and_provenance(func, provenance);
+                self.run_post_convergence(func, Some(provenance));
+                stats
             }
-            OptLevel::O3 => pm.run_to_fixpoint_with_provenance(func, provenance, 4),
+            OptLevel::O3 => {
+                let stats = pm.run_to_fixpoint_with_provenance(func, provenance, 4);
+                self.run_post_convergence(func, Some(provenance));
+                stats
+            }
         }
     }
 

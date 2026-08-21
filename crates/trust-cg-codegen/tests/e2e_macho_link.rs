@@ -33,6 +33,50 @@ use trust_ir::{
 use trust_ir::{BlockId, FuncId, ValueId};
 
 // ---------------------------------------------------------------------------
+// Host-native object support (GB10 re-baseline): these e2e tests emit objects
+// the HOST toolchain links and runs, so emission, magic checks, PIE flags and
+// disassembly must follow the host format — Mach-O on macOS, ELF elsewhere.
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+fn host_aarch64_triple() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "aarch64-apple-darwin"
+    } else {
+        "aarch64-unknown-linux-gnu"
+    }
+}
+
+#[allow(dead_code)]
+fn host_no_pie_flag() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "-Wl,-no_pie"
+    } else {
+        "-no-pie"
+    }
+}
+
+#[allow(dead_code)]
+fn host_object_magic_u32() -> u32 {
+    if cfg!(target_os = "macos") {
+        0xFEED_FACF
+    } else {
+        u32::from_le_bytes([0x7F, b'E', b'L', b'F'])
+    }
+}
+
+#[allow(dead_code)]
+fn assert_host_object_magic_bytes(obj_bytes: &[u8], context: &str) {
+    assert!(obj_bytes.len() >= 4, "{context}: object too small");
+    let expected = host_object_magic_u32().to_le_bytes();
+    assert_eq!(
+        &obj_bytes[0..4],
+        &expected,
+        "{context}: object magic must match the host-native format"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Test infrastructure
 // ---------------------------------------------------------------------------
 
@@ -117,6 +161,8 @@ fn verify_macho_magic(bytes: &[u8]) {
         "Object file too small: {} bytes",
         bytes.len()
     );
+    // This verifier is Mach-O-specific by contract; callers that emit
+    // host-native objects use `assert_host_object_magic_bytes` instead.
     assert_eq!(
         &bytes[0..4],
         &[0xCF, 0xFA, 0xED, 0xFE],
@@ -247,7 +293,7 @@ fn link_with_cc(dir: &Path, driver_c: &Path, obj: &Path, output_name: &str) -> P
         .arg(&binary)
         .arg(driver_c)
         .arg(obj)
-        .arg("-Wl,-no_pie")
+        .arg(host_no_pie_flag())
         .output()
         .expect("Failed to run cc");
 
@@ -270,6 +316,28 @@ fn link_with_cc(dir: &Path, driver_c: &Path, obj: &Path, output_name: &str) -> P
 // Helper: compile a trust_ir function through the full pipeline
 // ---------------------------------------------------------------------------
 
+/// Compile with PINNED Mach-O emission for the Mach-O *structure* tests:
+/// header/section parsing below is format-specific, and Mach-O byte emission
+/// is host-independent (only linking needs a macOS host).
+fn compile_trust_ir_function_macho(
+    trust_ir_func: &TrustIrFunction,
+    module: &TrustIrModule,
+    opt_level: OptLevel,
+) -> Result<Vec<u8>, String> {
+    let (lir_func, _proof_ctx) = trust_cg_lower::translate_function(trust_ir_func, module)
+        .map_err(|e| format!("adapter error: {}", e))?;
+    let config = PipelineConfig {
+        target_triple: "aarch64-apple-darwin".to_string(),
+        opt_level,
+        emit_debug: false,
+        ..Default::default()
+    };
+    let pipeline = Pipeline::new(config);
+    pipeline
+        .compile_function(&lir_func)
+        .map_err(|e| format!("pipeline error: {}", e))
+}
+
 fn compile_trust_ir_function(
     trust_ir_func: &TrustIrFunction,
     module: &TrustIrModule,
@@ -281,6 +349,7 @@ fn compile_trust_ir_function(
 
     // Phase 1-9: Compile LIR through full pipeline
     let config = PipelineConfig {
+        target_triple: host_aarch64_triple().to_string(),
         opt_level,
         emit_debug: false,
         ..Default::default()
@@ -484,7 +553,7 @@ fn build_abs_val_trust_ir() -> (TrustIrFunction, TrustIrModule) {
 fn test_e2e_link_add_i32_macho_structure() {
     let (trust_ir_func, module) = build_add_i32_trust_ir();
 
-    let obj_bytes = compile_trust_ir_function(&trust_ir_func, &module, OptLevel::O0)
+    let obj_bytes = compile_trust_ir_function_macho(&trust_ir_func, &module, OptLevel::O0)
         .expect("full pipeline should compile add_i32");
 
     // -- Mach-O header validation --
@@ -874,8 +943,14 @@ int main(void) {
             .unwrap_or_else(|e| panic!("pipeline at {:?} failed: {}", opt_level, e));
 
         // Verify Mach-O structure
-        verify_macho_magic(&obj_bytes);
-        assert_eq!(macho_filetype(&obj_bytes), MH_OBJECT);
+        assert_host_object_magic_bytes(&obj_bytes, "opt-levels object");
+        if cfg!(target_os = "macos") {
+            assert_eq!(macho_filetype(&obj_bytes), MH_OBJECT);
+        } else {
+            // ELF: e_type at offset 16 must be ET_REL (1).
+            let e_type = u16::from_le_bytes([obj_bytes[16], obj_bytes[17]]);
+            assert_eq!(e_type, 1, "ELF e_type should be ET_REL (1)");
+        }
 
         let obj_filename = format!("add_O{}.o", i);
         let obj_path = write_object_file(&dir, &obj_filename, &obj_bytes);
@@ -922,7 +997,7 @@ fn test_e2e_link_all_functions_produce_valid_macho() {
     ];
 
     for (name, trust_ir_func, module) in &functions {
-        let obj_bytes = compile_trust_ir_function(trust_ir_func, module, OptLevel::O0)
+        let obj_bytes = compile_trust_ir_function_macho(trust_ir_func, module, OptLevel::O0)
             .unwrap_or_else(|e| panic!("pipeline failed for {}: {}", name, e));
 
         verify_macho_magic(&obj_bytes);

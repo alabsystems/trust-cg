@@ -35,7 +35,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::abi::{AppleAArch64ABI, ArgLocation, HfaBaseType, PReg, gpr};
+use crate::abi::{AArch64AbiVariant, AppleAArch64ABI, ArgLocation, HfaBaseType, PReg, gpr};
 use crate::function::{EhCallSite, EhFunctionInfo, EhLandingPad, Signature, StackSlotInfo};
 use crate::instructions::{
     AtomicOrdering, AtomicRmwOp, Block, FloatCC, Instruction, IntCC, Opcode, Value,
@@ -1389,6 +1389,20 @@ fn abi_location_pregs(loc: &ArgLocation, _ty: &Type) -> Vec<PReg> {
     }
 }
 
+/// Whether this signature returns through the hidden indirect-result pointer
+/// in X8.
+///
+/// This intentionally over-approximates the aggregate-return branch: saving an
+/// unused pointer is harmless, while missing a required save is wrong code as
+/// soon as the function makes a call.
+fn aarch64_returns_via_sret(returns: &[Type]) -> bool {
+    let locs = AppleAArch64ABI::classify_returns(returns);
+    returns.iter().enumerate().any(|(i, ty)| {
+        matches!(locs.get(i), Some(ArgLocation::Indirect { .. }))
+            || (ty.is_aggregate() && AppleAArch64ABI::classify_hfa(ty).is_none() && ty.bytes() > 16)
+    })
+}
+
 fn append_formal_livein_uses(
     inst: ISelInst,
     formal_livein_pregs: &[PReg],
@@ -1637,6 +1651,16 @@ pub struct InstructionSelector {
     /// `BlockAlreadyPopulated` backstop against synthetic/real block-id
     /// aliasing — the A64-4/JIT-2 miscompile class).
     formal_args_block: Option<Block>,
+    /// Hidden indirect-result destination, copied out of X8 at entry.
+    ///
+    /// X8 is call-clobbered. Keeping the incoming sret pointer in a vreg makes
+    /// its live range across calls visible to register allocation, matching the
+    /// existing x86-64 `sret_return_ptr` design.
+    sret_return_ptr: Option<ISelOperand>,
+    /// Target-specific AArch64 calling-convention variant. The production
+    /// pipeline sets this before formal arguments or calls are lowered, keeping
+    /// both sides of the ABI on one authority.
+    abi_variant: AArch64AbiVariant,
     /// Per-block flags-consuming compare fold plan (icmp -> C/FCSEL). Computed
     /// by [`Self::detect_select_cond_folds`] at the start of each block, keyed
     /// on the block-local instruction index, consulted by `select_csel` and by
@@ -1702,8 +1726,18 @@ impl InstructionSelector {
             lattice_bounds_capabilities: Vec::new(),
             current_block: None,
             formal_args_block: None,
+            sret_return_ptr: None,
+            abi_variant: AArch64AbiVariant::default(),
             select_cond_fold_analysis: SelectCondFoldAnalysis::default(),
         }
+    }
+
+    /// Select the AArch64 ABI variant for this function.
+    ///
+    /// Call before [`Self::lower_formal_arguments`] and before selecting any
+    /// call, because caller and callee stack layouts must agree.
+    pub fn set_abi_variant(&mut self, variant: AArch64AbiVariant) {
+        self.abi_variant = variant;
     }
 
     /// Seed whole-function value use counts from a complete LIR function.
@@ -7668,7 +7702,7 @@ impl InstructionSelector {
         debug_assert_eq!(arg_vals.len(), arg_types.len());
 
         // Classify argument locations.
-        let arg_locs = AppleAArch64ABI::classify_params(arg_types);
+        let arg_locs = AppleAArch64ABI::classify_params_with(self.abi_variant, arg_types);
         let mut implicit_uses = call_implicit_uses(&arg_locs, arg_types);
 
         // sret CALLER side (audit P0/G1): a callee returning a >16-byte
@@ -7703,13 +7737,12 @@ impl InstructionSelector {
                     self.emit_abi_call_arg_copy(block, *preg, src);
                 }
                 ArgLocation::Stack { offset, size: _ } => {
-                    // STR to [SP + offset]. Apple packs stack arguments at their
-                    // natural size/offset, so a narrow integer must be stored with
-                    // a width-precise STRB/STRH — a full STR word would write 4
-                    // bytes and clobber the next packed argument (i8/i16 values
-                    // live in a 32-bit GPR, so class-driven StrRI stores 4 bytes).
-                    // Mirrors the callee-side width-precise LDRB/LDRH load. Wider
-                    // scalars and FP use StrRI (register class picks the size).
+                    // STR to [SP + offset]. A narrow integer must use a
+                    // width-precise STRB/STRH: Darwin packs the next argument
+                    // directly after its natural width, while AAPCS64's wider
+                    // slot is padding rather than part of the value. This
+                    // mirrors the callee-side width-precise LDRB/LDRH load.
+                    // Wider scalars and FP use StrRI (register class picks size).
                     let store_opc = match ty {
                         Type::B1 | Type::I8 => AArch64Opcode::StrbRI,
                         Type::I16 => AArch64Opcode::StrhRI,
@@ -8445,7 +8478,7 @@ impl InstructionSelector {
     ) -> Result<(), ISelError> {
         // Classify argument locations (excluding the function pointer)
         let arg_types: Vec<Type> = arg_vals.iter().map(|v| self.value_type(v)).collect();
-        let arg_locs = AppleAArch64ABI::classify_params(&arg_types);
+        let arg_locs = AppleAArch64ABI::classify_params_with(self.abi_variant, &arg_types);
         let mut implicit_uses = call_implicit_uses(&arg_locs, &arg_types);
 
         // sret CALLER side (audit P0/G1): allocate a result buffer for any
@@ -9971,6 +10004,20 @@ impl InstructionSelector {
         );
     }
 
+    /// Return the saved indirect-result destination.
+    ///
+    /// On the production path, a missing save means the function signature and
+    /// return shape disagree. Refuse to lower rather than silently fall back to
+    /// call-clobbered X8. Direct selector unit tests that never lower formal
+    /// arguments retain their historical physical-X8 fixture behavior.
+    fn sret_return_base(&self) -> Result<ISelOperand, ISelError> {
+        match (&self.sret_return_ptr, self.formal_args_block) {
+            (Some(base), _) => Ok(base.clone()),
+            (None, None) => Ok(ISelOperand::PReg(gpr::X8)),
+            (None, Some(_)) => Err(ISelError::UnsupportedReturnLocation),
+        }
+    }
+
     /// Select aggregate return value lowering.
     ///
     /// Apple AArch64 ABI:
@@ -10031,10 +10078,12 @@ impl InstructionSelector {
             self.emit_exact_aggregate_return_lane(block, gpr::X0, src.clone(), 0, 8)?;
             self.emit_exact_aggregate_return_lane(block, gpr::X1, src, 8, size - 8)?;
         } else {
-            // Large aggregate: store to [X8] (sret pointer).
+            // Large aggregate: store through the entry-saved sret pointer, not
+            // physical X8, which a call in this function may have clobbered.
             // Emit a sequence of stores from the source to the sret buffer.
             // For now, emit word-at-a-time copies. A real implementation would
             // use memcpy or unrolled LDP/STP for large sizes.
+            let sret_base = self.sret_return_base()?;
             let mut offset: u32 = 0;
             while offset + 8 <= size {
                 // Load 8 bytes from source
@@ -10057,7 +10106,7 @@ impl InstructionSelector {
                         AArch64Opcode::StrRI,
                         vec![
                             ISelOperand::VReg(tmp),
-                            ISelOperand::PReg(gpr::X8),
+                            sret_base.clone(),
                             ISelOperand::Imm(offset as i64),
                         ],
                     ),
@@ -10084,7 +10133,7 @@ impl InstructionSelector {
                         AArch64Opcode::StrRI,
                         vec![
                             ISelOperand::VReg(tmp),
-                            ISelOperand::PReg(gpr::X8),
+                            sret_base.clone(),
                             ISelOperand::Imm(offset as i64),
                         ],
                     ),
@@ -10111,7 +10160,7 @@ impl InstructionSelector {
                         AArch64Opcode::StrhRI,
                         vec![
                             ISelOperand::VReg(tmp),
-                            ISelOperand::PReg(gpr::X8),
+                            sret_base.clone(),
                             ISelOperand::Imm(offset as i64),
                         ],
                     ),
@@ -10138,7 +10187,7 @@ impl InstructionSelector {
                         AArch64Opcode::StrbRI,
                         vec![
                             ISelOperand::VReg(tmp),
-                            ISelOperand::PReg(gpr::X8),
+                            sret_base.clone(),
                             ISelOperand::Imm(offset as i64),
                         ],
                     ),
@@ -10449,13 +10498,42 @@ impl InstructionSelector {
         // selection — exempt it from the `BlockAlreadyPopulated` backstop.
         self.formal_args_block = Some(entry_block);
 
-        let param_locs = AppleAArch64ABI::classify_params(&sig.params);
+        let param_locs = AppleAArch64ABI::classify_params_with(self.abi_variant, &sig.params);
         let formal_pregs_by_param: Vec<Vec<PReg>> = sig
             .params
             .iter()
             .zip(param_locs.iter())
             .map(|(ty, loc)| abi_location_pregs(loc, ty))
             .collect();
+
+        // Save the hidden indirect-result pointer before the body can clobber
+        // X8. This must be the first entry instruction: an indirect-returning
+        // callee stages its own destination in X8 outright. Model every formal
+        // ABI register as live across this copy too, so allocating the sret vreg
+        // cannot overwrite a parameter that has not been copied yet.
+        self.sret_return_ptr = None;
+        if aarch64_returns_via_sret(&sig.returns) {
+            let mut formal_liveins = Vec::new();
+            for regs in &formal_pregs_by_param {
+                for &preg in regs {
+                    append_unique_preg(&mut formal_liveins, preg);
+                }
+            }
+            let sret_vreg = self.new_vreg(RegClass::Gpr64);
+            self.emit(
+                entry_block,
+                append_formal_livein_uses(
+                    ISelInst::new(
+                        AArch64Opcode::Copy,
+                        vec![ISelOperand::VReg(sret_vreg), ISelOperand::PReg(gpr::X8)],
+                    ),
+                    &formal_liveins,
+                    &[gpr::X8],
+                ),
+            );
+            self.sret_return_ptr = Some(ISelOperand::VReg(sret_vreg));
+        }
+
         // For each formal-arg index `i`, the incoming livein pregs of args
         // `i..` — i.e. arg `i` itself PLUS every not-yet-started arg. Args
         // `0..i` are already fully materialized into their vregs, so keeping
@@ -24245,6 +24323,107 @@ mod tests {
     }
 
     #[test]
+    fn sret_pointer_is_saved_out_of_x8_at_entry_and_used_at_return() {
+        let struct_ty = Type::Struct(vec![Type::I64, Type::I64, Type::I64]);
+        assert_eq!(struct_ty.bytes(), 24);
+        let sig = Signature {
+            params: vec![Type::I32],
+            returns: vec![struct_ty.clone()],
+        };
+        let mut isel = InstructionSelector::new("sret_saved".to_string(), sig.clone());
+        let entry = Block(0);
+        isel.lower_formal_arguments(&sig, entry).unwrap();
+
+        let first = isel.func.blocks[&entry].insts.first().cloned().unwrap();
+        assert_eq!(first.opcode, AArch64Opcode::Copy);
+        assert_eq!(first.operands.get(1), Some(&ISelOperand::PReg(gpr::X8)));
+        assert!(
+            first.implicit_uses.contains(&gpr::X0),
+            "the sret save must keep not-yet-copied formal registers live",
+        );
+        let saved = match first.operands.first() {
+            Some(ISelOperand::VReg(vreg)) => *vreg,
+            other => panic!("sret pointer must be saved into a vreg, got {other:?}"),
+        };
+
+        let src = isel.new_vreg(RegClass::Gpr64);
+        isel.define_value(Value(7), ISelOperand::VReg(src), struct_ty);
+        isel.select_instruction(
+            &Instruction {
+                opcode: Opcode::Return,
+                args: vec![Value(7)],
+                results: vec![],
+            },
+            entry,
+        )
+        .unwrap();
+
+        let mfunc = isel.finalize();
+        let insts = &mfunc.blocks[&entry].insts;
+        let stores: Vec<_> = insts
+            .iter()
+            .filter(|inst| inst.opcode == AArch64Opcode::StrRI)
+            .collect();
+        assert_eq!(stores.len(), 3);
+        for store in stores {
+            assert_eq!(
+                store.operands.get(1),
+                Some(&ISelOperand::VReg(saved)),
+                "sret stores must use the entry-saved pointer",
+            );
+        }
+        assert!(!insts.iter().any(|inst| {
+            matches!(
+                inst.opcode,
+                AArch64Opcode::StrRI | AArch64Opcode::StrhRI | AArch64Opcode::StrbRI
+            ) && inst.operands.get(1) == Some(&ISelOperand::PReg(gpr::X8))
+        }));
+    }
+
+    #[test]
+    fn sret_return_base_fails_closed_when_signature_declares_no_sret() {
+        let sig = Signature {
+            params: vec![Type::I32],
+            returns: vec![Type::I32],
+        };
+        let mut isel = InstructionSelector::new("no_sret".to_string(), sig.clone());
+        let entry = Block(0);
+        isel.lower_formal_arguments(&sig, entry).unwrap();
+
+        let aggregate = Type::Struct(vec![Type::I64, Type::I64, Type::I64]);
+        let src = isel.new_vreg(RegClass::Gpr64);
+        let err = isel
+            .select_aggregate_return(ISelOperand::VReg(src), &aggregate, entry)
+            .unwrap_err();
+        assert!(matches!(err, ISelError::UnsupportedReturnLocation));
+    }
+
+    #[test]
+    fn aarch64_returns_via_sret_classifies_return_shapes() {
+        assert!(aarch64_returns_via_sret(&[Type::Struct(vec![
+            Type::I64,
+            Type::I64,
+            Type::I64,
+        ])]));
+        assert!(aarch64_returns_via_sret(&[Type::Array(
+            Box::new(Type::I16),
+            12,
+        )]));
+        assert!(!aarch64_returns_via_sret(&[Type::Struct(vec![
+            Type::I64,
+            Type::I64,
+        ])]));
+        assert!(!aarch64_returns_via_sret(&[Type::I32]));
+        assert!(!aarch64_returns_via_sret(&[]));
+        assert!(!aarch64_returns_via_sret(&[Type::Struct(vec![
+            Type::F64,
+            Type::F64,
+            Type::F64,
+            Type::F64,
+        ])]));
+    }
+
+    #[test]
     fn select_large_struct_return_via_sret() {
         // Return a large struct (24 bytes) -> store to [X8]
         let struct_ty = Type::Struct(vec![Type::I64, Type::I64, Type::I64]);
@@ -32887,6 +33066,52 @@ mod tests {
     // =======================================================================
     // Stack-passed argument tests (9+ args, issue #337)
     // =======================================================================
+
+    #[test]
+    fn aapcs64_narrow_stack_offsets_are_shared_by_callee_and_caller() {
+        let mut params = vec![Type::I64; 8];
+        params.extend([Type::I16, Type::I16, Type::I32]);
+        let sig = Signature {
+            params,
+            returns: vec![],
+        };
+        let mut isel = InstructionSelector::new("aapcs64_roundtrip".to_string(), sig.clone());
+        isel.set_abi_variant(AArch64AbiVariant::Aapcs64);
+        let entry = Block(0);
+        isel.lower_formal_arguments(&sig, entry).unwrap();
+
+        let args: Vec<Value> = (0..sig.params.len())
+            .map(|index| Value(index as u32))
+            .collect();
+        isel.select_call("callee", &args, &[], &[], entry).unwrap();
+        let mfunc = isel.finalize();
+        let insts = &mfunc.blocks[&entry].insts;
+
+        let incoming: Vec<i64> = insts
+            .iter()
+            .flat_map(|inst| inst.operands.iter())
+            .filter_map(|operand| match operand {
+                ISelOperand::IncomingArg(offset) => Some(*offset),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(incoming, vec![0, 8, 16]);
+
+        let outgoing: Vec<i64> = insts
+            .iter()
+            .filter(|inst| {
+                matches!(
+                    inst.opcode,
+                    AArch64Opcode::StrRI | AArch64Opcode::StrhRI | AArch64Opcode::StrbRI
+                ) && inst.operands.get(1) == Some(&ISelOperand::PReg(SP))
+            })
+            .filter_map(|inst| match inst.operands.get(2) {
+                Some(ISelOperand::Imm(offset)) => Some(*offset),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(outgoing, vec![0, 8, 16]);
+    }
 
     #[test]
     fn lower_formal_arguments_nine_i64_stack_arg_uses_fp() {

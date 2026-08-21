@@ -1323,15 +1323,7 @@ fn alloc(func: &mut MachFunction, class: RegClass) -> VReg {
 }
 
 fn build_def_map(func: &MachFunction) -> HashMap<u32, InstId> {
-    let mut map = HashMap::new();
-    for (idx, inst) in func.insts.iter().enumerate() {
-        if let Some(MachOperand::VReg(v)) = inst.operands.first()
-            && inst.opcode.produces_value()
-        {
-            map.insert(v.id, InstId(idx as u32));
-        }
-    }
-    map
+    crate::effects::build_reaching_def_map(func)
 }
 
 fn block_of_inst(func: &MachFunction, target: InstId) -> Option<BlockId> {

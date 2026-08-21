@@ -21,8 +21,9 @@
 //!    via `clean cert verify-external`) confirm the proof BEFORE writing it, and
 //!    atomically persists `<store>/<verdict_key>.alethecert`;
 //!  * on a later HIT for the same obligation (same SMT2 bytes, same solver
-//!    binary) it credits the verdict ONLY after Carcara re-checks the stored
-//!    Alethe proof against the CURRENT SMT2, in this process.
+//!    binary) it credits the verdict ONLY after the byte-identical external
+//!    Clean/Carcara checker recorded at mint re-checks the stored Alethe proof
+//!    against the CURRENT SMT2, in this process.
 //!
 //! # Why a hit is SOUND (stronger than the live solve it replaces)
 //!
@@ -30,10 +31,10 @@
 //! `canary_cert`, with tooth 3 swapped for Carcara:
 //!  1. **key membership** — the caller derived `verdict_key` in-process from the
 //!     resolved solver's bytes-hash and the exact SMT2 bytes;
-//!  2. **binding** — the cert's recorded `solver_identity` equals the resolved
-//!     solver's identity AND its `smt2_sha256` equals the SHA-256 of the SMT2
-//!     being discharged NOW (so a cert can never be served for a different
-//!     query or under a different solver);
+//!  2. **binding** — the cert's recorded producer AY identity equals the
+//!     resolved solver identity, its `smt2_sha256` equals the exact query being
+//!     discharged, and its external Clean checker SHA equals the executable
+//!     replaying it now;
 //!  3. **independent re-check** — Carcara (a kernel-adjacent Alethe checker,
 //!     NOT the ay solver that produced the proof) verifies that the stored
 //!     Alethe proof refutes THIS SMT2, now, in this process.
@@ -46,6 +47,23 @@
 //! absent-checker / non-"fully verified" result falls through to the live solve
 //! below — never a weaker or wrong verdict.
 //!
+//! # Why the checker is CAPABILITY-PROBED, not just located
+//!
+//! Fail-closed is only half a safety property: it keeps wrong answers out, but
+//! it cannot tell "this proof is bad" from "this binary cannot check proofs".
+//! Both arrive here as `false`. A `clean` built without the `carcara-verify`
+//! cargo feature answers EVERY Alethe request with "carcara-verify feature
+//! required for tier 1 verification" — a content-INDEPENDENT refusal — and on
+//! this box that silently cost 22 of 54 compile-gate outcomes with not one line
+//! of output, because trust-cg accepted any file at the checker path on a bare
+//! `is_file()` and read each refusal as a failed proof.
+//!
+//! So [`clean_checker_path`] proves the external checker's capability before
+//! returning it: once per path per process (~10ms) it verifies a known-good
+//! CONTROL proof. A checker that cannot verify that cannot verify anything, is
+//! reported ABSENT rather than consulted, and produces one loud, self-
+//! explaining diagnostic naming the build line that fixes it.
+//!
 //! Gated OFF by default: the store is inert unless `TCG_PROOF_CERT_STORE` names
 //! a directory. `TCG_PROOF_CERT_STORE_DEBUG=1` traces consume/mint decisions.
 
@@ -57,7 +75,7 @@ use std::sync::{Mutex, OnceLock};
 use sha2::{Digest, Sha256};
 
 /// Certificate schema tag, first line of every stored `.alethecert`.
-const ALETHE_CERT_SCHEMA: &str = "tcg-alethe-cert-v1";
+const ALETHE_CERT_SCHEMA: &str = "tcg-alethe-cert-v2";
 
 /// Store directory from `TCG_PROOF_CERT_STORE`, or `None` (tier disabled).
 fn store_dir() -> Option<PathBuf> {
@@ -81,7 +99,11 @@ macro_rules! trace {
 struct AletheCert {
     /// Content identity (SHA-256 hex) of the solver binary that produced the
     /// proof; must equal the resolved solver's identity to be consulted.
-    solver_identity: String,
+    producer_ay_identity: String,
+    /// Content identity of the independent external Clean/Carcara executable
+    /// that accepted this proof when the certificate was minted. This is a C0
+    /// checker role, distinct from the C1 `clean-kernel` Rust dependency.
+    external_clean_checker_identity: String,
     /// SHA-256 hex of the SMT2 problem the proof refutes; binds the cert to an
     /// exact query.
     smt2_sha256: String,
@@ -101,7 +123,14 @@ impl AletheCert {
         let mut out = String::new();
         out.push_str(ALETHE_CERT_SCHEMA);
         out.push('\n');
-        out.push_str(&format!("solver-sha256:{}\n", self.solver_identity));
+        out.push_str(&format!(
+            "producer-ay-sha256:{}\n",
+            self.producer_ay_identity
+        ));
+        out.push_str(&format!(
+            "external-clean-checker-sha256:{}\n",
+            self.external_clean_checker_identity
+        ));
         out.push_str(&format!("smt2-sha256:{}\n", self.smt2_sha256));
         out.push_str(&format!("obligation:{}\n", self.obligation_name));
         out.push_str(&format!("smt2-bytes:{}\n", self.smt2.len()));
@@ -120,15 +149,34 @@ impl AletheCert {
         if lines.next()?.trim_end() != ALETHE_CERT_SCHEMA {
             return None;
         }
-        let solver_identity = header_value(lines.next()?, "solver-sha256:")?;
+        let producer_ay_identity = header_value(lines.next()?, "producer-ay-sha256:")?;
+        let external_clean_checker_identity =
+            header_value(lines.next()?, "external-clean-checker-sha256:")?;
         let smt2_sha256 = header_value(lines.next()?, "smt2-sha256:")?;
         let obligation_name = header_value(lines.next()?, "obligation:")?;
+        for digest in [
+            &producer_ay_identity,
+            &external_clean_checker_identity,
+            &smt2_sha256,
+        ] {
+            if digest.len() != 64
+                || !digest
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            {
+                return None;
+            }
+        }
         // The remaining text is `smt2-bytes:<n>\n<n bytes>\nproof-bytes:<n>\n<n bytes>\n`.
         // Re-split from the raw remainder to honor exact byte counts.
         let consumed = ALETHE_CERT_SCHEMA
             .len()
             .checked_add(1)?
-            .checked_add(header_line_len(text, "solver-sha256:")?)?
+            .checked_add(header_line_len(text, "producer-ay-sha256:")?)?
+            .checked_add(header_line_len_after(
+                text,
+                "external-clean-checker-sha256:",
+            )?)?
             .checked_add(header_line_len_after(text, "smt2-sha256:")?)?
             .checked_add(header_line_len_after(text, "obligation:")?)?;
         let rest = text.get(consumed..)?;
@@ -141,7 +189,8 @@ impl AletheCert {
             return None;
         }
         Some(AletheCert {
-            solver_identity,
+            producer_ay_identity,
+            external_clean_checker_identity,
             smt2_sha256,
             obligation_name,
             smt2,
@@ -206,22 +255,260 @@ fn cert_path(dir: &Path, verdict_key: &str) -> PathBuf {
     dir.join(format!("{safe}.alethecert"))
 }
 
-/// Per-process consume memo (verdict_key -> honored?), mirroring canary_cert.
+/// Per-process positive replay memo. The key binds the caller's verdict key,
+/// exact producer/query identities, complete certificate bytes, and exact
+/// checker executable bytes. Negative outcomes are never memoized: a cert
+/// minted or repaired later in the same process must remain consumable.
 fn consume_memo() -> &'static Mutex<HashMap<String, bool>> {
     static MEMO: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
     MEMO.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Resolve the Carcara/Clean external checker. `TCG_CLEAN_CHECKER` overrides
-/// the default `~/Clean/target/release/clean`. `None` (absent) => never skip.
-pub(crate) fn clean_checker_path() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("TCG_CLEAN_CHECKER") {
+fn consume_memo_key(
+    verdict_key: &str,
+    solver_identity: &str,
+    smt2: &str,
+    cert_text: &str,
+    checker_identity: &str,
+) -> String {
+    format!(
+        "{verdict_key}:{solver_identity}:{}:{}:{checker_identity}",
+        sha256_hex(smt2.as_bytes()),
+        sha256_hex(cert_text.as_bytes()),
+    )
+}
+
+/// The build line that produces a checker able to verify Alethe proofs.
+/// Quoted verbatim in the unusable-checker diagnostic, so an operator who sees
+/// the failure never has to go find out what to do about it.
+pub(crate) const CLEAN_CHECKER_BUILD_LINE: &str =
+    "cargo build --locked --release -p clean --features carcara-verify";
+
+/// The known-good CONTROL pair used to probe a resolved checker: a two-clause
+/// propositional contradiction (`p` and `not p`) and its one-step Alethe
+/// resolution refutation. Any checker with a working Alethe lane accepts this;
+/// no checker can accept it "by accident", because acceptance is reported
+/// through the same `Proof status: fully verified` contract
+/// [`clean_alethe_stdout_is_fully_verified`] requires of real obligations.
+const CHECKER_PROBE_SMT2: &str =
+    "(set-logic QF_UF)\n(declare-const p Bool)\n(assert p)\n(assert (not p))\n(check-sat)\n";
+const CHECKER_PROBE_ALETHE: &str =
+    "(assume t0 p)\n(assume t1 (not p))\n(step t2 (cl) :rule resolution :premises (t1 t0))\n";
+
+/// Stable substring Clean emits when its binary was built without the
+/// `carcara-verify` cargo feature (`VerifyError::CarcaraNotEnabled`).
+const CARCARA_FEATURE_MARKER: &str = "carcara-verify feature required";
+/// Stable substring Clean emits when built without `clean-elab/ay-smt`, the
+/// outer of the two gates in series on the Alethe lane.
+const AY_SMT_FEATURE_MARKER: &str = "ay-smt feature required";
+
+/// Why a checker that EXISTS on disk still cannot be used as proof authority.
+///
+/// The distinction this type draws is the whole point of the probe: a checker
+/// that refuses every proof content-INDEPENDENTLY is not a strict checker, it
+/// is a broken one, and consulting it produces the same `false` as a genuine
+/// refutation failure while meaning something completely different.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CheckerDefect {
+    /// Built without `carcara-verify`: answers EVERY Alethe request with
+    /// "carcara-verify feature required for tier 1 verification", whatever the
+    /// proof says. This is the failure this probe exists for.
+    CarcaraFeatureMissing,
+    /// Built without `ay-smt`: the Alethe lane is absent one level further out.
+    AySmtFeatureMissing,
+    /// Ran, but did not verify the control proof. Either not `clean`, too old
+    /// to speak the `verify-external` contract, or otherwise broken.
+    ControlProofRejected(String),
+    /// Could not be executed at all (not executable, bad architecture, ...).
+    NotRunnable(String),
+}
+
+impl CheckerDefect {
+    /// One-line reason, suitable for embedding in an `AYResult::Unknown`.
+    fn reason(&self) -> String {
+        match self {
+            Self::CarcaraFeatureMissing => format!(
+                "it was built WITHOUT the `carcara-verify` cargo feature, so it rejects every \
+                 Alethe proof regardless of validity; rebuild with `{CLEAN_CHECKER_BUILD_LINE}`"
+            ),
+            Self::AySmtFeatureMissing => format!(
+                "it was built WITHOUT the `ay-smt` cargo feature, so it has no Alethe lane at \
+                 all; rebuild with `{CLEAN_CHECKER_BUILD_LINE}`"
+            ),
+            Self::ControlProofRejected(detail) => format!(
+                "it did not verify a known-good control proof, so it cannot be trusted to \
+                 verify real ones (transcript: {detail})"
+            ),
+            Self::NotRunnable(detail) => format!("it could not be executed ({detail})"),
+        }
+    }
+}
+
+/// Resolve the independent C0 checker path WITHOUT probing it. The explicit
+/// role-named variable takes precedence; `TCG_CLEAN_CHECKER` remains a legacy
+/// compatibility alias. Neither variable names the C1 dependency Clean role.
+fn resolve_clean_checker_path() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("TCG_EXTERNAL_CLEAN_CHECKER")
+        .or_else(|| std::env::var_os("TCG_CLEAN_CHECKER"))
+    {
         let pb = PathBuf::from(p);
         return pb.is_file().then_some(pb);
     }
     let home = std::env::var_os("HOME")?;
     let pb = PathBuf::from(home).join("Clean/target/release/clean");
     pb.is_file().then_some(pb)
+}
+
+/// Per-process capability memo keyed by path AND executable content identity.
+/// Replacing a binary at an unchanged path cannot inherit the old verdict.
+fn checker_capability_memo() -> &'static Mutex<HashMap<(PathBuf, String), Result<(), CheckerDefect>>>
+{
+    static MEMO: OnceLock<Mutex<HashMap<(PathBuf, String), Result<(), CheckerDefect>>>> =
+        OnceLock::new();
+    MEMO.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Can this checker verify ANY Alethe proof? Probes once per path+bytes per process
+/// (~10ms) and warns loudly, exactly once, when the answer is no.
+fn clean_checker_capability(path: &Path) -> Result<String, CheckerDefect> {
+    let identity = crate::lrat_cert::checker_binary_sha256(path).ok_or_else(|| {
+        CheckerDefect::NotRunnable("could not read/hash checker executable".to_string())
+    })?;
+    let key = (path.to_path_buf(), identity.clone());
+    if let Some(verdict) = checker_capability_memo()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&key)
+        .cloned()
+    {
+        return verdict.map(|()| identity);
+    }
+    let verdict = probe_clean_checker(path);
+    let after = crate::lrat_cert::checker_binary_sha256(path);
+    let verdict = if after.as_deref() == Some(identity.as_str()) {
+        verdict
+    } else {
+        Err(CheckerDefect::NotRunnable(
+            "checker executable identity changed during capability probe".to_string(),
+        ))
+    };
+    let mut memo = checker_capability_memo()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    // Another thread may have raced us here; only the inserting thread warns,
+    // so the diagnostic stays a single block however many threads probe.
+    if !memo.contains_key(&key) {
+        if let Err(defect) = &verdict {
+            warn_checker_unusable(path, defect);
+        }
+        memo.insert(key, verdict.clone());
+    }
+    verdict.map(|()| identity)
+}
+
+/// The loud, self-explaining diagnostic. Deliberately NOT gated behind
+/// `TCG_PROOF_CERT_STORE_DEBUG`: a provisioned-but-incapable checker silently
+/// cost this repo 22 of 54 compile-gate outcomes, and silence is exactly the
+/// property being fixed. Absence of a checker stays quiet (not having Clean
+/// installed is a legitimate configuration); a checker that is PRESENT and
+/// CANNOT WORK is always a misconfiguration worth a line of stderr.
+fn warn_checker_unusable(path: &Path, defect: &CheckerDefect) {
+    eprintln!(
+        "\n\
+         [trust-cg] INDEPENDENT PROOF CHECKER UNUSABLE — verification is DEGRADED\n\
+         \x20 checker: {}\n\
+         \x20 problem: {}\n\
+         \x20 effect:  trust-cg is treating this checker as ABSENT rather than believing its\n\
+         \x20          answers. Solver UNSAT verdicts can no longer be promoted to Verified,\n\
+         \x20          and the Alethe certificate store will neither mint nor honor certs.\n\
+         \x20 fix:     {}\n\
+         \x20          (or point TCG_EXTERNAL_CLEAN_CHECKER at a binary built that way)\n",
+        path.display(),
+        defect.reason(),
+        CLEAN_CHECKER_BUILD_LINE,
+    );
+}
+
+/// Run the control pair through the checker and classify what came back.
+fn probe_clean_checker(path: &Path) -> Result<(), CheckerDefect> {
+    let Some(out) = run_clean_verify_external(path, CHECKER_PROBE_SMT2, CHECKER_PROBE_ALETHE)
+    else {
+        return Err(CheckerDefect::NotRunnable(
+            "could not spawn the checker or stage its certificate".to_string(),
+        ));
+    };
+    classify_probe_output(
+        out.status.success(),
+        &String::from_utf8_lossy(&out.stdout),
+        &String::from_utf8_lossy(&out.stderr),
+    )
+}
+
+/// Pure classifier over a probe transcript, so the mapping from Clean's actual
+/// bytes to a defect is unit-testable without a subprocess.
+fn classify_probe_output(
+    status_success: bool,
+    stdout: &str,
+    stderr: &str,
+) -> Result<(), CheckerDefect> {
+    if status_success && clean_alethe_stdout_is_fully_verified(stdout) {
+        return Ok(());
+    }
+    let transcript = format!("{stdout}\n{stderr}");
+    if transcript.contains(CARCARA_FEATURE_MARKER) {
+        return Err(CheckerDefect::CarcaraFeatureMissing);
+    }
+    if transcript.contains(AY_SMT_FEATURE_MARKER) {
+        return Err(CheckerDefect::AySmtFeatureMissing);
+    }
+    let detail: String = transcript
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let detail = if detail.len() > 300 {
+        format!("{}...", &detail[..300])
+    } else if detail.is_empty() {
+        "<no output>".to_string()
+    } else {
+        detail
+    };
+    Err(CheckerDefect::ControlProofRejected(detail))
+}
+
+/// Resolve the C0 Carcara/Clean external checker AND confirm it can actually
+/// verify a proof. `None` => never skip, never promote — the checker is absent
+/// or is one whose answers carry no information.
+pub(crate) fn clean_checker_path() -> Option<PathBuf> {
+    let pb = resolve_clean_checker_path()?;
+    clean_checker_capability(&pb).ok().map(|_| pb)
+}
+
+fn clean_checker_path_and_identity() -> Option<(PathBuf, String)> {
+    let path = resolve_clean_checker_path()?;
+    let identity = clean_checker_capability(&path).ok()?;
+    Some((path, identity))
+}
+
+/// Why no checker is available, for callers that must report WHY a proof could
+/// not be promoted. `None` when a usable checker IS available.
+///
+/// This exists to keep two opposite situations from sharing one message:
+/// "checked and refused" (the proof is bad — investigate the proof) versus
+/// "cannot check at all" (the toolchain is misprovisioned — fix the build).
+pub(crate) fn clean_checker_unavailable_reason() -> Option<String> {
+    let Some(pb) = resolve_clean_checker_path() else {
+        return Some(format!(
+            "no external Clean/Carcara checker is installed at \
+             $TCG_EXTERNAL_CLEAN_CHECKER (legacy $TCG_CLEAN_CHECKER) or \
+             ~/Clean/target/release/clean (build one with `{CLEAN_CHECKER_BUILD_LINE}`)"
+        ));
+    };
+    match clean_checker_capability(&pb) {
+        Ok(_) => None,
+        Err(defect) => Some(format!("{} is unusable: {}", pb.display(), defect.reason())),
+    }
 }
 
 /// CONSUME (hot path): does a stored Alethe cert back `verdict_key`, and does
@@ -237,35 +524,59 @@ pub(crate) fn alethe_cert_skip_verified(verdict_key: &str, solver_path: &str, sm
     if crate::verdict_db::recording_active() {
         return false;
     }
+    let Some(checker) = clean_checker_path_and_identity() else {
+        return false;
+    };
+    let path = cert_path(&dir, verdict_key);
+    let Ok(cert_text) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let Some(solver_identity) = crate::ay_bridge::solver_identity_hash(solver_path) else {
+        return false;
+    };
+    let memo_key = consume_memo_key(verdict_key, &solver_identity, smt2, &cert_text, &checker.1);
     if let Some(hit) = consume_memo()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .get(verdict_key)
+        .get(&memo_key)
         .copied()
     {
         return hit;
     }
-    let hit = consume_verified_in(&dir, verdict_key, solver_path, smt2, clean_checker_path());
-    consume_memo()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(verdict_key.to_string(), hit);
+    let hit = consume_verified_text(&cert_text, verdict_key, solver_path, smt2, Some(checker));
+    if hit {
+        consume_memo()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(memo_key, true);
+    }
     hit
 }
 
 /// Core of the consume path over explicit inputs (no memo / no env), so the
 /// soundness tests can drive forged / tampered / mismatched stores.
+#[cfg(test)]
 fn consume_verified_in(
     dir: &Path,
     verdict_key: &str,
     solver_path: &str,
     smt2: &str,
-    checker: Option<PathBuf>,
+    checker: Option<(PathBuf, String)>,
 ) -> bool {
     let path = cert_path(dir, verdict_key);
     let Ok(text) = std::fs::read_to_string(&path) else {
         return false; // tooth 1: no cert for this key
     };
+    consume_verified_text(&text, verdict_key, solver_path, smt2, checker)
+}
+
+fn consume_verified_text(
+    text: &str,
+    verdict_key: &str,
+    solver_path: &str,
+    smt2: &str,
+    checker: Option<(PathBuf, String)>,
+) -> bool {
     let Some(cert) = AletheCert::parse(&text) else {
         trace!("{verdict_key}: malformed cert, declining");
         return false;
@@ -274,7 +585,11 @@ fn consume_verified_in(
     let Some(identity) = crate::ay_bridge::solver_identity_hash(solver_path) else {
         return false;
     };
-    if identity != cert.solver_identity {
+    if crate::ay_bridge::verdict_cache_key_v2(&identity, smt2) != verdict_key {
+        trace!("{verdict_key}: caller key does not derive from producer+query, declining");
+        return false;
+    }
+    if identity != cert.producer_ay_identity {
         trace!("{verdict_key}: solver identity mismatch, declining");
         return false;
     }
@@ -289,12 +604,21 @@ fn consume_verified_in(
         trace!("{verdict_key}: stored smt2 self-hash mismatch, declining");
         return false;
     }
+    if cert.smt2.as_bytes() != smt2.as_bytes() {
+        trace!("{verdict_key}: stored smt2 bytes differ from current query, declining");
+        return false;
+    }
     // Tooth 3: independent Carcara re-check against the CURRENT smt2.
-    let Some(checker) = checker else {
+    let Some((checker, checker_identity)) = checker else {
         trace!("{verdict_key}: no Carcara checker available, declining (fail-safe)");
         return false;
     };
-    let ok = carcara_verify(&checker, smt2, &cert.alethe_proof);
+    if checker_identity != cert.external_clean_checker_identity {
+        trace!("{verdict_key}: external checker identity mismatch, declining");
+        return false;
+    }
+    let ok =
+        carcara_verify_with_expected_checker(&checker, &checker_identity, smt2, &cert.alethe_proof);
     trace!(
         "{verdict_key}: obligation={:?} carcara_verified={ok}",
         cert.obligation_name
@@ -302,14 +626,17 @@ fn consume_verified_in(
     ok
 }
 
-/// The Carcara/Clean external cert JSON (the 2026-07-15 `verify-external`
+/// Stage the Carcara/Clean external cert JSON (the 2026-07-15 `verify-external`
 /// contract): `{"type":"alethe_certificate","version":"1.0","problem":<smt2>,
-/// "proof":<alethe>}`. Returns true iff the checker reports a full, hole-free
-/// verification.
-pub(crate) fn carcara_verify(checker: &Path, smt2: &str, alethe_proof: &str) -> bool {
-    let Ok(dir) = tempfile::tempdir() else {
-        return false;
-    };
+/// "proof":<alethe>}` and run the checker over it. `None` when the request
+/// could not be made at all (staging or spawn failed) — distinct from a
+/// request the checker answered negatively.
+fn run_clean_verify_external(
+    checker: &Path,
+    smt2: &str,
+    alethe_proof: &str,
+) -> Option<std::process::Output> {
+    let dir = tempfile::tempdir().ok()?;
     let cert_json = dir.path().join("cert.json");
     let json = serde_json::json!({
         "type": "alethe_certificate",
@@ -317,10 +644,8 @@ pub(crate) fn carcara_verify(checker: &Path, smt2: &str, alethe_proof: &str) -> 
         "problem": smt2,
         "proof": alethe_proof,
     });
-    if std::fs::write(&cert_json, serde_json::to_vec(&json).unwrap_or_default()).is_err() {
-        return false;
-    }
-    let Ok(out) = Command::new(checker)
+    std::fs::write(&cert_json, serde_json::to_vec(&json).ok()?).ok()?;
+    Command::new(checker)
         .arg("cert")
         .arg("verify-external")
         .arg(&cert_json)
@@ -329,7 +654,36 @@ pub(crate) fn carcara_verify(checker: &Path, smt2: &str, alethe_proof: &str) -> 
         // distinguish a fully checked proof from a future weaker success mode.
         .arg("--verbose")
         .output()
-    else {
+        .ok()
+}
+
+/// Returns true iff the checker reports a full, hole-free verification of this
+/// exact proof. Callers must obtain `checker` from [`clean_checker_path`], so
+/// a `false` here always means "this proof was checked and refused", never
+/// "this binary refuses everything".
+pub(crate) fn carcara_verify(checker: &Path, smt2: &str, alethe_proof: &str) -> bool {
+    // Re-establish capability for the exact bytes about to perform this replay.
+    // `clean_checker_path()` and this call are separated by ordinary caller
+    // work, so a path-only handoff would otherwise admit a replacement binary
+    // without probing it. The capability memo is keyed by path+SHA and the
+    // replay hashes those same bytes before and after execution.
+    let Ok(identity) = clean_checker_capability(checker) else {
+        return false;
+    };
+    carcara_verify_with_expected_checker(checker, &identity, smt2, alethe_proof)
+}
+
+fn carcara_verify_with_expected_checker(
+    checker: &Path,
+    expected_checker_sha256: &str,
+    smt2: &str,
+    alethe_proof: &str,
+) -> bool {
+    if crate::lrat_cert::checker_binary_sha256(checker).as_deref() != Some(expected_checker_sha256)
+    {
+        return false;
+    }
+    let Some(out) = run_clean_verify_external(checker, smt2, alethe_proof) else {
         return false;
     };
     if debug_enabled() {
@@ -341,7 +695,10 @@ pub(crate) fn carcara_verify(checker: &Path, smt2: &str, alethe_proof: &str) -> 
             String::from_utf8_lossy(&out.stderr).trim(),
         );
     }
-    if !out.status.success() {
+    if !out.status.success()
+        || crate::lrat_cert::checker_binary_sha256(checker).as_deref()
+            != Some(expected_checker_sha256)
+    {
         return false;
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -377,6 +734,29 @@ fn clean_alethe_stdout_is_fully_verified(stdout: &str) -> bool {
     has_pass && has_alethe_type && has_full_status && !has_rejection
 }
 
+/// Accept exactly one successful SMT-LIB `unsat` verdict from AY.
+///
+/// A substring check is not a protocol check: diagnostics such as "proof for
+/// unsat was not produced" contain the same bytes, and a failed process can
+/// still have written partial stdout. Certificate minting therefore requires a
+/// successful child, one standalone `unsat` line, no competing verdict, and no
+/// SMT-LIB error row.
+fn ay_stdout_is_exact_unsat(status_success: bool, stdout: &str) -> bool {
+    if !status_success
+        || stdout
+            .lines()
+            .any(|line| line.trim_start().starts_with("(error"))
+    {
+        return false;
+    }
+    let verdicts: Vec<&str> = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| matches!(*line, "sat" | "unsat" | "unknown"))
+        .collect();
+    verdicts == ["unsat"]
+}
+
 /// MINT-ON-MISS (off the hot path, opt-in): after a live UNSAT for `smt2`,
 /// re-run the solver with Alethe proof emission, have Carcara confirm the proof
 /// BEFORE writing, and atomically persist the cert. Never mints unchecked;
@@ -397,7 +777,7 @@ pub(crate) fn mint_alethe_cert(
     if path.exists() {
         return; // already minted
     }
-    let Some(checker) = clean_checker_path() else {
+    let Some((checker, checker_identity)) = clean_checker_path_and_identity() else {
         trace!("{verdict_key}: mint skipped (no Carcara checker to pre-verify)");
         return;
     };
@@ -408,6 +788,7 @@ pub(crate) fn mint_alethe_cert(
         smt2,
         obligation_name,
         &checker,
+        &checker_identity,
     );
     if ok {
         trace!("{verdict_key}: minted Carcara-verified cert for {obligation_name:?}");
@@ -424,6 +805,7 @@ fn mint_into(
     smt2: &str,
     obligation_name: &str,
     checker: &Path,
+    expected_checker_identity: &str,
 ) -> bool {
     let path = cert_path(dir, verdict_key);
     if path.exists() {
@@ -432,6 +814,10 @@ fn mint_into(
     let Some(identity) = crate::ay_bridge::solver_identity_hash(solver_path) else {
         return false;
     };
+    if crate::ay_bridge::verdict_cache_key_v2(&identity, smt2) != verdict_key {
+        trace!("{verdict_key}: mint skipped (key does not derive from producer+query)");
+        return false;
+    }
     let Ok(work) = tempfile::tempdir() else {
         return false;
     };
@@ -452,9 +838,11 @@ fn mint_into(
     else {
         return false;
     };
-    let stdout = String::from_utf8_lossy(&out.stdout).to_lowercase();
-    if !stdout.contains("unsat") {
-        trace!("{verdict_key}: mint skipped (solver did not report unsat)");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if !ay_stdout_is_exact_unsat(out.status.success(), &stdout) {
+        trace!(
+            "{verdict_key}: mint skipped (solver did not return one exact successful unsat verdict)"
+        );
         return false;
     }
     let Ok(alethe_proof) = std::fs::read_to_string(&proof_path) else {
@@ -463,13 +851,23 @@ fn mint_into(
     if alethe_proof.trim().is_empty() {
         return false;
     }
+    if crate::ay_bridge::solver_identity_hash(solver_path).as_deref() != Some(identity.as_str()) {
+        trace!("{verdict_key}: mint skipped (AY producer bytes changed during proof emission)");
+        return false;
+    }
     // 2. Carcara MUST confirm the proof before we ever persist it.
-    if !carcara_verify(checker, smt2, &alethe_proof) {
+    if !carcara_verify_with_expected_checker(
+        checker,
+        expected_checker_identity,
+        smt2,
+        &alethe_proof,
+    ) {
         trace!("{verdict_key}: mint REFUSED (Carcara did not verify the fresh proof)");
         return false;
     }
     let cert = AletheCert {
-        solver_identity: identity,
+        producer_ay_identity: identity,
+        external_clean_checker_identity: expected_checker_identity.to_string(),
         smt2_sha256: sha256_hex(smt2.as_bytes()),
         obligation_name: obligation_name.to_string(),
         smt2: smt2.to_string(),
@@ -494,13 +892,226 @@ fn mint_into(
 mod tests {
     use super::*;
 
+    /// VERBATIM `clean cert verify-external <control> --verbose` stdout from a
+    /// `clean` built WITHOUT `carcara-verify` (exit 1). Captured on this box
+    /// 2026-08-17 from the binary that silently voided 22 of 54 compile-gate
+    /// outcomes. If Clean ever changes this text, the test that reads it fails
+    /// LOUDLY rather than the probe quietly misclassifying the build again.
+    const TRANSCRIPT_NO_CARCARA_STDOUT: &str = "External certificate verification: FAILED\n  \
+        Type: Alethe SMT proof\n  Error: proof_verification_failed: carcara-verify feature \
+        required for tier 1 verification\n  Time: 0.000031s\n";
+    const TRANSCRIPT_NO_CARCARA_STDERR: &str = "Error: proof_verification_failed: carcara-verify feature required for tier 1 \
+         verification\n";
+
+    /// VERBATIM stdout from the same command on a `--features carcara-verify`
+    /// build (exit 0), same control certificate.
+    const TRANSCRIPT_CAPABLE_STDOUT: &str = "External certificate verification: PASSED\n  \
+        Type: Alethe SMT proof\n  Problem bytes: 81, proof bytes: 84\n  Proof status: fully \
+        verified\n  Verified in 0.000230s\n";
+
     fn write_cert(dir: &Path, key: &str, cert: &AletheCert) {
         std::fs::write(cert_path(dir, key), cert.serialize()).unwrap();
     }
 
+    #[test]
+    fn probe_accepts_a_checker_that_verifies_the_control_proof() {
+        assert_eq!(
+            classify_probe_output(true, TRANSCRIPT_CAPABLE_STDOUT, ""),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn probe_names_the_missing_carcara_feature_rather_than_blaming_the_proof() {
+        // THE REGRESSION UNDER TEST. This transcript is a content-INDEPENDENT
+        // refusal: the checker did not evaluate the proof, it declined to have
+        // an Alethe lane. It must never be reported as a rejected proof.
+        assert_eq!(
+            classify_probe_output(
+                false,
+                TRANSCRIPT_NO_CARCARA_STDOUT,
+                TRANSCRIPT_NO_CARCARA_STDERR
+            ),
+            Err(CheckerDefect::CarcaraFeatureMissing)
+        );
+    }
+
+    #[test]
+    fn probe_diagnostic_quotes_the_build_line_that_fixes_it() {
+        let reason = CheckerDefect::CarcaraFeatureMissing.reason();
+        assert!(
+            reason.contains(CLEAN_CHECKER_BUILD_LINE),
+            "the missing-feature reason must be actionable, got: {reason}"
+        );
+        assert!(
+            reason.contains("regardless of validity"),
+            "the reason must say the refusal is content-independent, got: {reason}"
+        );
+    }
+
+    #[test]
+    fn probe_names_the_missing_ay_smt_feature_separately() {
+        // The outer of the two gates in series produces a different message,
+        // and a different rebuild conversation.
+        assert_eq!(
+            classify_probe_output(
+                false,
+                "External certificate verification: FAILED\n",
+                "Error: verifier_not_available: ay-smt feature required for Alethe proof \
+                 verification\n"
+            ),
+            Err(CheckerDefect::AySmtFeatureMissing)
+        );
+    }
+
+    #[test]
+    fn probe_rejects_a_binary_that_is_not_the_clean_checker() {
+        // A wrong-but-runnable binary at the checker path used to be trusted
+        // on a bare `is_file()`.
+        let verdict = classify_probe_output(false, "", "error: unrecognized subcommand 'cert'\n");
+        match verdict {
+            Err(CheckerDefect::ControlProofRejected(detail)) => {
+                assert!(
+                    detail.contains("unrecognized subcommand"),
+                    "detail: {detail}"
+                );
+            }
+            other => panic!("expected ControlProofRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn probe_rejects_a_silent_success_that_does_not_claim_full_verification() {
+        // Exit 0 alone is not capability: the probe demands the same
+        // `Proof status: fully verified` contract real obligations must meet,
+        // so a future weaker success mode cannot silently pass the gate.
+        assert!(matches!(
+            classify_probe_output(true, "External certificate verification: PASSED\n", ""),
+            Err(CheckerDefect::ControlProofRejected(_))
+        ));
+    }
+
+    /// Stage an executable stub at `dir/clean` that replays a fixed
+    /// transcript, so the resolve -> probe -> verdict path can be driven end to
+    /// end without a 124 MB checker build.
+    #[cfg(unix)]
+    fn fake_checker(dir: &Path, stdout: &str, stderr: &str, code: i32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("clean");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nprintf '%s' {}\nprintf '%s' {} >&2\nexit {code}\n",
+                shell_single_quote(stdout),
+                shell_single_quote(stderr),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn shell_single_quote(s: &str) -> String {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incapable_checker_is_reported_absent_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let checker = fake_checker(
+            dir.path(),
+            TRANSCRIPT_NO_CARCARA_STDOUT,
+            TRANSCRIPT_NO_CARCARA_STDERR,
+            1,
+        );
+        // The binary EXISTS and RUNS — the old `is_file()` gate admitted it.
+        assert!(checker.is_file());
+        assert!(matches!(
+            clean_checker_capability(&checker),
+            Err(CheckerDefect::CarcaraFeatureMissing)
+        ));
+        // ...and a second call is served from the memo, so the loud diagnostic
+        // is printed once per process, not once per obligation.
+        assert!(matches!(
+            clean_checker_capability(&checker),
+            Err(CheckerDefect::CarcaraFeatureMissing)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capable_checker_passes_the_probe_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let checker = fake_checker(dir.path(), TRANSCRIPT_CAPABLE_STDOUT, "", 0);
+        assert!(clean_checker_capability(&checker).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checker_replacement_at_same_path_cannot_inherit_capability() {
+        let dir = tempfile::tempdir().unwrap();
+        let checker = fake_checker(dir.path(), TRANSCRIPT_CAPABLE_STDOUT, "", 0);
+        let first_identity = clean_checker_capability(&checker).expect("capable checker");
+        let replaced = fake_checker(
+            dir.path(),
+            TRANSCRIPT_NO_CARCARA_STDOUT,
+            TRANSCRIPT_NO_CARCARA_STDERR,
+            1,
+        );
+        assert_eq!(checker, replaced);
+        assert_ne!(
+            crate::lrat_cert::checker_binary_sha256(&replaced).as_deref(),
+            Some(first_identity.as_str())
+        );
+        assert!(matches!(
+            clean_checker_capability(&replaced),
+            Err(CheckerDefect::CarcaraFeatureMissing)
+        ));
+    }
+
+    #[test]
+    fn control_pair_is_a_real_refutation_not_a_placeholder() {
+        // Guards against the probe degenerating into a liveness check: the
+        // control must be an actual contradiction with an actual resolution
+        // step, or a checker could "pass" it without doing any proof checking.
+        assert!(CHECKER_PROBE_SMT2.contains("(assert p)"));
+        assert!(CHECKER_PROBE_SMT2.contains("(assert (not p))"));
+        assert!(CHECKER_PROBE_ALETHE.contains(":rule resolution"));
+        assert!(
+            CHECKER_PROBE_ALETHE.contains("(cl)"),
+            "must derive the empty clause"
+        );
+    }
+
+    #[test]
+    fn ay_mint_requires_one_exact_successful_unsat_verdict() {
+        assert!(ay_stdout_is_exact_unsat(true, "unsat\n"));
+        assert!(ay_stdout_is_exact_unsat(
+            true,
+            "producer diagnostic\nunsat\nproof written\n"
+        ));
+        for (status, stdout) in [
+            (false, "unsat\n"),
+            (true, "solver could not produce an unsat proof\n"),
+            (true, "unknown\n"),
+            (true, "sat\n"),
+            (true, "unsat\nsat\n"),
+            (true, "unsat\nunsat\n"),
+            (true, "(error \"proof emission failed\")\nunsat\n"),
+        ] {
+            assert!(
+                !ay_stdout_is_exact_unsat(status, stdout),
+                "must reject status={status} stdout={stdout:?}"
+            );
+        }
+    }
+
     fn sample(smt2: &str, proof: &str, solver_id: &str) -> AletheCert {
         AletheCert {
-            solver_identity: solver_id.to_string(),
+            producer_ay_identity: solver_id.to_string(),
+            external_clean_checker_identity: "55".repeat(32),
             smt2_sha256: sha256_hex(smt2.as_bytes()),
             obligation_name: "test_ob".to_string(),
             smt2: smt2.to_string(),
@@ -513,11 +1124,15 @@ mod tests {
         let c = sample(
             "(assert false)\n(check-sat)",
             "(step t1 (cl) :rule false)",
-            "abcd",
+            &"aa".repeat(32),
         );
         let text = c.serialize();
         let p = AletheCert::parse(&text).expect("parses");
-        assert_eq!(p.solver_identity, c.solver_identity);
+        assert_eq!(p.producer_ay_identity, c.producer_ay_identity);
+        assert_eq!(
+            p.external_clean_checker_identity,
+            c.external_clean_checker_identity
+        );
         assert_eq!(p.smt2_sha256, c.smt2_sha256);
         assert_eq!(p.obligation_name, c.obligation_name);
         assert_eq!(p.smt2, c.smt2);
@@ -525,8 +1140,64 @@ mod tests {
     }
 
     #[test]
+    fn positive_replay_memo_binds_query_cert_producer_and_checker_bytes() {
+        let make = |verdict: &str, producer: &str, smt2: &str, cert: &str, checker: &str| {
+            consume_memo_key(verdict, producer, smt2, cert, checker)
+        };
+        let producer = "11".repeat(32);
+        let checker = "22".repeat(32);
+        let base = make(
+            "verdict-a",
+            &producer,
+            "(assert false)",
+            "certificate bytes",
+            &checker,
+        );
+        for mutant in [
+            make(
+                "verdict-b",
+                &producer,
+                "(assert false)",
+                "certificate bytes",
+                &checker,
+            ),
+            make(
+                "verdict-a",
+                &"33".repeat(32),
+                "(assert false)",
+                "certificate bytes",
+                &checker,
+            ),
+            make(
+                "verdict-a",
+                &producer,
+                "(assert true)",
+                "certificate bytes",
+                &checker,
+            ),
+            make(
+                "verdict-a",
+                &producer,
+                "(assert false)",
+                "mutated certificate bytes",
+                &checker,
+            ),
+            make(
+                "verdict-a",
+                &producer,
+                "(assert false)",
+                "certificate bytes",
+                &"44".repeat(32),
+            ),
+        ] {
+            assert_ne!(base, mutant);
+        }
+    }
+
+    #[test]
     fn parse_rejects_wrong_schema() {
         assert!(AletheCert::parse("not-a-cert\nsolver-sha256:x\n").is_none());
+        assert!(AletheCert::parse("tcg-alethe-cert-v1\nsolver-sha256:x\n").is_none());
     }
 
     #[test]
@@ -580,14 +1251,16 @@ mod tests {
         let mut c = sample("(assert PROBLEM_A)", "proof", &id);
         c.smt2 = "(assert PROBLEM_A)".to_string();
         c.smt2_sha256 = sha256_hex(c.smt2.as_bytes());
-        write_cert(dir.path(), "k1", &c);
+        let presented = "(assert PROBLEM_B)";
+        let key = crate::ay_bridge::verdict_cache_key_v2(&id, presented);
+        write_cert(dir.path(), &key, &c);
         // Present a DIFFERENT smt2: binding tooth-2 must fail before any checker.
-        let checker = Some(PathBuf::from("/bin/echo")); // would "succeed" — but we must not reach it
+        let checker = Some((PathBuf::from("/bin/echo"), "55".repeat(32)));
         assert!(!consume_verified_in(
             dir.path(),
-            "k1",
+            &key,
             solver.to_str().unwrap(),
-            "(assert PROBLEM_B)",
+            presented,
             checker
         ));
     }
@@ -598,16 +1271,37 @@ mod tests {
         let solver = dir.path().join("solverbin");
         std::fs::write(&solver, b"solver-bytes").unwrap();
         let smt2 = "(assert false)";
+        let actual_id = crate::ay_bridge::solver_identity_hash(solver.to_str().unwrap()).unwrap();
+        let key = crate::ay_bridge::verdict_cache_key_v2(&actual_id, smt2);
         // Cert names a DIFFERENT solver identity than the resolved one.
-        let c = sample(smt2, "proof", "some-other-solver-identity");
-        write_cert(dir.path(), "k2", &c);
-        let checker = Some(PathBuf::from("/bin/echo"));
+        let c = sample(smt2, "proof", &"66".repeat(32));
+        write_cert(dir.path(), &key, &c);
+        let checker = Some((PathBuf::from("/bin/echo"), "55".repeat(32)));
         assert!(!consume_verified_in(
             dir.path(),
-            "k2",
+            &key,
             solver.to_str().unwrap(),
             smt2,
             checker
+        ));
+    }
+
+    #[test]
+    fn consume_declines_external_checker_identity_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let solver = dir.path().join("solverbin");
+        std::fs::write(&solver, b"solver-bytes").unwrap();
+        let solver_id = crate::ay_bridge::solver_identity_hash(solver.to_str().unwrap()).unwrap();
+        let smt2 = "(assert false)";
+        let key = crate::ay_bridge::verdict_cache_key_v2(&solver_id, smt2);
+        let cert = sample(smt2, "proof", &solver_id);
+        write_cert(dir.path(), &key, &cert);
+        assert!(!consume_verified_in(
+            dir.path(),
+            &key,
+            solver.to_str().unwrap(),
+            smt2,
+            Some((PathBuf::from("/bin/echo"), "77".repeat(32))),
         ));
     }
 
@@ -619,7 +1313,8 @@ mod tests {
     ///
     /// ```text
     /// TRUST_CG_RUN_EXTERNAL_CERT_TESTS=1 \
-    /// AY_SOLVER_PATH=/path/to/ay TCG_CLEAN_CHECKER=/path/to/clean-with-carcara-verify \
+    /// AY_SOLVER_PATH=/path/to/ay \
+    /// TCG_EXTERNAL_CLEAN_CHECKER=/path/to/clean-with-carcara-verify \
     /// cargo test -p trust-cg-verify --lib \
     ///     end_to_end_mint_then_consume_real_binaries
     /// ```
@@ -632,7 +1327,7 @@ mod tests {
             eprintln!(
                 "external certificate campaign not requested; \
                  set TRUST_CG_RUN_EXTERNAL_CERT_TESTS=1 with explicit \
-                 AY_SOLVER_PATH and TCG_CLEAN_CHECKER paths to run"
+                 AY_SOLVER_PATH and TCG_EXTERNAL_CLEAN_CHECKER paths to run"
             );
             return;
         }
@@ -642,8 +1337,9 @@ mod tests {
                 .expect("AY_SOLVER_PATH must name the exact AY binary under test"),
         );
         let checker = PathBuf::from(
-            std::env::var_os("TCG_CLEAN_CHECKER")
-                .expect("TCG_CLEAN_CHECKER must name the exact Clean checker under test"),
+            std::env::var_os("TCG_EXTERNAL_CLEAN_CHECKER")
+                .or_else(|| std::env::var_os("TCG_CLEAN_CHECKER"))
+                .expect("TCG_EXTERNAL_CLEAN_CHECKER must name the exact checker under test"),
         );
         assert!(
             ay.is_file(),
@@ -652,7 +1348,7 @@ mod tests {
         );
         assert!(
             checker.is_file(),
-            "TCG_CLEAN_CHECKER is not a file: {}",
+            "TCG_EXTERNAL_CLEAN_CHECKER is not a file: {}",
             checker.display()
         );
         let ay = ay
@@ -667,33 +1363,57 @@ mod tests {
         // cannot serve as a certificate-pipeline canary.
         let smt2 = "(set-logic QF_BV)\n(assert false)\n(check-sat)\n";
         let dir = tempfile::tempdir().unwrap();
-        let key = "e2e_false_qfbv";
+        let producer_identity = crate::ay_bridge::solver_identity_hash(ay).unwrap();
+        let key = crate::ay_bridge::verdict_cache_key_v2(&producer_identity, smt2);
+        let checker_identity = crate::lrat_cert::checker_binary_sha256(&checker).unwrap();
 
         // MINT: real ay emits Alethe; Carcara pre-verifies; cert is written.
-        let minted = mint_into(dir.path(), key, ay, smt2, "false_qfbv", &checker);
+        let minted = mint_into(
+            dir.path(),
+            &key,
+            ay,
+            smt2,
+            "false_qfbv",
+            &checker,
+            &checker_identity,
+        );
         assert!(
             minted,
             "mint should succeed for a real unsat + verifiable proof"
         );
-        assert!(cert_path(dir.path(), key).exists(), "cert file written");
+        assert!(cert_path(dir.path(), &key).exists(), "cert file written");
 
         // CONSUME (happy path): binding + independent Carcara re-check => hit.
         assert!(
-            consume_verified_in(dir.path(), key, ay, smt2, Some(checker.clone())),
+            consume_verified_in(
+                dir.path(),
+                &key,
+                ay,
+                smt2,
+                Some((checker.clone(), checker_identity.clone()))
+            ),
             "a freshly minted, Carcara-verifiable cert must be honored"
         );
 
         // ADVERSARIAL 1 — tampered proof: Carcara must reject => no skip.
         {
-            let text = std::fs::read_to_string(cert_path(dir.path(), key)).unwrap();
+            let path = cert_path(dir.path(), &key);
+            let text = std::fs::read_to_string(&path).unwrap();
             let cert = AletheCert::parse(&text).unwrap();
             let mut bad = cert.clone();
             bad.alethe_proof = "(malformed".to_string();
-            std::fs::write(cert_path(dir.path(), "tampered"), bad.serialize()).unwrap();
+            std::fs::write(&path, bad.serialize()).unwrap();
             assert!(
-                !consume_verified_in(dir.path(), "tampered", ay, smt2, Some(checker.clone())),
+                !consume_verified_in(
+                    dir.path(),
+                    &key,
+                    ay,
+                    smt2,
+                    Some((checker.clone(), checker_identity.clone()))
+                ),
                 "a proof Carcara cannot re-check must NOT be honored"
             );
+            std::fs::write(path, text).unwrap();
         }
 
         // ADVERSARIAL 2 — wrong SMT2 presented: binding tooth-2 rejects before
@@ -701,17 +1421,17 @@ mod tests {
         assert!(
             !consume_verified_in(
                 dir.path(),
-                key,
+                &key,
                 ay,
                 "(set-logic QF_BV)\n(declare-const y (_ BitVec 8))\n(assert (= y y))\n(check-sat)\n",
-                Some(checker.clone())
+                Some((checker.clone(), checker_identity.clone()))
             ),
             "a cert must never be served for a different query"
         );
 
         // ADVERSARIAL 3 — no checker: fail-safe decline even with a valid cert.
         assert!(
-            !consume_verified_in(dir.path(), key, ay, smt2, None),
+            !consume_verified_in(dir.path(), &key, ay, smt2, None),
             "absent Carcara checker must fail closed"
         );
     }
@@ -724,11 +1444,12 @@ mod tests {
         std::fs::write(&solver, b"solver-bytes").unwrap();
         let id = crate::ay_bridge::solver_identity_hash(solver.to_str().unwrap()).unwrap();
         let smt2 = "(assert false)";
+        let key = crate::ay_bridge::verdict_cache_key_v2(&id, smt2);
         let c = sample(smt2, "proof", &id);
-        write_cert(dir.path(), "k3", &c);
+        write_cert(dir.path(), &key, &c);
         assert!(!consume_verified_in(
             dir.path(),
-            "k3",
+            &key,
             solver.to_str().unwrap(),
             smt2,
             None

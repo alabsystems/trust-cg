@@ -2736,10 +2736,36 @@ pub struct FunctionVerifier {
 }
 
 impl FunctionVerifier {
+    /// Every proof category reachable from this verifier's query builders.
+    ///
+    /// Building only these categories avoids constructing architecture-specific
+    /// databases this AArch64 verifier cannot consult (notably 531 x86-64
+    /// obligations). `ProofDatabase::for_categories` preserves each category's
+    /// full-database order and fails closed if this list ever under-requests.
+    const CONSULTED_CATEGORIES: &'static [ProofCategory] = &[
+        ProofCategory::AddressMode,
+        ProofCategory::Arithmetic,
+        ProofCategory::AtomicOperations,
+        ProofCategory::BitwiseShift,
+        ProofCategory::Branch,
+        ProofCategory::CmpCombine,
+        ProofCategory::Comparison,
+        ProofCategory::ConstantMaterialization,
+        ProofCategory::Division,
+        ProofCategory::ExtensionTruncation,
+        ProofCategory::FloatingPoint,
+        ProofCategory::FpConversion,
+        ProofCategory::FrameLayout,
+        ProofCategory::MachOEmission,
+        ProofCategory::Memory,
+        ProofCategory::NeonLowering,
+        ProofCategory::RegAlloc,
+    ];
+
     /// Create a new function verifier with default configuration.
     pub fn new() -> Self {
         Self {
-            db: ProofDatabase::new(),
+            db: ProofDatabase::for_categories(Self::CONSULTED_CATEGORIES),
             config: VerificationConfig::default(),
         }
     }
@@ -2747,7 +2773,7 @@ impl FunctionVerifier {
     /// Create a new function verifier with custom verification configuration.
     pub fn with_config(config: VerificationConfig) -> Self {
         Self {
-            db: ProofDatabase::new(),
+            db: ProofDatabase::for_categories(Self::CONSULTED_CATEGORIES),
             config,
         }
     }
@@ -2899,10 +2925,22 @@ impl FunctionVerifier {
                 "callee-save pair slots don't overlap",
                 ProofCategory::FrameLayout,
             )),
-            LdpRI | LdpPostIndex => Some((
-                "callee-save restore is identity",
-                ProofCategory::FrameLayout,
-            )),
+            // LDP (offset and post-index writeback): the FRAME callee-save
+            // roundtrip proof (`proof_frame_callee_save_restore_identity`)
+            // models ONE slot that THIS code stored — not a pair, and not a
+            // base writeback. `mem-pair-formation` folds ordinary ARRAY loads
+            // into `LdpRI`, so the old opcode-wide match handed that frame
+            // proof to arbitrary data loads: a category error, since nothing
+            // stored those addresses here.
+            //
+            // The frame shape keeps the frame proof, bound operand-sensitively
+            // by `frame_pair_restore_query` (which runs BEFORE this fallback).
+            // Everything else is ordinary data movement and lands on the SAME
+            // shared Ldr*/Str* dereference debt every scalar and NEON load
+            // already carries above — honest acknowledged debt (it inventories
+            // the memory op, not the loaded value) instead of a false identity
+            // claim.
+            LdpRI | LdpPostIndex => Some(("load", ProofCategory::Memory)),
 
             // Floating-point
             FaddRR => Some(("fadd", ProofCategory::FloatingPoint)),
@@ -3761,6 +3799,7 @@ impl FunctionVerifier {
             .or_else(|| Self::generated_emergency_spill_slot_address_query(inst))
             .or_else(|| Self::generated_frame_address_materialization_query(inst))
             .or_else(|| Self::generated_fp_sp_relative_addressing_query(inst))
+            .or_else(|| Self::frame_pair_restore_query(inst))
             .or_else(|| Self::operand_sensitive_or_opcode_query(inst))
     }
 
@@ -3776,6 +3815,7 @@ impl FunctionVerifier {
             .or_else(|| Self::generated_frame_address_materialization_query(inst))
             .or_else(|| Self::generated_fp_sp_relative_addressing_query(inst))
             .or_else(|| Self::i128_carry_chain_low_limb_query(func, block_insts, block_pos))
+            .or_else(|| Self::frame_pair_restore_query(inst))
             .or_else(|| Self::operand_sensitive_or_opcode_query(inst))
     }
 
@@ -3949,6 +3989,17 @@ impl FunctionVerifier {
         // the preservation of the remaining bits at exactly this slot, so a MOVK
         // emitted at the wrong halfword cannot inherit another slot's proof.
         if inst.opcode == AArch64Opcode::Movk {
+            // A MOVK to WZR/XZR architecturally discards the write; the
+            // splice theorem models a real register destination, so a
+            // zero-register MOVK earns no credit (review hardening — no
+            // producer emits it, and a malformed dead-splice chain must not
+            // verify).
+            if matches!(
+                inst.operands.first(),
+                Some(MachOperand::Special(SpecialReg::WZR | SpecialReg::XZR))
+            ) {
+                return None;
+            }
             let width = if is_w_form { 32 } else { 64 };
             let query = crate::const_materialize_proofs::movk_halfword_query(width, shift as u32)?;
             return Some((query, ProofCategory::ConstantMaterialization));
@@ -4232,6 +4283,36 @@ impl FunctionVerifier {
 
     fn is_frame_materialization_scratch_reg(reg: PReg) -> bool {
         matches!(reg, X16 | X17)
+    }
+
+    /// Frame callee-save PAIR restore: `LDP Rt,Rt2,[SP|X29 ...]`.
+    ///
+    /// The backing obligation (`FrameLayout: callee-save restore is identity`)
+    /// models a store-then-load-back roundtrip at ONE offset of memory THIS
+    /// code wrote. That story is only available for the frame restore shape,
+    /// so the credit requires a frame base register. A pair load off any other
+    /// base is ordinary data movement (`mem-pair-formation` produces exactly
+    /// that) and gets NOTHING here — it must earn its own faithful obligation.
+    ///
+    /// SCOPE (honest): even for the frame shape this credits the pair through a
+    /// single-slot obligation and says nothing about the second destination or
+    /// a post-index base update. Narrowing it to the frame shape removes the
+    /// unbounded-data case; a faithful pair+writeback obligation is the
+    /// recorded follow-up.
+    fn frame_pair_restore_query(inst: &MachInst) -> Option<(&'static str, ProofCategory)> {
+        if !matches!(
+            inst.opcode,
+            AArch64Opcode::LdpRI | AArch64Opcode::LdpPostIndex
+        ) {
+            return None;
+        }
+        if !Self::is_frame_base_operand(inst.operands.get(2)?) {
+            return None;
+        }
+        Some((
+            "callee-save restore is identity",
+            ProofCategory::FrameLayout,
+        ))
     }
 
     fn is_frame_base_operand(operand: &MachOperand) -> bool {
@@ -4585,6 +4666,7 @@ pub fn verify_function(func: &MachFunction) -> FunctionVerificationReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coverage_gate::ALL_AARCH64_OPCODES;
     use trust_cg_ir::aarch64_regs::{SP, X0, X1};
     use trust_cg_ir::types::InstId;
     use trust_cg_ir::{
@@ -4614,6 +4696,50 @@ mod tests {
 
     fn inst_with_operands(opcode: AArch64Opcode, operands: Vec<MachOperand>) -> MachInst {
         MachInst::new(opcode, operands)
+    }
+
+    #[test]
+    fn consulted_category_manifest_covers_every_opcode_query() {
+        for &opcode in ALL_AARCH64_OPCODES {
+            if let Some((_, category)) = FunctionVerifier::opcode_to_proof_query(opcode) {
+                assert!(
+                    FunctionVerifier::CONSULTED_CATEGORIES.contains(&category),
+                    "{opcode:?} queries undeclared category {}",
+                    category.name(),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn aarch64_database_matches_full_database_for_consulted_categories() {
+        let full = ProofDatabase::new();
+        let filtered = ProofDatabase::for_categories(FunctionVerifier::CONSULTED_CATEGORIES);
+        assert!(
+            filtered
+                .all()
+                .iter()
+                .all(|proof| proof.category != ProofCategory::X8664Lowering),
+            "the AArch64 verifier must not construct x86-64 obligations",
+        );
+        for &category in FunctionVerifier::CONSULTED_CATEGORIES {
+            let expected: Vec<&str> = full
+                .by_category(category)
+                .iter()
+                .map(|proof| proof.obligation.name.as_str())
+                .collect();
+            let actual: Vec<&str> = filtered
+                .by_category(category)
+                .iter()
+                .map(|proof| proof.obligation.name.as_str())
+                .collect();
+            assert_eq!(
+                actual,
+                expected,
+                "filtered AArch64 database drifted in {}",
+                category.name(),
+            );
+        }
     }
 
     fn assert_verified_with_proof(
@@ -5719,17 +5845,48 @@ mod tests {
     }
 
     #[test]
-    fn test_ldp_pair_loads_verified_as_generated_callee_save_restore() {
-        assert_verified_with_proof(
-            AArch64Opcode::LdpRI,
-            ProofCategory::FrameLayout,
-            "callee-save restore is identity",
-        );
-        assert_verified_with_proof(
-            AArch64Opcode::LdpPostIndex,
-            ProofCategory::FrameLayout,
-            "callee-save restore is identity",
-        );
+    fn test_ldp_pair_loads_credit_frame_shape_only() {
+        use trust_cg_ir::aarch64_regs::{SP, X0, X1, X2};
+        // FRAME SHAPE (base is SP/X29): keeps the callee-save roundtrip proof.
+        for opcode in [AArch64Opcode::LdpRI, AArch64Opcode::LdpPostIndex] {
+            let frame = MachInst::new(
+                opcode,
+                vec![
+                    MachOperand::PReg(X0),
+                    MachOperand::PReg(X1),
+                    MachOperand::PReg(SP),
+                    MachOperand::Imm(16),
+                ],
+            );
+            assert_eq!(
+                FunctionVerifier::inst_to_proof_query(&frame),
+                Some((
+                    "callee-save restore is identity",
+                    ProofCategory::FrameLayout
+                )),
+                "{opcode:?} off a frame base is the callee-save restore"
+            );
+        }
+        // DATA SHAPE (any other base): the frame roundtrip models one slot THIS
+        // code stored, which is false for an array load that mem-pair-formation
+        // folded. It must land on the shared Ldr*/Str* dereference debt
+        // instead — never on the frame identity claim.
+        for opcode in [AArch64Opcode::LdpRI, AArch64Opcode::LdpPostIndex] {
+            let data = MachInst::new(
+                opcode,
+                vec![
+                    MachOperand::PReg(X0),
+                    MachOperand::PReg(X1),
+                    MachOperand::PReg(X2),
+                    MachOperand::Imm(16),
+                ],
+            );
+            assert_eq!(
+                FunctionVerifier::inst_to_proof_query(&data),
+                Some(("load", ProofCategory::Memory)),
+                "{opcode:?} off a non-frame base must NOT claim the frame identity"
+            );
+        }
     }
 
     #[test]
@@ -7564,14 +7721,20 @@ mod tests {
         assert_eq!(query, "callee-save pair slots don't overlap");
         assert_eq!(cat, ProofCategory::FrameLayout);
 
+        // LDP has no OPCODE-WIDE frame credit: the callee-save roundtrip proof
+        // only fits the frame shape, and mem-pair-formation folds ordinary
+        // array loads into these opcodes. Opcode-wide they carry the shared
+        // dereference debt; the frame shape is re-credited operand-sensitively
+        // by `frame_pair_restore_query` (see
+        // `test_ldp_pair_loads_credit_frame_shape_only`).
         let (query, cat) = FunctionVerifier::opcode_to_proof_query(AArch64Opcode::LdpRI).unwrap();
-        assert_eq!(query, "callee-save restore is identity");
-        assert_eq!(cat, ProofCategory::FrameLayout);
+        assert_eq!(query, "load");
+        assert_eq!(cat, ProofCategory::Memory);
 
         let (query, cat) =
             FunctionVerifier::opcode_to_proof_query(AArch64Opcode::LdpPostIndex).unwrap();
-        assert_eq!(query, "callee-save restore is identity");
-        assert_eq!(cat, ProofCategory::FrameLayout);
+        assert_eq!(query, "load");
+        assert_eq!(cat, ProofCategory::Memory);
 
         let (query, cat) = FunctionVerifier::opcode_to_proof_query(AArch64Opcode::Sxtb).unwrap();
         assert_eq!(query, "sextend_i8_to_i32");

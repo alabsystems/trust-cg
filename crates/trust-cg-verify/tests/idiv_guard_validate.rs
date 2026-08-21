@@ -29,13 +29,15 @@ fn guarded_idiv_proofs_validate() {
 }
 
 #[test]
-fn x86_64_proof_count_is_531_after_forward_port() {
+fn x86_64_proof_count_is_543_after_rol_and_saxpy() {
     assert_eq!(
         all_x86_64_proofs().len(),
-        531,
-        "x86-64 proof registration count drifted from expected 531 \
-         (518 through slice 3 + 10 slice-4 CMPXCHG conditional-data-flow proofs \
-         + 3 v2i64 SSE2 lane proofs: uniform PSLLQ/PSRLQ immediate shifts and \
-         the PMULUDQ low-32 multiply, 16ab91cb)"
+        543,
+        "x86-64 proof registration count drifted from expected 543 \
+         (531 through the slice-4/SSE2 forward port, 16ab91cb; \
+         + the ROL rotate-left-by-constant obligation family, 732de1f5; \
+         + the scalar-IMUL/PUNPCKLQDQ/PADDQ saxpy sequence proofs, 0bfe4e1e \
+         — reviewed 2026-08-19 while re-pinning: both commits added real \
+         registered obligations and forgot this fence)"
     );
 }

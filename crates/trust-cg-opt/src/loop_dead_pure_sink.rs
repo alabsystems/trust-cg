@@ -74,7 +74,7 @@ use trust_cg_ir::{
 
 use crate::dom::DomTree;
 use crate::effects::{
-    MemoryEffect, aarch64_use_operand_positions, inst_produces_value, opcode_effect, reads_flags,
+    MemoryEffect, aarch64_use_operand_positions, for_each_inst_def, opcode_effect, reads_flags,
     writes_flags,
 };
 use crate::loops::{LoopAnalysis, NaturalLoop};
@@ -739,13 +739,12 @@ fn slot_accesses_admissible(
                         // (Flag-setting compares on addresses would be exotic;
                         // they produce no pointer, so they are safe to ignore
                         // as derivations but we still require a plain def.)
-                        if inst_produces_value(inst)
-                            && let Some(MachOperand::VReg(d)) = inst.operands.first()
-                            && !derived.contains(d)
-                        {
-                            derived.insert(*d);
-                            grew = true;
-                        }
+                        for_each_inst_def(inst, |d| {
+                            if !derived.contains(&d) {
+                                derived.insert(d);
+                                grew = true;
+                            }
+                        });
                     }
                     MemoryEffect::Load => {
                         // Only the exact scalar `LdrRI [dst, base(derived),
@@ -765,8 +764,7 @@ fn slot_accesses_admissible(
                             // Derived vreg in a non-base position of a load.
                             return false;
                         }
-                        if inst_produces_value(inst)
-                            && let Some(MachOperand::VReg(d)) = inst.operands.first()
+                        if let Some(MachOperand::VReg(d)) = inst.operands.first()
                             && d.class == RegClass::Gpr64
                             && !derived.contains(d)
                         {

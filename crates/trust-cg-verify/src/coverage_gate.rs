@@ -1317,9 +1317,10 @@ pub fn classify_aarch64(opcode: AArch64Opcode) -> OpcodeClass {
         // (`aarch64_elf_tls_reloc_proofs`: TLSIE_ADR_GOTTPREL_PAGE21 ADRP ==
         // page(G+A); TLSIE_LD64_GOTTPREL_LO12_NC ADRP+LDR addresses exactly
         // the 8-aligned GOT slot G+A) — the ELF TLS sibling of LdrGot/LdrTlvp
-        // above. This instruction-level evidence does not authorize the
-        // production Certified object inventory; every AArch64 ELF relocation
-        // row remains fail-closed there.
+        // above. In the production Certified object inventory the emitted TLS
+        // rows promote through the same fail-closed composition as the ordinary
+        // eight: their dedicated value-proof lane plus the exact per-object ELF
+        // reparse binding.
         O::LdrGottprel => EmittableNeedsProof,
         // LDRSW Xt,[Xn,Xm,LSL#2] (the jump-table scaled table-entry load) is
         // credited to the FAITHFUL scaled-EFFECTIVE-ADDRESS proof

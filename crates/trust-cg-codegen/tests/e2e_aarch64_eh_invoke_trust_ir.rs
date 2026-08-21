@@ -43,6 +43,16 @@ use trust_ir::{
     InstrNode, Linkage, Module as TrustIrModule, Ty, ValueId,
 };
 
+/// These fixtures parse Mach-O structure (unwind/LSDA sections), so pin the
+/// aarch64-apple-darwin spec explicitly: `Compiler::new` derives the object
+/// format from the HOST, which on Linux emits ELF and breaks every Mach-O
+/// header parse below. Mach-O byte emission itself is host-independent.
+fn macho_compiler(config: CompilerConfig) -> Compiler {
+    let spec = trust_cg_codegen::target::TargetSpec::parse("aarch64-apple-darwin")
+        .expect("aarch64-apple-darwin parses");
+    Compiler::new_for_target_spec(config, spec)
+}
+
 fn host_is_aarch64_macos() -> bool {
     cfg!(all(target_os = "macos", target_arch = "aarch64"))
 }
@@ -267,7 +277,7 @@ fn eh_invoke_fully_unreachable_region_prunes_eh_metadata_in_lockstep() {
     //    targets block BlockId(2), which is absent from block_order"
     let module = build_dead_invoke_region_module();
     for opt_level in [OptLevel::O1, OptLevel::O2] {
-        let compiler = Compiler::new(CompilerConfig {
+        let compiler = macho_compiler(CompilerConfig {
             opt_level,
             ..CompilerConfig::default()
         });
@@ -292,7 +302,7 @@ fn eh_invoke_fully_unreachable_region_prunes_eh_metadata_in_lockstep() {
 
 /// Compile the module at O0 and return the `tc_try` object code.
 fn compile_to_obj(module: &TrustIrModule) -> Vec<u8> {
-    let compiler = Compiler::new(CompilerConfig {
+    let compiler = macho_compiler(CompilerConfig {
         opt_level: OptLevel::O0,
         ..CompilerConfig::default()
     });

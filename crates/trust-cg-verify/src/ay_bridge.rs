@@ -2102,6 +2102,16 @@ pub fn verify_with_cli_raw(obligation: &ProofObligation, config: &AYConfig) -> A
 /// query. Split out so both the normal (simplified) and raw (un-simplified)
 /// query paths share solver selection, temp-file handling, and output parsing.
 fn verify_with_cli_smt2(obligation: &ProofObligation, config: &AYConfig, smt2: &str) -> AYResult {
+    // PORTABLE CERT-SKIP must run before solver selection.  Its authority is
+    // the exact query bytes plus an independently replayed committed proof;
+    // AY is only the offline producer recorded in the certificate. Requiring
+    // a live/local AY binary here would make the certificate non-portable and
+    // would reject a checkable proof before consulting it.
+    let recording = crate::verdict_db::recording_active();
+    if !recording && crate::canary_cert::cert_skip_verified(smt2) {
+        return AYResult::Verified;
+    }
+
     // Find the solver binary
     let solver_selection = match &config.solver_path {
         Some(path) => config_solver_selection(path.clone()),
@@ -2122,7 +2132,6 @@ fn verify_with_cli_smt2(obligation: &ProofObligation, config: &AYConfig, smt2: &
     // `AYResult::Verified`. The key binds the exact query and solver bytes;
     // recording bypasses even the process-local memo so regen observes live
     // solver output.
-    let recording = crate::verdict_db::recording_active();
     let cache_key = if recording {
         None
     } else {
@@ -2131,24 +2140,6 @@ fn verify_with_cli_smt2(obligation: &ProofObligation, config: &AYConfig, smt2: &
     if let Some(key) = &cache_key
         && session_proof_cache_lookup_verified(key)
     {
-        return AYResult::Verified;
-    }
-
-    // CERT-SKIP tier (crate::canary_cert): a repo-committed, build-embedded
-    // DRAT certificate for a fixed canary obligation, INDEPENDENTLY re-checked
-    // by the vendored drat-trim in this process before it is credited. Unlike
-    // the removed `.verdict` disk cache, no recorded verdict is trusted here:
-    // the recorded proof is re-checked on every consume, the key binds the
-    // exact SMT2 bytes and the solver binary's bytes-hash, and any
-    // miss/mismatch/tamper/check-failure falls through to the live solve
-    // below (fail-closed, never a weaker verdict). `cache_key` is `None`
-    // while the regen recorder is armed or under `TCG_NO_PROOF_CACHE`, so
-    // regen always observes live runs; `TCG_CANARY_NO_CACHE=1` disables just
-    // this tier. See canary_cert.rs for the full soundness argument.
-    if let Some(key) = &cache_key
-        && crate::canary_cert::cert_skip_verified(key, &solver_path)
-    {
-        session_proof_cache_store_verified(key);
         return AYResult::Verified;
     }
 
@@ -2385,11 +2376,20 @@ fn promote_fresh_solver_unsat(
         }
     };
 
+    // Two very different situations must not share one message. "The checker
+    // refused THIS proof" is evidence about the proof; "no checker can run
+    // here" is evidence about the installation, and they demand opposite
+    // responses. `clean_checker_path` capability-probes, so a checker that
+    // refuses everything is reported here as unavailable-with-a-reason rather
+    // than masquerading as a rejection of this particular proof.
     let Some(checker) = crate::obligation_cert_store::clean_checker_path() else {
         let _ = std::fs::remove_file(&proof_path);
-        return AYResult::Unknown(
-            "AY reported UNSAT but no independent Clean/Carcara checker is available".to_string(),
-        );
+        let reason = crate::obligation_cert_store::clean_checker_unavailable_reason()
+            .unwrap_or_else(|| "no usable checker".to_string());
+        return AYResult::Unknown(format!(
+            "AY reported UNSAT but it CANNOT BE CHECKED here — {reason}. \
+             This is a toolchain problem, not evidence about the proof."
+        ));
     };
     let checked = crate::obligation_cert_store::carcara_verify(&checker, smt2, &proof);
     let _ = std::fs::remove_file(&proof_path);
@@ -2397,7 +2397,8 @@ fn promote_fresh_solver_unsat(
         AYResult::Verified
     } else {
         AYResult::Unknown(format!(
-            "AY reported UNSAT but {} rejected or could not fully verify the exact Alethe proof",
+            "AY reported UNSAT but {} — which verified a known-good control proof, so it is a \
+             working checker — rejected or could not fully verify THIS Alethe proof",
             checker.display()
         ))
     }
@@ -2620,8 +2621,9 @@ pub(crate) fn verdict_cache_key_v2(solver_identity_hex: &str, smt2: &str) -> Str
     format!("{:x}", hasher.finalize())
 }
 
-/// Process-wide memo behind [`solver_identity_hash`], keyed by the solver's
-/// (path, size, mtime).
+/// Process-wide memo behind [`solver_identity_hash`], keyed by stable file
+/// metadata. Unix additionally binds device, inode, and ctime, so an in-place
+/// edit with its mtime restored cannot reuse a stale content hash.
 ///
 /// The value is a per-key mutex rather than a bare `String` so the hash is
 /// COMPUTE-ONCE: a caller arriving while another thread is mid-hash waits for
@@ -2629,9 +2631,55 @@ pub(crate) fn verdict_cache_key_v2(solver_identity_hex: &str, smt2: &str) -> Str
 /// makes the background warm a real prefetch, and it is what lets
 /// [`solver_identity_hash_if_ready`] distinguish "already resolved" from
 /// "in flight" without blocking.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct SolverIdentityStatKey {
+    path: String,
+    size: u64,
+    mtime_ns: u128,
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+    #[cfg(unix)]
+    ctime_ns: i128,
+}
+
+impl SolverIdentityStatKey {
+    fn of(path: &str, meta: &std::fs::Metadata) -> Option<Self> {
+        let mtime_ns = meta
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_nanos();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Some(Self {
+                path: path.to_owned(),
+                size: meta.len(),
+                mtime_ns,
+                dev: meta.dev(),
+                ino: meta.ino(),
+                ctime_ns: i128::from(meta.ctime()) * 1_000_000_000 + i128::from(meta.ctime_nsec()),
+            })
+        }
+
+        #[cfg(not(unix))]
+        {
+            Some(Self {
+                path: path.to_owned(),
+                size: meta.len(),
+                mtime_ns,
+            })
+        }
+    }
+}
+
 type SolverIdentityMemo = std::sync::Mutex<
     std::collections::HashMap<
-        (String, u64, u128),
+        SolverIdentityStatKey,
         std::sync::Arc<std::sync::Mutex<Option<String>>>,
     >,
 >;
@@ -2657,13 +2705,7 @@ pub(crate) fn solver_identity_hash(solver_path: &str) -> Option<String> {
     // cached (the slot stays `None`), preserving the prior behaviour that a
     // transient IO error is retried rather than remembered.
     let meta = std::fs::metadata(solver_path).ok()?;
-    let mtime = meta
-        .modified()
-        .ok()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_nanos();
-    let stat_key = (solver_path.to_string(), meta.len(), mtime);
+    let stat_key = SolverIdentityStatKey::of(solver_path, &meta)?;
 
     let memo = solver_identity_memo();
     let slot = {
@@ -2714,13 +2756,7 @@ pub(crate) fn solver_identity_hash(solver_path: &str) -> Option<String> {
 /// all of which the caller treats as "no cache", i.e. discharge live.
 fn solver_identity_hash_if_ready(solver_path: &str) -> Option<String> {
     let meta = std::fs::metadata(solver_path).ok()?;
-    let mtime = meta
-        .modified()
-        .ok()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_nanos();
-    let stat_key = (solver_path.to_string(), meta.len(), mtime);
+    let stat_key = SolverIdentityStatKey::of(solver_path, &meta)?;
 
     let memo = solver_identity_memo();
     // `try_lock` throughout: this function must never wait on the hash.
@@ -2820,6 +2856,16 @@ pub fn warm_solver_identity() {
 /// produced the committed verdicts.
 pub(crate) fn resolved_solver_path() -> Option<String> {
     let path = find_solver_binary();
+    if path.is_empty() { None } else { Some(path) }
+}
+
+/// Resolve AY as an offline artifact producer without requiring the external
+/// Alethe checker that gates live solver authority. Certificate generation
+/// independently checks its DRAT output with `drat-trim`; conflating producer
+/// discovery with the live AY+Clean route would make regeneration impossible
+/// on an otherwise correctly provisioned DRAT-only host.
+pub(crate) fn resolved_certificate_producer_path() -> Option<String> {
+    let path = select_solver_binary().path;
     if path.is_empty() { None } else { Some(path) }
 }
 
@@ -3055,7 +3101,7 @@ fn ay_server_next_seq() -> u64 {
 /// Resident-server path enabled? Default ON; opt out with
 /// `TCG_NO_SOLVER_SERVER=1`. Never while the regen recorder is armed (the
 /// offline builder must observe genuine fresh live solver runs).
-fn ay_server_enabled() -> bool {
+pub(crate) fn ay_server_enabled() -> bool {
     std::env::var_os("TCG_NO_SOLVER_SERVER").is_none() && !crate::verdict_db::recording_active()
 }
 
@@ -3396,7 +3442,12 @@ fn run_solver_command(
 fn find_solver_binary() -> String {
     // AY alone is a solver-verdict source, not proof authority.  Do not expose
     // a "formal solver available" route unless the independent Alethe checker
-    // needed to promote UNSAT is available too.
+    // needed to promote UNSAT is available too.  "Available" means CAPABLE, not
+    // merely present: `clean_checker_path` probes the checker against a
+    // known-good control proof, so a `clean` built without `carcara-verify`
+    // (which refuses every proof content-independently) correctly reads as no
+    // checker at all instead of turning every UNSAT into an Unknown after the
+    // solve has already been paid for.
     if crate::obligation_cert_store::clean_checker_path().is_none() {
         String::new()
     } else {
@@ -4834,6 +4885,19 @@ mod tests {
         let k1 = session_proof_cache_key(solver, "(assert true)").unwrap();
         let k2 = session_proof_cache_key(solver, "(assert false)").unwrap();
         assert_ne!(k1, k2, "different SMT2 must produce different keys");
+
+        // Keep raw SMT2 bytes authoritative. A textual `_v<digits>` rewrite
+        // looks like SSA alpha-renaming for generated bit-vector symbols, but
+        // the same bytes are legal inside semantic string literals. These two
+        // formulas have opposite satisfiability and therefore must never alias:
+        // `"x_v9"` has length 4, while `"x_v73"` has length 5.
+        let sat = "(assert (= (str.len \"x_v9\") 4))";
+        let unsat = "(assert (= (str.len \"x_v73\") 4))";
+        assert_ne!(
+            session_proof_cache_key(solver, sat).unwrap(),
+            session_proof_cache_key(solver, unsat).unwrap(),
+            "unparsed SMT2 renaming must not merge SAT and UNSAT queries",
+        );
         assert_eq!(
             k1,
             session_proof_cache_key(solver, "(assert true)").unwrap(),
@@ -4916,6 +4980,80 @@ mod tests {
             verdict_cache_key_v2(&ia, smt2),
             verdict_cache_key_v2(&ic, smt2),
             "a changed solver binary invalidates every verdict key"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The process-local memo key must DISCRIMINATE a binary that was modified
+    /// IN PLACE — same path, same inode, same length, mtime restored.
+    ///
+    /// The old `(path, size, mtime)` key served a stale hash after an
+    /// mtime-restoring in-place edit. The tightened key also binds dev+inode (a
+    /// replaced file is a different record) and ctime, which advances on every
+    /// write and which an unprivileged process cannot rewind (unlike mtime, via
+    /// `utimensat`).
+    ///
+    /// Threat-model note: an attacker who can rewrite the solver binary in place
+    /// already controls the solver and could simply make it answer `unsat`.
+    /// Hashing is not the weak link there. This test guards the ACCIDENTAL case
+    /// — a rebuild or restore that lands the same size and mtime.
+    #[cfg(unix)]
+    #[test]
+    fn solver_identity_memo_key_discriminates_in_place_edit() {
+        let dir = std::env::temp_dir().join(format!(
+            "tcg_solver_identity_inplace_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let solver = dir.join("solver");
+
+        std::fs::write(&solver, b"solver bytes v1").unwrap();
+        let meta_before = std::fs::metadata(&solver).unwrap();
+        let solver_path = solver.to_str().unwrap();
+        let key_before =
+            SolverIdentityStatKey::of(solver_path, &meta_before).expect("unix metadata");
+        let hash_before = solver_identity_hash(solver_path).unwrap();
+        let modified = meta_before.modified().unwrap();
+
+        // Overwrite in place at the SAME length, then restore mtime to hide it.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        std::fs::write(&solver, b"solver bytes v2").unwrap();
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&solver)
+            .unwrap();
+        let times = std::fs::FileTimes::new()
+            .set_modified(modified)
+            .set_accessed(modified);
+        let _ = f.set_times(times);
+        drop(f);
+
+        let meta_after = std::fs::metadata(&solver).unwrap();
+        assert_eq!(meta_after.len(), meta_before.len(), "same length");
+        let key_after = SolverIdentityStatKey::of(solver_path, &meta_after).expect("unix metadata");
+
+        // Precision: dev, inode and size are all UNCHANGED and mtime was
+        // restored, so ctime is the only field that can carry the difference.
+        // Asserting that keeps this test from passing for the wrong reason if
+        // the key composition ever changes.
+        assert_eq!(key_before.dev, key_after.dev, "same device");
+        assert_eq!(key_before.ino, key_after.ino, "same inode");
+        assert_eq!(key_before.size, key_after.size, "same size");
+        assert_eq!(key_before.mtime_ns, key_after.mtime_ns, "mtime restored");
+        assert_ne!(
+            key_before.ctime_ns, key_after.ctime_ns,
+            "ctime must advance on an in-place write",
+        );
+        assert!(
+            key_before != key_after,
+            "the memo key must differ after an in-place edit even with mtime restored",
+        );
+        assert_ne!(
+            solver_identity_hash(solver_path).unwrap(),
+            hash_before,
+            "the process memo must re-hash bytes after the in-place edit",
         );
 
         let _ = std::fs::remove_dir_all(&dir);

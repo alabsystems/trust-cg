@@ -1,3 +1,6 @@
+#[path = "support/target_dir.rs"]
+mod target_dir_support;
+
 // Integration test — C-ABI by-value ZST-field structs, `#[repr(packed)]` structs,
 // and by-value UNIONS across a REAL `extern "C"` boundary, validated against an
 // INDEPENDENT clang-compiled C object (the System V AMD64 C-ABI oracle), in BOTH
@@ -195,9 +198,7 @@ fn dylib_name() -> String {
 
 fn ensure_dylib_built() -> PathBuf {
     let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| crate_dir.join("target"));
+    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
     let name = dylib_name();
     for cand in [
         target_dir.join("release").join(&name),

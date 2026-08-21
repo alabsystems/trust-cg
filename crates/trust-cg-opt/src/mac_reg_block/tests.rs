@@ -146,3 +146,68 @@ fn kill_switch_disables_pass() {
     assert_eq!(pass.fired(), 0);
     unsafe { std::env::remove_var("TCG_NO_MAC_REG_BLOCK") };
 }
+
+/// WRONG-CODE REGRESSION (2026-08-17): recognition used to accept any positive
+/// element scale while `apply` emits 64-bit lanes unconditionally, so an i32
+/// matmul (scale 4) became 64-bit loads at 4-byte strides — two packed i32s per
+/// lane and a 4-byte over-read past the array. It miscompiled silently and
+/// NON-DETERMINISTICALLY (repeat runs of one binary disagreed) at O2/O3 for
+/// square i32 N in {8,16,24,32,64,128}, all now matching LLVM.
+///
+/// The end-to-end differential coverage for this pass was i64-only, which is
+/// exactly how it survived; this pins the width invariant directly.
+#[test]
+fn kernel_rejects_non_eight_byte_elements() {
+    assert!(kernel_supports_scale(8), "i64 lanes are what apply() emits");
+    for bad in [1, 2, 4, 16, 3, -8, 0] {
+        assert!(
+            !kernel_supports_scale(bad),
+            "scale {bad} must fail closed: apply() would emit 64-bit lanes for it"
+        );
+    }
+}
+
+// --- k-loop pointer-writeback gate ---------------------------------------
+//
+// `pair_writeback_ok` is the fail-closed guard in front of the `LdrPostIndex` /
+// `LdpRI` / `LdpPostIndex` k-loop shape. Anything it rejects must fall back to
+// the original `LdrRI` + two `AddRI` body, so the pass never emits a pair
+// offset outside the LDP signed-imm7 range or a pair load of the wrong width.
+
+#[test]
+fn pair_writeback_accepts_the_shipped_tile() {
+    // TILE = 8, i64 elements, N = 24 -> lane offsets 0..48, writeback 192.
+    assert!(pair_writeback_ok(8, 24 * 8, TILE));
+}
+
+#[test]
+fn pair_writeback_rejects_non_i64_scale() {
+    // LDP of a Gpr64 pair always transfers 8 bytes per lane; a 4-byte element
+    // scale would silently load the wrong width.
+    assert!(!pair_writeback_ok(4, 24 * 4, TILE));
+    assert!(!pair_writeback_ok(1, 24, TILE));
+}
+
+#[test]
+fn pair_writeback_rejects_odd_tile() {
+    // Lanes are consumed two at a time.
+    assert!(!pair_writeback_ok(8, 24 * 8, 7));
+    assert!(!pair_writeback_ok(8, 24 * 8, 1));
+    assert!(!pair_writeback_ok(8, 24 * 8, 0));
+}
+
+#[test]
+fn pair_writeback_rejects_out_of_range_writeback() {
+    // The post-index amount is N*scale; LDP's scaled imm7 tops out at 504.
+    assert!(pair_writeback_ok(8, 504, TILE)); // N = 63, exactly encodable
+    assert!(!pair_writeback_ok(8, 512, TILE)); // N = 64, one step too far
+    assert!(!pair_writeback_ok(8, 8 * 1024, TILE));
+}
+
+#[test]
+fn pair_writeback_rejects_out_of_range_lane_offset() {
+    // Highest lane offset is (TILE-2)*scale, so at scale 8 the last encodable
+    // tile is TILE = 64 ((64-2)*8 = 496 <= 504) and TILE = 66 is one past it.
+    assert!(pair_writeback_ok(8, 8, 64));
+    assert!(!pair_writeback_ok(8, 8, 66)); // (66-2)*8 = 512 > 504
+}

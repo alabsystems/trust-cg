@@ -31,8 +31,9 @@
 //!   classify fails the loop closed.
 //! - **Speculation (fault) safety.** Hoisting to the preheader must not
 //!   introduce a fault on a zero-trip or early-exit path. The load is
-//!   admitted only when it is GUARANTEED TO EXECUTE: its block dominates the
-//!   latch and every loop-exiting block, AND the preheader unconditionally
+//!   admitted only when it is GUARANTEED TO EXECUTE: its block dominates
+//!   EVERY latch (back-edge source, not just the cached `lp.latch`) and every
+//!   loop-exiting block, AND the preheader unconditionally
 //!   enters the loop (so reaching the preheader implies the loop body runs at
 //!   least once). See `load_guaranteed_to_execute`.
 //! - **Excluded load forms.** Pre/post-index writeback loads (they redefine
@@ -79,7 +80,10 @@ use trust_cg_ir::{
 };
 
 use crate::dom::DomTree;
-use crate::effects::{opcode_effect, produces_value, reads_flags, writes_flags};
+use crate::effects::{
+    aarch64_for_each_use_position, for_each_inst_def, inst_defines_vreg, opcode_effect,
+    produces_value, reads_flags, single_inst_def, writes_flags,
+};
 use crate::interfaces::OpInterfaces;
 use crate::loops::{LoopAnalysis, NaturalLoop};
 use crate::pass_manager::{AnalysisCache, MachinePass};
@@ -178,8 +182,8 @@ impl LoopInvariantCodeMotion {
         // definitions of a vreg and the InstId that defines it, which is all
         // these two maps record (neither stores a block). The CFG surgery that
         // does create instructions, `region_licm_hoist`, has already run above,
-        // and the one instruction it creates is a `B` branch, which
-        // `produces_value` excludes from both maps anyway.
+        // and the one instruction it creates is a `B` branch with no modeled
+        // definition positions, so it is absent from both maps.
         let def_counts = build_def_counts(func);
         let def_map = build_def_map(func);
 
@@ -412,9 +416,9 @@ fn hoist_loop_invariants(
                 if !inst.opcode.is_pure() && !is_hoistable_load {
                     continue;
                 }
-                if !produces_value(inst.opcode) {
+                let Some(def) = single_inst_def(inst) else {
                     continue;
-                }
+                };
 
                 // Relocation-bearing address materialization (Adrp / Adr /
                 // AddPCRel) IS loop-invariant and safe to hoist. The prior
@@ -450,10 +454,7 @@ fn hoist_loop_invariants(
                 // values: hoisting `x16 <- target` can separate it from a
                 // later `blr x16`, and hoisting `dst <- x0` can read a stale
                 // return value.
-                let Some(MachOperand::VReg(def)) = inst.operands.first() else {
-                    continue;
-                };
-                if def_counts.get(def).copied().unwrap_or(0) != 1 {
+                if def_counts.get(&def).copied().unwrap_or(0) != 1 {
                     continue;
                 }
                 if inst_touches_fixed_register(inst) {
@@ -466,9 +467,13 @@ fn hoist_loop_invariants(
                 }
 
                 // Check if all source operands are loop-invariant.
-                let use_start = 1; // operand[0] is the def
-                let all_invariant = inst.operands[use_start..].iter().all(|op| {
-                    is_operand_loop_invariant(op, &loop_defs, &invariant_vregs, &def_counts)
+                let mut all_invariant = true;
+                aarch64_for_each_use_position(inst.opcode, inst.operands.len(), |pos| {
+                    if !inst.operands.get(pos).is_some_and(|op| {
+                        is_operand_loop_invariant(op, &loop_defs, &invariant_vregs, &def_counts)
+                    }) {
+                        all_invariant = false;
+                    }
                 });
 
                 if !all_invariant {
@@ -495,7 +500,7 @@ fn hoist_loop_invariants(
                 }
 
                 // Mark this instruction's def as invariant.
-                invariant_vregs.insert(*def);
+                invariant_vregs.insert(def);
                 to_hoist.push((inst_id, block_id));
                 found_new = true;
             }
@@ -914,11 +919,9 @@ fn build_def_counts(func: &MachFunction) -> HashMap<VReg, usize> {
         let block = func.block(block_id);
         for &inst_id in &block.insts {
             let inst = func.inst(inst_id);
-            if produces_value(inst.opcode)
-                && let Some(MachOperand::VReg(def)) = inst.operands.first()
-            {
-                *counts.entry(*def).or_insert(0) += 1;
-            }
+            for_each_inst_def(inst, |def| {
+                *counts.entry(def).or_insert(0) += 1;
+            });
         }
     }
 
@@ -940,11 +943,9 @@ fn build_loop_defs(
         let block = func.block(block_id);
         for &inst_id in &block.insts {
             let inst = func.inst(inst_id);
-            if produces_value(inst.opcode)
-                && let Some(MachOperand::VReg(def)) = inst.operands.first()
-            {
-                defs.insert(*def, (inst_id, block_id));
-            }
+            for_each_inst_def(inst, |def| {
+                defs.insert(def, (inst_id, block_id));
+            });
         }
     }
 
@@ -1124,11 +1125,9 @@ fn find_hoistable_constant_chains(
                     }
                 }
             }
-            if produces_value(inst.opcode)
-                && let Some(MachOperand::VReg(def)) = inst.operands.first()
-            {
-                defs.entry(*def).or_default().push((block_id, idx, inst_id));
-            }
+            for_each_inst_def(inst, |def| {
+                defs.entry(def).or_default().push((block_id, idx, inst_id));
+            });
         }
     }
 
@@ -1412,9 +1411,11 @@ fn compute_loop_memory_facts(
 /// original program did not already have.
 ///
 /// Two conditions:
-/// - **Dominates the latch** — the load runs on every complete iteration
-///   (also rules out a load buried in a conditional inside an infinite loop
-///   with no exiting block, where the exit test below is vacuous).
+/// - **Dominates EVERY latch** — i.e. every back-edge source, not merely the
+///   one `lp.latch` happens to cache. The load then runs on every complete
+///   iteration (which is also what rules out a load buried in a conditional
+///   inside an infinite loop with no exiting block, where the exit test below
+///   is vacuous).
 /// - **Dominates every loop-exiting block** — the load runs before control can
 ///   leave the loop, so it is not skipped on an early-exit path.
 ///
@@ -1427,12 +1428,18 @@ fn load_guaranteed_to_execute(
     lp: &NaturalLoop,
     load_block: BlockId,
 ) -> bool {
+    // Defense in depth: the cached representative latch must be dominated even
+    // if `lp.body` were somehow stale and missed it in the sweep below.
     if !dom.dominates(load_block, lp.latch) {
         return false;
     }
     for &b in &lp.body {
-        let exits_loop = func.block(b).succs.iter().any(|s| !lp.body.contains(s));
-        if exits_loop && !dom.dominates(load_block, b) {
+        let succs = &func.block(b).succs;
+        // A back-edge source (ANY latch of this loop), or a block from which
+        // control can leave the loop.
+        let is_latch = succs.contains(&lp.header);
+        let exits_loop = succs.iter().any(|s| !lp.body.contains(s));
+        if (is_latch || exits_loop) && !dom.dominates(load_block, b) {
             return false;
         }
     }
@@ -1496,19 +1503,7 @@ fn load_is_admissible(
 /// [`InstId`]. Only meaningful for single-def VRegs (the caller pairs this with
 /// `def_counts` to reject multi-def carriers).
 fn build_def_map(func: &MachFunction) -> HashMap<VReg, InstId> {
-    let mut defs: HashMap<VReg, InstId> = HashMap::new();
-    for &block_id in &func.block_order {
-        let block = func.block(block_id);
-        for &inst_id in &block.insts {
-            let inst = func.inst(inst_id);
-            if produces_value(inst.opcode)
-                && let Some(MachOperand::VReg(def)) = inst.operands.first()
-            {
-                defs.insert(*def, inst_id);
-            }
-        }
-    }
-    defs
+    crate::effects::build_reaching_def_map_by_vreg(func)
 }
 
 // ===========================================================================
@@ -1554,13 +1549,7 @@ fn region_licm_run(func: &mut MachFunction) -> bool {
 /// first operand is a plain VReg (the local convention used by the region
 /// scan; mirrors x86 `region_def_of`).
 fn region_def_of(inst: &MachInst) -> Option<VReg> {
-    if !produces_value(inst.opcode) {
-        return None;
-    }
-    match inst.operands.first() {
-        Some(MachOperand::VReg(d)) => Some(*d),
-        _ => None,
-    }
+    single_inst_def(inst)
 }
 
 /// Retarget every CFG edge `from -> old_to` to `from -> new_to`: the branch
@@ -1674,9 +1663,9 @@ fn region_interp_const_defs(
                 }
             }
             _ => {
-                if let Some(d) = region_def_of(inst) {
+                for_each_inst_def(inst, |d| {
                     vals.remove(&d);
-                }
+                });
             }
         }
     }
@@ -1736,9 +1725,9 @@ fn region_loop_runs_at_least_once(
             continue;
         }
         for &iid in &func.block(block_id).insts {
-            if let Some(d) = region_def_of(func.inst(iid)) {
+            for_each_inst_def(func.inst(iid), |d| {
                 untrusted.insert(d);
-            }
+            });
         }
     }
 
@@ -1823,8 +1812,10 @@ fn region_loop_runs_at_least_once(
                     } else {
                         vals.remove(d);
                     }
-                } else if let Some(d) = region_def_of(inst) {
-                    vals.remove(&d);
+                } else {
+                    for_each_inst_def(inst, |d| {
+                        vals.remove(&d);
+                    });
                 }
             }
             AArch64Opcode::MovR => {
@@ -1837,8 +1828,10 @@ fn region_loop_runs_at_least_once(
                             vals.remove(d);
                         }
                     }
-                } else if let Some(d) = region_def_of(inst) {
-                    vals.remove(&d);
+                } else {
+                    for_each_inst_def(inst, |d| {
+                        vals.remove(&d);
+                    });
                 }
             }
             op => {
@@ -1851,9 +1844,9 @@ fn region_loop_runs_at_least_once(
                 if inst.is_branch() || inst.is_terminator() {
                     return false;
                 }
-                if let Some(d) = region_def_of(inst) {
+                for_each_inst_def(inst, |d| {
                     vals.remove(&d);
-                }
+                });
             }
         }
     }
@@ -1987,15 +1980,16 @@ fn verify_preheader_defs_precede_uses(
     let insts = &func.block(preheader).insts;
     let mut def_pos: HashMap<VReg, usize> = HashMap::new();
     for (i, &iid) in insts.iter().enumerate() {
-        if let Some(d) = region_def_of(func.inst(iid))
-            && def_counts.get(&d).copied().unwrap_or(0) == 1
-        {
-            def_pos.entry(d).or_insert(i);
-        }
+        for_each_inst_def(func.inst(iid), |d| {
+            if def_counts.get(&d).copied().unwrap_or(0) == 1 {
+                def_pos.entry(d).or_insert(i);
+            }
+        });
     }
     for (i, &iid) in insts.iter().enumerate() {
-        for op in &func.inst(iid).operands {
-            if let MachOperand::VReg(v) = op
+        let inst = func.inst(iid);
+        aarch64_for_each_use_position(inst.opcode, inst.operands.len(), |pos| {
+            if let Some(MachOperand::VReg(v)) = inst.operands.get(pos)
                 && let Some(&dp) = def_pos.get(v)
             {
                 assert!(
@@ -2006,7 +2000,7 @@ fn verify_preheader_defs_precede_uses(
                     func.name
                 );
             }
-        }
+        });
     }
 }
 
@@ -2073,9 +2067,8 @@ fn verify_preheader_constant_chains(
                 continue;
             }
             let inst = func.inst(id);
-            let use_start = if produces_value(inst.opcode) { 1 } else { 0 };
-            for operand in inst.operands.iter().skip(use_start) {
-                if operand == &MachOperand::VReg(*carrier) {
+            aarch64_for_each_use_position(inst.opcode, inst.operands.len(), |pos| {
+                if inst.operands.get(pos) == Some(&MachOperand::VReg(*carrier)) {
                     assert!(
                         position > last,
                         "LICM constant-chain use-before-complete in fn `{}`: carrier {carrier:?} \
@@ -2084,7 +2077,7 @@ fn verify_preheader_constant_chains(
                         func.name
                     );
                 }
-            }
+            });
         }
     }
 }
@@ -2264,26 +2257,22 @@ fn region_licm_hoist(func: &mut MachFunction, loops: &[NaturalLoop], dom: &DomTr
         let mut inner_defs: HashSet<VReg> = HashSet::new();
         for &b in &inner.body {
             for &iid in &func.block(b).insts {
-                if let Some(d) = region_def_of(func.inst(iid)) {
+                for_each_inst_def(func.inst(iid), |d| {
                     inner_defs.insert(d);
-                }
+                });
             }
         }
         let mut inner_reads: HashSet<VReg> = HashSet::new();
         for &b in &inner.body {
             for &iid in &func.block(b).insts {
                 let inst = func.inst(iid);
-                let produces = produces_value(inst.opcode);
-                for (oi, op) in inst.operands.iter().enumerate() {
-                    if produces && oi == 0 {
-                        continue;
-                    }
-                    if let MachOperand::VReg(v) = op
+                aarch64_for_each_use_position(inst.opcode, inst.operands.len(), |pos| {
+                    if let Some(MachOperand::VReg(v)) = inst.operands.get(pos)
                         && !inner_defs.contains(v)
                     {
                         inner_reads.insert(*v);
                     }
-                }
+                });
             }
         }
 
@@ -2293,7 +2282,7 @@ fn region_licm_hoist(func: &mut MachFunction, loops: &[NaturalLoop], dom: &DomTr
                 f.block(*b)
                     .insts
                     .iter()
-                    .any(|&iid| region_def_of(f.inst(iid)) == Some(v))
+                    .any(|&iid| inst_defines_vreg(f.inst(iid), v))
             })
         };
 
@@ -2307,18 +2296,22 @@ fn region_licm_hoist(func: &mut MachFunction, loops: &[NaturalLoop], dom: &DomTr
         let ip_insts: Vec<InstId> = func.block(ip).insts.clone();
         let mut ip_def_idx: HashMap<VReg, usize> = HashMap::new();
         for (idx, &iid) in ip_insts.iter().enumerate() {
-            if let Some(d) = region_def_of(func.inst(iid)) {
+            for_each_inst_def(func.inst(iid), |d| {
                 ip_def_idx.entry(d).or_insert(idx);
-            }
+            });
         }
         // Seed: `ip` defs of a vreg the inner body reads or carries (redefines).
         let mut init_set: HashSet<usize> = HashSet::new();
         let mut init_defs: HashSet<VReg> = HashSet::new();
         let mut worklist: Vec<usize> = Vec::new();
         for (idx, &iid) in ip_insts.iter().enumerate() {
-            if let Some(d) = region_def_of(func.inst(iid))
-                && (inner_reads.contains(&d) || inner_defs.contains(&d))
-            {
+            let mut seeds = false;
+            for_each_inst_def(func.inst(iid), |d| {
+                if inner_reads.contains(&d) || inner_defs.contains(&d) {
+                    seeds = true;
+                }
+            });
+            if seeds {
                 worklist.push(idx);
             }
         }
@@ -2390,17 +2383,13 @@ fn region_licm_hoist(func: &mut MachFunction, loops: &[NaturalLoop], dom: &DomTr
                 continue;
             }
             let inst = func.inst(iid);
-            let produces = produces_value(inst.opcode);
-            for (oi, op) in inst.operands.iter().enumerate() {
-                if produces && oi == 0 {
-                    continue;
-                }
-                if let MachOperand::VReg(v) = op
+            aarch64_for_each_use_position(inst.opcode, inst.operands.len(), |pos| {
+                if let Some(MachOperand::VReg(v)) = inst.operands.get(pos)
                     && init_defs.contains(v)
                 {
                     sep_bad = true;
                 }
-            }
+            });
         }
         if sep_bad {
             note("ip split not clean (REST reads an INIT def)");
@@ -2419,11 +2408,11 @@ fn region_licm_hoist(func: &mut MachFunction, loops: &[NaturalLoop], dom: &DomTr
                 if b == ip && init_set.contains(&idx) {
                     continue; // the INIT defs themselves
                 }
-                if let Some(d) = region_def_of(func.inst(iid))
-                    && region_defs.contains(&d)
-                {
-                    inv_bad = true;
-                }
+                for_each_inst_def(func.inst(iid), |d| {
+                    if region_defs.contains(&d) {
+                        inv_bad = true;
+                    }
+                });
             }
         }
         if inv_bad {
@@ -4537,6 +4526,146 @@ mod tests {
             "load must not hoist past an opaque call"
         );
         assert!(func.block(bb1).insts.contains(&load));
+    }
+
+    // ---------------------------------------------------------------------
+    // MULTI-LATCH must-execute (2026-08-18)
+    // ---------------------------------------------------------------------
+
+    /// A natural loop with TWO back-edges to the same header and NO exiting
+    /// block: bb0 -> bb1; bb1 -> {bb2, bb3}; bb2 -> bb1; bb3 -> bb1.
+    ///
+    /// `LoopAnalysis` merges both back-edges into ONE `NaturalLoop` (bodies
+    /// unioned) but caches a SINGLE representative `lp.latch`, so a gate that
+    /// tests only that one is blind to the sibling latch.
+    fn multi_latch_no_exit_loop() -> (MachFunction, BlockId, BlockId, BlockId, BlockId) {
+        let mut func = MachFunction::new("licm_ml".to_string(), Signature::new(vec![], vec![]));
+        let bb0 = func.entry;
+        let bb1 = func.create_block();
+        let bb2 = func.create_block();
+        let bb3 = func.create_block();
+        func.add_edge(bb0, bb1);
+        func.add_edge(bb1, bb2);
+        func.add_edge(bb1, bb3);
+        func.add_edge(bb2, bb1);
+        func.add_edge(bb3, bb1);
+        (func, bb0, bb1, bb2, bb3)
+    }
+
+    /// WRONG-CODE REGRESSION: a load sitting in ONE latch of a multi-latch loop
+    /// must not be speculated into the preheader.
+    ///
+    /// `load_guaranteed_to_execute` used to check `dominates(load, lp.latch)`
+    /// for the single cached latch plus every EXITING block. Here bb2 is the
+    /// cached latch (first back-edge source in block order) so that check
+    /// passes, and the loop has no exiting block at all so the exit sweep is
+    /// VACUOUS — yet an iteration can return to the header through bb3 without
+    /// ever entering bb2. Hoisting then makes a program that merely spins
+    /// forever instead FAULT on the very first entry.
+    #[test]
+    fn test_licm_no_hoist_load_in_undominated_second_latch() {
+        let (mut func, bb0, bb1, bb2, bb3) = multi_latch_no_exit_loop();
+        append(
+            &mut func,
+            bb0,
+            AArch64Opcode::MovI,
+            vec![vreg(0), imm(4096)],
+        );
+        finish_preheader_branch(&mut func, bb0, bb1);
+        append(
+            &mut func,
+            bb1,
+            AArch64Opcode::BCond,
+            vec![MachOperand::Block(bb2), MachOperand::Block(bb3)],
+        );
+        // Latch A carries the invariant load ...
+        let load = append(
+            &mut func,
+            bb2,
+            AArch64Opcode::LdrRI,
+            vec![vreg(1), vreg(0), imm(0)],
+        );
+        append(
+            &mut func,
+            bb2,
+            AArch64Opcode::B,
+            vec![MachOperand::Block(bb1)],
+        );
+        // ... latch B does not, and bb2 does not dominate it.
+        append(
+            &mut func,
+            bb3,
+            AArch64Opcode::AddRI,
+            vec![vreg(8), vreg(8), imm(1)],
+        );
+        append(
+            &mut func,
+            bb3,
+            AArch64Opcode::B,
+            vec![MachOperand::Block(bb1)],
+        );
+
+        let mut licm = LoopInvariantCodeMotion;
+        licm.run(&mut func);
+        assert!(
+            func.block(bb2).insts.contains(&load),
+            "a load in a latch that a SIBLING latch bypasses must not be \
+             speculated into the preheader (multi-latch must-execute)"
+        );
+        assert!(
+            !func.block(bb0).insts.contains(&load),
+            "the load must not appear in the preheader"
+        );
+    }
+
+    /// POSITIVE CONTROL for the tightened gate — it must not over-gate.
+    /// The header dominates every back-edge source, so a header load still
+    /// hoists out of the same multi-latch loop.
+    #[test]
+    fn test_licm_hoists_load_from_header_of_multi_latch_loop() {
+        let (mut func, bb0, bb1, bb2, bb3) = multi_latch_no_exit_loop();
+        append(
+            &mut func,
+            bb0,
+            AArch64Opcode::MovI,
+            vec![vreg(0), imm(4096)],
+        );
+        finish_preheader_branch(&mut func, bb0, bb1);
+        let load = append(
+            &mut func,
+            bb1,
+            AArch64Opcode::LdrRI,
+            vec![vreg(1), vreg(0), imm(0)],
+        );
+        append(
+            &mut func,
+            bb1,
+            AArch64Opcode::BCond,
+            vec![MachOperand::Block(bb2), MachOperand::Block(bb3)],
+        );
+        append(
+            &mut func,
+            bb2,
+            AArch64Opcode::B,
+            vec![MachOperand::Block(bb1)],
+        );
+        append(
+            &mut func,
+            bb3,
+            AArch64Opcode::AddRI,
+            vec![vreg(8), vreg(8), imm(1)],
+        );
+        append(
+            &mut func,
+            bb3,
+            AArch64Opcode::B,
+            vec![MachOperand::Block(bb1)],
+        );
+
+        let mut licm = LoopInvariantCodeMotion;
+        assert!(licm.run(&mut func), "header load must still hoist");
+        assert!(func.block(bb0).insts.contains(&load));
+        assert!(!func.block(bb1).insts.contains(&load));
     }
 }
 

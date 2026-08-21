@@ -82,7 +82,10 @@
 //!
 //! SERIAL mode (only) also admits a STORE in the body to a loop-INVARIANT
 //! address (the redundant `store *result` clang -O1 leaves in `*result +=
-//! a[row][i]*b[i][column]`, FloatMM's inner product). Verbatim replication is
+//! a[row][i]*b[i][column]`, FloatMM's inner product) — but NEVER one whose
+//! stored VALUE is the induction variable, which fails closed (a store is the
+//! only body instruction with a use at operand 0, and `apply`'s per-lane index
+//! materialization reads uses from operand 1 onward). Verbatim replication is
 //! bit-identical for a store exactly as for a compute op: each lane emits the
 //! store in program order after its own compute, so the unrolled block is the
 //! literal instruction stream of `k` consecutive scalar iterations — whatever
@@ -183,6 +186,10 @@ use trust_cg_ir::{
 };
 
 use crate::dom::DomTree;
+use crate::effects::{
+    aarch64_for_each_def_position, aarch64_for_each_use_position, for_each_inst_def,
+    inst_defines_vreg,
+};
 use crate::loops::LoopAnalysis;
 use crate::pass_manager::{AnalysisCache, MachinePass};
 
@@ -1055,11 +1062,9 @@ impl Plan {
         let mut def_count: HashMap<u32, usize> = HashMap::new();
         for &id in &loop_inst_ids {
             let inst = func.inst(id);
-            if produces_def(inst.opcode)
-                && let Some(d) = inst.operands.first().and_then(vreg_of)
-            {
+            for_each_inst_def(inst, |d| {
                 *def_count.entry(d.id).or_insert(0) += 1;
-            }
+            });
         }
         if def_count.get(&iv.id) != Some(&1) {
             return None;
@@ -1082,7 +1087,7 @@ impl Plan {
             let chain: Vec<InstId> = loop_inst_ids
                 .iter()
                 .copied()
-                .filter(|&id| func.inst(id).operands.first().and_then(vreg_of) == Some(bound))
+                .filter(|&id| inst_defines_vreg(func.inst(id), bound))
                 .collect();
             let all_const = chain.iter().all(|&id| {
                 let i = func.inst(id);
@@ -1118,13 +1123,11 @@ impl Plan {
             .collect();
         for &carried in &carried_regs {
             let outside_defs = func
-                .insts
+                .block_order
                 .iter()
-                .enumerate()
-                .filter(|(idx, inst)| {
-                    !loop_set.contains(&InstId(*idx as u32))
-                        && crate::effects::inst_produces_value(inst)
-                        && inst.operands.first().and_then(vreg_of) == Some(carried)
+                .flat_map(|&b| func.block(b).insts.iter().copied())
+                .filter(|&iid| {
+                    !loop_set.contains(&iid) && inst_defines_vreg(func.inst(iid), carried)
                 })
                 .count();
             if outside_defs != 1 {
@@ -1196,13 +1199,31 @@ impl Plan {
                 for (idx, op) in inst.operands.iter().enumerate() {
                     if let Some(v) = vreg_of(op) {
                         if idx == 0 {
-                            // Stored value: {iv, acc, earlier body def, invariant}.
+                            // Stored value: {acc, earlier body def, invariant}.
+                            //
+                            // The INDUCTION VARIABLE is explicitly NOT admitted
+                            // here. A store is the only body instruction whose
+                            // operand 0 is a USE, and `apply`'s per-lane index
+                            // materialization decides whether the `iv+k` registers
+                            // are needed by scanning `operands.iter().skip(1)`
+                            // (correct for every def-first instruction, blind to a
+                            // store's value operand). A loop whose ONLY read of
+                            // `iv` is the stored value would therefore pass
+                            // recognition with `body_uses_iv == false`, and all
+                            // `UNROLL` lane clones would store the SAME `iv`
+                            // instead of `iv, iv+1, ..., iv+UNROLL-1` — wrong code
+                            // (the store address is loop-invariant, so the last
+                            // lane's value is the observable one, and a non-
+                            // `header_reentry` main loop can leave a ZERO-iteration
+                            // scalar tail). Fail closed rather than widen the
+                            // emitter: `iv`-valued stores are not a shape this pass
+                            // needs.
+                            if v == iv {
+                                return None;
+                            }
                             if acc_ids.contains(&v.id) {
                                 acc_reads += 1;
-                            } else if v != iv
-                                && !body_defs.contains(&v.id)
-                                && def_count.contains_key(&v.id)
-                            {
+                            } else if !body_defs.contains(&v.id) && def_count.contains_key(&v.id) {
                                 return None; // value is a non-invariant that is not a body def
                             }
                         } else if def_count.contains_key(&v.id) {
@@ -1215,10 +1236,7 @@ impl Plan {
                 }
                 continue;
             }
-            if !produces_def(inst.opcode) {
-                return None;
-            }
-            let d = inst.operands.first().and_then(vreg_of)?;
+            let d = simple_body_def(inst)?;
             if def_count.get(&d.id) != Some(&1) || d == iv || acc_ids.contains(&d.id) || d == bound
             {
                 return None;
@@ -1403,36 +1421,35 @@ fn const_val_rec(func: &MachFunction, v: VReg, depth: u32) -> Option<i64> {
         return None;
     }
     let mut found: Option<i64> = None;
-    for (idx, inst) in func.insts.iter().enumerate() {
-        if !produces_def(inst.opcode) {
-            continue;
-        }
-        if inst.operands.first().and_then(vreg_of) != Some(v) {
-            continue;
-        }
-        // Second def of `v` ⇒ ambiguous ⇒ not a stable constant.
-        if found.is_some() {
-            return None;
-        }
-        let _ = idx;
-        found = Some(match inst.opcode {
-            AArch64Opcode::Movz => {
-                let (dst, value) = crate::reaching_const::movz_value(inst)?;
-                if dst != v {
-                    return None;
+    for &b in &func.block_order {
+        for &iid in &func.block(b).insts {
+            let inst = func.inst(iid);
+            if !inst_defines_vreg(inst, v) {
+                continue;
+            }
+            // Second def of `v` ⇒ ambiguous ⇒ not a stable constant.
+            if found.is_some() {
+                return None;
+            }
+            found = Some(match inst.opcode {
+                AArch64Opcode::Movz => {
+                    let (dst, value) = crate::reaching_const::movz_value(inst)?;
+                    if dst != v {
+                        return None;
+                    }
+                    i64::try_from(value).ok()?
                 }
-                i64::try_from(value).ok()?
-            }
-            AArch64Opcode::MovR | AArch64Opcode::Copy => {
-                let s = vreg_of(&inst.operands[1])?;
-                const_val_rec(func, s, depth + 1)?
-            }
-            AArch64Opcode::AddRI if imm_of(&inst.operands[2]) == Some(0) => {
-                let s = vreg_of(&inst.operands[1])?;
-                const_val_rec(func, s, depth + 1)?
-            }
-            _ => return None,
-        });
+                AArch64Opcode::MovR | AArch64Opcode::Copy => {
+                    let s = vreg_of(&inst.operands[1])?;
+                    const_val_rec(func, s, depth + 1)?
+                }
+                AArch64Opcode::AddRI if imm_of(&inst.operands[2]) == Some(0) => {
+                    let s = vreg_of(&inst.operands[1])?;
+                    const_val_rec(func, s, depth + 1)?
+                }
+                _ => return None,
+            });
+        }
     }
     found
 }
@@ -1446,35 +1463,35 @@ fn outside_def_const(
     loop_set: &HashSet<InstId>,
 ) -> Option<i64> {
     let mut result: Option<i64> = None;
-    for (idx, inst) in func.insts.iter().enumerate() {
-        if loop_set.contains(&InstId(idx as u32)) {
-            continue;
-        }
-        if !crate::effects::inst_produces_value(inst) {
-            continue;
-        }
-        if inst.operands.first().and_then(vreg_of) != Some(carried) {
-            continue;
-        }
-        if result.is_some() {
-            return None; // more than one outside def
-        }
-        result = Some(match inst.opcode {
-            AArch64Opcode::Movz => {
-                let (dst, value) = crate::reaching_const::movz_value(inst)?;
-                if dst != carried {
-                    return None;
+    for &b in &func.block_order {
+        for &iid in &func.block(b).insts {
+            if loop_set.contains(&iid) {
+                continue;
+            }
+            let inst = func.inst(iid);
+            if !inst_defines_vreg(inst, carried) {
+                continue;
+            }
+            if result.is_some() {
+                return None; // more than one outside def
+            }
+            result = Some(match inst.opcode {
+                AArch64Opcode::Movz => {
+                    let (dst, value) = crate::reaching_const::movz_value(inst)?;
+                    if dst != carried {
+                        return None;
+                    }
+                    i64::try_from(value).ok()?
                 }
-                i64::try_from(value).ok()?
-            }
-            AArch64Opcode::MovR | AArch64Opcode::Copy => {
-                const_val_of(func, vreg_of(&inst.operands[1])?)?
-            }
-            AArch64Opcode::AddRI if imm_of(&inst.operands[2]) == Some(0) => {
-                const_val_of(func, vreg_of(&inst.operands[1])?)?
-            }
-            _ => return None,
-        });
+                AArch64Opcode::MovR | AArch64Opcode::Copy => {
+                    const_val_of(func, vreg_of(&inst.operands[1])?)?
+                }
+                AArch64Opcode::AddRI if imm_of(&inst.operands[2]) == Some(0) => {
+                    const_val_of(func, vreg_of(&inst.operands[1])?)?
+                }
+                _ => return None,
+            });
+        }
     }
     result
 }
@@ -1801,9 +1818,9 @@ fn try_full_unroll(
     // Map every in-loop-defined vreg to its (single) def instruction.
     let mut loop_def: HashMap<u32, InstId> = HashMap::new();
     for &id in body {
-        if let Some(d) = func.inst(id).operands.first().and_then(vreg_of) {
+        for_each_inst_def(func.inst(id), |d| {
             loop_def.insert(d.id, id);
-        }
+        });
     }
 
     let mut folds: Vec<LoadFold> = Vec::new();
@@ -2014,9 +2031,12 @@ fn is_increment_by_one(
 /// `v` is defined by exactly one `Movz v, #1` (no shift) outside the loop.
 fn is_movz_one_outside(func: &MachFunction, loop_insts: &[InstId], v: VReg) -> bool {
     let mut found = false;
-    for (idx, inst) in func.insts.iter().enumerate() {
-        if produces_def(inst.opcode) && inst.operands.first().and_then(vreg_of) == Some(v) {
-            let id = InstId(idx as u32);
+    for &b in &func.block_order {
+        for &id in &func.block(b).insts {
+            let inst = func.inst(id);
+            if !inst_defines_vreg(inst, v) {
+                continue;
+            }
             if loop_insts.contains(&id) {
                 return false;
             }
@@ -2717,15 +2737,23 @@ fn alloc(func: &mut MachFunction, class: RegClass) -> VReg {
     VReg::new(id, class)
 }
 
-/// Conservative "operand 0 is a written def" predicate for whitelisted ops.
-/// Stores define nothing (operand 0 is the stored value, a use), and the
-/// control ops define nothing either.
-fn produces_def(op: AArch64Opcode) -> bool {
-    use AArch64Opcode::*;
-    !matches!(
-        op,
-        CmpRR | CmpRI | BCond | B | StrRI | StrbRI | StrhRI | StrRO | StrbRO | StrhRO
-    )
+/// The sole untied operand-0 definition supported by the generic body cloner.
+fn simple_body_def(inst: &MachInst) -> Option<VReg> {
+    let mut defs = Vec::new();
+    aarch64_for_each_def_position(inst.opcode, inst.operands.len(), |pos| defs.push(pos));
+    if defs.as_slice() != [0] {
+        return None;
+    }
+    let mut tied = false;
+    aarch64_for_each_use_position(inst.opcode, inst.operands.len(), |pos| {
+        if pos == 0 {
+            tied = true;
+        }
+    });
+    if tied {
+        return None;
+    }
+    inst.operands.first().and_then(vreg_of)
 }
 
 fn branch_targets(inst: &MachInst) -> Vec<BlockId> {

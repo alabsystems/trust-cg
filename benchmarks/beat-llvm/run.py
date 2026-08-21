@@ -219,6 +219,13 @@ def sha256_file(p: Path) -> str:
     return h.hexdigest()
 
 
+# Thresholds for the non-gating `runtime_geomean_reliable_only` aggregate: a row
+# counts as resolvable when the LLVM baseline runs at least this long AND
+# neither lane's observed spread exceeds this fraction of its median.
+RELIABLE_MIN_S = 0.05
+RELIABLE_SPREAD_MAX = 0.25
+
+
 def geomean(xs):
     xs = [x for x in xs if x is not None and x > 0]
     if not xs:
@@ -491,8 +498,21 @@ class Harness:
             code, dt = self.run_bin(path)
             if code != code0:
                 return {"exit": code0, "nondet_exit": code, "times_s": times, "median_s": None}
-            times.append(round(dt, 3))
-        med = round(statistics.median(times), 3)
+            # PRESERVE RAW SAMPLES (contract: "Preserve all raw samples and
+            # report the median plus spread"). `round(dt, 3)` quantized every
+            # sample to a MILLISECOND — one significant digit for this corpus's
+            # shortest programs (v3_popcount's bridge lane runs ~2 ms) — so the
+            # runtime metric could not resolve what it measured. Across five
+            # headline rows whose binaries were BYTE-IDENTICAL the geomean read
+            # 0.793 / 0.828 / 0.795 / 0.846 / 0.768, moved entirely by 2-40 ms
+            # programs: h1_vec_push_sum's bridge lane reported 0.008 then 0.017
+            # for the SAME machine code. `time.monotonic()` resolves
+            # nanoseconds; keep microseconds.
+            #
+            # The METRIC is unchanged (median of the same N samples, plus
+            # spread) — only the precision of the samples it is computed from.
+            times.append(round(dt, 6))
+        med = round(statistics.median(times), 6)
         spread = round((max(times) - min(times)) / med, 4) if med else None
         return {"exit": code0, "nondet_exit": None, "times_s": times, "median_s": med,
                 "rel_spread": spread}
@@ -680,15 +700,22 @@ class Harness:
             row["reason"] = f"bridge fail-closed ({why}): {err}"
         else:
             row["label"] = "NONDET-CANDIDATE"
+            if is_timeout:
+                failure_detail = (
+                    "; the failure is a SOLVER TIMEOUT (wall-clock deadline), which is "
+                    "load-sensitive by construction — NOT evidence of a coverage gap"
+                )
+            elif (retry_err or "") == err:
+                failure_detail = (
+                    "; both attempts reported the IDENTICAL error, so a deterministic "
+                    "completeness gap is the leading hypothesis"
+                )
+            else:
+                failure_detail = ""
             row["reason"] = (f"NONDET-CANDIDATE: fail-closed twice under load "
                              f"(load {load_at_fail}->{load_at_retry} > {thr}); rejection under load "
                              f"is not a valid completeness datum — rerun on a quiet machine"
-                             f"{'; the failure is a SOLVER TIMEOUT (wall-clock deadline), which is '
-                               'load-sensitive by construction — NOT evidence of a coverage gap'
-                               if is_timeout else
-                               ('; both attempts reported the IDENTICAL error, so a deterministic '
-                                'completeness gap is the leading hypothesis'
-                                if (retry_err or '') == err else '')}. "
+                             f"{failure_detail}. "
                              f"error: {retry_err or err}")
         return row
 
@@ -708,6 +735,44 @@ class Harness:
             "coverage_pct": round(100.0 * len(match) / len(programs), 1) if programs else 0.0,
         }
         agg["runtime_geomean_vs_llvm_o3"] = rnd(geomean([v["ratios"].get("runtime_vs_llvm_o3") for v in match.values()]))
+
+        # ADDITIONAL, NON-GATING aggregate: the same geomean restricted to rows
+        # whose measurement is actually resolvable.
+        #
+        # The full-corpus runtime geomean is dominated by programs that run for
+        # a few milliseconds, where run-to-run variance swamps any real
+        # difference. Measured on a quiet box (load 0.27), the SAME row reports:
+        #
+        #   all 18 programs                    0.843x
+        #   rel_spread <= 0.25  (14 programs)  0.913x
+        #   llvm median >= 50 ms (9 programs)  0.973x
+        #
+        # `v3_popcount` is the clearest case: ratio 0.245 off an LLVM lane whose
+        # own rel_spread is 2.345 — the BASELINE varies by 234%, so that ratio
+        # is not a measurement of anything, yet it alone moves the 18-program
+        # geomean by roughly 7%.
+        #
+        # This does NOT replace or alter `runtime_geomean_vs_llvm_o3` (the gate
+        # basis, contract section 10) — it is published beside it so a reader can
+        # see how much of the headline rests on rows the harness itself reports
+        # as unstable. `RELIABLE_SPREAD_MAX` and `RELIABLE_MIN_S` are the two
+        # knobs; both are conservative.
+        reliable = [
+            v for v in match.values()
+            if (v.get("run", {}).get("llvm_o3", {}).get("median_s") or 0) >= RELIABLE_MIN_S
+            and max(
+                v.get("run", {}).get("llvm_o3", {}).get("rel_spread") or 0.0,
+                v.get("run", {}).get("bridge", {}).get("rel_spread") or 0.0,
+            ) <= RELIABLE_SPREAD_MAX
+        ]
+        agg["runtime_geomean_reliable_only"] = rnd(
+            geomean([v["ratios"].get("runtime_vs_llvm_o3") for v in reliable])
+        )
+        agg["runtime_reliable_program_count"] = len(reliable)
+        agg["runtime_reliable_criteria"] = {
+            "min_llvm_median_s": RELIABLE_MIN_S,
+            "max_rel_spread": RELIABLE_SPREAD_MAX,
+        }
         worst = [v["ratios"].get("runtime_vs_llvm_o3") for v in match.values() if v["ratios"].get("runtime_vs_llvm_o3")]
         agg["runtime_worst_vs_llvm_o3"] = max(worst) if worst else None
         # scalar-category geomean is the G1a basis (contract section 10) now that the corpus
@@ -762,6 +827,9 @@ class Harness:
             f"nondet: {a['nondet_failclosed_count']} NONDET-FAILCLOSED, "
             f"{a.get('nondet_candidate_count', 0)} NONDET-CANDIDATE)** — "
             f"runtime geomean vs LLVM -O3: **{a['runtime_geomean_vs_llvm_o3']}x** "
+            f"[resolvable-rows-only: **{a.get('runtime_geomean_reliable_only')}x** over "
+            f"{a.get('runtime_reliable_program_count')} programs with llvm median >= "
+            f"{RELIABLE_MIN_S}s and rel_spread <= {RELIABLE_SPREAD_MAX}] "
             f"(scalar {a.get('scalar_runtime_geomean_vs_llvm_o3')}x, "
             f"worst {a['runtime_worst_vs_llvm_o3']}x); compile warm geomean vs -O2: "
             f"**{a['compile_warm_geomean_vs_llvm_o2']}x** (vs -O3: {a['compile_warm_geomean_vs_llvm_o3']}x)",
@@ -786,6 +854,13 @@ class Harness:
                     d = d.get(k) if isinstance(d, dict) else None
                     if d is None:
                         return "—"
+                # Display only: the JSON keeps microsecond precision (the
+                # contract's "preserve all raw samples"), but a table of
+                # 0.008341 is unreadable. 4 decimals = 0.1 ms, which is enough
+                # to distinguish this corpus's short programs — the whole point
+                # of preserving the samples in the first place.
+                if isinstance(d, float):
+                    return f"{d:.4f}".rstrip("0").rstrip(".") or "0"
                 return d
             lines.append(
                 f"| {name} | {v.get('category', 'scalar')} "

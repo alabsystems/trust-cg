@@ -89,6 +89,15 @@ enum Variant {
     WithCall,
     /// rotated do-while: the `j < N` continue-test is in the LATCH -> BAIL.
     Rotated,
+    /// the RMW store is PREDICATED inside the body (`if j != k { c[..] += .. }`):
+    /// the store block does NOT dominate the latch, so the MAC does not run on
+    /// every iteration -> BAIL (unrolling it would run all four lanes
+    /// unconditionally).
+    PredicatedStore,
+    /// the body carries an EARLY EXIT (`if j == k { break }`) that is not one of
+    /// the three recognized bounds checks -> BAIL (unrolling would run four
+    /// iterations without ever evaluating the break test).
+    EarlyExit,
 }
 
 struct Cfg {
@@ -124,6 +133,19 @@ fn build_mac(cfg: Cfg) -> MachFunction {
     let latch = func.create_block();
     let exit = func.create_block();
     let abort = func.create_block();
+    let predicated = cfg.variant == Variant::PredicatedStore;
+    // PredicatedStore only: `pred` tests `j != k` and `st` holds the RMW store,
+    // so the store block no longer dominates the latch.
+    let (pred, st) = if predicated {
+        (func.create_block(), func.create_block())
+    } else {
+        (latch, latch)
+    };
+    // EarlyExit only: `brk` sits between the header and the body chain and
+    // leaves the loop on `j == k` — a loop-exiting block that is NOT one of the
+    // three recognized bounds checks.
+    let early = cfg.variant == Variant::EarlyExit;
+    let brk = if early { func.create_block() } else { b1 };
 
     let push = |func: &mut MachFunction, blk: BlockId, op, ops| {
         let id = func.push_inst(MachInst::new(op, ops));
@@ -188,22 +210,34 @@ fn build_mac(cfg: Cfg) -> MachFunction {
         push(func, b3, MovR, vec![x(113), x(100)]);
         push(func, b3, Madd, vec![x(127), x(50), x(83), x(113)]); // i*N + j
         push(func, b3, CmpRR, vec![x(127), x(6)]);
-        push(func, b3, BCond, vec![i(CC_LO), bl(latch)]);
+        push(
+            func,
+            b3,
+            BCond,
+            vec![i(CC_LO), bl(if predicated { pred } else { latch })],
+        );
         push(func, b3, B, vec![bl(abort)]);
 
-        // latch: caddr2 = cidx2*scale + c_base ; c[cidx2] = mac ; j += step.
+        // PredicatedStore: `if j != k` — the else arm skips the store and goes
+        // straight to the latch, so the MAC is NOT performed every iteration.
+        if predicated {
+            push(func, pred, CmpRR, vec![x(100), x(51)]);
+            push(func, pred, BCond, vec![i(1 /* NE */), bl(st)]);
+            push(func, pred, B, vec![bl(latch)]);
+        }
+
+        // st (== latch unless predicated): caddr2 = cidx2*scale + c_base ;
+        // c[cidx2] = mac.  latch: j += step.
         let store_base = if cfg.variant == Variant::StoreWrongBase {
             1
         } else {
             2
         };
-        push(
-            func,
-            latch,
-            Madd,
-            vec![x(128), x(127), x(103), x(store_base)],
-        );
-        push(func, latch, StrRI, vec![x(126), x(128), i(0)]);
+        push(func, st, Madd, vec![x(128), x(127), x(103), x(store_base)]);
+        push(func, st, StrRI, vec![x(126), x(128), i(0)]);
+        if predicated {
+            push(func, st, B, vec![bl(latch)]);
+        }
         if cfg.variant == Variant::TwoStores {
             push(func, latch, StrRI, vec![x(126), x(128), i(0)]);
         }
@@ -230,8 +264,13 @@ fn build_mac(cfg: Cfg) -> MachFunction {
         // NATIVE: header pre-tests j < N.
         push(&mut func, header, MovR, vec![x(101), x(100)]);
         push(&mut func, header, CmpRR, vec![x(101), x(83)]);
-        push(&mut func, header, BCond, vec![i(CC_LO), bl(b1)]);
+        push(&mut func, header, BCond, vec![i(CC_LO), bl(brk)]);
         push(&mut func, header, B, vec![bl(exit)]);
+        if early {
+            push(&mut func, brk, CmpRR, vec![x(100), x(51)]);
+            push(&mut func, brk, BCond, vec![i(0 /* EQ */), bl(exit)]);
+            push(&mut func, brk, B, vec![bl(b1)]);
+        }
         emit_body(&mut func);
         push(&mut func, latch, B, vec![bl(header)]);
     }
@@ -252,13 +291,24 @@ fn build_mac(cfg: Cfg) -> MachFunction {
         func.add_edge(latch, header);
         func.add_edge(latch, exit);
     } else {
-        func.add_edge(header, b1);
+        func.add_edge(header, brk);
         func.add_edge(header, exit);
+        if early {
+            func.add_edge(brk, b1);
+            func.add_edge(brk, exit);
+        }
         func.add_edge(b1, b2);
         func.add_edge(b1, abort);
         func.add_edge(b2, b3);
         func.add_edge(b2, abort);
-        func.add_edge(b3, latch);
+        if predicated {
+            func.add_edge(b3, pred);
+            func.add_edge(pred, st);
+            func.add_edge(pred, latch);
+            func.add_edge(st, latch);
+        } else {
+            func.add_edge(b3, latch);
+        }
         func.add_edge(b3, abort);
         func.add_edge(latch, header);
     }
@@ -545,4 +595,36 @@ fn bails_when_length_below_unroll_factor() {
     });
     let (changed, fired) = run(&mut func);
     assert!(!changed && fired == 0, "L < 4 must bail");
+}
+
+/// A PREDICATED MAC (`while j <u N { if j != k { c[..] += aik*b[..] } ; j+=1 }`)
+/// must BAIL: the store block does not dominate the latch, so unrolling would
+/// execute all four lanes' MACs unconditionally and drop the predicate.
+/// Regression for the rustc-bridge differential (LLVM exit 96 vs bridge 78 on a
+/// `if j != k` matmul) that this gate closes.
+#[test]
+fn bails_on_predicated_store() {
+    assert_bails(
+        Cfg {
+            variant: Variant::PredicatedStore,
+            ..Cfg::default()
+        },
+        "MAC is predicated inside the body (store does not dominate the latch)",
+    );
+}
+
+/// An EARLY EXIT in the body (`while j <u N { if j == k { break } ; c[..] +=
+/// aik*b[..] ; j+=1 }`) must BAIL: the break test is not one of the three
+/// recognized bounds checks, and the unrolled block would run four iterations
+/// without ever evaluating it. Regression for the rustc-bridge differential
+/// (LLVM exit 0 vs bridge 78 on a `break` matmul) that this gate closes.
+#[test]
+fn bails_on_early_exit_in_body() {
+    assert_bails(
+        Cfg {
+            variant: Variant::EarlyExit,
+            ..Cfg::default()
+        },
+        "body carries an unmodeled loop-exiting block (break)",
+    );
 }

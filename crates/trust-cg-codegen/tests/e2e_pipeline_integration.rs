@@ -30,6 +30,18 @@ use trust_ir::{BlockId, FuncId, FuncTyId, ValueId};
 // Test infrastructure
 // ---------------------------------------------------------------------------
 
+/// This file inspects Mach-O structure end to end, so pin the
+/// aarch64-apple-darwin spec for the Compiler-API tests: `Compiler::new`
+/// derives the object format from the HOST, which on Linux emits ELF and
+/// breaks every Mach-O header parse below. The Pipeline-based tests already
+/// use the empty-triple historical Mach-O default; Mach-O byte emission is
+/// host-independent.
+fn macho_compiler(config: CompilerConfig) -> Compiler {
+    let spec = trust_cg_codegen::target::TargetSpec::parse("aarch64-apple-darwin")
+        .expect("aarch64-apple-darwin parses");
+    Compiler::new_for_target_spec(config, spec)
+}
+
 /// Verify that bytes begin with a valid Mach-O 64-bit magic number.
 fn assert_valid_macho(bytes: &[u8], context: &str) {
     assert!(
@@ -1184,7 +1196,7 @@ fn test_pipeline_proof_annotation_valid_shift() {
 #[test]
 fn test_compiler_metrics_surface_non_zero_divisor_proof_optimization() {
     let (_, module) = build_div_with_nonzero_proof();
-    let compiler = Compiler::new(CompilerConfig {
+    let compiler = macho_compiler(CompilerConfig {
         opt_level: OptLevel::O2,
         parallel: false,
         ..CompilerConfig::default()
@@ -1211,7 +1223,7 @@ fn test_compiler_metrics_surface_non_zero_divisor_proof_optimization() {
 #[test]
 fn test_compiler_metrics_surface_valid_shift_proof_optimization() {
     let (_, module) = build_shift_with_in_range_proof();
-    let compiler = Compiler::new(CompilerConfig {
+    let compiler = macho_compiler(CompilerConfig {
         opt_level: OptLevel::O2,
         parallel: false,
         ..CompilerConfig::default()
@@ -1239,7 +1251,7 @@ fn test_compiler_metrics_surface_valid_shift_proof_optimization() {
 #[test]
 fn test_jit_metrics_surface_proof_optimization_summary() {
     let (_, module) = build_div_with_nonzero_proof();
-    let compiler = Compiler::new(CompilerConfig {
+    let compiler = macho_compiler(CompilerConfig {
         opt_level: OptLevel::O2,
         target: trust_cg_codegen::Target::Aarch64,
         parallel: false,
@@ -1350,7 +1362,7 @@ fn test_pipeline_all_optimization_levels() {
 #[test]
 fn test_compiler_api_compile_ir_function() {
     let mut ir_func = trust_cg_codegen::pipeline::build_add_test_function();
-    let compiler = Compiler::default_o2();
+    let compiler = macho_compiler(CompilerConfig::default());
 
     let result = compiler
         .compile_ir_function(&mut ir_func)
@@ -1380,7 +1392,7 @@ fn test_compiler_api_compile_ir_function() {
 fn test_compiler_api_with_tracing() {
     let mut ir_func = trust_cg_codegen::pipeline::build_add_test_function();
 
-    let compiler = Compiler::new(CompilerConfig {
+    let compiler = macho_compiler(CompilerConfig {
         trace_level: CompilerTraceLevel::Full,
         ..CompilerConfig::default()
     });
@@ -1409,7 +1421,7 @@ fn test_compiler_api_with_tracing() {
 fn test_compiler_api_proofs_require_exact_emission_inventory() {
     let mut ir_func = trust_cg_codegen::pipeline::build_add_test_function();
 
-    let compiler = Compiler::new(CompilerConfig {
+    let compiler = macho_compiler(CompilerConfig {
         emit_proofs: true,
         ..CompilerConfig::default()
     });
@@ -1470,7 +1482,7 @@ fn test_compiler_api_compile_module() {
     let module =
         build_multi_function_module("test_module", &[build_simple_add, build_return_const]);
 
-    let compiler = Compiler::default_o2();
+    let compiler = macho_compiler(CompilerConfig::default());
     let result = compiler
         .compile(&module)
         .expect("module compilation should succeed");
@@ -1490,7 +1502,7 @@ fn test_compiler_api_compile_module() {
 #[test]
 fn test_compiler_api_empty_module_error() {
     let module = TrustIrModule::new("empty_module");
-    let compiler = Compiler::default_o2();
+    let compiler = macho_compiler(CompilerConfig::default());
 
     let result = compiler.compile(&module);
     assert!(result.is_err(), "empty module should produce an error");
@@ -1635,7 +1647,7 @@ fn test_compiler_api_optimization_pass_metrics() {
     let mut ir_func = trust_cg_codegen::pipeline::build_add_test_function();
 
     // O0 should report 0 optimization passes.
-    let compiler_o0 = Compiler::new(CompilerConfig {
+    let compiler_o0 = macho_compiler(CompilerConfig {
         opt_level: OptLevel::O0,
         ..CompilerConfig::default()
     });
@@ -1649,7 +1661,7 @@ fn test_compiler_api_optimization_pass_metrics() {
 
     // O2 should report > 0 optimization passes.
     let mut ir_func2 = trust_cg_codegen::pipeline::build_add_test_function();
-    let compiler_o2 = Compiler::default_o2();
+    let compiler_o2 = macho_compiler(CompilerConfig::default());
     let result_o2 = compiler_o2
         .compile_ir_function(&mut ir_func2)
         .expect("O2 should compile");
@@ -1804,7 +1816,7 @@ fn test_multi_function_module_all_functions_emitted() {
         &[build_simple_add, build_simple_sub, build_return_const],
     );
 
-    let compiler = Compiler::default_o2();
+    let compiler = macho_compiler(CompilerConfig::default());
     let result = compiler
         .compile(&module)
         .expect("multi-function module should compile");
@@ -1849,7 +1861,7 @@ fn test_multi_function_module_differs_from_single() {
     let module_two =
         build_multi_function_module("two_func", &[build_simple_add, build_return_const]);
 
-    let compiler = Compiler::default_o2();
+    let compiler = macho_compiler(CompilerConfig::default());
     let result_one = compiler
         .compile(&module_one)
         .expect("single-function module");

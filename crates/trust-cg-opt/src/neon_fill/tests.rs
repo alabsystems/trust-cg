@@ -273,11 +273,12 @@ fn fires_on_byte_fill_helper_shape() {
         0,
         "invariant value uses DUP not MOVI"
     );
-    // One paired store; qb stored twice (both operands the same broadcast Q).
+    // STORE_PAIRS_PER_ITER paired stores; qb stored twice per pair (both
+    // operands the same broadcast Q).
     assert_eq!(
         count_op(&func, AArch64Opcode::NeonStpQPost),
-        1,
-        "one STP q,q store"
+        super::STORE_PAIRS_PER_ITER as usize,
+        "STORE_PAIRS_PER_ITER STP q,q stores per vector iteration"
     );
     let stp = func
         .blocks
@@ -557,4 +558,134 @@ fn byte_replicable_predicate() {
     assert!(!byte_replicable(0x1234, 2));
     assert!(!byte_replicable(0x1234_5678, 4));
     assert_eq!(low_byte(0x1234_5678), 0x78);
+}
+
+// ---------------------------------------------------------------------------
+// Transfer-register CLASS (the store width / DUP source are BOTH derived from
+// it, so a non-GPR transfer must BAIL)
+// ---------------------------------------------------------------------------
+
+/// Retype every occurrence of vreg `id` to `class` — models an FP-typed stored
+/// value (`Store F32/F64/F16`, which `trust-cg-lower::select_store` lowers to
+/// `StrRI` with an `Fpr*` transfer register).
+fn retype_vreg(func: &mut MachFunction, id: u32, class: RegClass) {
+    for inst in func.insts.iter_mut() {
+        for op in inst.operands.iter_mut() {
+            if let MachOperand::VReg(v) = op
+                && v.id == id
+            {
+                *v = VReg::new(id, class);
+            }
+        }
+    }
+}
+
+#[test]
+fn bails_on_fp_transfer_register() {
+    // `Fpr32`: the derived width (4) happens to be right, but the stored value
+    // would be broadcast with `DUP Vd.4S, Rn` reading the GPR bank — `V5` would
+    // silently become `W5`.
+    // `Fpr64` / `Fpr16`: `str d`/`str h` access 8/2 bytes while the arm derives
+    // 4, so the vector fill would write the wrong bytes-per-element.
+    for class in [RegClass::Fpr32, RegClass::Fpr64, RegClass::Fpr16] {
+        let mut func = build_fill(Cfg {
+            elem_size: 4,
+            bound: BoundK::Runtime,
+            val: Val::Invariant,
+            variant: Variant::Good,
+        });
+        // v3 is the stored-value register in the canonical fill loop.
+        retype_vreg(&mut func, 3, class);
+        let (changed, fired) = run(&mut func);
+        assert!(
+            !changed && fired == 0,
+            "must BAIL on a {class:?} transfer register"
+        );
+        assert_eq!(
+            count_op(&func, AArch64Opcode::NeonStpQPost),
+            0,
+            "no NEON store emitted for a {class:?} transfer register"
+        );
+        assert_eq!(
+            count_op(&func, AArch64Opcode::NeonDupGen),
+            0,
+            "no DUP-from-GPR emitted for a {class:?} transfer register"
+        );
+    }
+}
+
+#[test]
+fn still_fires_on_gpr32_transfer_register() {
+    // The gate must admit BOTH GPR widths: `StrRI` with a `Gpr32` transfer is
+    // the ordinary 4-byte integer fill, and it must keep vectorizing.
+    let mut func = build_fill(Cfg {
+        elem_size: 4,
+        bound: BoundK::Runtime,
+        val: Val::Invariant,
+        variant: Variant::Good,
+    });
+    let (changed, fired) = run(&mut func);
+    assert!(changed && fired == 1, "Gpr32 4-byte fill must still fire");
+}
+
+/// A MERGE vreg — one def per predecessor, which is how the frontend lowers
+/// every block parameter (`isel::select_copy` reuses the parameter's vreg for
+/// each incoming edge) — must not resolve to a constant. The def map is
+/// last-wins over the emitted layout, so it names whichever arm comes LAST.
+///
+/// Regression: `match k { 0 => 3, 1 => 5, _ => 7 }` used as a fill value made
+/// the vectorized loop broadcast 7 on every path. On a 64-byte fill with k==0,
+/// LLVM returned 192 and trust-cg returned 197 (= 64*7 mod 251), at -O2 and
+/// -O3. The comment above the admitting predicate already promised this bail;
+/// it was never implemented. End-to-end cover: `benchmarks/shape-coverage`
+/// `s15_fill_merge_value`.
+#[test]
+fn const_value_declines_a_merge_vreg() {
+    use AArch64Opcode::*;
+    let push = |func: &mut MachFunction, blk: BlockId, op, ops| {
+        let id = func.push_inst(MachInst::new(op, ops));
+        func.append_inst(blk, id);
+    };
+
+    let mut func = MachFunction::new("m".to_string(), Signature::new(vec![], vec![]));
+    let bb0 = func.entry;
+    let arm_a = func.create_block();
+    let arm_b = func.create_block();
+    let join = func.create_block();
+    push(&mut func, bb0, CmpRI, vec![w(1), i(0)]);
+    push(&mut func, bb0, BCond, vec![i(1), bl(arm_a)]);
+    push(&mut func, bb0, B, vec![bl(arm_b)]);
+    // Both arms write the SAME vreg — the merge.
+    push(&mut func, arm_a, Movz, vec![w(3), i(3)]);
+    push(&mut func, arm_a, B, vec![bl(join)]);
+    push(&mut func, arm_b, Movz, vec![w(3), i(7)]);
+    push(&mut func, arm_b, B, vec![bl(join)]);
+    push(&mut func, join, Ret, vec![]);
+
+    let v3 = VReg::new(3, RegClass::Gpr32);
+    assert_eq!(
+        crate::effects::live_def_count(&func, 3),
+        2,
+        "both arms must be live defs of the merge vreg",
+    );
+    let def = build_def_map(&func);
+    assert_eq!(
+        const_value(&func, &def, v3),
+        None,
+        "a merge vreg must not resolve to whichever arm comes last in layout",
+    );
+    assert_eq!(
+        strip_copies(&func, &def, v3),
+        v3,
+        "and copy-stripping must stop at it rather than walk one arm's source",
+    );
+
+    // Control: a single-def constant still resolves, so the guard above is not
+    // simply refusing everything.
+    let mut single = MachFunction::new("s".to_string(), Signature::new(vec![], vec![]));
+    let e = single.entry;
+    push(&mut single, e, Movz, vec![w(3), i(3)]);
+    push(&mut single, e, Ret, vec![]);
+    let def1 = build_def_map(&single);
+    assert_eq!(const_value(&single, &def1, v3), Some(3));
 }

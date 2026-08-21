@@ -26,8 +26,8 @@
 # never a pass. Only five audited wide x86 bit-vector obligations may remain
 # pending (Sdiv I32/I64, Srem I32/I64, and V2I64 widening Umul); an entry may
 # graduate to Verified, but any new pending name hard-fails the floor. The
-# registry contains exactly 1,869 unique obligations, so the five-row capacity
-# ceiling requires at least 1,864 formally Verified rows and 0 soundness
+# registry contains exactly 1,877 unique obligations, so the five-row capacity
+# ceiling requires at least 1,872 formally Verified rows and 0 soundness
 # failures. Several minutes; quick smoke via
 # `--test representative_arithmetic_is_formally_verified`.
 #
@@ -114,7 +114,7 @@ echo "[proof-gate] TRUST_CG_AY_TIMEOUT_MS=${TRUST_CG_AY_TIMEOUT_MS:-<default 300
 # zero-tests-ran guard. `tee` would mask cargo's exit, so use PIPESTATUS.
 gate_out_log="$(mktemp -t trust_cg_proof_gate.XXXXXX)"
 set +e
-cargo test \
+cargo test --locked \
     -p "${PACKAGE}" \
     --test "${TEST_TARGET}" \
     "${TEST_FILTER}" \

@@ -25,9 +25,11 @@
 //!  1. **bit-blast** the SMT2 to a DIMACS CNF, and
 //!  2. **refute** that exact CNF (a SAT search), emitting a DRAT proof.
 //!
-//! Both artifacts are transactionally published by one authenticated AY run
-//! (`ay solve <smt2> --dump-bv-cnf <cnf> --proof <drat>`); trust-cg never
-//! re-solves a detached CNF in a second process.
+//! Current AY deliberately separates these operations: an SMT-LIB run exports
+//! a PID-bound bit-blasted CNF, then a DIMACS run emits the DRAT for those exact
+//! bytes. Generation clears stale artifacts and verifies the in-band PID
+//! provenance before the second run, then independently replays both the raw
+//! and trimmed proofs.
 //!
 //! `drat-trim` independently confirms job (2): it replays the DRAT against the
 //! CNF and derives the empty clause, i.e. the CNF **is** UNSAT — no trust in
@@ -40,21 +42,21 @@
 //!
 //! # Schema binding
 //!
-//! A cert carries the SAME `verdict_key` a tier-0 row uses
-//! ([`crate::ay_bridge::verdict_cache_key_v2`] over the solver identity and the
-//! byte-identical `crate::verdict_db::db_obligation_smt2` query), so a cert
-//! provably backs a *specific* verdict-DB row and can never be silently
-//! re-pointed at a different obligation.
+//! A schema-v3 cert carries a `verdict_key` derived with
+//! [`crate::ay_bridge::verdict_cache_key_v2`] from its producer identity and
+//! byte-identical SMT2. That self-binding prevents the proof payload from being
+//! silently re-pointed at a different obligation. Registry certificates use
+//! [`crate::verdict_db::db_obligation_smt2`] and therefore also reproduce the
+//! corresponding tier-0 row key. Portable canaries need not have a tier-0 row:
+//! their source-embedded manifest adds a solver-independent exact-query lookup
+//! key while retaining this producer/query binding as artifact provenance.
 //!
 //! # Scope / cost
 //!
-//! This is an **opt-in / offline** lane. Nothing here runs on the per-compile
-//! hot path; candidate rows are currently revalidated with live ay instead of
-//! consuming these certificates. Certificate *generation* shells out to `ay`;
-//! certificate *re-checking* shells out to `drat-trim`. Both executables are
-//! passed in as paths, so the library carries **no** production dependency on
-//! either — tests supply the vendored `drat-trim` (dev-dependency) and the
-//! resolved `ay` binary.
+//! Certificate generation is an explicit offline operation and shells out to
+//! AY. The fixed portable canary set is build-embedded and its DRAT is replayed
+//! by the vendored `drat-trim` on a cache hit before a live AY is resolved.
+//! Generic callers may also use the recheck API with an explicit checker path.
 //!
 //! # Teeth
 //!
@@ -100,6 +102,33 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+fn file_sha256(path: &Path) -> Option<String> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1 << 20];
+    loop {
+        let read = file.read(&mut buffer).ok()?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+/// Content identity of an external proof-checker executable.
+///
+/// A path is not an identity: the bytes at that path can be replaced between
+/// two replays.  Callers that memoize a successful replay must key that memo by
+/// this digest, and the replay itself must use
+/// [`recheck_cert_with_expected_checker`] so a replacement during the check is
+/// detected rather than inheriting the old binary's authority.
+pub fn checker_binary_sha256(path: &Path) -> Option<String> {
+    file_sha256(path)
+}
+
 /// The outcome of an independent `drat-trim` re-check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DratTrimOutcome {
@@ -127,11 +156,13 @@ impl DratTrimOutcome {
 ///
 /// Self-contained: it records the exact bit-blasted CNF and the DRAT proof, so
 /// [`recheck_cert`] re-runs `drat-trim` with no other inputs. The `verdict_key`
-/// ties it to a `verdict_db` tier-0 row; `cnf_sha256` binds the recorded CNF to
-/// the proof so neither can be swapped without detection.
+/// binds it to its producer and exact SMT2; `cnf_sha256` binds the recorded CNF
+/// to the proof so neither can be swapped without detection. A caller using the
+/// verdict-DB query schema obtains the same key as its tier-0 row, but the
+/// certificate format itself does not require such a row to exist.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LratCert {
-    /// The v2 verdict key of the row this cert backs
+    /// The v2 producer/query key this cert backs
     /// (`verdict_cache_key_v2(solver_identity, obligation_smt2)`).
     pub verdict_key: String,
     /// Lowercase-hex SHA-256 of the `ay` solver binary that produced the proof.
@@ -140,9 +171,9 @@ pub struct LratCert {
     pub obligation_name: String,
     /// Lowercase-hex SHA-256 of `cnf` (integrity binding CNF↔proof).
     pub cnf_sha256: String,
-    /// The bit-blasted DIMACS CNF from AY's transactional proof run.
+    /// The PID-bound bit-blasted DIMACS CNF from AY's SMT-LIB export run.
     pub cnf: String,
-    /// The DRAT proof published for `cnf` by that same AY run.
+    /// The DRAT proof emitted by AY's DIMACS run over the exact recorded CNF.
     pub drat: String,
     /// The SMT2 obligation text this cert certifies (schema v3).
     ///
@@ -155,14 +186,16 @@ pub struct LratCert {
     /// byte-identical SMT2. Storing a second digest of the same bytes proves
     /// nothing new.
     ///
-    /// Storing the TEXT is what actually shrinks the trusted link. The two-run
+    /// Storing the TEXT makes the trusted link explicit and auditable. The two-run
     /// split (SMT2 -> CNF, then CNF -> DRAT) means `drat-trim` no longer
     /// incidentally cross-checks that the recorded CNF really is this
     /// obligation's bit-blasting — the DRAT is derived from whatever bytes sit at
     /// `cnf_path`. With the SMT2 in the artifact an OFFLINE auditor can re-run
-    /// the bit-blast and diff it against the recorded CNF, which is the only
-    /// thing that closes that correspondence gap without trusting AY's export
-    /// transaction. AY's exporter writes no digest of the query at all.
+    /// the bit-blast and diff it against the recorded CNF. This does not by
+    /// itself prove the translation correct—the AY bit-blaster remains in the
+    /// stated TCB—but it prevents the certificate from being silently pointed
+    /// at a different query and makes independent translation audits possible.
+    /// AY's exporter writes no digest of the query itself.
     pub smt2: String,
 }
 
@@ -276,6 +309,63 @@ pub fn drat_trim_check(
 /// `workdir` is where the CNF/proof are materialized for the subprocess; use a
 /// fresh temp dir per call.
 pub fn recheck_cert(cert: &LratCert, drat_trim_exe: &Path, workdir: &Path) -> DratTrimOutcome {
+    let Some(checker_identity) = checker_binary_sha256(drat_trim_exe) else {
+        return DratTrimOutcome::Error(format!(
+            "cannot read/hash proof checker {}",
+            drat_trim_exe.display()
+        ));
+    };
+    recheck_cert_with_expected_checker(cert, drat_trim_exe, &checker_identity, workdir)
+}
+
+/// Re-check `cert` while binding the verdict to the exact checker bytes named
+/// by `expected_checker_sha256`.
+///
+/// The checker is hashed both before and after the subprocess.  A mismatch at
+/// either edge is a non-credit, including a path whose executable was replaced
+/// while the replay was running.  This makes a positive replay authority a
+/// tuple `(certificate bytes, checker binary SHA-256)` rather than a bare path
+/// plus an easily-stale process memo.
+pub fn recheck_cert_with_expected_checker(
+    cert: &LratCert,
+    drat_trim_exe: &Path,
+    expected_checker_sha256: &str,
+    workdir: &Path,
+) -> DratTrimOutcome {
+    let Some(before) = checker_binary_sha256(drat_trim_exe) else {
+        return DratTrimOutcome::Error(format!(
+            "cannot read/hash proof checker {}",
+            drat_trim_exe.display()
+        ));
+    };
+    if before != expected_checker_sha256 {
+        return DratTrimOutcome::Error(format!(
+            "proof checker identity mismatch before replay: expected {}, got {} for {}",
+            expected_checker_sha256,
+            before,
+            drat_trim_exe.display()
+        ));
+    }
+
+    let outcome = recheck_cert_payload(cert, drat_trim_exe, workdir);
+    let Some(after) = checker_binary_sha256(drat_trim_exe) else {
+        return DratTrimOutcome::Error(format!(
+            "cannot re-hash proof checker {} after replay",
+            drat_trim_exe.display()
+        ));
+    };
+    if after != expected_checker_sha256 {
+        return DratTrimOutcome::Error(format!(
+            "proof checker identity changed during replay: expected {}, got {} for {}",
+            expected_checker_sha256,
+            after,
+            drat_trim_exe.display()
+        ));
+    }
+    outcome
+}
+
+fn recheck_cert_payload(cert: &LratCert, drat_trim_exe: &Path, workdir: &Path) -> DratTrimOutcome {
     let actual = sha256_hex(cert.cnf.as_bytes());
     if actual != cert.cnf_sha256 {
         return DratTrimOutcome::Error(format!(
@@ -324,7 +414,7 @@ pub fn recheck_cert(cert: &LratCert, drat_trim_exe: &Path, workdir: &Path) -> Dr
 // Serialization (recording a cert as a committable artifact)
 // ---------------------------------------------------------------------------
 
-/// Serialize a cert to the strict `tcg-lrat-cert-v2` text format. The CNF and
+/// Serialize a cert to the strict `tcg-lrat-cert-v3` text format. The CNF and
 /// DRAT payloads are length-framed (they are multi-line), mirroring the
 /// `verdict_db` row framing. Round-trips through [`parse_cert`] before
 /// returning, so a renderer bug can never emit a cert the parser would misread.
@@ -351,6 +441,17 @@ pub fn render_cert(cert: &LratCert) -> Result<String, String> {
     if sha256_hex(cert.cnf.as_bytes()) != cert.cnf_sha256 {
         return Err("cnf_sha256 does not match cnf bytes".to_string());
     }
+    if cert.smt2.is_empty() {
+        return Err("schema-v3 certificates require non-empty exact SMT2 bytes".to_string());
+    }
+    let expected_key = crate::ay_bridge::verdict_cache_key_v2(&cert.solver_identity, &cert.smt2);
+    if expected_key != cert.verdict_key {
+        return Err(format!(
+            "verdict_key does not derive from the schema-v3 producer/query binding: \
+             expected {expected_key}, got {}",
+            cert.verdict_key
+        ));
+    }
 
     let mut out = String::new();
     out.push_str(LRAT_CERT_SCHEMA_LINE);
@@ -376,7 +477,7 @@ pub fn render_cert(cert: &LratCert) -> Result<String, String> {
     }
 }
 
-/// Parse a `tcg-lrat-cert-v2` cert. STRICT: any malformed construct is an error
+/// Parse a `tcg-lrat-cert-v2` or `tcg-lrat-cert-v3` cert. STRICT: any malformed construct is an error
 /// (a corrupt cert is never silently half-read). Re-derives and enforces
 /// `cnf_sha256` from the recorded CNF bytes, so a cert whose header hash was
 /// edited to disagree with its payload is rejected at parse time.
@@ -466,6 +567,9 @@ pub fn parse_cert(text: &str) -> Result<LratCert, String> {
     if pos != bytes.len() {
         return Err("trailing bytes after cert".to_string());
     }
+    if is_v3 && smt2.is_empty() {
+        return Err("schema-v3 certificate carries an empty SMT2 binding".to_string());
+    }
     // Enforce the integrity binding at parse time: header hash MUST match the
     // recorded CNF. A cert claiming a hash it cannot reproduce is rejected.
     let actual = sha256_hex(cnf.as_bytes());
@@ -501,9 +605,11 @@ pub fn parse_cert(text: &str) -> Result<LratCert, String> {
 ///
 /// The cert's `verdict_key` is computed as
 /// `verdict_cache_key_v2(solver_identity, smt2)` so it backs the byte-identical
-/// verdict-DB row. Returns `Err` (never a bogus cert) if ay does not answer
-/// `unsat`, if the obligation is not bit-blastable to a pure CNF (e.g. array
-/// theories), or if `drat-trim` does not independently confirm.
+/// verdict-DB row. Returns `Err` (never a bogus cert) unless AY answers either
+/// `unsat` or conservatively `unknown` while still exporting a genuine
+/// PID-bound bit-blast that its DIMACS lane refutes and `drat-trim`
+/// independently confirms. Non-bit-blastable theories and every missing,
+/// satisfiable, malformed, or unchecked artifact are refused.
 /// What AY's `--dump-bv-cnf` exporter actually wrote, as stated by the artifact's
 /// own in-band header. See [`classify_dumped_cnf`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -598,7 +704,11 @@ pub fn generate_cert_for_smt2(
     drat_trim_exe: &Path,
     workdir: &Path,
 ) -> Result<LratCert, String> {
-    let solver_identity = crate::ay_bridge::solver_identity_hash(&ay_exe.to_string_lossy())
+    // Generation is offline, so hash the executable bytes directly rather
+    // than consulting the live-path metadata memo. This identity is provenance
+    // (never runtime checker authority), but it must still name the producer
+    // bytes exactly.
+    let solver_identity = file_sha256(ay_exe)
         .ok_or_else(|| format!("cannot read/hash ay binary at {}", ay_exe.display()))?;
 
     std::fs::create_dir_all(workdir)
@@ -703,9 +813,12 @@ pub fn generate_cert_for_smt2(
              refusing to mint a cert"
         ));
     }
-    if !solve_out.lines().any(|l| l.trim() == "unsat") {
+    let producer_reported_unsat = solve_out.lines().any(|l| l.trim() == "unsat");
+    let producer_reported_unknown = solve_out.lines().any(|l| l.trim() == "unknown");
+    if !producer_reported_unsat && !producer_reported_unknown {
         return Err(format!(
-            "ay did not report unsat for {obligation_name:?} (stdout: {})",
+            "ay reported neither unsat nor the fail-closed unknown verdict for \
+             {obligation_name:?} (stdout: {})",
             solve_out.trim()
         ));
     }
@@ -782,6 +895,14 @@ pub fn generate_cert_for_smt2(
             ));
         }
     }
+    // An `unknown` here commonly means AY declined its own UNSAT promotion
+    // because its internal Alethe self-check is incomplete. It is not proof
+    // authority and does not prevent offline certification: the PID-bound
+    // export above establishes that this run genuinely bit-blasted the exact
+    // SMT2, and the DIMACS step below produces proof bytes that independent
+    // drat-trim must accept. SAT was rejected above. Thus the producer may
+    // conservatively abstain while the independently checkable artifact still
+    // establishes the result; no unchecked verdict is being upgraded.
     // 1b. DIMACS mode over the dumped CNF: emit the DRAT refutation.
     // A DIMACS solve reports UNSAT as exit code 20 with `s UNSATISFIABLE` on
     // stdout (exit 10 / `s SATISFIABLE` is the SAT answer), so `success()` is
@@ -855,6 +976,16 @@ pub fn generate_cert_for_smt2(
         ));
     }
 
+    let producer_after = file_sha256(ay_exe)
+        .ok_or_else(|| format!("cannot re-read/hash AY producer {}", ay_exe.display()))?;
+    if producer_after != solver_identity {
+        return Err(format!(
+            "AY producer identity changed during certificate generation for \
+             {obligation_name:?}: started as {solver_identity}, ended as {producer_after}; \
+             refusing to record ambiguous provenance"
+        ));
+    }
+
     let verdict_key = crate::ay_bridge::verdict_cache_key_v2(&solver_identity, smt2);
     Ok(LratCert::new(
         verdict_key,
@@ -866,12 +997,14 @@ pub fn generate_cert_for_smt2(
     ))
 }
 
-/// Trim a cert's DRAT proof to its optimized core (`drat-trim -O -l`) and
+/// Trim a cert's DRAT proof to its dependency core (`drat-trim -l`) and
 /// return a new cert carrying the trimmed proof, INDEPENDENTLY re-checked
 /// before it is returned. The raw solver-emitted DRAT for a hard obligation
-/// can be ~2x the trimmed core (the popcnt width-32 canary: 10.4 MB raw ->
-/// ~5 MB core), and the core also re-checks faster — so the trimmed form is
-/// what the committed canary certs ship.
+/// can be substantially larger than the dependency core, and the core also
+/// re-checks faster — so the trimmed form is what committed certs ship. We do
+/// not use `-O`: drat-trim's unbounded optimize-to-fixpoint pass took over 20
+/// minutes on the 32-bit popcount proof, while the complete one-pass core
+/// extraction and verification took 2.16 seconds on the same artifact.
 ///
 /// The CNF, `verdict_key`, and `solver_identity` are carried over unchanged
 /// (the trim only rewrites the proof half; `LratCert::new` re-derives
@@ -900,17 +1033,16 @@ pub fn trim_cert(
     std::fs::write(&raw_path, cert.drat.as_bytes())
         .map_err(|e| format!("cannot write {}: {e}", raw_path.display()))?;
 
-    // Verify + optimize to fixpoint + emit the core lemmas (ASCII DRAT). The
+    // Verify + emit the dependency-core lemmas (ASCII DRAT). The
     // trim run itself must VERIFY: drat-trim only emits a meaningful core off
     // a proof it accepted.
     let output = Command::new(drat_trim_exe)
         .arg(&cnf_path)
         .arg(&raw_path)
-        .arg("-O")
         .arg("-l")
         .arg(&core_path)
         .output()
-        .map_err(|e| format!("spawning drat-trim -O -l failed: {e}"))?;
+        .map_err(|e| format!("spawning drat-trim -l failed: {e}"))?;
     if !interpret_drat_trim(&output).is_verified() {
         return Err(format!(
             "drat-trim did not VERIFY the proof for {:?} while trimming",
@@ -1143,6 +1275,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn replay_rejects_a_different_checker_identity() {
+        let dir = temp_dir("checker_identity");
+        let outcome =
+            recheck_cert_with_expected_checker(&golden_cert(), drat_trim(), &"00".repeat(32), &dir);
+        assert!(
+            matches!(outcome, DratTrimOutcome::Error(ref message) if message.contains("identity mismatch")),
+            "wrong checker bytes must be a non-credit: {outcome:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// TEETH: a withheld proof (no refutation steps at all) is REJECTED —
     /// `drat-trim` reports "no conflict". A cert whose proof body was stripped
     /// must never pass as a Formal verdict.
@@ -1238,11 +1382,26 @@ mod tests {
         // rejected (the parse-time integrity check).
         let bad = text.replace(&cert.cnf_sha256, DUMMY_KEY);
         assert!(parse_cert(&bad).is_err());
+
+        let mut wrong_key = cert.clone();
+        wrong_key.verdict_key = DUMMY_KEY.to_string();
+        assert!(
+            render_cert(&wrong_key).is_err(),
+            "the v3 renderer must not serialize an internally unbound key"
+        );
+
+        let smt2_frame = format!("smt2 {}\n{}\n", cert.smt2.len(), cert.smt2);
+        let empty_binding = text.replace(&smt2_frame, "smt2 0\n\n");
+        assert_ne!(empty_binding, text);
+        assert!(
+            parse_cert(&empty_binding).is_err(),
+            "a v3 tag with an empty SMT2 body must not downgrade to v2 semantics"
+        );
     }
 
     /// END-TO-END (gated on `ay` being resolvable): generate a fresh cert for
-    /// the representative obligation SMT2 via ay's atomic `--dump-bv-cnf` +
-    /// `--proof` route, have the vendored drat-trim independently confirm it,
+    /// the representative obligation SMT2 via AY's PID-bound CNF export and
+    /// separate DIMACS proof route, have the vendored drat-trim independently confirm it,
     /// verify the recorded cert re-checks, and verify the `verdict_key` binds
     /// to the verdict-DB schema. Skips cleanly when no ay is present (matches
     /// the solver-optional posture of the rest of the suite).
@@ -1498,8 +1657,10 @@ mod tests {
     }
 
     /// ENC-11 verdict-tier TAXONOMY LOCK (criterion d): an LRAT-certified verdict
-    /// — the STRONGEST tier — can only ever be minted from a real `ay` UNSAT plus
-    /// an independent drat-trim confirmation. Cert generation takes no
+    /// — the STRONGEST tier — can only ever be minted from a genuine AY
+    /// bit-blast, an AY DIMACS refutation, and an independent drat-trim
+    /// confirmation. AY may itself conservatively abstain (`unknown`) because
+    /// its producer verdict has no authority here. Cert generation takes no
     /// `VerificationStrength`, so there is literally no way to feed a Statistical
     /// (sampled) verdict into it; and with no solver binary present it fails
     /// closed (never mints a cert). This is hermetic (needs no solver): it fails
@@ -1519,7 +1680,7 @@ mod tests {
         );
         assert!(
             res.is_err(),
-            "an LRAT cert must never be minted without a real solver UNSAT proof"
+            "an LRAT cert must never be minted without real proof production and replay"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

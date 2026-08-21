@@ -1,3 +1,6 @@
+#[path = "support/target_dir.rs"]
+mod target_dir_support;
+
 // Differential regression test for MISCOMPILE #69: a by-value struct whose fields
 // rustc REORDERS was passed with the fields in declaration order, so the callee
 // (which reads each field at rustc's byte offset) saw every field wrong.
@@ -54,9 +57,7 @@ fn pinned_toolchain() -> String {
 
 fn ensure_dylib_built() -> PathBuf {
     let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| crate_dir.join("target"));
+    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
     let candidates = [
         target_dir
             .join("release")

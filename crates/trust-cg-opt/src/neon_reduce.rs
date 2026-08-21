@@ -852,12 +852,33 @@ fn apply(func: &mut MachFunction, rec: &Recognized) -> bool {
         AArch64Opcode::AddRR,
         vec![vreg(ssum), vreg(s01), vreg(s23)],
     );
-    // Seed the scalar accumulator with the partial sum.
+    // FOLD the vector partial sum INTO the scalar accumulator — never
+    // overwrite it.
+    //
+    // WRONG-CODE FIX (2026-08-18): this was `MovR acc, ssum`, which silently
+    // DROPPED the accumulator's pre-loop value M0. `vx` sits on the only edge
+    // out of the vector loop, so it runs on every path (including a zero-trip
+    // vector loop), and recognition never required `acc == 0` on the preheader
+    // edge — it only constrains how `acc` is carried and read. A source
+    // reduction seeded with a non-zero value (`let mut acc = seed;`) therefore
+    // computed `sum(TERM)` instead of `seed + sum(TERM)`, wrong by exactly the
+    // seed for every trip count. Proven end-to-end through the LLVM-import
+    // frontend (the rustc bridge cannot currently reach this STRICT path — its
+    // loop headers carry a materializing copy that the split-latch recognizer
+    // rejects — but the import path is a supported frontend and reached it
+    // immediately).
+    //
+    // At `vx` the accumulator still holds M0 because the vector loop
+    // accumulates only into the NEON lane registers and never writes `acc`.
+    // Every sibling drain already folds: `apply_chain` below ("Fold the
+    // extracted lanes into `acc` (= M0)"), and neon_array's ("never overwrite:
+    // preserves a non-zero initial acc"). The STRICT recognizer admits only
+    // `AddRR`/`Madd` reductions, so ADD is the correct fold operator.
     emit(
         func,
         vx,
-        AArch64Opcode::MovR,
-        vec![vreg(rec.acc), vreg(ssum)],
+        AArch64Opcode::AddRR,
+        vec![vreg(rec.acc), vreg(rec.acc), vreg(ssum)],
     );
     emit(func, vx, AArch64Opcode::B, vec![block(rec.guard)]);
 
@@ -1151,23 +1172,7 @@ fn alloc(func: &mut MachFunction, class: RegClass) -> VReg {
 }
 
 fn build_def_map(func: &MachFunction) -> HashMap<u32, InstId> {
-    let mut map = HashMap::new();
-    for (idx, inst) in func.insts.iter().enumerate() {
-        // Operand 0 is the def for value-producing opcodes we care about.
-        if let Some(MachOperand::VReg(v)) = inst.operands.first()
-            && produces_def(inst.opcode)
-        {
-            map.insert(v.id, InstId(idx as u32));
-        }
-    }
-    map
-}
-
-/// Conservative "operand 0 is a written def" predicate for the opcodes this
-/// pass reasons about. Compares/branches do not define a register value.
-fn produces_def(op: AArch64Opcode) -> bool {
-    use AArch64Opcode::*;
-    !matches!(op, CmpRR | CmpRI | BCond | B)
+    crate::effects::build_reaching_def_map(func)
 }
 
 fn block_of_inst(func: &MachFunction, target: InstId) -> Option<BlockId> {
@@ -1486,36 +1491,14 @@ fn allowed_chain_op(op: AArch64Opcode) -> bool {
 /// `acc`) the last in block/program order wins, tolerated because the walkers
 /// check `== iv` / `== acc` before following a def.
 fn build_live_def_map(func: &MachFunction) -> HashMap<u32, InstId> {
-    let mut map = HashMap::new();
-    for &bid in &func.block_order {
-        for &id in &func.block(bid).insts {
-            let inst = func.inst(id);
-            if let Some(MachOperand::VReg(v)) = inst.operands.first()
-                && produces_def_chain(inst.opcode)
-            {
-                map.insert(v.id, id);
-            }
-        }
-    }
-    map
-}
-
-/// Operand-0-is-a-written-def predicate for [`build_live_def_map`]. Excludes the
-/// flag/branch ops (like [`produces_def`]) AND `StrRI` / `TrapBoundsCheckExact`.
-fn produces_def_chain(op: AArch64Opcode) -> bool {
-    use AArch64Opcode::*;
-    !matches!(op, CmpRR | CmpRI | BCond | B | StrRI | TrapBoundsCheckExact)
+    crate::effects::build_reaching_def_map(func)
 }
 
 /// Count the definitions of `v` inside `loop_insts`.
 fn count_loop_defs(func: &MachFunction, loop_insts: &HashSet<InstId>, v: VReg) -> usize {
     loop_insts
         .iter()
-        .filter(|&&id| {
-            let inst = func.inst(id);
-            produces_def_chain(inst.opcode)
-                && matches!(inst.operands.first(), Some(MachOperand::VReg(d)) if d.id == v.id)
-        })
+        .filter(|&&id| crate::effects::inst_defines_vreg(func.inst(id), v))
         .count()
 }
 
@@ -1546,6 +1529,21 @@ fn same_as_iv(func: &MachFunction, def: &HashMap<u32, InstId>, mut v: VReg, iv: 
 /// multi-def induction or accumulator.
 fn strip_copies(func: &MachFunction, def: &HashMap<u32, InstId>, mut v: VReg) -> VReg {
     for _ in 0..16 {
+        // A vreg with several live defs has no single reaching definition: the
+        // def map is LAST-WINS over the emitted layout, so it names whichever
+        // def comes last rather than the one that reaches this use. Every
+        // loop-carried variable is multi-def by construction (a preheader copy
+        // and a latch copy into the same vreg), and every `if`/`match` value has
+        // one def per arm — so walking one resolves an induction variable to its
+        // LATCH source, or a merge value to whichever arm came last.
+        //
+        // Confirmed wrong-code from this exact hole in neon_fill, mac_reg_block,
+        // mac_row_unroll, strided_store_unroll, neon_iota_fill and neon_bytesum.
+        // `swap_range_guard::single_def` and `neon_find`'s bound check were the
+        // in-tree precedents for doing it right.
+        if crate::effects::live_def_count(func, v.id) != 1 {
+            return v;
+        }
         let Some(&d) = def.get(&v.id) else {
             return v;
         };
@@ -2323,6 +2321,91 @@ mod tests {
         func.add_edge(bb3, bb4);
         func.next_vreg = 64;
         func
+    }
+
+    /// WRONG-CODE REGRESSION (2026-08-18): the STRICT drain must FOLD the
+    /// vector partial sum into the scalar accumulator, never overwrite it.
+    ///
+    /// It used to emit `MovR acc, ssum`, dropping the accumulator's pre-loop
+    /// value — so a reduction seeded with a non-zero value computed
+    /// `sum(TERM)` instead of `seed + sum(TERM)`, wrong by exactly the seed at
+    /// every trip count (including zero, since the drain block is on the only
+    /// edge out of the vector loop). Recognition never required `acc == 0`.
+    ///
+    /// Pin it structurally: after the pass fires, the accumulator must be READ
+    /// by the drain, not merely written. A `MovR acc, ssum` reads `acc` zero
+    /// times; the correct `AddRR acc, acc, ssum` reads it once.
+    #[test]
+    fn strict_drain_folds_into_accumulator_never_overwrites() {
+        let mut func = build_loop(1);
+        let mut pass = NeonReducePass::new();
+        assert!(
+            pass.run(&mut func),
+            "pass should fire on the recognized shape"
+        );
+
+        // Scope the check to the DRAIN block — the one holding the four
+        // NeonUmovGen lane extracts. Checking function-wide would be vacuous:
+        // the untouched scalar loop's own `AddRR acc, acc, term` would satisfy
+        // any "some fold exists" assertion even with the bug present.
+        let drain = func
+            .blocks
+            .iter()
+            .find(|b| {
+                b.insts
+                    .iter()
+                    .filter(|&&id| func.inst(id).opcode == AArch64Opcode::NeonUmovGen)
+                    .count()
+                    == 4
+            })
+            .expect("drain block with 4 lane extracts");
+
+        // The last writer of the accumulator in the drain must READ it (fold).
+        // `MovR acc, ssum` reads it zero times — that is the bug.
+        let mut last_acc_writer: Option<(AArch64Opcode, bool)> = None;
+        let mut acc_id: Option<u32> = None;
+        for &id in &drain.insts {
+            let inst = func.inst(id);
+            let Some(MachOperand::VReg(dst)) = inst.operands.first() else {
+                continue;
+            };
+            if !matches!(inst.opcode, AArch64Opcode::MovR | AArch64Opcode::AddRR) {
+                continue;
+            }
+            let reads_own_dst = inst
+                .operands
+                .iter()
+                .skip(1)
+                .any(|o| matches!(o, MachOperand::VReg(v) if v.id == dst.id));
+            // The accumulator is the only vreg the drain writes that is ALSO
+            // live into the scalar loop, i.e. written elsewhere in the function.
+            let written_elsewhere = func.blocks.iter().any(|b| {
+                !std::ptr::eq(b.insts.as_slice(), drain.insts.as_slice())
+                    && b.insts.iter().any(|&oid| {
+                        matches!(func.inst(oid).operands.first(),
+                                 Some(MachOperand::VReg(v)) if v.id == dst.id)
+                    })
+            });
+            if written_elsewhere {
+                acc_id = Some(dst.id);
+                last_acc_writer = Some((inst.opcode, reads_own_dst));
+            }
+        }
+
+        let (opcode, reads_own_dst) =
+            last_acc_writer.expect("drain must write the loop-carried accumulator");
+        assert!(
+            reads_own_dst,
+            "drain writes accumulator v{} with {opcode:?} WITHOUT reading it — that \
+             overwrites the pre-loop value M0, so a seeded reduction loses its seed",
+            acc_id.unwrap_or(0)
+        );
+        assert_eq!(
+            opcode,
+            AArch64Opcode::AddRR,
+            "the STRICT recognizer admits only AddRR/Madd reductions, so the drain \
+             fold must be an ADD"
+        );
     }
 
     #[test]

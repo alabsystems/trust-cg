@@ -3851,6 +3851,80 @@ fn x86_try_collapse_bridge_into_lea(
     Some(b)
 }
 
+/// Immediate-step analogue of [`x86_try_collapse_bridge_into_lea`]:
+/// `mov d,a ; add d,d,IMM`  =>  `lea d,[a+IMM]`.
+///
+/// Returns the immediate when the caller should delete the copy at `copy_pos`.
+///
+/// # Why this arm exists
+///
+/// The register form only matches an `AddRR` step. Every unit-stride loop steps
+/// its induction variable by a CONSTANT (`addq $0x10, …`), which lowers to
+/// `AddRI` and so fell out of scope entirely — the two-address `mov/add/mov`
+/// bridge survived in the hottest loop of every counted-loop program. This was
+/// established behaviourally, not by grep: rebuilding v2_memfill with
+/// `TCG_NO_X86_COPY_OP_WRITEBACK=1` produced a BYTE-IDENTICAL `..4main`, proving
+/// the existing pass never fires there.
+///
+/// # Soundness
+///
+/// `d = a; d = d + k` leaves `d = a + k` with `a` unchanged, which is exactly
+/// `lea d,[a+k]`. Conditions, mirroring the register form:
+///
+/// * `d != a`, otherwise the copy is an identity and there is no bridge.
+/// * The add's RFLAGS must be dead — `LEA` writes none.
+/// * Both registers are whole 64-bit GPRs.
+/// * ⚑ `k` must fit a **signed 32-bit** displacement. This is the one condition
+///   the register form does not need, and it is a hard encoding limit rather
+///   than a heuristic: `LEA`'s disp field is 32 bits, so a wider immediate
+///   cannot be represented and the collapse must be declined.
+///
+/// ⚑ The register form's aliasing hazard (`d == b` silently computing `a + a`)
+/// CANNOT arise here: an immediate has no register to alias. That removes the
+/// single condition whose absence would not have failed closed.
+fn x86_try_collapse_bridge_into_lea_imm(
+    insts: &[X86ISelInst],
+    copy_pos: usize,
+    d: X86PReg,
+    a: X86PReg,
+    d_root: X86PReg,
+    a_root: X86PReg,
+    alloc: &HashMap<VReg, X86PReg>,
+) -> Option<i32> {
+    if !bridge_into_lea_enabled() {
+        return None;
+    }
+    if d != d_root || a != a_root || d_root == a_root {
+        return None;
+    }
+    let add = insts.get(copy_pos + 1)?;
+    if add.opcode != X86Opcode::AddRI
+        || add.flags != X86Opcode::AddRI.default_flags()
+        || add.proof_origin.is_some()
+    {
+        return None;
+    }
+    // POST-FIXUP SHAPE, exactly as in the register form: a tied op keeps its
+    // three-address operands `[dst, ghost_src1, src2]`, so operand 1 is the
+    // copy's SOURCE `a` — not `d`. Matching `o1 == d` is what made the register
+    // arm fire zero times before it was corrected.
+    let [o0, o1, o2] = add.operands.as_slice() else {
+        return None;
+    };
+    if resolve_operand(o0, alloc) != Some(d) || resolve_operand(o1, alloc) != Some(a) {
+        return None;
+    }
+    let X86ISelOperand::Imm(k) = o2 else {
+        return None;
+    };
+    let k32 = i32::try_from(*k).ok()?;
+    // LEA writes no flags, so the add's flag definition must be dead.
+    if !x86_add_flags_dead_after(insts, copy_pos + 1) {
+        return None;
+    }
+    Some(k32)
+}
+
 /// RFLAGS written at `idx` are dead: no reader before a FULL redefinition.
 ///
 /// Conservative by construction — falling off the block end returns false,
@@ -4240,6 +4314,41 @@ fn coalesce_x86_redundant_movrr_copies(
                         eprintln!(
                             "[bridge-lea] ACCEPT lea {:?} <- [{:?} + {:?}] in `{}`",
                             pdst, psrc, b_reg, func.name,
+                        );
+                    }
+                    delete[pos] = true;
+                    total += 1;
+                } else if let Some(k) = x86_try_collapse_bridge_into_lea_imm(
+                    &insts, pos, pdst, psrc, pdst_root, psrc_root, alloc,
+                ) {
+                    // `mov d,a ; add d,d,IMM`  =>  `lea d,[a+IMM]`; drop the bridge.
+                    //
+                    // ⚑ SAME RULE AS THE REGISTER ARM: reuse the add's OWN
+                    // operands. Rebuilding the base from a raw `PReg` discards
+                    // the VREG identity it carries, leaving the destination vreg
+                    // with no definition at this instruction even though its
+                    // register is still written — which TV-5 correctly refuses,
+                    // failing CLOSED on 7 of 18 programs (cfa78287). Operand 1
+                    // is already exactly `a`, so the faithful rewrite changes the
+                    // opcode and repackages that one source; it never re-spells it.
+                    let add_idx = pos + 1;
+                    let [dst_op, a_op, _imm_op] = insts[add_idx].operands.as_slice() else {
+                        unreachable!("the predicate matched a three-operand AddRI");
+                    };
+                    let (dst_op, a_op) = (dst_op.clone(), a_op.clone());
+                    insts[add_idx].opcode = X86Opcode::Lea;
+                    insts[add_idx].flags = X86Opcode::Lea.default_flags();
+                    insts[add_idx].operands = vec![
+                        dst_op,
+                        X86ISelOperand::MemAddr {
+                            base: Box::new(a_op),
+                            disp: k,
+                        },
+                    ];
+                    if std::env::var_os("TCG_X86_BRIDGE_LEA_LOG").is_some() {
+                        eprintln!(
+                            "[bridge-lea] ACCEPT lea {:?} <- [{:?} + {}] in `{}`",
+                            pdst, psrc, k, func.name,
                         );
                     }
                     delete[pos] = true;
@@ -7284,16 +7393,16 @@ fn expand_x86_dynamic_stack_allocs(
 /// Each caller derives ONE local `trap_cond` and passes it here AND to the emitted
 /// `Jcc`, so the proof and the emitted code cannot drift. Memoized per kind (the
 /// expansion is a static fact) and only ever reached when a carrier of that kind
-/// is actually present, so non-guard programs pay nothing. i8 is exhaustive; i32
-/// and i64 (the real operand widths) are added when a formal solver is available
-/// (each discharges in ~30 ms — the obligation is a single CMP-flag/`Jcc`
-/// equality, not a popcount).
+/// is actually present, so non-guard programs pay nothing. i8 is exhaustive;
+/// i32 and i64 (the real operand widths) are always required and normally
+/// discharge through the independently replayed portable certificate set. A
+/// certificate miss enters the ordinary live proof lane and still fails closed
+/// when no solver is available.
 fn run_guard_carrier_canary(
     kind: trust_cg_verify::pass_validators::GuardCarrierKind,
     cond: trust_cg_ir::x86_64_ops::X86CondCode,
 ) -> Result<(), X86PipelineError> {
     use std::sync::OnceLock;
-    use trust_cg_verify::ay_bridge::z3_available;
     use trust_cg_verify::pass_validators::{
         GuardCarrierExpansionValidator, GuardCarrierKind, PassValidation, PassValidator,
     };
@@ -7309,12 +7418,10 @@ fn run_guard_carrier_canary(
         GuardCarrierKind::DivZero => &DIVZ,
     };
     cell.get_or_init(|| {
-        let mut widths: Vec<u32> = vec![8];
-        if z3_available() {
-            widths.push(32);
-            widths.push(64);
-        }
-        for width in widths {
+        // The wide lanes are backed by portable committed certificates and
+        // therefore do not require a live AY installation. A cert miss still
+        // enters the live funnel and fails closed when AY is unavailable.
+        for width in [8, 32, 64] {
             let validator =
                 GuardCarrierExpansionValidator::new("x86-guard-carrier-expand", kind, cond, width);
             if let PassValidation::Rejected {
@@ -12648,7 +12755,33 @@ fn x86_block_loop_depths(func: &X86ISelFunction) -> Vec<u32> {
         .max()
         .unwrap_or(0);
     let mut depths = vec![0u32; max_block_id + 1];
-    if std::env::var_os("TCG_X86_RA_LOOP_DEPTH").is_none() || func.block_order.len() < 2 {
+    // DEFAULT-ON since the 17-program paired A/B below; `TCG_NO_X86_RA_LOOP_DEPTH`
+    // is the kill switch.
+    //
+    // ⚑ This analysis was fully implemented but gated behind an opt-in
+    // `TCG_X86_RA_LOOP_DEPTH` that nothing set, so it returned all-zero depths
+    // in every production compile. The consequence was not subtle: the spill
+    // weight is `sum(base^loop_depth)/interval_length`, so at depth 0 it
+    // degenerates to a pure (uses+defs)/length DENSITY with no loop awareness —
+    // a value used once per iteration of a 90M-iteration innermost loop scored
+    // the same as one used once in cold code, and *worse* if its live range was
+    // longer. It also silently made `TCG_RA_WEIGHT_BASE` a no-op on x86, since
+    // any base raised to 0 is 1.
+    //
+    // Measured on h1_vec_push_sum: depth histogram {0:11} -> {0:4, 1:5, 2:2},
+    // the two intervals spanning the hot sum loop stop being spilled, and the
+    // program goes 1.61x best / 1.50x median (6.08x -> 3.78x vs LLVM -O3).
+    //
+    // 17-program paired A/B, interleaved, run TWICE in opposite orders:
+    //     run 1   best 1.0441   median 1.0377
+    //     run 2   best 1.0355   median 1.0384
+    // All 17 checksums identical to the flag-off build; no new fail-closed
+    // (v3_popcount fails in BOTH arms, pre-existing). Spill COUNT is unchanged
+    // at 14 — what changes is WHICH intervals lose, which is the only thing
+    // that was ever going to matter.
+    if std::env::var_os("TCG_NO_X86_RA_LOOP_DEPTH").is_some_and(|v| v != "0")
+        || func.block_order.len() < 2
+    {
         return depths;
     }
 
@@ -12818,6 +12951,25 @@ fn x86_block_loop_depths(func: &X86ISelFunction) -> Vec<u32> {
 
 fn x86_isel_to_regalloc(func: &X86ISelFunction) -> Result<RegAllocFunction, X86PipelineError> {
     let block_loop_depths = x86_block_loop_depths(func);
+
+    // Spill weight is `sum(base^loop_depth)/interval_length`, so if these depths
+    // are all zero the weight degenerates to a pure (uses+defs)/length density
+    // with NO loop awareness -- and `TCG_RA_WEIGHT_BASE` becomes a no-op,
+    // because any base raised to 0 is 1. Distinguishing "loop detection failed"
+    // from "the spilled values really are cold" is otherwise pure inference off
+    // the weights, so report the histogram.
+    if x86_ra_spill_stats_enabled() {
+        let mut hist: BTreeMap<u32, usize> = BTreeMap::new();
+        for d in &block_loop_depths {
+            *hist.entry(*d).or_insert(0) += 1;
+        }
+        eprintln!(
+            "[trust-cg-ra-loopdepth] func={} blocks={} depth_histogram={:?}",
+            func.name,
+            block_loop_depths.len(),
+            hist,
+        );
+    }
     let mut ra_insts: Vec<RegAllocInst> = Vec::new();
     let max_block_id = func
         .block_order

@@ -18,9 +18,12 @@
 //! | Store  | Writes memory. Barrier for loads and other stores. |
 //! | Call   | Clobbers everything (conservative default). |
 
+use std::collections::HashMap;
+
 use trust_cg_ir::AArch64Opcode;
 use trust_cg_ir::OpcodeCategory;
 use trust_cg_ir::X86Opcode;
+use trust_cg_ir::{InstId, MachFunction, MachInst, MachOperand, VReg};
 use trust_cg_lower::{X86ISelInst, X86ISelOperand};
 
 /// Memory effect classification for an instruction.
@@ -230,24 +233,281 @@ pub fn opcode_effect(opcode: AArch64Opcode) -> MemoryEffect {
     }
 }
 
-/// Returns true if this opcode produces a value (`operand[0]` is a def).
+/// Legacy classifier for opcodes with a primary result in operand 0.
 ///
-/// Instructions that don't produce values: CMP, TST, STR, STP, branches,
-/// returns, NOP, calls, traps, and reference counting ops.
+/// This is not a complete definition oracle: paired loads have additional
+/// results, writeback addressing defines its base, and LSE atomics can define
+/// operand 1 while returning `false` here. Definition/use maps must call
+/// [`aarch64_for_each_def_position`] or [`for_each_inst_def`] instead.
 ///
 /// Delegates to [`AArch64Opcode::produces_value`] — the single source of
-/// truth. This wrapper preserves the existing function signature for callers.
-/// See issue #96.
+/// truth for the primary-result classification. This wrapper preserves the
+/// existing function signature for opcode-shape-bounded callers. See issue #96.
 pub fn produces_value(opcode: AArch64Opcode) -> bool {
     opcode.produces_value()
 }
 
-/// Returns true if this instruction produces a value.
+/// Returns the legacy primary-result classification for this instruction.
 ///
-/// Convenience wrapper around [`produces_value`] that takes a `MachInst`
-/// reference instead of a bare opcode.
+/// Convenience wrapper around [`produces_value`]; it is not a complete
+/// definition query. Use [`for_each_inst_def`] for role-sensitive code.
 pub fn inst_produces_value(inst: &trust_cg_ir::MachInst) -> bool {
     produces_value(inst.opcode)
+}
+
+/// Visit every vreg written by one instruction according to the shared
+/// operand-role model.
+///
+/// Definition maps must not special-case operand 0. Paired loads define a
+/// second destination, post-indexed memory operations define-use their base,
+/// and LSE read-modify-write atomics place their result at operand 1. Omitting
+/// any of those writes can leave an older definition looking unique and
+/// reachable in this deliberately non-SSA IR.
+#[inline]
+pub(crate) fn for_each_inst_def(inst: &MachInst, mut f: impl FnMut(VReg)) {
+    // A malformed instruction may repeat one vreg in multiple def positions.
+    // Definition maps count defining INSTRUCTIONS, not operand occurrences, so
+    // visit it once. Real AArch64 forms have at most three explicit defs; keep
+    // that common path allocation-free and retain a safe overflow path.
+    let mut seen_inline = [None; ROLE_INLINE_CAP];
+    let mut seen_inline_len = 0usize;
+    let mut seen_overflow = Vec::new();
+    aarch64_for_each_def_position(inst.opcode, inst.operands.len(), |pos| {
+        if let Some(MachOperand::VReg(v)) = inst.operands.get(pos) {
+            if seen_inline[..seen_inline_len].contains(&Some(*v)) || seen_overflow.contains(v) {
+                return;
+            }
+            if seen_inline_len < ROLE_INLINE_CAP {
+                seen_inline[seen_inline_len] = Some(*v);
+                seen_inline_len += 1;
+            } else {
+                seen_overflow.push(*v);
+            }
+            f(*v);
+        }
+    });
+}
+
+/// Visit every explicit vreg read by one instruction according to the shared
+/// operand-role model. Tied operands (for example `Movk` operand 0) are
+/// intentionally visited even when the same position is also a definition.
+#[inline]
+pub(crate) fn for_each_inst_use(inst: &MachInst, mut f: impl FnMut(VReg)) {
+    aarch64_for_each_use_position(inst.opcode, inst.operands.len(), |pos| {
+        if let Some(MachOperand::VReg(v)) = inst.operands.get(pos) {
+            f(*v);
+        }
+    });
+}
+
+/// Whether `inst` explicitly defines `v` at any modeled def position.
+#[inline]
+pub(crate) fn inst_defines_vreg(inst: &MachInst, v: VReg) -> bool {
+    let mut found = false;
+    for_each_inst_def(inst, |defined| {
+        if defined == v {
+            found = true;
+        }
+    });
+    found
+}
+
+/// The vreg in the sole modeled def position, or `None` for zero/multiple defs
+/// or a malformed non-vreg destination.
+///
+/// Consumers with a one-result representation must decline paired/multi-def
+/// instructions rather than silently selecting operand 0.
+#[inline]
+pub(crate) fn single_inst_def(inst: &MachInst) -> Option<VReg> {
+    let mut def_positions = 0usize;
+    let mut one = None;
+    aarch64_for_each_def_position(inst.opcode, inst.operands.len(), |pos| {
+        def_positions += 1;
+        if let Some(MachOperand::VReg(defined)) = inst.operands.get(pos) {
+            one = Some(*defined);
+        }
+    });
+    if def_positions == 1 { one } else { None }
+}
+
+/// Maps each vreg id to the instruction that DEFINES it, for the passes that
+/// resolve copy chains and constants back to a defining instruction
+/// (`strip_copies`, `same_as_iv`, `const_value` and friends).
+///
+/// **This is the one implementation.** It replaced 24 hand-rolled copies that
+/// had drifted apart on two independent axes, each copy looking locally
+/// reasonable. The drift *is* the defect, so a new pass must call this rather
+/// than open-code the loop again.
+///
+/// Two ways the naive loop
+///
+/// ```ignore
+/// for (idx, inst) in func.insts.iter().enumerate() {
+///     if let Some(MachOperand::VReg(v)) = inst.operands.first() { .. }
+/// }
+/// ```
+///
+/// names a "definition" that never defines the value the consumer reads. Note
+/// it is last-wins by ARENA INDEX, which is not program order, so a bad entry
+/// silently outranks the real def:
+///
+/// 1. **Detached instructions.** `func.insts` is an append-only ARENA that
+///    RETAINS instructions a prior pass removed from its block — `cse`, `dce`,
+///    `gvn`, `licm`, `if_convert`, `loop_unroll`, `ext_addr`, `mach_view`,
+///    `cmp_branch_fusion` and `aarch64-bounds-check-elim` all detach. A
+///    detached instruction with a higher arena index SHADOWS the live def.
+///    Only instructions in the emitted layout define anything, so the sweep is
+///    restricted to it.
+///
+/// 2. **Assuming operand 0 is the only def.** For stores, comparisons,
+///    branches, and traps operand 0 is a read. Conversely, paired loads, LSE
+///    atomics, and writeback addressing have real definitions after operand
+///    0. [`aarch64_for_each_def_position`] is the authority; a hand-rolled
+///    operand-0 predicate drifts behind the opcode set as it grows.
+///
+/// Both hazards point the same way: they make a resolver SUCCEED against a
+/// definition that does not reach the use, so `same_as_iv` can equate a
+/// register that never tracked the induction variable and `const_value` can
+/// report a constant the register does not hold. Those are the inputs
+/// vectorization recognition is built on, so a bad entry admits a transform
+/// rather than declining one.
+///
+/// The sweep walks `block_order` — the EMITTED layout — not `func.blocks`.
+/// Those differ: `if_convert`'s triangle transform drops the then-block from
+/// `block_order` without clearing its instructions, leaving an attached-but-
+/// never-emitted `MovR` that `copy_like` happily matches, and it runs before
+/// every vectorizer that builds one of these maps. Walking the layout is also
+/// O(live instructions) instead of O(arena), so it is cheaper than the
+/// live-set-plus-arena-sweep formulation it replaces.
+///
+/// Residual, deliberately NOT handled here: a vreg with more than one def still
+/// resolves last-wins, which may name the def on a path that does not reach the
+/// use. A flat map cannot express that; a pass needing the guarantee must ask
+/// [`live_def_count`] for exactly 1, or use [`build_unique_reaching_def_map`],
+/// which omits such ids outright.
+///
+/// That residual is UNIVERSAL, not a corner case, and it is why the unique
+/// variant is not the default. Every loop-carried variable has two live defs
+/// into the SAME vreg — the frontend lowers block parameters to per-predecessor
+/// copies, so an ordinary counted loop lowers to `MovR v, <init>` in the
+/// preheader and `MovR v, <next>` in the latch. Resolution therefore walks any
+/// induction variable to its LATCH source, which is not what reaches the header
+/// on the entry iteration. Gating the map on uniqueness would drop every
+/// induction variable and disable the vectorizers wholesale.
+///
+/// The frontend's `LoopCarriedSlotMisthreaded` (`[TCG-SSA-071]`) check is NOT a
+/// structural safety backstop for this residual. The bridge may discharge an
+/// all-misthread violation set through its semantic back-edge threading VC and
+/// admit value-correct threading. Optimizers must therefore remain safe even
+/// when that frontend refinement succeeds.
+///
+/// Consumers that resolve an admitting operand through this non-unique map
+/// must enforce uniqueness at their own boundary with [`live_def_count`] or
+/// [`build_unique_reaching_def_map`]. The audited vectorization recognizers do
+/// that for non-loop-carried values and copy chains; the induction variable
+/// itself deliberately retains its two expected definitions. Any new consumer
+/// inherits the same obligation and must fail closed rather than crediting
+/// `[TCG-SSA-071]` as proof authority.
+pub fn build_reaching_def_map(func: &MachFunction) -> HashMap<u32, InstId> {
+    let mut map = HashMap::new();
+    for &b in &func.block_order {
+        for &id in &func.block(b).insts {
+            let inst = func.inst(id);
+            for_each_inst_def(inst, |v| {
+                map.insert(v.id, id);
+            });
+        }
+    }
+    map
+}
+
+/// [`build_reaching_def_map`] keyed by the FULL `VReg` rather than by bare id.
+///
+/// A `VReg` is `{ id, class }`, so the two keyings are not interchangeable: an
+/// id-keyed map conflates registers that share an id across register classes,
+/// which is precisely the confusion that once had a `*mut f32` fill loop emit
+/// `dup v0.2d, x28`. Same sweep, same complete role model, stricter key.
+pub fn build_reaching_def_map_by_vreg(func: &MachFunction) -> HashMap<VReg, InstId> {
+    let mut map = HashMap::new();
+    for &b in &func.block_order {
+        for &id in &func.block(b).insts {
+            let inst = func.inst(id);
+            for_each_inst_def(inst, |v| {
+                map.insert(v, id);
+            });
+        }
+    }
+    map
+}
+
+/// Every def of each vreg in the emitted layout, in layout order, rather than
+/// only the last one.
+///
+/// Same sweep and same predicate as [`build_reaching_def_map`]; it differs by
+/// not collapsing multi-def ids, so a caller can SEE that a register has more
+/// than one definition instead of silently resolving to whichever came last.
+pub fn build_all_defs_map(func: &MachFunction) -> HashMap<VReg, Vec<InstId>> {
+    let mut map: HashMap<VReg, Vec<InstId>> = HashMap::new();
+    for &b in &func.block_order {
+        for &id in &func.block(b).insts {
+            let inst = func.inst(id);
+            for_each_inst_def(inst, |v| {
+                map.entry(v).or_default().push(id);
+            });
+        }
+    }
+    map
+}
+
+/// Number of instructions in the EMITTED layout that write vreg `id`, counting
+/// every def position the shared operand-role model reports — so multi-def
+/// loads (`LdpRI`, `LdpPostIndex`) and def-use modifies (`Movk`, `Bfm`, NEON
+/// `Ins`) are counted exactly, not just writes that land at operand 0.
+///
+/// Fail-closed companion to [`build_reaching_def_map`]: an id with more than
+/// one def has no single reaching definition a flat map can express.
+pub fn live_def_count(func: &MachFunction, id: u32) -> usize {
+    let mut n = 0;
+    for &b in &func.block_order {
+        for &i in &func.block(b).insts {
+            let inst = func.inst(i);
+            let mut hit = false;
+            for_each_inst_def(inst, |d| {
+                if d.id == id {
+                    hit = true;
+                }
+            });
+            if hit {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// [`build_reaching_def_map`] restricted to ids with exactly ONE def in the
+/// emitted layout, so a hit is a genuine reaching definition on every path
+/// rather than whichever def happened to come last in the sweep.
+///
+/// NOT the default, because it is conservative in a way that costs real
+/// recognition: a constant materialized as `Movz` + `Movk` writes its
+/// destination twice (`Movk` define-uses operand 0), so every wide constant
+/// drops out of the map and `const_value`-style resolution stops seeing it.
+/// Reach for this where resolving through a def that may not reach the use
+/// would be UNSOUND rather than merely imprecise.
+pub fn build_unique_reaching_def_map(func: &MachFunction) -> HashMap<u32, InstId> {
+    let mut counts: HashMap<u32, usize> = HashMap::new();
+    for &b in &func.block_order {
+        for &i in &func.block(b).insts {
+            let inst = func.inst(i);
+            for_each_inst_def(inst, |d| {
+                *counts.entry(d.id).or_insert(0) += 1;
+            });
+        }
+    }
+    let mut map = build_reaching_def_map(func);
+    map.retain(|id, _| counts.get(id).copied() == Some(1));
+    map
 }
 
 /// Explicit register-operand role used by passes that need AArch64 def/use
@@ -1727,6 +1987,273 @@ mod tests {
 }
 
 // ===========================================================================
+// Reaching-def map
+// ===========================================================================
+
+#[cfg(test)]
+mod tests_reaching_def_map {
+    use super::*;
+    use trust_cg_ir::{BlockId, MachInst, RegClass, Signature};
+
+    fn v64(id: u32) -> VReg {
+        VReg::new(id, RegClass::Gpr64)
+    }
+    fn vr(v: VReg) -> MachOperand {
+        MachOperand::VReg(v)
+    }
+    fn im(x: i64) -> MachOperand {
+        MachOperand::Imm(x)
+    }
+    fn new_func() -> MachFunction {
+        MachFunction::new("t".into(), Signature::new(vec![], vec![]))
+    }
+    fn emit(f: &mut MachFunction, b: BlockId, op: AArch64Opcode, ops: Vec<MachOperand>) -> InstId {
+        let id = f.push_inst(MachInst::new(op, ops));
+        f.append_inst(b, id);
+        id
+    }
+
+    /// Positive control: without this the three shadowing tests below could all
+    /// pass on a map that is simply always empty.
+    #[test]
+    fn ordinary_defs_are_recorded() {
+        let mut f = new_func();
+        let e = f.entry;
+        let (x, y) = (v64(0), v64(1));
+        let d = emit(&mut f, e, AArch64Opcode::AddRR, vec![vr(x), vr(y), vr(y)]);
+        assert_eq!(build_reaching_def_map(&f).get(&x.id), Some(&d));
+    }
+
+    /// A DETACHED instruction — still in the `func.insts` arena, no longer in
+    /// any block — must not shadow the live def, even though it lands LATER in
+    /// the arena and so wins a naive last-wins sweep over `func.insts`.
+    #[test]
+    fn detached_instruction_does_not_shadow_the_live_def() {
+        let mut f = new_func();
+        let e = f.entry;
+        let (x, y, iv) = (v64(0), v64(1), v64(2));
+        let live = emit(&mut f, e, AArch64Opcode::AddRR, vec![vr(x), vr(y), vr(y)]);
+        let detached = f.push_inst(MachInst::new(AArch64Opcode::MovR, vec![vr(x), vr(iv)]));
+        assert!(detached.0 > live.0, "the shadow must be later in the arena");
+
+        let map = build_reaching_def_map(&f);
+        assert_eq!(
+            map.get(&x.id),
+            Some(&live),
+            "a detached MovR must not become x's definition — resolving through \
+             it would let `same_as_iv` equate x with the induction variable",
+        );
+    }
+
+    /// A block dropped from the emitted LAYOUT keeps its instructions attached
+    /// in `func.blocks`: `if_convert`'s triangle transform removes the then-block
+    /// from `block_order` without clearing it, and runs before every vectorizer
+    /// that builds one of these maps. Those instructions never execute.
+    #[test]
+    fn block_dropped_from_layout_defines_nothing() {
+        let mut f = new_func();
+        let e = f.entry;
+        let orphan = f.create_block();
+        let (x, y, iv) = (v64(0), v64(1), v64(2));
+        let live = emit(&mut f, e, AArch64Opcode::AddRR, vec![vr(x), vr(y), vr(y)]);
+        emit(&mut f, orphan, AArch64Opcode::MovR, vec![vr(x), vr(iv)]);
+        f.block_order.retain(|&b| b != orphan);
+        assert!(
+            !f.block(orphan).insts.is_empty(),
+            "the orphaned block must keep its instructions — that is the shape \
+             if_convert leaves behind",
+        );
+
+        let map = build_reaching_def_map(&f);
+        assert_eq!(map.get(&x.id), Some(&live));
+    }
+
+    /// Operand 0 of a store is the stored VALUE — a READ. The hand-rolled
+    /// predicates this helper replaced excluded only `StrRI`, so every sibling
+    /// store slipped through and was recorded as defining what it stored.
+    #[test]
+    fn store_at_operand_zero_is_not_a_def() {
+        let mut f = new_func();
+        let e = f.entry;
+        let (x, y, p) = (v64(0), v64(1), v64(2));
+        let live = emit(&mut f, e, AArch64Opcode::AddRR, vec![vr(x), vr(y), vr(y)]);
+        emit(&mut f, e, AArch64Opcode::StrbRI, vec![vr(x), vr(p), im(0)]);
+
+        let map = build_reaching_def_map(&f);
+        assert_eq!(
+            map.get(&x.id),
+            Some(&live),
+            "a store of x must not shadow the AddRR that produced x",
+        );
+    }
+
+    /// Same for the bounds-check carriers, whose operand 0 is the CHECKED INDEX.
+    /// The hand-rolled predicates excluded `TrapBoundsCheckExact` but not its
+    /// siblings — the exact hazard the original comment set out to close.
+    #[test]
+    fn trap_carrier_at_operand_zero_is_not_a_def() {
+        let mut f = new_func();
+        let e = f.entry;
+        let (x, y, len) = (v64(0), v64(1), v64(2));
+        let live = emit(&mut f, e, AArch64Opcode::AddRR, vec![vr(x), vr(y), vr(y)]);
+        emit(
+            &mut f,
+            e,
+            AArch64Opcode::TrapBoundsCheck,
+            vec![vr(x), vr(len), im(0)],
+        );
+
+        let map = build_reaching_def_map(&f);
+        assert_eq!(map.get(&x.id), Some(&live));
+    }
+
+    /// The unique-def variant drops ids with more than one definition, so a
+    /// caller cannot silently resolve through whichever def came last.
+    #[test]
+    fn unique_variant_drops_multiply_defined_ids() {
+        let mut f = new_func();
+        let e = f.entry;
+        let (x, y) = (v64(0), v64(1));
+        emit(&mut f, e, AArch64Opcode::AddRR, vec![vr(x), vr(y), vr(y)]);
+        let second = emit(&mut f, e, AArch64Opcode::MovR, vec![vr(x), vr(y)]);
+
+        assert_eq!(live_def_count(&f, x.id), 2);
+        assert_eq!(build_reaching_def_map(&f).get(&x.id), Some(&second));
+        assert_eq!(build_unique_reaching_def_map(&f).get(&x.id), None);
+        // y is never written, so it is absent from both.
+        assert_eq!(live_def_count(&f, y.id), 0);
+    }
+
+    /// `live_def_count` counts EVERY def position, not just operand 0 — an
+    /// operand-0-only count would call a paired-load destination undefined.
+    #[test]
+    fn live_def_count_sees_non_zero_def_positions() {
+        let mut f = new_func();
+        let e = f.entry;
+        let (a, b, p) = (v64(0), v64(1), v64(2));
+        emit(
+            &mut f,
+            e,
+            AArch64Opcode::LdpRI,
+            vec![vr(a), vr(b), vr(p), im(0)],
+        );
+        assert_eq!(live_def_count(&f, a.id), 1);
+        assert_eq!(
+            live_def_count(&f, b.id),
+            1,
+            "LdpRI defines operand 1 as well as operand 0",
+        );
+    }
+
+    /// A paired post-index load defines operand 1 and define-uses its base.
+    /// Both writes must replace older entries in the reaching maps and remain
+    /// visible in the all-def map; otherwise a non-SSA consumer can mistake
+    /// the stale `MovI` values for unique definitions.
+    #[test]
+    fn operand_one_and_writeback_defs_shadow_stale_history() {
+        let mut f = new_func();
+        let e = f.entry;
+        let (a, b, base) = (v64(0), v64(1), v64(2));
+        let old_b = emit(&mut f, e, AArch64Opcode::MovI, vec![vr(b), im(11)]);
+        let old_base = emit(&mut f, e, AArch64Opcode::MovI, vec![vr(base), im(4096)]);
+        let pair = emit(
+            &mut f,
+            e,
+            AArch64Opcode::LdpPostIndex,
+            vec![vr(a), vr(b), vr(base), im(16)],
+        );
+
+        let reaching = build_reaching_def_map(&f);
+        assert_eq!(reaching.get(&a.id), Some(&pair));
+        assert_eq!(reaching.get(&b.id), Some(&pair));
+        assert_eq!(reaching.get(&base.id), Some(&pair));
+
+        let by_vreg = build_reaching_def_map_by_vreg(&f);
+        assert_eq!(by_vreg.get(&b), Some(&pair));
+        assert_eq!(by_vreg.get(&base), Some(&pair));
+
+        let all = build_all_defs_map(&f);
+        assert_eq!(all.get(&b), Some(&vec![old_b, pair]));
+        assert_eq!(all.get(&base), Some(&vec![old_base, pair]));
+        assert_eq!(live_def_count(&f, b.id), 2);
+        assert_eq!(live_def_count(&f, base.id), 2);
+        assert!(!build_unique_reaching_def_map(&f).contains_key(&b.id));
+        assert!(!build_unique_reaching_def_map(&f).contains_key(&base.id));
+    }
+
+    /// LSE RMW operations read operand 0 and define operand 1. The shared map
+    /// used to avoid the false operand-0 def but then omitted the real result
+    /// def, allowing an older result value to survive as the apparent source.
+    #[test]
+    fn lse_operand_one_def_shadows_stale_history() {
+        let mut f = new_func();
+        let e = f.entry;
+        let (update, result, address) = (v64(0), v64(1), v64(2));
+        let old_result = emit(&mut f, e, AArch64Opcode::MovI, vec![vr(result), im(7)]);
+        let atomic = emit(
+            &mut f,
+            e,
+            AArch64Opcode::Ldadd,
+            vec![vr(update), vr(result), vr(address)],
+        );
+
+        let reaching = build_reaching_def_map(&f);
+        assert_eq!(reaching.get(&result.id), Some(&atomic));
+        assert!(!reaching.contains_key(&update.id));
+        assert_eq!(
+            build_all_defs_map(&f).get(&result),
+            Some(&vec![old_result, atomic]),
+        );
+        assert_eq!(live_def_count(&f, result.id), 2);
+        assert!(!build_unique_reaching_def_map(&f).contains_key(&result.id));
+    }
+
+    /// Repeating one vreg in multiple modeled def positions is malformed but
+    /// must remain fail-closed and deterministic: one instruction contributes
+    /// one definition, not an artificial multi-def count.
+    #[test]
+    fn repeated_def_operand_is_deduplicated_per_instruction() {
+        let mut f = new_func();
+        let e = f.entry;
+        let (same, base) = (v64(0), v64(1));
+        let pair = emit(
+            &mut f,
+            e,
+            AArch64Opcode::LdpRI,
+            vec![vr(same), vr(same), vr(base), im(0)],
+        );
+        assert_eq!(build_all_defs_map(&f).get(&same), Some(&vec![pair]));
+        assert_eq!(live_def_count(&f, same.id), 1);
+        assert_eq!(build_unique_reaching_def_map(&f).get(&same.id), Some(&pair));
+        assert_eq!(
+            single_inst_def(f.inst(pair)),
+            None,
+            "a one-result consumer must still reject a two-destination shape"
+        );
+    }
+
+    /// The by-vreg keying must not conflate two registers that share an id
+    /// across register classes.
+    #[test]
+    fn by_vreg_keying_separates_register_classes() {
+        let mut f = new_func();
+        let e = f.entry;
+        let g = VReg::new(7, RegClass::Gpr64);
+        let s = VReg::new(7, RegClass::Fpr64);
+        let y = v64(1);
+        let gdef = emit(&mut f, e, AArch64Opcode::AddRR, vec![vr(g), vr(y), vr(y)]);
+        let sdef = emit(&mut f, e, AArch64Opcode::FaddRR, vec![vr(s), vr(s), vr(s)]);
+
+        let by_vreg = build_reaching_def_map_by_vreg(&f);
+        assert_eq!(by_vreg.get(&g), Some(&gdef));
+        assert_eq!(by_vreg.get(&s), Some(&sdef));
+        // The id-keyed map cannot tell them apart — which is why passes that
+        // care about register class must use the by-vreg form.
+        assert_eq!(build_reaching_def_map(&f).get(&7), Some(&sdef));
+    }
+}
+
+// ===========================================================================
 // x86-64 tests
 // ===========================================================================
 
@@ -2242,5 +2769,357 @@ mod tests_category {
         let op = AArch64Opcode::AddRR;
         let cat = op.categorize();
         assert_eq!(category_memory_effect(cat), opcode_effect(op));
+    }
+}
+
+// ===========================================================================
+// Def-map authority
+// ===========================================================================
+
+#[cfg(test)]
+mod tests_defmap_authority {
+    use super::*;
+    use trust_cg_ir::{AArch64Opcode, MachInst, MachOperand, RegClass, VReg};
+
+    /// The current `AArch64Opcode` inventory used to exercise the def visitor
+    /// over every supported operand arity. Keep this list synchronized with the
+    /// enum; concrete multi-def regressions below carry the soundness teeth.
+    const ALL: &[AArch64Opcode] = &[
+        AArch64Opcode::AddRR,
+        AArch64Opcode::AddRI,
+        AArch64Opcode::AddRIShift12,
+        AArch64Opcode::SubRR,
+        AArch64Opcode::SubRI,
+        AArch64Opcode::MulRR,
+        AArch64Opcode::Msub,
+        AArch64Opcode::Smull,
+        AArch64Opcode::Umull,
+        AArch64Opcode::SDiv,
+        AArch64Opcode::UDiv,
+        AArch64Opcode::Neg,
+        AArch64Opcode::AndRR,
+        AArch64Opcode::AndRI,
+        AArch64Opcode::OrrRR,
+        AArch64Opcode::OrrRI,
+        AArch64Opcode::EorRR,
+        AArch64Opcode::EorRI,
+        AArch64Opcode::EorRRShift,
+        AArch64Opcode::AddRRShift,
+        AArch64Opcode::SubRRShift,
+        AArch64Opcode::EorRRLsl,
+        AArch64Opcode::EorRRLsr,
+        AArch64Opcode::AddRRShiftLsr,
+        AArch64Opcode::OrnRR,
+        AArch64Opcode::BicRR,
+        AArch64Opcode::LslRR,
+        AArch64Opcode::LsrRR,
+        AArch64Opcode::AsrRR,
+        AArch64Opcode::LslRI,
+        AArch64Opcode::LsrRI,
+        AArch64Opcode::AsrRI,
+        AArch64Opcode::RorRI,
+        AArch64Opcode::Rbit,
+        AArch64Opcode::CmpRR,
+        AArch64Opcode::CmpRI,
+        AArch64Opcode::Tst,
+        AArch64Opcode::Csel,
+        AArch64Opcode::Csinc,
+        AArch64Opcode::Csinv,
+        AArch64Opcode::Csneg,
+        AArch64Opcode::FcselRR,
+        AArch64Opcode::MovR,
+        AArch64Opcode::MovI,
+        AArch64Opcode::Movz,
+        AArch64Opcode::Movn,
+        AArch64Opcode::Movk,
+        AArch64Opcode::FmovImm,
+        AArch64Opcode::LdrRI,
+        AArch64Opcode::StrRI,
+        AArch64Opcode::LdrPreIndex,
+        AArch64Opcode::StrPreIndex,
+        AArch64Opcode::LdrPostIndex,
+        AArch64Opcode::StrPostIndex,
+        AArch64Opcode::LdrbRI,
+        AArch64Opcode::LdrhRI,
+        AArch64Opcode::LdrsbRI,
+        AArch64Opcode::LdrshRI,
+        AArch64Opcode::StrbRI,
+        AArch64Opcode::StrhRI,
+        AArch64Opcode::LdrLiteral,
+        AArch64Opcode::LdpRI,
+        AArch64Opcode::StpRI,
+        AArch64Opcode::StpPreIndex,
+        AArch64Opcode::LdpPostIndex,
+        AArch64Opcode::LdrRO,
+        AArch64Opcode::StrRO,
+        AArch64Opcode::LdrbRO,
+        AArch64Opcode::LdrhRO,
+        AArch64Opcode::LdrGot,
+        AArch64Opcode::LdrTlvp,
+        AArch64Opcode::B,
+        AArch64Opcode::BCond,
+        AArch64Opcode::Cbz,
+        AArch64Opcode::Cbnz,
+        AArch64Opcode::Tbz,
+        AArch64Opcode::Tbnz,
+        AArch64Opcode::Br,
+        AArch64Opcode::Bl,
+        AArch64Opcode::Blr,
+        AArch64Opcode::Ret,
+        AArch64Opcode::CSet,
+        AArch64Opcode::Sxtw,
+        AArch64Opcode::Uxtw,
+        AArch64Opcode::Sxtb,
+        AArch64Opcode::Sxth,
+        AArch64Opcode::Uxtb,
+        AArch64Opcode::Uxth,
+        AArch64Opcode::Ubfm,
+        AArch64Opcode::Sbfm,
+        AArch64Opcode::Bfm,
+        AArch64Opcode::FaddRR,
+        AArch64Opcode::FsubRR,
+        AArch64Opcode::FmulRR,
+        AArch64Opcode::FdivRR,
+        AArch64Opcode::FmaddRR,
+        AArch64Opcode::FminnmRR,
+        AArch64Opcode::FmaxnmRR,
+        AArch64Opcode::FnegRR,
+        AArch64Opcode::FabsRR,
+        AArch64Opcode::FsqrtRR,
+        AArch64Opcode::FrintmRR,
+        AArch64Opcode::FrintpRR,
+        AArch64Opcode::FrintzRR,
+        AArch64Opcode::Fcmp,
+        AArch64Opcode::FcvtzsRR,
+        AArch64Opcode::FcvtzuRR,
+        AArch64Opcode::ScvtfRR,
+        AArch64Opcode::UcvtfRR,
+        AArch64Opcode::FcvtSD,
+        AArch64Opcode::FcvtDS,
+        AArch64Opcode::FcvtHS,
+        AArch64Opcode::FcvtHD,
+        AArch64Opcode::FcvtSH,
+        AArch64Opcode::FcvtDH,
+        AArch64Opcode::FmovGprFpr,
+        AArch64Opcode::FmovFprGpr,
+        AArch64Opcode::FmovFprFpr,
+        AArch64Opcode::NeonAddV,
+        AArch64Opcode::NeonSubV,
+        AArch64Opcode::NeonMulV,
+        AArch64Opcode::NeonSmaxV,
+        AArch64Opcode::NeonSminV,
+        AArch64Opcode::NeonUmaxV,
+        AArch64Opcode::NeonUminV,
+        AArch64Opcode::NeonFaddV,
+        AArch64Opcode::NeonFsubV,
+        AArch64Opcode::NeonFmulV,
+        AArch64Opcode::NeonFdivV,
+        AArch64Opcode::NeonFcmgtV,
+        AArch64Opcode::NeonAndV,
+        AArch64Opcode::NeonOrrV,
+        AArch64Opcode::NeonEorV,
+        AArch64Opcode::NeonBicV,
+        AArch64Opcode::NeonNotV,
+        AArch64Opcode::NeonRbitV,
+        AArch64Opcode::NeonRev32V,
+        AArch64Opcode::NeonRev64V,
+        AArch64Opcode::NeonCmeqV,
+        AArch64Opcode::NeonCmgtV,
+        AArch64Opcode::NeonCmgeV,
+        AArch64Opcode::NeonCmhiV,
+        AArch64Opcode::NeonCmhsV,
+        AArch64Opcode::NeonUmaxv,
+        AArch64Opcode::NeonAddpScalar,
+        AArch64Opcode::NeonDupElem,
+        AArch64Opcode::NeonDupGen,
+        AArch64Opcode::NeonInsGen,
+        AArch64Opcode::NeonUmovGen,
+        AArch64Opcode::NeonMovi,
+        AArch64Opcode::NeonLd1Post,
+        AArch64Opcode::NeonLdpQPost,
+        AArch64Opcode::NeonSt1Post,
+        AArch64Opcode::NeonStpQPost,
+        AArch64Opcode::NeonCntV,
+        AArch64Opcode::NeonUaddlpV,
+        AArch64Opcode::NeonSaddlpV,
+        AArch64Opcode::NeonAbsV,
+        AArch64Opcode::NeonBitV,
+        AArch64Opcode::NeonUdotV,
+        AArch64Opcode::NeonExtV,
+        AArch64Opcode::NeonSmlalV,
+        AArch64Opcode::NeonSmlal2V,
+        AArch64Opcode::NeonUmlalV,
+        AArch64Opcode::NeonUmlal2V,
+        AArch64Opcode::NeonUaddwV,
+        AArch64Opcode::NeonUaddw2V,
+        AArch64Opcode::NeonSaddwV,
+        AArch64Opcode::NeonSaddw2V,
+        AArch64Opcode::NeonMlaV,
+        AArch64Opcode::NeonUadalpV,
+        AArch64Opcode::NeonFmlaV,
+        AArch64Opcode::NeonFmlsV,
+        AArch64Opcode::NeonUcvtfV,
+        AArch64Opcode::NeonScvtfV,
+        AArch64Opcode::NeonFcvtlV,
+        AArch64Opcode::NeonFcvtl2V,
+        AArch64Opcode::NeonDupScalarD,
+        AArch64Opcode::Ldar,
+        AArch64Opcode::Ldarb,
+        AArch64Opcode::Ldarh,
+        AArch64Opcode::Stlr,
+        AArch64Opcode::Stlrb,
+        AArch64Opcode::Stlrh,
+        AArch64Opcode::Ldadd,
+        AArch64Opcode::Ldadda,
+        AArch64Opcode::Ldaddal,
+        AArch64Opcode::Ldaddl,
+        AArch64Opcode::Ldclr,
+        AArch64Opcode::Ldclra,
+        AArch64Opcode::Ldclral,
+        AArch64Opcode::Ldclrl,
+        AArch64Opcode::Ldeor,
+        AArch64Opcode::Ldeora,
+        AArch64Opcode::Ldeoral,
+        AArch64Opcode::Ldeorl,
+        AArch64Opcode::Ldset,
+        AArch64Opcode::Ldseta,
+        AArch64Opcode::Ldsetal,
+        AArch64Opcode::Ldsetl,
+        AArch64Opcode::Ldsmax,
+        AArch64Opcode::Ldsmaxa,
+        AArch64Opcode::Ldsmaxal,
+        AArch64Opcode::Ldsmaxl,
+        AArch64Opcode::Ldsmin,
+        AArch64Opcode::Ldsmina,
+        AArch64Opcode::Ldsminal,
+        AArch64Opcode::Ldsminl,
+        AArch64Opcode::Ldumax,
+        AArch64Opcode::Ldumaxa,
+        AArch64Opcode::Ldumaxal,
+        AArch64Opcode::Ldumaxl,
+        AArch64Opcode::Ldumin,
+        AArch64Opcode::Ldumina,
+        AArch64Opcode::Lduminal,
+        AArch64Opcode::Lduminl,
+        AArch64Opcode::Swp,
+        AArch64Opcode::Swpa,
+        AArch64Opcode::Swpal,
+        AArch64Opcode::Swpl,
+        AArch64Opcode::Cas,
+        AArch64Opcode::Casa,
+        AArch64Opcode::Casal,
+        AArch64Opcode::Casl,
+        AArch64Opcode::Ldaxr,
+        AArch64Opcode::Stlxr,
+        AArch64Opcode::Dmb,
+        AArch64Opcode::Dsb,
+        AArch64Opcode::Isb,
+        AArch64Opcode::Adrp,
+        AArch64Opcode::Adr,
+        AArch64Opcode::AddPCRel,
+        AArch64Opcode::AddTprelHi12,
+        AArch64Opcode::AddTprelLo12,
+        AArch64Opcode::LdrswRO,
+        AArch64Opcode::AddsRR,
+        AArch64Opcode::AddsRI,
+        AArch64Opcode::SubsRR,
+        AArch64Opcode::SubsRI,
+        AArch64Opcode::Adc,
+        AArch64Opcode::Sbc,
+        AArch64Opcode::Umulh,
+        AArch64Opcode::Smulh,
+        AArch64Opcode::Madd,
+        AArch64Opcode::Brk,
+        AArch64Opcode::TrapOverflow,
+        AArch64Opcode::TrapBoundsCheck,
+        AArch64Opcode::TrapBoundsCheckExact,
+        AArch64Opcode::TrapNull,
+        AArch64Opcode::TrapNullIfZero,
+        AArch64Opcode::TrapDivZero,
+        AArch64Opcode::TrapDivZeroIfZero,
+        AArch64Opcode::TrapShiftRange,
+        AArch64Opcode::TrapShiftRangeIfOOB,
+        AArch64Opcode::Retain,
+        AArch64Opcode::Release,
+        AArch64Opcode::MOVWrr,
+        AArch64Opcode::MOVXrr,
+        AArch64Opcode::STRWui,
+        AArch64Opcode::STRXui,
+        AArch64Opcode::STRSui,
+        AArch64Opcode::STRDui,
+        AArch64Opcode::BL,
+        AArch64Opcode::BLR,
+        AArch64Opcode::CMPWrr,
+        AArch64Opcode::CMPXrr,
+        AArch64Opcode::CMPWri,
+        AArch64Opcode::CMPXri,
+        AArch64Opcode::MOVZWi,
+        AArch64Opcode::MOVZXi,
+        AArch64Opcode::Bcc,
+        AArch64Opcode::Mrs,
+        AArch64Opcode::Phi,
+        AArch64Opcode::StackAlloc,
+        AArch64Opcode::Copy,
+        AArch64Opcode::Nop,
+        AArch64Opcode::NeonShlVImm,
+        AArch64Opcode::NeonUshrVImm,
+        AArch64Opcode::NeonSshrVImm,
+        AArch64Opcode::TrapOverflowExact,
+        AArch64Opcode::TailCall,
+        AArch64Opcode::LdrGottprel,
+        AArch64Opcode::NeonFmlaLaneV,
+        AArch64Opcode::VolatileLdrRI,
+        AArch64Opcode::VolatileLdrbRI,
+        AArch64Opcode::VolatileLdrhRI,
+        AArch64Opcode::VolatileStrRI,
+        AArch64Opcode::VolatileStrbRI,
+        AArch64Opcode::VolatileStrhRI,
+        AArch64Opcode::AlignNop,
+    ];
+
+    /// The instruction-level visitor must enumerate exactly the vreg operands
+    /// classified as definitions by the shared role model, including positions
+    /// after operand 0 and excluding reads at operand 0.
+    #[test]
+    fn def_visitor_agrees_with_the_complete_role_model() {
+        let mut bad = Vec::new();
+        for &op in ALL {
+            for n in 1..=4usize {
+                let operands: Vec<MachOperand> = (0..n)
+                    .map(|id| MachOperand::VReg(VReg::new(id as u32, RegClass::Gpr64)))
+                    .collect();
+                let inst = MachInst::new(op, operands);
+                let mut expected = Vec::new();
+                aarch64_for_each_def_position(op, n, |pos| {
+                    expected.push(VReg::new(pos as u32, RegClass::Gpr64));
+                });
+                let mut actual = Vec::new();
+                for_each_inst_def(&inst, |v| actual.push(v));
+                if actual != expected {
+                    bad.push(format!("{op:?}/{n}: expected {expected:?}, got {actual:?}"));
+                }
+            }
+        }
+        assert!(bad.is_empty(), "disagreement on: {}", bad.join(", "));
+    }
+
+    /// The concrete case that motivated the above: an LSE RMW atomic must NOT
+    /// be recorded as defining its operand-0 vreg.
+    #[test]
+    fn lse_rmw_operand_zero_is_a_read_not_a_def() {
+        for &op in ALL {
+            if is_lse_rmw(op) {
+                assert_eq!(
+                    aarch64_def_operand_positions(op, 3),
+                    vec![1],
+                    "{op:?}: operand 0 is the VALUE operand (a read); the def is operand 1",
+                );
+                assert!(
+                    produces_value(op),
+                    "{op:?}: produces_value is still true — this test documents \
+                     that the two predicates answer DIFFERENT questions",
+                );
+            }
+        }
     }
 }

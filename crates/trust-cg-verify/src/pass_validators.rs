@@ -173,6 +173,14 @@ pub trait PassValidator {
     /// solver at all) is **Rejected** (fail closed). We never downgrade a missing
     /// solver or a merely-statistical pass into a certificate.
     fn validate(&self) -> PassValidation {
+        self.validate_with_config(&AYConfig::default())
+    }
+
+    /// As [`PassValidator::validate`], with an explicit proof configuration.
+    /// This is also the hermetic seam that demonstrates a portable committed
+    /// certificate can discharge a wide validator even when `solver_path`
+    /// names no live AY executable.
+    fn validate_with_config(&self, config: &AYConfig) -> PassValidation {
         let obligation = self.obligation();
         let max_width = max_input_width(&obligation);
 
@@ -188,22 +196,12 @@ pub trait PassValidator {
             obligation.inputs.len() <= 2 && max_width <= EXHAUSTIVE_WIDTH_THRESHOLD;
 
         if !exhaustive_is_complete {
-            // Outside the exhaustive lanes: a sampled `Valid` is not a proof.
-            // Require the formal solver and treat anything short of a formal
-            // `Verified` as a rejection.
-            if !ay_bridge::z3_available() {
-                return PassValidation::Rejected {
-                    obligation_name: obligation.name,
-                    reason: format!(
-                        "fail-closed: obligation (width {max_width}, {} inputs) is outside \
-                         verify_by_evaluation's exhaustive lanes (<= 2 inputs, width <= \
-                         {EXHAUSTIVE_WIDTH_THRESHOLD}); a statistical (sampled) result is \
-                         not a proof and no formal solver is available",
-                        obligation.inputs.len()
-                    ),
-                };
-            }
-            return match ay_bridge::verify_with_ay(&obligation, &AYConfig::default()) {
+            // Do not pre-gate on live solver availability: verify_with_ay's
+            // proof funnel consults portable, independently checked certs
+            // before resolving AY. A miss still reaches the live path and
+            // returns Error when no solver exists, preserving fail-closed
+            // semantics.
+            return match ay_bridge::verify_with_ay(&obligation, config) {
                 AYResult::Verified => PassValidation::Verified {
                     obligation_name: obligation.name,
                 },
@@ -707,7 +705,7 @@ pub enum GuardCarrierKind {
 /// operand with itself (`x & x == x`) and so sets ZF = `(x & x) == 0`, SF =
 /// `msb(x & x)`, PF = parity of the low byte, and clears CF and OF. Modeling the
 /// emitted-side ZF as `(x & x) == 0` (rather than `x == 0`) keeps the obligation
-/// non-degenerate: the proof genuinely discharges `(x & x) == 0  ⟺  x == 0`.
+/// non-degenerate: the proof genuinely discharges `(x & x) == 0  ⟺  x <u 1`.
 fn test_self_flags(width: u32, x: SmtExpr) -> IntCmpFlags {
     let anded = x.clone().bvand(x.clone());
     let msb = |v: SmtExpr| {
@@ -741,8 +739,9 @@ fn test_self_flags(width: u32, x: SmtExpr) -> IntCmpFlags {
 /// expander emits (see the canary in `trust-cg-codegen` — it derives one local
 /// `trap_cond` and uses it for both the proof and the emitted `Jcc`, so they
 /// cannot drift). The obligation proves the emitted-condition predicate equals an
-/// INDEPENDENTLY-expressed intended predicate (`bvuge` / `== 0` via `x & x`), so a
-/// wrong cc refutes and the correct cc is not a degenerate `X == X`.
+/// INDEPENDENTLY-expressed intended predicate (`bvuge` / `x <u 1`) against the
+/// emitted CMP/TEST flags, so a wrong cc refutes and the correct cc is not a
+/// degenerate `X == X`.
 pub struct GuardCarrierExpansionValidator {
     /// Pass name recorded in the certificate.
     pub pass_name: String,
@@ -799,10 +798,17 @@ impl PassValidator for GuardCarrierExpansionValidator {
                 )
             }
             // `TEST lhs, lhs; Jcc <cond>` — intended: trap iff lhs == 0.
+            // Express the independent intended predicate as `lhs <u 1` rather
+            // than another syntactic equality-to-zero. Besides being exactly
+            // equivalent for every unsigned bitvector, this keeps the formal
+            // obligation non-degenerate through AY's SMT rewriting: the
+            // emitted side remains TEST's `(lhs & lhs) == 0`, so offline
+            // portable certification reaches a genuine bit-blast instead of
+            // collapsing to an evidence-free canonical-false CNF.
             GuardCarrierKind::NullIfZero | GuardCarrierKind::DivZero => {
                 let flags = test_self_flags(w, lhs.clone());
                 let emitted = eval_int_condition(self.cond, &flags);
-                let intended = lhs.clone().eq_expr(SmtExpr::bv_const(0, w));
+                let intended = lhs.clone().bvult(SmtExpr::bv_const(1, w));
                 (emitted, intended, vec![("lhs".to_string(), w)])
             }
         };
@@ -1786,27 +1792,13 @@ mod tests {
     /// proof never exercises the multi-byte folds the shipped 32-bit code uses.
     /// The width-32 model is byte-for-byte `expand_x86_popcnt_inst` (masks
     /// 0x5555_5555/0x3333_3333/0x0f0f_0f0f, folds `>>8`,`>>16`, final mask 0x3f),
-    /// so this is a genuine solver proof of the exact 32-bit instruction stream.
-    /// Discharges in a few seconds; gated on a solver (the soundness-critical
-    /// no-solver path is the exhaustive width-8 proof, asserted above).
+    /// so this is a genuine proof of the exact 32-bit instruction stream. The
+    /// committed exact-query certificate is independently replayed before AY
+    /// resolution, making this a mandatory solver-independent regression gate.
     #[test]
     fn popcnt_swar_32_emitted_width_genuinely_verifies() {
-        if !crate::ay_bridge::z3_available() {
-            eprintln!("no formal solver; the width-32 popcnt proof requires one — skipping");
-            return;
-        }
         let v = PopcntSwarExpansionValidator::x86_generic("popcnt-expand", 32);
         let validation = v.validate();
-        // Certification-gap guard (crate::formal_gap): skip LOUDLY on the
-        // exact fail-closed gap diagnostics only; anything else still fails
-        // the original assertion.
-        if let Some(reason) = validator_certification_gap(&v.obligation(), &validation) {
-            crate::formal_gap::print_gap_skip(
-                "popcnt_swar_32_emitted_width_genuinely_verifies",
-                &reason,
-            );
-            return;
-        }
         assert!(
             validation.is_verified(),
             "the emitted Gpr32 popcount SWAR (>>8/>>16 folds) must genuinely verify"
@@ -1917,35 +1909,57 @@ mod tests {
         }
     }
 
-    /// At the REAL operand widths (i32/i64) the obligation still discharges (needs
-    /// a solver; each is ~30 ms — a single CMP-flag/`Jcc` equality, unlike popcnt).
+    /// At the REAL operand widths (i32/i64), require the committed exact-query
+    /// certificates to replay without a live solver. These are a single
+    /// CMP/TEST-flag + `Jcc` equivalence, not a sampled result.
     #[test]
     fn guard_carrier_real_widths_verify() {
-        if !crate::ay_bridge::z3_available() {
-            eprintln!("no solver; the wide guard-carrier proofs require one — skipping");
-            return;
-        }
         use GuardCarrierKind::*;
         for w in [32u32, 64] {
             for (kind, cc) in [(Bounds, X86CondCode::AE), (NullIfZero, X86CondCode::E)] {
                 let v = GuardCarrierExpansionValidator::new("guard", kind, cc, w);
                 let validation = v.validate();
-                // Certification-gap guard (crate::formal_gap): skip LOUDLY on
-                // the exact fail-closed gap diagnostics only; anything else
-                // still fails the original assertion.
-                if let Some(reason) = validator_certification_gap(&v.obligation(), &validation) {
-                    crate::formal_gap::print_gap_skip(
-                        &format!("guard_carrier_real_widths_verify {kind:?}/{cc:?} i{w}"),
-                        &reason,
-                    );
-                    continue;
-                }
                 assert!(
                     validation.is_verified(),
                     "{kind:?}/{cc:?} must verify at i{w}"
                 );
             }
         }
+    }
+
+    #[test]
+    fn wide_validators_use_portable_certs_before_missing_solver_and_mutation_fails_closed() {
+        let config = AYConfig {
+            solver_path: Some("/definitely/missing/ay".to_string()),
+            timeout_ms: crate::verdict_db::DB_VERDICT_TIMEOUT_MS,
+            produce_models: true,
+        };
+        let popcnt = PopcntSwarExpansionValidator::x86_generic("x86-popcnt-expand", 32);
+        assert!(
+            popcnt.validate_with_config(&config).is_verified(),
+            "the expensive popcount cert must also be portable across AY absence"
+        );
+        let valid = GuardCarrierExpansionValidator::new(
+            "x86-guard-carrier-expand",
+            GuardCarrierKind::Bounds,
+            X86CondCode::AE,
+            32,
+        );
+        assert!(
+            valid.validate_with_config(&config).is_verified(),
+            "an exact portable cert hit must not require a live AY binary"
+        );
+
+        let mutated = GuardCarrierExpansionValidator::new(
+            "x86-guard-carrier-expand",
+            GuardCarrierKind::Bounds,
+            X86CondCode::B,
+            32,
+        );
+        assert!(
+            !mutated.validate_with_config(&config).is_verified(),
+            "a query mutation must miss the cert and fail closed without AY"
+        );
     }
 
     /// LOCKS IN #67: the SDIV-identity expansion is correct on AArch64

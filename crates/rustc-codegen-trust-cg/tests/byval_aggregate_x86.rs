@@ -1,3 +1,6 @@
+#[path = "support/target_dir.rs"]
+mod target_dir_support;
+
 // Integration test: BY-VALUE AGGREGATES across the ABI — structs / tuples /
 // fixed arrays / multi-variant enums / Option passed, returned, stored, matched,
 // and matched THROUGH A REFERENCE — compiled for x86_64 via the
@@ -58,9 +61,7 @@ fn dylib_name() -> String {
 
 fn ensure_dylib_built() -> PathBuf {
     let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| crate_dir.join("target"));
+    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
     let name = dylib_name();
     let candidates = [
         target_dir.join("release").join(&name),

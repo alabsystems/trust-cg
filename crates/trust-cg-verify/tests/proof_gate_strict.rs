@@ -83,7 +83,22 @@ const SOLVER_CAPACITY_PENDING_ALLOWLIST: &[&str] = &[
 /// Exact static corpus cardinality after removing duplicate registrations.
 /// A change requires auditing both the capacity allowlist and the documented
 /// full-gate scope; silently shrinking the database is not a green gate.
-const EXPECTED_STATIC_PROOF_OBLIGATION_COUNT: usize = 1_869;
+///
+/// The 1,869 -> 1,877 increase is exactly the eight AArch64 ELF relocation
+/// rows named below. Keep their names live-bound so an unrelated replacement
+/// cannot inherit the cardinality credit.
+const EXPECTED_STATIC_PROOF_OBLIGATION_COUNT: usize = 1_877;
+
+const AARCH64_ELF_RELOCATION_CORPUS_ADDITION: &[&str] = &[
+    "ELF AArch64: R_AARCH64_CALL26 BL == S+A (PC-relative call)",
+    "ELF AArch64: R_AARCH64_JUMP26 B == S+A (PC-relative tail jump)",
+    "ELF AArch64: R_AARCH64_PREL32 word + P == S+A (PC-relative data)",
+    "ELF AArch64: R_AARCH64_ABS64 == S + A (abs64 pointer slot)",
+    "ELF AArch64: R_AARCH64_ADR_PREL_PG_HI21 ADRP == page(S+A)",
+    "ELF AArch64: R_AARCH64_ADD_ABS_LO12_NC ADRP+ADD == S+A",
+    "ELF AArch64: R_AARCH64_ADR_GOT_PAGE ADRP == page(G+A) (GOT slot page)",
+    "ELF AArch64: R_AARCH64_LD64_GOT_LO12_NC ADRP+LDR == G+A (GOT slot address)",
+];
 
 #[test]
 fn solver_capacity_pending_allowlist_is_narrow_unique_and_live() {
@@ -136,6 +151,57 @@ fn solver_capacity_pending_allowlist_is_narrow_unique_and_live() {
             "each name-bound capacity exception must identify exactly one registered proof: \
              {ambiguous_or_dead:?}"
         );
+    });
+}
+
+#[test]
+fn aarch64_elf_relocation_corpus_addition_is_exact_live_and_nondegenerate() {
+    on_large_stack(|| {
+        use std::collections::HashSet;
+        use trust_cg_verify::aarch64_elf_reloc_proofs::aarch64_elf_relocation_proofs;
+
+        let expected: HashSet<String> = AARCH64_ELF_RELOCATION_CORPUS_ADDITION
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        assert_eq!(
+            expected.len(),
+            AARCH64_ELF_RELOCATION_CORPUS_ADDITION.len(),
+            "AArch64 ELF relocation corpus ratchet contains duplicate names"
+        );
+
+        let lane = aarch64_elf_relocation_proofs();
+        let lane_names: HashSet<String> = lane.iter().map(|proof| proof.name.clone()).collect();
+        assert_eq!(
+            lane_names, expected,
+            "the eight-obligation corpus increase must remain exactly the audited AArch64 ELF relocation lane"
+        );
+        assert!(
+            lane.iter().all(|proof| proof.is_genuinely_proven()),
+            "every newly credited AArch64 ELF relocation obligation must be structurally non-degenerate"
+        );
+
+        let db = ProofDatabase::new();
+        for name in AARCH64_ELF_RELOCATION_CORPUS_ADDITION {
+            let registrations: Vec<_> = db
+                .all()
+                .iter()
+                .filter(|proof| proof.obligation.name == *name)
+                .collect();
+            assert_eq!(
+                registrations.len(),
+                1,
+                "new corpus row {name:?} must identify exactly one live registration"
+            );
+            assert!(
+                registrations[0].obligation.is_genuinely_proven(),
+                "registered corpus row {name:?} must remain structurally non-degenerate"
+            );
+            assert!(
+                !SOLVER_CAPACITY_PENDING_ALLOWLIST.contains(name),
+                "new corpus row {name:?} may not silently inherit solver-capacity debt"
+            );
+        }
     });
 }
 

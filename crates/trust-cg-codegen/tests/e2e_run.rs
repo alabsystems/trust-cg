@@ -45,6 +45,61 @@ use common::rosetta::{
 
 /// Returns true if we are running on AArch64 (Apple Silicon).
 /// E2E tests only work on the native target architecture.
+/// The HOST's native triple: these tests emit objects the host linker links
+/// and the host runs, so the empty-triple Mach-O default only works on macOS.
+fn host_aarch64_triple() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "aarch64-apple-darwin"
+    } else {
+        "aarch64-unknown-linux-gnu"
+    }
+}
+
+/// `cc` PIE opt-out, per host linker dialect.
+fn host_no_pie_flag() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "-Wl,-no_pie"
+    } else {
+        "-no-pie"
+    }
+}
+
+/// Expected object magic for the host-native format.
+fn host_object_magic_u32() -> u32 {
+    if cfg!(target_os = "macos") {
+        0xFEED_FACF
+    } else {
+        u32::from_le_bytes([0x7F, b'E', b'L', b'F'])
+    }
+}
+
+fn assert_host_object_magic_bytes(obj_bytes: &[u8], context: &str) {
+    assert!(obj_bytes.len() >= 4, "{context}: object too small");
+    let expected = host_object_magic_u32().to_le_bytes();
+    assert_eq!(
+        &obj_bytes[0..4],
+        &expected,
+        "{context}: object magic must match the host-native format"
+    );
+}
+
+/// Host-native disassembler: `otool -tv` on macOS, binutils `objdump -d`
+/// elsewhere. Both print lowercase AArch64 mnemonics, which is all the
+/// assertions below key on.
+fn disasm_object(path: &Path) -> String {
+    let output = if cfg!(target_os = "macos") {
+        Command::new("otool")
+            .args(["-tv", path.to_str().unwrap()])
+            .output()
+    } else {
+        Command::new("objdump")
+            .args(["-d", path.to_str().unwrap()])
+            .output()
+    }
+    .expect("host disassembler (otool/objdump) available");
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
 fn is_aarch64() -> bool {
     cfg!(target_arch = "aarch64")
 }
@@ -105,7 +160,7 @@ fn link_with_cc(dir: &Path, driver_c: &Path, obj: &Path, output_name: &str) -> P
         .arg(&binary)
         .arg(driver_c)
         .arg(obj)
-        .arg("-Wl,-no_pie"); // Simplify linking for test objects
+        .arg(host_no_pie_flag()); // Simplify linking for test objects
     let result = link_command_output(&mut link_cmd, output_name);
 
     if result.timed_out || !result.output.status.success() {
@@ -187,13 +242,25 @@ fn cleanup(dir: &Path) {
 ///
 /// For full pipeline compilation with frame lowering (prologue/epilogue),
 /// use `Pipeline::encode_and_emit` instead.
-fn encode_naked_to_macho(func: &MachFunction) -> Vec<u8> {
+/// Encode a naked function into a HOST-native relocatable object: Mach-O on
+/// macOS (leading-underscore symbols), ELF elsewhere. The host `cc` links the
+/// result against the C drivers below, so the format must be the host's own.
+fn encode_naked_to_host_object(func: &MachFunction) -> Vec<u8> {
     let code = encode_function(func).expect("encoding should succeed");
-    let mut writer = MachOWriter::new();
-    writer.add_text_section(&code);
-    let symbol_name = format!("_{}", func.name);
-    writer.add_symbol(&symbol_name, 1, 0, true).unwrap();
-    writer.write().unwrap()
+    if cfg!(target_os = "macos") {
+        let mut writer = MachOWriter::new();
+        writer.add_text_section(&code);
+        let symbol_name = format!("_{}", func.name);
+        writer.add_symbol(&symbol_name, 1, 0, true).unwrap();
+        writer.write().unwrap()
+    } else {
+        let mut writer =
+            trust_cg_codegen::elf::ElfWriter::new(trust_cg_codegen::elf::ElfMachine::AArch64);
+        let text = writer.add_text_section(&code);
+        // STT_FUNC = 2; ELF symbols carry no leading underscore.
+        writer.add_symbol(&func.name, text, 0, code.len() as u64, true, 2);
+        writer.write()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -470,7 +537,7 @@ fn test_e2e_return_const() {
 
     // Build the function: MOVZ X0, #42; RET
     let func = build_return_const_function();
-    let obj_bytes = encode_naked_to_macho(&func);
+    let obj_bytes = encode_naked_to_host_object(&func);
 
     // Write object file
     let obj_path = write_object_file(&dir, "return_const.o", &obj_bytes);
@@ -515,7 +582,7 @@ fn test_e2e_add() {
 
     // Build the function: ADD X0, X0, X1; RET
     let func = build_add_function();
-    let obj_bytes = encode_naked_to_macho(&func);
+    let obj_bytes = encode_naked_to_host_object(&func);
 
     // Write object file
     let obj_path = write_object_file(&dir, "add.o", &obj_bytes);
@@ -561,7 +628,7 @@ fn test_e2e_sub() {
     let dir = make_test_dir("sub");
 
     let func = build_sub_function();
-    let obj_bytes = encode_naked_to_macho(&func);
+    let obj_bytes = encode_naked_to_host_object(&func);
 
     let obj_path = write_object_file(&dir, "sub.o", &obj_bytes);
 
@@ -602,7 +669,7 @@ fn test_e2e_max() {
     let dir = make_test_dir("max");
 
     let func = build_max_function();
-    let obj_bytes = encode_naked_to_macho(&func);
+    let obj_bytes = encode_naked_to_host_object(&func);
 
     let obj_path = write_object_file(&dir, "max.o", &obj_bytes);
 
@@ -675,7 +742,7 @@ fn test_e2e_factorial() {
     }
 
     // Link and run the factorial binary.
-    let obj_bytes = encode_naked_to_macho(&func);
+    let obj_bytes = encode_naked_to_host_object(&func);
     let obj_path = write_object_file(&dir, "factorial.o", &obj_bytes);
     let driver_src = r#"
 #include <stdio.h>
@@ -727,6 +794,7 @@ fn test_full_pipeline_frame_lowering() {
     let mut func = build_add_function();
 
     let pipeline = Pipeline::new(PipelineConfig {
+        target_triple: host_aarch64_triple().to_string(),
         opt_level: OptLevel::O0,
         emit_debug: false,
         ..Default::default()
@@ -738,11 +806,7 @@ fn test_full_pipeline_frame_lowering() {
 
     // The object file is structurally valid Mach-O.
     assert!(obj_bytes.len() >= 4);
-    assert_eq!(
-        &obj_bytes[0..4],
-        &[0xCF, 0xFA, 0xED, 0xFE],
-        "Should be valid Mach-O"
-    );
+    assert_host_object_magic_bytes(&obj_bytes, "Should be valid Mach-O");
 
     // Verify the Mach-O is structurally valid and disassembles correctly.
     if is_aarch64() {
@@ -846,6 +910,7 @@ fn test_e2e_stack_store_reload() {
 
     // Run through encode_and_emit which does frame lowering + encoding.
     let pipeline = Pipeline::new(PipelineConfig {
+        target_triple: host_aarch64_triple().to_string(),
         opt_level: OptLevel::O0,
         emit_debug: false,
         ..Default::default()
@@ -858,17 +923,13 @@ fn test_e2e_stack_store_reload() {
     // Verify Mach-O header.
     assert!(obj_bytes.len() >= 4);
     let magic = u32::from_le_bytes([obj_bytes[0], obj_bytes[1], obj_bytes[2], obj_bytes[3]]);
-    assert_eq!(magic, 0xFEED_FACF, "should be valid Mach-O");
+    assert_eq!(magic, host_object_magic_u32(), "should be valid Mach-O");
 
     // Write and link.
     let obj_path = write_object_file(&dir, "store_reload.o", &obj_bytes);
 
     // Disassemble to verify the encoding includes store/load instructions.
-    let otool = Command::new("otool")
-        .args(["-tv", obj_path.to_str().unwrap()])
-        .output()
-        .expect("otool");
-    let disasm = String::from_utf8_lossy(&otool.stdout);
+    let disasm = disasm_object(&obj_path);
     eprintln!("store_reload disassembly:\n{}", disasm);
 
     // The disassembly should contain str and ldr instructions.
@@ -977,6 +1038,7 @@ fn test_e2e_callee_saved_spill() {
 
     // Run through encode_and_emit (includes frame lowering).
     let pipeline = Pipeline::new(PipelineConfig {
+        target_triple: host_aarch64_triple().to_string(),
         opt_level: OptLevel::O0,
         emit_debug: false,
         ..Default::default()
@@ -989,11 +1051,7 @@ fn test_e2e_callee_saved_spill() {
     let obj_path = write_object_file(&dir, "callee_saved_accum.o", &obj_bytes);
 
     // Disassemble — should show STP/LDP for callee-saved registers.
-    let otool = Command::new("otool")
-        .args(["-tv", obj_path.to_str().unwrap()])
-        .output()
-        .expect("otool");
-    let disasm = String::from_utf8_lossy(&otool.stdout);
+    let disasm = disasm_object(&obj_path);
     eprintln!("callee_saved_accum disassembly:\n{}", disasm);
 
     // Should contain stp (save pair) for callee-saved registers.
@@ -1113,6 +1171,7 @@ fn test_e2e_stack_slots_with_callee_saved() {
 
     // Run through encode_and_emit.
     let pipeline = Pipeline::new(PipelineConfig {
+        target_triple: host_aarch64_triple().to_string(),
         opt_level: OptLevel::O0,
         emit_debug: false,
         ..Default::default()
@@ -1125,11 +1184,7 @@ fn test_e2e_stack_slots_with_callee_saved() {
     let obj_path = write_object_file(&dir, "multi_slot.o", &obj_bytes);
 
     // Disassemble.
-    let otool = Command::new("otool")
-        .args(["-tv", obj_path.to_str().unwrap()])
-        .output()
-        .expect("otool");
-    let disasm = String::from_utf8_lossy(&otool.stdout);
+    let disasm = disasm_object(&obj_path);
     eprintln!("multi_slot disassembly:\n{}", disasm);
 
     // Should contain sub sp (stack allocation) and stp (callee-saved save).
@@ -1211,7 +1266,7 @@ fn test_e2e_trust_ir_high_register_pressure() {
     // Verify valid Mach-O.
     let obj = &result.object_code;
     let magic = u32::from_le_bytes([obj[0], obj[1], obj[2], obj[3]]);
-    assert_eq!(magic, 0xFEED_FACF, "should be valid Mach-O");
+    assert_eq!(magic, host_object_magic_u32(), "should be valid Mach-O");
 
     // If we are on AArch64, try to link and run.
     if is_aarch64() && has_cc() {
@@ -1219,11 +1274,7 @@ fn test_e2e_trust_ir_high_register_pressure() {
         let obj_path = write_object_file(&dir, "high_pressure.o", &result.object_code);
 
         // Disassemble to inspect.
-        let otool = Command::new("otool")
-            .args(["-tv", obj_path.to_str().unwrap()])
-            .output()
-            .expect("otool");
-        let disasm = String::from_utf8_lossy(&otool.stdout);
+        let disasm = disasm_object(&obj_path);
         eprintln!("trust_ir_high_pressure disassembly:\n{}", disasm);
 
         // The function should have frame setup (STP for FP/LR at minimum).
@@ -1262,7 +1313,7 @@ int main(void) {
             .arg(&binary)
             .arg(&driver_path)
             .arg(&obj_path)
-            .arg("-Wl,-no_pie");
+            .arg(host_no_pie_flag());
         let link_result = link_command_output(&mut link_cmd, "high_pressure");
 
         if !link_result.timed_out && link_result.output.status.success() {
@@ -1463,6 +1514,7 @@ fn test_e2e_stack_slots_all_opt_levels() {
         func.append_inst(entry, ret_id);
 
         let pipeline = Pipeline::new(PipelineConfig {
+            target_triple: host_aarch64_triple().to_string(),
             opt_level: *opt,
             emit_debug: false,
             ..Default::default()
@@ -1476,7 +1528,8 @@ fn test_e2e_stack_slots_all_opt_levels() {
         assert!(obj_bytes.len() >= 4, "{:?} produced tiny output", opt);
         let magic = u32::from_le_bytes([obj_bytes[0], obj_bytes[1], obj_bytes[2], obj_bytes[3]]);
         assert_eq!(
-            magic, 0xFEED_FACF,
+            magic,
+            host_object_magic_u32(),
             "{:?} produced invalid Mach-O magic",
             opt
         );
@@ -1508,15 +1561,15 @@ fn test_e2e_multiple_functions() {
     // at different offsets or multiple sections. For now, use separate .o files.)
 
     let add_func = build_add_function();
-    let add_obj = encode_naked_to_macho(&add_func);
+    let add_obj = encode_naked_to_host_object(&add_func);
     let add_path = write_object_file(&dir, "add.o", &add_obj);
 
     let sub_func = build_sub_function();
-    let sub_obj = encode_naked_to_macho(&sub_func);
+    let sub_obj = encode_naked_to_host_object(&sub_func);
     let sub_path = write_object_file(&dir, "sub.o", &sub_obj);
 
     let const_func = build_return_const_function();
-    let const_obj = encode_naked_to_macho(&const_func);
+    let const_obj = encode_naked_to_host_object(&const_func);
     let const_path = write_object_file(&dir, "return_const.o", &const_obj);
 
     // Write C driver that tests all three functions.
@@ -1548,7 +1601,7 @@ int main(void) {
         .arg(&add_path)
         .arg(&sub_path)
         .arg(&const_path)
-        .arg("-Wl,-no_pie");
+        .arg(host_no_pie_flag());
     let result = link_command_output(&mut link_cmd, "multiple objects");
 
     if result.timed_out || !result.output.status.success() {
@@ -1715,7 +1768,7 @@ fn test_e2e_sum_1_to_n() {
     );
 
     // Link and run the sum_1_to_n binary.
-    let obj_bytes = encode_naked_to_macho(&func);
+    let obj_bytes = encode_naked_to_host_object(&func);
     let obj_path = write_object_file(&dir, "sum_1_to_n.o", &obj_bytes);
     let driver_src = r#"
 #include <stdio.h>
@@ -1778,7 +1831,7 @@ fn test_e2e_factorial_extended() {
     // Link and run the factorial binary with 64-bit checks.
     // The build_factorial_function uses X registers (64-bit), so we can test
     // with 'long' in C to verify factorial(20) = 2432902008176640000.
-    let obj_bytes = encode_naked_to_macho(&func);
+    let obj_bytes = encode_naked_to_host_object(&func);
     let obj_path = write_object_file(&dir, "factorial_extended.o", &obj_bytes);
     let driver_src = r#"
 #include <stdio.h>
@@ -1964,18 +2017,14 @@ fn test_e2e_sum_trust_ir_pipeline() {
 
     let obj = &result.object_code;
     let magic = u32::from_le_bytes([obj[0], obj[1], obj[2], obj[3]]);
-    assert_eq!(magic, 0xFEED_FACF, "should be valid Mach-O");
+    assert_eq!(magic, host_object_magic_u32(), "should be valid Mach-O");
 
     if is_aarch64() && has_cc() {
         let dir = make_test_dir("trust_ir_sum_1_to_n");
         let obj_path = write_object_file(&dir, "sum_1_to_n_trust_ir.o", &result.object_code);
 
         // Disassemble for inspection.
-        let otool = Command::new("otool")
-            .args(["-tv", obj_path.to_str().unwrap()])
-            .output()
-            .expect("otool");
-        let disasm = String::from_utf8_lossy(&otool.stdout);
+        let disasm = disasm_object(&obj_path);
         eprintln!("trust_ir sum_1_to_n disassembly:\n{}", disasm);
 
         let driver_src = r#"
@@ -2003,7 +2052,7 @@ int main(void) {
             .arg(&binary)
             .arg(&driver_path)
             .arg(&obj_path)
-            .arg("-Wl,-no_pie");
+            .arg(host_no_pie_flag());
         let link_result = link_command_output(&mut link_cmd, "trust_ir_sum_1_to_n");
 
         if !link_result.timed_out && link_result.output.status.success() {

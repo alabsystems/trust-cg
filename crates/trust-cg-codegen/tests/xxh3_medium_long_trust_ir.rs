@@ -17,6 +17,50 @@ use trust_cg_codegen::pipeline::OptLevel;
 use trust_ir::{BinOp, Inst, Ty, ValueId};
 use trust_ir_build::{FunctionBuilder, ModuleBuilder};
 
+// ---------------------------------------------------------------------------
+// Host-native object support (GB10 re-baseline): these e2e tests emit objects
+// the HOST toolchain links and runs, so emission, magic checks, PIE flags and
+// disassembly must follow the host format — Mach-O on macOS, ELF elsewhere.
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+fn host_aarch64_triple() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "aarch64-apple-darwin"
+    } else {
+        "aarch64-unknown-linux-gnu"
+    }
+}
+
+#[allow(dead_code)]
+fn host_no_pie_flag() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "-Wl,-no_pie"
+    } else {
+        "-no-pie"
+    }
+}
+
+#[allow(dead_code)]
+fn host_object_magic_u32() -> u32 {
+    if cfg!(target_os = "macos") {
+        0xFEED_FACF
+    } else {
+        u32::from_le_bytes([0x7F, b'E', b'L', b'F'])
+    }
+}
+
+#[allow(dead_code)]
+fn assert_host_object_magic_bytes(obj_bytes: &[u8], context: &str) {
+    assert!(obj_bytes.len() >= 4, "{context}: object too small");
+    let expected = host_object_magic_u32().to_le_bytes();
+    assert_eq!(
+        &obj_bytes[0..4],
+        &expected,
+        "{context}: object magic must match the host-native format"
+    );
+}
+
 const XXH_PRIME64_1: u64 = 0x9E37_79B1_85EB_CA87;
 const PRIME_MX1: u64 = 0x1656_6791_9E37_79F9;
 const MASK32: u64 = 0xFFFF_FFFF;
@@ -110,7 +154,7 @@ fn link_with_cc(dir: &Path, driver_c: &Path, obj: &Path, output_name: &str) -> P
         .arg(&binary)
         .arg(driver_c)
         .arg(obj)
-        .arg("-Wl,-no_pie")
+        .arg(host_no_pie_flag())
         .output()
         .expect("run cc");
     if !output.status.success() {
@@ -155,8 +199,8 @@ fn assert_valid_macho(bytes: &[u8], ctx: &str) {
     );
     assert_eq!(
         &bytes[..4],
-        &[0xCF, 0xFA, 0xED, 0xFE],
-        "{ctx}: invalid Mach-O magic"
+        &host_object_magic_u32().to_le_bytes(),
+        "{ctx}: invalid host object magic"
     );
 }
 

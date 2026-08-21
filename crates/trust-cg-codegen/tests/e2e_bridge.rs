@@ -42,6 +42,50 @@ use trust_cg_lower::instructions::{Block, Instruction, IntCC, Opcode, Value};
 use trust_cg_lower::types::Type;
 
 // ---------------------------------------------------------------------------
+// Host-native object support (GB10 re-baseline): these e2e tests emit objects
+// the HOST toolchain links and runs, so emission, magic checks, PIE flags and
+// disassembly must follow the host format — Mach-O on macOS, ELF elsewhere.
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+fn host_aarch64_triple() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "aarch64-apple-darwin"
+    } else {
+        "aarch64-unknown-linux-gnu"
+    }
+}
+
+#[allow(dead_code)]
+fn host_no_pie_flag() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "-Wl,-no_pie"
+    } else {
+        "-no-pie"
+    }
+}
+
+#[allow(dead_code)]
+fn host_object_magic_u32() -> u32 {
+    if cfg!(target_os = "macos") {
+        0xFEED_FACF
+    } else {
+        u32::from_le_bytes([0x7F, b'E', b'L', b'F'])
+    }
+}
+
+#[allow(dead_code)]
+fn assert_host_object_magic_bytes(obj_bytes: &[u8], context: &str) {
+    assert!(obj_bytes.len() >= 4, "{context}: object too small");
+    let expected = host_object_magic_u32().to_le_bytes();
+    assert_eq!(
+        &obj_bytes[0..4],
+        &expected,
+        "{context}: object magic must match the host-native format"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Test infrastructure
 // ---------------------------------------------------------------------------
 
@@ -95,7 +139,7 @@ fn link_with_cc(dir: &Path, driver_c: &Path, obj: &Path, output_name: &str) -> P
         .arg(&binary)
         .arg(driver_c)
         .arg(obj)
-        .arg("-Wl,-no_pie")
+        .arg(host_no_pie_flag())
         .output()
         .expect("Failed to run cc");
 
@@ -141,6 +185,7 @@ fn cleanup(dir: &Path) {
 /// Compile a bridge-format LIR function through the Trust Codegen pipeline at O0.
 fn compile_bridge_lir(func: &Function) -> Result<Vec<u8>, String> {
     let config = PipelineConfig {
+        target_triple: host_aarch64_triple().to_string(),
         opt_level: OptLevel::O0,
         emit_debug: false,
         ..Default::default()
@@ -729,7 +774,7 @@ fn test_bridge_all_functions_compile() {
         );
         assert_eq!(
             &obj_bytes[0..4],
-            &[0xCF, 0xFA, 0xED, 0xFE],
+            &host_object_magic_u32().to_le_bytes(),
             "invalid Mach-O magic for '{}'",
             func.name
         );
@@ -745,7 +790,15 @@ fn test_bridge_macho_filetype() {
     let func = build_bridge_add();
     let obj_bytes = compile_bridge_lir(&func).expect("compilation should succeed");
 
-    // Mach-O header: filetype at offset 12, should be MH_OBJECT (1)
-    let filetype = u32::from_le_bytes([obj_bytes[12], obj_bytes[13], obj_bytes[14], obj_bytes[15]]);
-    assert_eq!(filetype, 1, "Mach-O filetype should be MH_OBJECT (1)");
+    if cfg!(target_os = "macos") {
+        // Mach-O header: filetype at offset 12, should be MH_OBJECT (1)
+        let filetype =
+            u32::from_le_bytes([obj_bytes[12], obj_bytes[13], obj_bytes[14], obj_bytes[15]]);
+        assert_eq!(filetype, 1, "Mach-O filetype should be MH_OBJECT (1)");
+    } else {
+        // ELF header: e_type at offset 16, should be ET_REL (1) — the same
+        // "relocatable object, not an executable" claim in the host format.
+        let e_type = u16::from_le_bytes([obj_bytes[16], obj_bytes[17]]);
+        assert_eq!(e_type, 1, "ELF e_type should be ET_REL (1)");
+    }
 }

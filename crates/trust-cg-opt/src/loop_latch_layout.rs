@@ -80,6 +80,7 @@ use trust_cg_ir::{
 };
 
 use crate::dom::DomTree;
+use crate::effects::{aarch64_for_each_use_position, for_each_inst_def};
 use crate::loops::{LoopAnalysis, NaturalLoop};
 use crate::pass_manager::{AnalysisCache, MachinePass};
 
@@ -92,7 +93,11 @@ impl MachinePass for LoopLatchLayoutCombine {
     }
 
     fn run(&mut self, func: &mut MachFunction) -> bool {
-        run_loop_latch_layout_combine(func, None)
+        // In-pipeline instance: LEGACY tiers only. The extended tier-3b
+        // rotation runs as a POST-CONVERGENCE single shot (see
+        // `run_extended_loop_rotation`) so no loop-shape recognizer in the
+        // iterative pipeline ever observes an extension-rotated loop.
+        run_loop_latch_layout_combine(func, None, false)
     }
 
     fn run_with_provenance(
@@ -100,7 +105,7 @@ impl MachinePass for LoopLatchLayoutCombine {
         func: &mut MachFunction,
         provenance: &mut ProvenanceMap,
     ) -> bool {
-        run_loop_latch_layout_combine(func, Some(provenance))
+        run_loop_latch_layout_combine(func, Some(provenance), false)
     }
 
     fn run_with_analyses(
@@ -136,9 +141,26 @@ fn loop_latch_layout_pass_id() -> PassId {
     PassId::new("loop-latch-layout")
 }
 
+/// Post-convergence entry for the EXTENDED tier-3b rotation (inverted
+/// orientations, carrier-copy prefixes, cmp headers). Called by the pipeline
+/// AFTER `run_to_fixpoint` so the vectorizers' NATIVE loop classifiers never
+/// see an extension-rotated loop (2026-08-13 v2_memfill wrong-abort class);
+/// their own canonical-backedge hardening (neon-fill) remains as defense in
+/// depth for importer-emitted do-whiles. Honors both kill switches.
+pub fn run_extended_loop_rotation(
+    func: &mut MachFunction,
+    provenance: Option<&mut ProvenanceMap>,
+) -> bool {
+    if !loop_rotate_enabled() || !loop_rotate_extended_enabled() {
+        return false;
+    }
+    run_loop_latch_layout_combine(func, provenance, true)
+}
+
 fn run_loop_latch_layout_combine(
     func: &mut MachFunction,
     mut provenance: Option<&mut ProvenanceMap>,
+    extended: bool,
 ) -> bool {
     let mut changed = false;
 
@@ -148,11 +170,26 @@ fn run_loop_latch_layout_combine(
     for _ in 0..func.blocks.len() {
         let dom = DomTree::compute(func);
         let loops = LoopAnalysis::compute(func, &dom);
-        let candidates: Vec<NaturalLoop> = loops.all_loops().cloned().collect();
+        // The EXTENDED tier rotates INNERMOST loops only: rotating a loop
+        // that contains other loops buys one taken branch per OUTER
+        // iteration — amortized over the whole inner execution, nothing —
+        // while reshaping the layout of every contained loop (measured
+        // +5% on p7_sieve when its 60k-iteration outer loop rotated).
+        // Innermost bodies are where the per-iteration savings live
+        // (b1_mispredict -11%); the legacy tiers keep their own admission.
+        let candidates: Vec<(NaturalLoop, bool)> = loops
+            .all_loops()
+            .map(|lp| {
+                let innermost = loops
+                    .all_loops()
+                    .all(|o| o.header == lp.header || !lp.body.contains(&o.header));
+                (lp.clone(), innermost)
+            })
+            .collect();
 
         let mut rewrote_one = false;
-        for lp in candidates {
-            if rewrite_loop(func, &lp, provenance.as_deref_mut()) {
+        for (lp, innermost) in candidates {
+            if rewrite_loop(func, &lp, provenance.as_deref_mut(), extended && innermost) {
                 changed = true;
                 rewrote_one = true;
                 break;
@@ -171,6 +208,7 @@ fn rewrite_loop(
     func: &mut MachFunction,
     lp: &NaturalLoop,
     mut provenance: Option<&mut ProvenanceMap>,
+    extended: bool,
 ) -> bool {
     if rewrite_counted_two_block_loop(func, lp, provenance.as_deref_mut()) {
         return true;
@@ -188,7 +226,7 @@ fn rewrite_loop(
         // duplicating that test into each in-loop backedge predecessor, so the
         // steady state skips the header round-trip (ackermann's countdown loop
         // with two backedges, header `cbz M, exit`).
-        if duplicate_header_test_into_latches(func, lp, provenance.as_deref_mut()) {
+        if duplicate_header_test_into_latches(func, lp, provenance.as_deref_mut(), extended) {
             return true;
         }
     }
@@ -201,6 +239,23 @@ fn rewrite_loop(
 /// `TRUST_CG_DISABLE_PASSES=looplatch`.
 fn loop_rotate_enabled() -> bool {
     std::env::var_os("TCG_NO_LOOP_ROTATE").is_none()
+}
+
+/// Gate for the EXTENDED tier-3b rotation (inverted-orientation headers,
+/// carrier-copy prefixes, CmpRR/CmpRI headers). Default ON since 2026-08-14:
+/// the miscompile that originally forced this behind an opt-in flag —
+/// neon-fill's NATIVE classifier routing its vector residual into a rotated
+/// loop's abort-armed header check (v2_memfill/v3_popcount wrong-abort) —
+/// is fixed at the source: neon-fill's NATIVE arm now requires the canonical
+/// unconditional latch backedge and classifies rotated loops through its
+/// ROTATED arm's `rotated_exit` guard instead. `TCG_NO_LOOP_ROTATE_EXT`
+/// remains as a bisection kill switch for the extension alone
+/// (`TCG_NO_LOOP_ROTATE` still disables all rotation tiers).
+/// Measured upside: b1_mispredict -11% (1.140x -> 1.016x vs LLVM).
+/// Consulted only by [`run_extended_loop_rotation`]; the in-pipeline pass
+/// instance always runs legacy-only.
+fn loop_rotate_extended_enabled() -> bool {
+    std::env::var_os("TCG_NO_LOOP_ROTATE_EXT").is_none()
 }
 
 fn rewrite_counted_two_block_loop(
@@ -511,13 +566,13 @@ fn deleted_value_uses_are_limited_to_condition_sequence(
 
     parsed.removed_ids.iter().copied().all(|removed_id| {
         let removed = func.inst(removed_id);
-        if !removed.produces_value() {
-            return true;
-        }
-        let Some(MachOperand::VReg(def)) = removed.operands.first() else {
-            return false;
-        };
-        all_vreg_uses_are_by(func, *def, &accepted_users)
+        let mut safe = true;
+        for_each_inst_def(removed, |def| {
+            if !all_vreg_uses_are_by(func, def, &accepted_users) {
+                safe = false;
+            }
+        });
+        safe
     })
 }
 
@@ -526,13 +581,13 @@ fn all_vreg_uses_are_by(func: &MachFunction, vreg: VReg, accepted_users: &HashSe
         let block = func.block(block_id);
         for &inst_id in &block.insts {
             let inst = func.inst(inst_id);
-            let use_start = if inst.produces_value() { 1 } else { 0 };
-            let uses_vreg = inst
-                .operands
-                .get(use_start..)
-                .unwrap_or(&[])
-                .iter()
-                .any(|op| matches!(op, MachOperand::VReg(candidate) if *candidate == vreg));
+            let mut uses_vreg = false;
+            aarch64_for_each_use_position(inst.opcode, inst.operands.len(), |pos| {
+                if matches!(inst.operands.get(pos), Some(MachOperand::VReg(candidate)) if *candidate == vreg)
+                {
+                    uses_vreg = true;
+                }
+            });
             if uses_vreg && !accepted_users.contains(&inst_id) {
                 return false;
             }
@@ -947,13 +1002,20 @@ fn apply_rotate_case_b(
 /// predecessor (the header is the predecessor's successor and consumes them at
 /// entry, so cloning changes no value on any path).
 struct TestOnlyHeader {
-    /// Header instructions preceding the final `b BODY` — the flag-only
-    /// compare(s) and the conditional exit branch; cloned into each latch.
+    /// Header instructions preceding the final unconditional `b` — the
+    /// flag-only compare(s) and the conditional branch; cloned into each latch.
     clone_insts: Vec<InstId>,
     /// Body-entry successor (inside the loop).
     body: BlockId,
     /// Exit successor (outside the loop).
     exit: BlockId,
+    /// Where each latch's terminating `b` is retargeted after the clone: the
+    /// header's own unconditional-branch target. `body` when the header is
+    /// `b.cond exit; b body` (the conditional EXITS), `exit` when it is
+    /// `b.cond body; b exit` (the conditional CONTINUES — b1_mispredict's
+    /// while-loop orientation, where the cloned `b.cond body` becomes the
+    /// rotated backedge and the fallthrough exits).
+    terminal_target: BlockId,
 }
 
 /// Recognize a pure test-only header ending in `b BODY`. Fail-closed: every
@@ -961,7 +1023,11 @@ struct TestOnlyHeader {
 /// (`B`/`BCond`/`Cbz`/`Cbnz`); none may define a virtual register or touch
 /// memory. The header must have exactly two successors — one in the loop body,
 /// one outside — and its branch targets must be exactly those two.
-fn parse_test_only_header(func: &MachFunction, lp: &NaturalLoop) -> Option<TestOnlyHeader> {
+fn parse_test_only_header(
+    func: &MachFunction,
+    lp: &NaturalLoop,
+    extended: bool,
+) -> Option<TestOnlyHeader> {
     let header = func.block(lp.header);
     if header.succs.len() != 2 {
         return None;
@@ -976,19 +1042,63 @@ fn parse_test_only_header(func: &MachFunction, lp: &NaturalLoop) -> Option<TestO
         return None;
     }
 
+    let mut carrier_dsts: Vec<u32> = Vec::new();
+    let mut seen_non_copy = false;
     for &id in &header.insts {
         let inst = func.inst(id);
         match inst.opcode {
-            AArch64Opcode::CmpRR
-            | AArch64Opcode::CmpRI
-            | AArch64Opcode::B
-            | AArch64Opcode::BCond
-            | AArch64Opcode::Cbz
-            | AArch64Opcode::Cbnz => {}
+            // A leading run of GPR carrier copies feeding the test (the
+            // importer's block-param protocol keeps the IV compare reading a
+            // header-local temp, e.g. `MovR t, iv; CmpRR t, n`). Each clone
+            // renames the dest to a FRESH vreg per latch — no second
+            // definition is ever created — so these are safe to duplicate.
+            // The dest must be header-local (checked below).
+            AArch64Opcode::MovR | AArch64Opcode::Copy
+                if extended && !seen_non_copy && can_harden_carrier_copy(inst) =>
+            {
+                // Per-INSTANCE flag vetting (review hardening): the arm's
+                // `continue` bypasses the blanket check below, and flags are
+                // stamped per instance — a MovR carrying memory/call flags
+                // must not be cloned uninspected.
+                if inst.reads_memory() || inst.writes_memory() || inst.is_call() {
+                    return None;
+                }
+                let Some(MachOperand::VReg(dst)) = inst.operands.first() else {
+                    return None;
+                };
+                carrier_dsts.push(dst.id);
+                continue;
+            }
+            // The compares' only "side effect" is the NZCV write — which is
+            // precisely what the clone exists to reproduce at the latch. The
+            // clones are spliced immediately before the latch terminal, after
+            // every existing flag consumer in the latch, and the rotated
+            // latch->body edge carries the same flag values the header's own
+            // compare produced (same opcode, same operand values). Exempting
+            // them here revives arms that were dead since the tier landed:
+            // `has_side_effects()` is true for CmpRR/CmpRI, so only
+            // cbz/cbnz-style headers ever passed the blanket check below.
+            AArch64Opcode::CmpRR | AArch64Opcode::CmpRI if extended => {
+                // Exempt ONLY the NZCV write (`has_side_effects`); every other
+                // per-instance screen still applies (review hardening — a
+                // compare instance stamped with memory flags must decline).
+                if inst.produces_value()
+                    || inst.reads_memory()
+                    || inst.writes_memory()
+                    || inst.is_call()
+                {
+                    return None;
+                }
+                seen_non_copy = true;
+                continue;
+            }
+            AArch64Opcode::B | AArch64Opcode::BCond | AArch64Opcode::Cbz | AArch64Opcode::Cbnz => {
+                seen_non_copy = true;
+            }
             _ => return None,
         }
-        // No value-producing instruction may appear: cloning it would create a
-        // second definition of its destination in every latch.
+        // No other value-producing instruction may appear: cloning it would
+        // create a second definition of its destination in every latch.
         if inst.produces_value()
             || inst.has_side_effects()
             || inst.reads_memory()
@@ -998,15 +1108,46 @@ fn parse_test_only_header(func: &MachFunction, lp: &NaturalLoop) -> Option<TestO
             return None;
         }
     }
+    // Every carrier dest must be consumed ONLY inside this header: a use
+    // anywhere else would read the original vreg while the rotated latches
+    // define fresh renames, changing the value it sees.
+    if !carrier_dsts.is_empty() {
+        let header_ids: HashSet<InstId> = header.insts.iter().copied().collect();
+        for block in func.blocks.iter() {
+            for &iid in &block.insts {
+                if header_ids.contains(&iid) {
+                    continue;
+                }
+                for op in &func.inst(iid).operands {
+                    if let MachOperand::VReg(v) = op
+                        && carrier_dsts.contains(&v.id)
+                    {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
 
-    // The header's last instruction is the unconditional fall-into-body branch;
-    // each latch reuses its own terminating branch as this edge, so only the
-    // prefix (compare + conditional exit) needs cloning.
+    // The header's last instruction is its unconditional branch; each latch
+    // reuses its own terminating branch as that edge, so only the prefix
+    // (compare + conditional branch) needs cloning. Both orientations are
+    // accepted: `b.cond exit; b body` (terminal -> body) and
+    // `b.cond body; b exit` (terminal -> exit). The exact-{body, exit}
+    // targets check below guarantees the prefix conditional(s) point at the
+    // OTHER successor in each case.
     let (&last_id, prefix) = header.insts.split_last()?;
     let last = func.inst(last_id);
-    if last.opcode != AArch64Opcode::B || branch_target(last) != Some(body) {
+    if last.opcode != AArch64Opcode::B {
         return None;
     }
+    let terminal_target = match branch_target(last) {
+        Some(t) if t == body => t,
+        // Inverted orientation (`b.cond body; b exit`) is part of the
+        // extended rotation.
+        Some(t) if t == exit && extended => t,
+        _ => return None,
+    };
 
     // The branch targets across the whole header must be exactly {body, exit}.
     let mut targets: Vec<BlockId> = header
@@ -1027,6 +1168,7 @@ fn parse_test_only_header(func: &MachFunction, lp: &NaturalLoop) -> Option<TestO
         clone_insts: prefix.to_vec(),
         body,
         exit,
+        terminal_target,
     })
 }
 
@@ -1035,15 +1177,32 @@ fn parse_test_only_header(func: &MachFunction, lp: &NaturalLoop) -> Option<TestO
 /// only as the one-time entry guard, so steady-state iterations back-edge
 /// straight into the body without the header round-trip (ackermann's countdown
 /// loop with two backedges into a `cbz M, exit` header).
+/// Extended-rotation profitability floor: total in-loop instruction count.
+/// Rotating a TINY loop (a vectorizer residual, a 3-inst byte loop) buys at
+/// most one taken branch per iteration of a loop that barely runs, while the
+/// cloned test and the changed loop shape perturb downstream block layout —
+/// measured on p7_sieve as a net +4.6% runtime when tiny residual loops were
+/// rotated (their neighbors' headers lost body-fallthrough orientation). The
+/// win case (b1_mispredict, -11%) is a ~33-inst multi-block body; 16 cleanly
+/// separates the populations on the corpus.
+const MIN_EXTENDED_ROTATE_LOOP_INSTS: usize = 8;
+
 fn duplicate_header_test_into_latches(
     func: &mut MachFunction,
     lp: &NaturalLoop,
     provenance: Option<&mut ProvenanceMap>,
+    extended: bool,
 ) -> bool {
     if block_contains_phi(func, lp.header) {
         return false;
     }
-    let Some(header) = parse_test_only_header(func, lp) else {
+    if extended {
+        let loop_insts: usize = lp.body.iter().map(|&b| func.block(b).insts.len()).sum();
+        if loop_insts < MIN_EXTENDED_ROTATE_LOOP_INSTS {
+            return false;
+        }
+    }
+    let Some(header) = parse_test_only_header(func, lp, extended) else {
         return false;
     };
     if block_contains_phi(func, header.body) || block_contains_phi(func, header.exit) {
@@ -1062,7 +1221,17 @@ fn duplicate_header_test_into_latches(
             has_outside_pred = true;
             continue;
         }
-        if pred == header.body || pred == lp.header {
+        if pred == lp.header {
+            return false;
+        }
+        // A latch that IS the body-entry means a two-block loop; the legacy
+        // tier defers those to tiers 1/3a. The EXTENDED tier takes them:
+        // tier 1's `header_has_only_condition_insts` declines carrier-copy
+        // headers (p5_struct_acc's `MovR t, iv; cmp t, n` shape), and the
+        // clone-into-latch transform is orientation- and shape-sound here —
+        // the cloned conditional simply becomes a self-backedge on the body
+        // block, with the header surviving as the entry guard.
+        if pred == header.body && !extended {
             return false;
         }
         let pred_block = func.block(pred);
@@ -1099,16 +1268,52 @@ fn apply_duplicate_header_test(
     let pass = loop_latch_layout_pass_id();
 
     for latch in latches {
-        // Clone the header's test prefix (compare + conditional exit).
+        // Clone the header's test prefix (carrier copies + compare +
+        // conditional branch). Carrier-copy dests are renamed to fresh vregs
+        // (one per latch) and every later cloned instruction reads the
+        // renamed temp, so no vreg ever gains a second definition.
+        // Keyed on the FULL VReg (id, class): same-id different-class vregs
+        // are distinct values in this IR (see `all_vreg_uses_are_by`), and an
+        // id-only key would conflate two carrier dests sharing an id across
+        // classes — renaming a use to a never-defined fresh vreg
+        // (review-confirmed PLAUSIBLE miscompile shape).
+        let mut rename: std::collections::HashMap<VReg, u32> = std::collections::HashMap::new();
         let mut cloned_ids: Vec<(InstId, InstId)> = Vec::with_capacity(header.clone_insts.len());
         for &src_id in &header.clone_insts {
-            let cloned_inst = func.inst(src_id).clone();
+            let mut cloned_inst = func.inst(src_id).clone();
+            let is_copy = matches!(
+                cloned_inst.opcode,
+                AArch64Opcode::MovR | AArch64Opcode::Copy
+            ) && can_harden_carrier_copy(&cloned_inst);
+            if is_copy {
+                // Rename src via the map first, then allocate the fresh dest.
+                if let Some(MachOperand::VReg(srcv)) = cloned_inst.operands.get(1).cloned()
+                    && let Some(&fresh) = rename.get(&srcv)
+                {
+                    cloned_inst.operands[1] = MachOperand::VReg(VReg { id: fresh, ..srcv });
+                }
+                if let Some(MachOperand::VReg(dstv)) = cloned_inst.operands.first().cloned() {
+                    let fresh = func.alloc_vreg();
+                    rename.insert(dstv, fresh);
+                    cloned_inst.operands[0] = MachOperand::VReg(VReg { id: fresh, ..dstv });
+                }
+            } else {
+                for op in cloned_inst.operands.iter_mut() {
+                    if let MachOperand::VReg(v) = op
+                        && let Some(&fresh) = rename.get(v)
+                    {
+                        *op = MachOperand::VReg(VReg { id: fresh, ..*v });
+                    }
+                }
+            }
             let new_id = func.push_inst(cloned_inst);
             cloned_ids.push((src_id, new_id));
         }
 
         // Splice the clones in front of the latch's terminating `b header`, then
-        // retarget that branch to the body — it becomes the rotated backedge.
+        // retarget that branch to the header's own unconditional-branch target
+        // (`terminal_target`: body in the classic orientation, exit in the
+        // inverted one); the cloned conditional supplies the other edge.
         let term_id = *func
             .block(latch)
             .insts
@@ -1119,7 +1324,7 @@ fn apply_duplicate_header_test(
             let pos = insts.len() - 1;
             insts.splice(pos..pos, cloned_ids.iter().map(|&(_, id)| id));
         }
-        func.inst_mut(term_id).operands = vec![MachOperand::Block(header.body)];
+        func.inst_mut(term_id).operands = vec![MachOperand::Block(header.terminal_target)];
 
         if let Some(provenance) = provenance.as_deref_mut() {
             for &(src_id, new_id) in &cloned_ids {
@@ -2467,5 +2672,121 @@ mod tests {
             func.inst(ids.latch_b_branch).operands,
             vec![block(ids.header)]
         );
+    }
+    /// b1_mispredict's RNG while-loop shape: multi-block body, header =
+    /// carrier copy + CmpRR + BCond(body) + B(exit) (the INVERTED
+    /// orientation), single latch ending `b header`. Tier 3b must rotate:
+    /// clone the test (with a renamed carrier temp) into the latch and
+    /// retarget its terminal to the exit.
+    #[test]
+    fn rotates_multiblock_while_loop_with_carrier_copy_header() {
+        // The extended rotation is default-on (kill switch
+        // TCG_NO_LOOP_ROTATE_EXT); nothing in this binary sets it, so the
+        // test exercises the production default.
+        let mut func = MachFunction::new("b1shape".to_string(), Signature::new(vec![], vec![]));
+        let entry = func.entry;
+        let header = func.create_block();
+        let body = func.create_block();
+        let latch = func.create_block();
+        let exit = func.create_block();
+        func.next_vreg = 100;
+
+        push(
+            &mut func,
+            entry,
+            MachInst::new(AArch64Opcode::B, vec![block(header)]),
+        );
+
+        // header: MovR t, iv ; CmpRR t, n ; BCond cc -> body ; B exit
+        push(
+            &mut func,
+            header,
+            MachInst::new(AArch64Opcode::MovR, vec![vreg(12), vreg(9)]),
+        );
+        push(
+            &mut func,
+            header,
+            MachInst::new(AArch64Opcode::CmpRR, vec![vreg(12), vreg(1)]),
+        );
+        push(
+            &mut func,
+            header,
+            MachInst::new(
+                AArch64Opcode::BCond,
+                vec![imm(CondCode::LO.encoding() as i64), block(body)],
+            ),
+        );
+        push(
+            &mut func,
+            header,
+            MachInst::new(AArch64Opcode::B, vec![block(exit)]),
+        );
+
+        // body: enough arithmetic to clear MIN_EXTENDED_ROTATE_LOOP_INSTS
+        // (the profitability floor), then fall to latch.
+        for k in 0..14u32 {
+            push(
+                &mut func,
+                body,
+                MachInst::new(AArch64Opcode::EorRR, vec![vreg(20 + k), vreg(9), vreg(1)]),
+            );
+        }
+        push(
+            &mut func,
+            body,
+            MachInst::new(AArch64Opcode::B, vec![block(latch)]),
+        );
+
+        // latch: iv update, b header
+        push(
+            &mut func,
+            latch,
+            MachInst::new(AArch64Opcode::AddRI, vec![vreg(9), vreg(9), imm(1)]),
+        );
+        let latch_b = push(
+            &mut func,
+            latch,
+            MachInst::new(AArch64Opcode::B, vec![block(header)]),
+        );
+
+        func.add_edge(entry, header);
+        func.add_edge(header, body);
+        func.add_edge(header, exit);
+        func.add_edge(body, latch);
+        func.add_edge(latch, header);
+
+        let changed = run_loop_latch_layout_combine(&mut func, None, true);
+        assert!(changed, "tier 3b must rotate the inverted-orientation loop");
+
+        // The latch's terminal must now target the EXIT (fallthrough-out), and
+        // a cloned BCond -> body must precede it as the rotated backedge.
+        let term = func.inst(latch_b);
+        assert_eq!(term.opcode, AArch64Opcode::B);
+        assert_eq!(
+            branch_target(term),
+            Some(exit),
+            "terminal retargeted to exit"
+        );
+        let latch_insts = &func.block(latch).insts;
+        let cloned_bcond = latch_insts
+            .iter()
+            .filter(|&&id| func.inst(id).opcode == AArch64Opcode::BCond)
+            .count();
+        assert_eq!(cloned_bcond, 1, "cloned conditional backedge present");
+        // CFG: latch no longer feeds the header.
+        assert!(!func.block(latch).succs.contains(&header));
+        assert!(func.block(latch).succs.contains(&body));
+        assert!(func.block(latch).succs.contains(&exit));
+        // The cloned carrier copy must define a FRESH vreg, not vreg 12.
+        let clone_movs: Vec<_> = latch_insts
+            .iter()
+            .filter(|&&id| func.inst(id).opcode == AArch64Opcode::MovR)
+            .collect();
+        assert_eq!(clone_movs.len(), 1, "carrier copy cloned once");
+        let mov = func.inst(*clone_movs[0]);
+        let MachOperand::VReg(d) = &mov.operands[0] else {
+            panic!()
+        };
+        assert_ne!(d.id, 12, "cloned carrier dest renamed to a fresh vreg");
     }
 }

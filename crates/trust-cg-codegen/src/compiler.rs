@@ -2470,10 +2470,10 @@ fn validate_x86_overflow_expansion_canary() -> Result<(), CompileError> {
 /// Width 8 keeps the base proof EXHAUSTIVE (complete over all 256 inputs, never
 /// sampled) — but at width 8 the SWAR reduction-fold loop (`dst += dst >> {8,16,
 /// 32}`) runs zero times, so it never exercises the multi-byte folds the emitted
-/// Gpr32/Gpr64 code actually ships. When a formal solver is available we ALSO
-/// genuinely prove the real emitted Gpr32 width (32) — whose model masks, shifts
-/// and final mask are byte-for-byte `expand_x86_popcnt_inst` — so a regression in
-/// either the `>>8` or `>>16` fold now fails the compile closed. The Gpr64 width
+/// Gpr32/Gpr64 code actually ships. We therefore also require the real emitted
+/// Gpr32 width (32), whose model masks, shifts and final mask are byte-for-byte
+/// `expand_x86_popcnt_inst`, so a regression in either the `>>8` or `>>16` fold
+/// fails the compile closed. The Gpr64 width
 /// (64) is provable too but ~30x slower (the 64-term spec pushes AY past the 30 s
 /// timeout `validate()` would surface as a Rejection), so it is pinned as the
 /// dedicated proof test `popcnt_swar_64_emitted_width_genuinely_verifies` (run in
@@ -2488,30 +2488,25 @@ fn validate_x86_overflow_expansion_canary() -> Result<(), CompileError> {
 /// build-embedded DRAT certificate for exactly this obligation, INDEPENDENTLY
 /// re-checked by the vendored `drat-trim` in this process (~1-2 s,
 /// deterministic replay — no search, no deadline) before it is credited. The
-/// recorded verdict is never trusted: the key binds the solver binary's
-/// bytes-hash and the exact SMT2 bytes derived here from the live SWAR model,
-/// so a regressed model or a changed solver misses and re-proves LIVE; any
-/// miss/mismatch/tamper/check-failure falls back to the live proof
-/// (fail-closed, never a weaker verdict; `TCG_CANARY_NO_CACHE=1` forces live).
+/// recorded verdict is never trusted: a source-embedded manifest binds the
+/// complete certificate bytes, exact SMT2 derived here from the live SWAR
+/// model, producer provenance, and authorized checker bytes. A regressed model
+/// misses; any miss/mismatch/tamper/check-failure falls through to the ordinary
+/// live proof lane (fail-closed, never a weaker verdict;
+/// `TCG_CANARY_NO_CACHE=1` forces live). Consuming an exact certificate does not
+/// require the offline AY producer to be installed.
 fn validate_x86_popcnt_expansion_canary() -> Result<(), CompileError> {
     use std::sync::OnceLock;
-    use trust_cg_verify::ay_bridge::z3_available;
     use trust_cg_verify::pass_validators::{
         PassValidation, PassValidator, PopcntSwarExpansionValidator,
     };
 
     static RESULT: OnceLock<Result<(), (String, String, String)>> = OnceLock::new();
     let cached = RESULT.get_or_init(|| {
-        // Width 8 is exhaustive and always checked; width 32 (the dominant emitted
-        // width) is a genuine solver proof of the exact 32-bit instruction stream
-        // and is added only when a solver is present (without one `validate()`
-        // fails closed above the exhaustive threshold, which must not reject every
-        // popcnt compile on a solver-less host). Cached for the life of the process.
-        let mut widths: Vec<u32> = vec![8];
-        if z3_available() {
-            widths.push(32);
-        }
-        for width in widths {
+        // Width 8 discharges exhaustively. Width 32 is always requested: its
+        // committed portable certificate is checked before AY resolution, and
+        // a missing/invalid cert still fails closed through the live lane.
+        for width in [8, 32] {
             let validator = PopcntSwarExpansionValidator::x86_generic("x86-popcnt-expand", width);
             if let PassValidation::Rejected {
                 obligation_name,
@@ -3933,6 +3928,34 @@ fn generate_x86_64_proof_certificates(
     certs
 }
 
+#[cfg(feature = "verify")]
+fn crosscheck_elf_relocation_inventory_digest(
+    object_bytes: &[u8],
+    inventory_kinds: &[trust_cg_verify::ObjectRelocationKind],
+) -> Result<(), CompileError> {
+    let digest = crate::elf::reparse::reloc_type_digest(object_bytes).map_err(|e| {
+        CompileError::Pipeline(crate::pipeline::PipelineError::RelocationInventoryDigest(
+            format!("emitted object failed relocation digest parse: {e}"),
+        ))
+    })?;
+    let mut artifact: Vec<trust_cg_verify::ObjectRelocationKind> = digest
+        .into_iter()
+        .map(crate::pipeline::aarch64_elf_kind_from_r_type)
+        .collect();
+    artifact.sort_unstable();
+    let mut inventory: Vec<trust_cg_verify::ObjectRelocationKind> = inventory_kinds.to_vec();
+    inventory.sort_unstable();
+    if artifact != inventory {
+        return Err(CompileError::Pipeline(
+            crate::pipeline::PipelineError::RelocationInventoryDigest(format!(
+                "object carries {artifact:?} but the proof inventory names {inventory:?}; \
+                 a relocation outside the mirrored inventory must never ship"
+            )),
+        ));
+    }
+    Ok(())
+}
+
 impl Compiler {
     /// Create a new compiler with the given configuration.
     pub fn new(config: CompilerConfig) -> Self {
@@ -5035,6 +5058,8 @@ impl Compiler {
         let proofs: Option<Vec<ProofCertificate>> = None;
 
         #[cfg(feature = "verify")]
+        let mut elf_inventory_kinds: Option<Vec<trust_cg_verify::ObjectRelocationKind>> = None;
+        #[cfg(feature = "verify")]
         if let Some(proofs) = proofs.as_mut()
             && let Some(report) = pipeline.module_relocation_inventory_report_with_object_state(
                 &prepared_funcs,
@@ -5043,6 +5068,11 @@ impl Compiler {
                 format!("{}-module.o", compiler_target_triple(self.target_spec)),
             )?
         {
+            // Retain the ELF inventory rows for the ARTIFACT-LEVEL digest
+            // cross-check against the emitted object bytes below.
+            if crate::pipeline::target_triple_uses_elf(&compiler_target_triple(self.target_spec)) {
+                elf_inventory_kinds = Some(report.entries.iter().map(|e| e.kind).collect());
+            }
             append_object_relocation_inventory_certificate(proofs, &report);
         }
 
@@ -5125,6 +5155,20 @@ impl Compiler {
             }
             bytes
         };
+
+        // ARTIFACT-LEVEL relocation-row digest (recorded follow-up to the
+        // aarch64 ELF Certified composition): the inventory above was built by
+        // MIRRORING emitter bookkeeping, and the reparse gate proves only
+        // bytes == writer intent — so a writer-side relocation the mirror
+        // never anticipated would pass both while shipping uninventoried.
+        // Parse the relocation records back OUT of the artifact itself and
+        // require the multiset to equal the inventory rows; any drift (in
+        // EITHER direction, cached artifacts included) fails the compile
+        // closed.
+        #[cfg(feature = "verify")]
+        if let Some(kinds) = elf_inventory_kinds.as_deref() {
+            crosscheck_elf_relocation_inventory_digest(&obj_bytes, kinds)?;
+        }
 
         if tracing {
             trace_entries.push(TraceEntry {
@@ -10209,7 +10253,7 @@ mod tests {
 
     #[cfg(feature = "verify")]
     #[test]
-    fn test_actual_aarch64_elf_relocation_inventory_blocks_without_formal_proof() {
+    fn test_actual_aarch64_elf_relocation_inventory_promotes_with_value_lane_and_binding() {
         use trust_cg_ir::function::{MachFunction as IrMachFunction, Signature as IrSignature};
         use trust_cg_ir::inst::{AArch64Opcode as IrOpcode, MachInst as IrMachInst};
         use trust_cg_ir::operand::MachOperand as IrOperand;
@@ -10235,17 +10279,22 @@ mod tests {
         let mut certs = Vec::new();
         append_object_relocation_inventory_certificate(&mut certs, &report);
 
-        assert!(!report.is_promotable());
+        // The Certified composition now holds for the ordinary rows: the
+        // CALL26 registry row cites the aarch64_elf_reloc_proofs value lane
+        // and the shared ELF reparse gate (default Enforce) supplies the
+        // per-object binding.
+        assert!(report.is_promotable(), "{report:?}");
         let inventory_cert = certs
             .iter()
-            .find(|cert| !cert.verified && cert.category == "relocation_inventory")
-            .expect("an implemented but unproven ELF relocation must append a blocker");
+            .find(|cert| cert.category == "relocation_inventory")
+            .expect("the relocation inventory must always append a certificate");
         assert!(
-            inventory_cert.strength.contains("R_AARCH64_CALL26")
-                && inventory_cert
-                    .strength
-                    .contains("no object relocation proof is registered"),
-            "ordinary ELF relocation blocker should name its missing proof: {inventory_cert:?}"
+            inventory_cert.verified,
+            "bound + registered rows must certify: {inventory_cert:?}"
+        );
+        assert!(
+            inventory_cert.strength.contains("aarch64_elf_reloc_proofs"),
+            "the certificate should cite the value lane: {inventory_cert:?}"
         );
     }
 
@@ -10375,15 +10424,71 @@ mod tests {
 
     /// The ELF local-exec `#[thread_local]` read (`MRS; ADD #:tprel_hi12:, LSL #12;
     /// ADD #:tprel_lo12_nc:`) emits the two TLSLE relocation rows
-    /// (`R_AARCH64_TLSLE_ADD_TPREL_HI12` / `_LO12_NC`), each backed by an
-    /// solver-backed bit-field-placement obligation
-    /// (`trust_cg_verify::aarch64_elf_tls_reloc_proofs`). That is Trusted formal
-    /// evidence, not production Certified authority: the inventory cannot yet
-    /// represent that distinction or bind the strict gate report and solver
-    /// identity to this object, so both rows must block certified promotion.
+    /// (`R_AARCH64_TLSLE_ADD_TPREL_HI12` / `_LO12_NC`), each a production
+    /// registry row citing the solver-backed bit-field-placement obligations
+    /// (`trust_cg_verify::aarch64_elf_tls_reloc_proofs`). Under the DEFAULT
+    /// Enforce ELF reparse gate the inventory composes that value lane with
+    /// the per-object `ElfReparseEnforced` binding — the same Certified
+    /// composition as the ordinary eight rows — so the report PROMOTES with
+    /// both rows Verified. (The unbound side — registry row without the
+    /// binding must fail closed — is pinned in-crate by
+    /// `trust_cg_verify::object_inventory` tests and end-to-end by the CLI
+    /// `emit_proofs_flag` suite, which can withdraw the binding via
+    /// subprocess env; the reparse mode is OnceLock-cached, so an in-process
+    /// env toggle here would race sibling tests.)
+    /// The ARTIFACT-LEVEL digest cross-check: an emitted object's parsed
+    /// relocation multiset must equal the mirrored inventory rows, and ANY
+    /// drift — a row the mirror missed, a row the object lacks, or a foreign
+    /// relocation type — fails closed with the exact disagreement named.
     #[cfg(feature = "verify")]
     #[test]
-    fn test_actual_aarch64_elf_local_exec_tls_relocation_inventory_blocks_certification() {
+    fn elf_relocation_inventory_digest_crosscheck_matches_and_fails_closed() {
+        use trust_cg_verify::ObjectRelocationKind as O;
+
+        // A minimal object with two known relocations: CALL26 + ABS64.
+        let mut writer = crate::elf::ElfWriter::new(crate::elf::ElfMachine::AArch64);
+        writer.add_text_section_with_align(&[0u8; 16], 4);
+        writer.add_symbol("callee", 0, 0, 0, true, 2);
+        writer.add_relocation(
+            0,
+            crate::elf::Elf64Rela::aarch64(0, 1, crate::elf::AArch64RelocType::Call26, 0),
+        );
+        writer.add_relocation(
+            0,
+            crate::elf::Elf64Rela::aarch64(8, 1, crate::elf::AArch64RelocType::Abs64, 0),
+        );
+        let bytes = writer.write_checked().expect("checked write");
+
+        // Digest == inventory (order-independent): passes.
+        crosscheck_elf_relocation_inventory_digest(
+            &bytes,
+            &[O::AArch64ElfAbs64, O::AArch64ElfCall26],
+        )
+        .expect("matching inventory must pass");
+
+        // A row the object lacks: fails closed.
+        let err = crosscheck_elf_relocation_inventory_digest(
+            &bytes,
+            &[O::AArch64ElfAbs64, O::AArch64ElfCall26, O::AArch64ElfPrel32],
+        )
+        .expect_err("inventory naming a row the object lacks must fail");
+        assert!(err.to_string().contains("relocation inventory digest"));
+
+        // A row the mirror missed (object has more than the inventory): fails.
+        crosscheck_elf_relocation_inventory_digest(&bytes, &[O::AArch64ElfCall26])
+            .expect_err("an object relocation outside the inventory must fail");
+
+        // Same count, wrong kind: fails.
+        crosscheck_elf_relocation_inventory_digest(
+            &bytes,
+            &[O::AArch64ElfAbs64, O::AArch64ElfJump26],
+        )
+        .expect_err("a kind mismatch must fail");
+    }
+
+    #[cfg(feature = "verify")]
+    #[test]
+    fn test_actual_aarch64_elf_local_exec_tls_relocation_inventory_certifies_bound() {
         use trust_cg_ir::function::{MachFunction as IrMachFunction, Signature as IrSignature};
         use trust_cg_ir::inst::{AArch64Opcode as IrOpcode, MachInst as IrMachInst};
         use trust_cg_ir::operand::MachOperand as IrOperand;
@@ -10426,7 +10531,11 @@ mod tests {
             .expect("local-exec TLSLE fixups map to ELF relocations")
             .expect("AArch64 Linux ELF should produce an inventory report");
 
-        assert!(!report.is_promotable());
+        assert!(
+            report.is_promotable(),
+            "TLSLE rows must promote under the Certified composition (value \
+             lane + default-Enforce reparse binding): {report:?}"
+        );
         // The emitted rows are exactly the two local-exec TLSLE relocations.
         let kinds: Vec<_> = report.entries.iter().map(|e| e.kind).collect();
         assert!(
@@ -10437,32 +10546,36 @@ mod tests {
             "expected both TLSLE local-exec rows in the inventory, got {kinds:?}"
         );
         assert!(
-            report
-                .entries
-                .iter()
-                .all(|e| e.status == trust_cg_verify::RelocationInventoryStatus::Unverified),
-            "solver-backed TLSLE evidence must not become Certified: {report:?}"
+            report.entries.iter().all(|e| {
+                e.status == trust_cg_verify::RelocationInventoryStatus::Verified
+                    && e.detail.contains("ELF reparse-enforced")
+            }),
+            "each TLSLE row must be Verified through the reparse-enforced \
+             composition, never through inherited credit: {report:?}"
         );
         let mut certs = Vec::new();
         append_object_relocation_inventory_certificate(&mut certs, &report);
         assert!(
             certs
                 .iter()
-                .any(|cert| !cert.verified && cert.category == "relocation_inventory"),
-            "TLSLE inventory must append a certified-output blocker: {certs:?}"
+                .any(|cert| cert.verified && cert.category == "relocation_inventory"),
+            "TLSLE inventory must append a VERIFIED relocation certificate: {certs:?}"
         );
     }
 
     /// The ELF initial-exec `#[thread_local]` read (`ADRP :gottprel:;
     /// LDR #:gottprel_lo12:; MRS; ADD`) emits the two TLSIE relocation rows
     /// (`R_AARCH64_TLSIE_ADR_GOTTPREL_PAGE21` / `_LD64_GOTTPREL_LO12_NC`),
-    /// each backed by a solver-backed GOT-slot address reconstruction
-    /// obligation (`trust_cg_verify::aarch64_elf_tls_reloc_proofs`, TLSIE rows).
-    /// This remains Trusted evidence only; both rows block production Certified
-    /// promotion until the authority surface carries that distinction.
+    /// each a production registry row citing the solver-backed GOT-slot
+    /// address reconstruction obligations
+    /// (`trust_cg_verify::aarch64_elf_tls_reloc_proofs`, TLSIE rows). Under
+    /// the DEFAULT Enforce ELF reparse gate the report PROMOTES with both
+    /// rows Verified through the same Certified composition as the ordinary
+    /// eight (unbound side pinned by the verify-crate and CLI suites — see
+    /// the local-exec sibling above for why not here).
     #[cfg(feature = "verify")]
     #[test]
-    fn test_actual_aarch64_elf_initial_exec_tls_relocation_inventory_blocks_certification() {
+    fn test_actual_aarch64_elf_initial_exec_tls_relocation_inventory_certifies_bound() {
         use trust_cg_ir::function::{MachFunction as IrMachFunction, Signature as IrSignature};
         use trust_cg_ir::inst::{AArch64Opcode as IrOpcode, MachInst as IrMachInst};
         use trust_cg_ir::operand::MachOperand as IrOperand;
@@ -10503,7 +10616,11 @@ mod tests {
             .expect("initial-exec TLSIE fixups map to ELF relocations")
             .expect("AArch64 Linux ELF should produce an inventory report");
 
-        assert!(!report.is_promotable());
+        assert!(
+            report.is_promotable(),
+            "TLSIE rows must promote under the Certified composition (value \
+             lane + default-Enforce reparse binding): {report:?}"
+        );
         // The emitted rows are exactly the two initial-exec TLSIE relocations.
         let kinds: Vec<_> = report.entries.iter().map(|e| e.kind).collect();
         assert!(
@@ -10515,19 +10632,20 @@ mod tests {
             "expected both TLSIE initial-exec rows in the inventory, got {kinds:?}"
         );
         assert!(
-            report
-                .entries
-                .iter()
-                .all(|e| e.status == trust_cg_verify::RelocationInventoryStatus::Unverified),
-            "solver-backed TLSIE evidence must not become Certified: {report:?}"
+            report.entries.iter().all(|e| {
+                e.status == trust_cg_verify::RelocationInventoryStatus::Verified
+                    && e.detail.contains("ELF reparse-enforced")
+            }),
+            "each TLSIE row must be Verified through the reparse-enforced \
+             composition, never through inherited credit: {report:?}"
         );
         let mut certs = Vec::new();
         append_object_relocation_inventory_certificate(&mut certs, &report);
         assert!(
             certs
                 .iter()
-                .any(|cert| !cert.verified && cert.category == "relocation_inventory"),
-            "TLSIE inventory must append a certified-output blocker: {certs:?}"
+                .any(|cert| cert.verified && cert.category == "relocation_inventory"),
+            "TLSIE inventory must append a VERIFIED relocation certificate: {certs:?}"
         );
     }
 

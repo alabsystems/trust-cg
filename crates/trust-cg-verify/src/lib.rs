@@ -110,6 +110,7 @@ use rayon as _;
 pub mod aarch64_backend_proof_report;
 pub mod aarch64_eh_coverage_proofs;
 pub mod aarch64_eh_lsda_proofs;
+pub mod aarch64_elf_reloc_proofs;
 pub mod aarch64_elf_tls_reloc_proofs;
 pub mod aarch64_jumptable_proofs;
 pub mod aarch64_macho_call_reloc_proofs;

@@ -2016,6 +2016,29 @@ pub fn batch_presolve_refinements(
     {
         return 0;
     }
+    // REDUNDANT WITH THE RESIDENT SERVER, AND A NET LOSS ALONGSIDE IT.
+    //
+    // This batch exists to amortize per-query solver startup by pre-solving a
+    // window of obligations in ONE invocation. The resident `--incremental`
+    // server (`ay_server_enabled`, default ON) already amortizes exactly that,
+    // and it does it better: the batch spawns a FRESH solver process, and the
+    // `ay` binary is ~115 MB, so that spawn costs more than the inline solves
+    // it replaces — the server discharges each obligation in 3-8 ms.
+    //
+    // Measured on aarch64, `codegen_crate`, min-of-5, pinned, interleaved:
+    //   p1_xorshift 0.224 -> 0.195   p3_gcd 0.228 -> 0.202
+    //   p4_matmul   0.249 -> 0.226   h3_box_leak 0.412 -> 0.363
+    //   v1_saxpy    0.272 -> 0.241
+    // i.e. skipping the batch is 23-49 ms FASTER per compile, and all 18
+    // beat-llvm programs are `.text` BYTE-IDENTICAL with matching exit codes
+    // either way (this only populates the session memo; verdicts are unchanged,
+    // which the surrounding doc already establishes for batch-vs-inline).
+    //
+    // Kept for the no-server configuration, where the original amortization
+    // argument still holds: `TCG_NO_SOLVER_SERVER=1` re-enables the batch.
+    if ay_bridge::ay_server_enabled() {
+        return 0;
+    }
 
     // CT-11: if the session verdict memo cannot produce keys at all, EVERY item
     // below is guaranteed to be dropped at `default_route_cache_key` — after
@@ -2051,7 +2074,7 @@ pub fn batch_presolve_refinements(
         // byte-identical either way.
         let smt2 = frontend_inline_smt2(&obligation, config);
         // Byte-identical key + resolved solver, exactly as the inline path.
-        let Some((solver_path, key)) = ay_bridge::default_route_cache_key(&smt2) else {
+        let Some((_solver_path, key)) = ay_bridge::default_route_cache_key(&smt2) else {
             continue;
         };
         if !seen.insert(key.clone()) {
@@ -2063,7 +2086,7 @@ pub fn batch_presolve_refinements(
         }
         // CERT-SKIP already covers it -> the inline path re-checks the committed
         // DRAT cert (cheap, no live spawn). Leave that tier untouched.
-        if crate::canary_cert::cert_skip_verified(&key, &solver_path) {
+        if crate::canary_cert::cert_skip_verified(&smt2) {
             continue;
         }
         let Some(body) = frontend_strip_trailing_exit(&smt2) else {

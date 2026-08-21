@@ -17,7 +17,7 @@
 //! Reference: LLVM `RegisterCoalescer.cpp` — simplified to pure virtual
 //! register coalescing without sub-register handling.
 
-use crate::liveness::{LiveInterval, LiveRange, compute_live_intervals};
+use crate::liveness::{LiveInterval, LiveRange, number_insts};
 use crate::machine_types::{InstId, MachFunction, MachOperand, RegClass, VReg};
 use crate::phi_elim;
 use std::collections::{BTreeMap, BTreeSet};
@@ -80,6 +80,20 @@ pub struct CoalesceTuning {
     /// in-place update (`add d, d, #1` / `fadd d, d, x` / `csel d, a, d`).
     /// Empty disables the kill-at-def rule.
     pub kill_def_producers: BTreeSet<u16>,
+    /// Subset of [`Self::kill_def_producers`] whose SECOND register source
+    /// (`uses[1]`, the shifted `Rm` of the AArch64 shifted-register ALU forms)
+    /// must NOT be the coalesced destination. For these opcodes `Rm` feeds the
+    /// shifter, and making it the loop-carried in-place register measurably
+    /// lengthens the recurrence on real cores: retargeting
+    /// `eor t, x, d, lsr #11; d <- t` to `eor d, x, d, lsr #11` regressed
+    /// `m2_call_heavy` 35 -> 51 ms (1.46x, reproduced with a one-word binary
+    /// patch of just that destination field), while the same merge carried
+    /// through the un-shifted `Rn` (`eor d, d, t, ror #55`, p5_struct_acc)
+    /// closed a 1.023x gap entirely. The merge is refused (fail-closed, the
+    /// copy simply stays) whenever the killed value resolves to the `uses[1]`
+    /// slot; membership here is only meaningful for opcodes also present in
+    /// `kill_def_producers`.
+    pub kill_def_rn_only_producers: BTreeSet<u16>,
 }
 
 impl CoalesceTuning {
@@ -130,6 +144,54 @@ impl CoalesceTuning {
             // the `llvm.fmuladd` FP-reduction accumulator whose loop-carried
             // latch copy this rule can now merge into an in-place update.
             A::FmaddRR as u16,
+            // Logical ops, register and bitmask-immediate forms — the x86-64
+            // tuning already trusts And/Or/Xor {RR,RI}; the AArch64 encoder
+            // arms are the same shape as the trusted AddRR/AddRI: one
+            // `encode_logical_shifted_reg` / `encode_logical_immediate` word,
+            // single pure def written after all source reads, fail-closed on
+            // an unencodable immediate (Err, never a multi-instruction
+            // expansion). Carries `acc ^= x` / `acc &= m` / `acc |= m`
+            // loop-carried latch updates.
+            A::AndRR as u16,
+            A::AndRI as u16,
+            A::OrrRR as u16,
+            A::OrrRI as u16,
+            A::EorRR as u16,
+            A::EorRI as u16,
+            // Shifted-second-source ALU fusions (`add d, n, m, lsl|lsr #k`,
+            // `sub d, n, m, lsl #k`, `eor d, n, m, ror|lsl|lsr #k`) — each is
+            // ONE `encode_add_sub_shifted_reg` / `encode_logical_shifted_reg`
+            // word with a single pure def, all register sources read before
+            // the write, and a fail-closed range check on the shift amount.
+            // These carry the struct-accumulator latch shapes
+            // (`b += a >> 3` -> AddRRShiftLsr, `c ^= rotl(t, k)` ->
+            // EorRRShift, p5_struct_acc) that the plain-opcode list missed.
+            // All six are ALSO in `kill_def_rn_only_producers`: the merge is
+            // allowed only when the loop-carried value sits in the un-shifted
+            // `Rn` slot (see that field's doc for the measured `Rm` hazard).
+            //
+            // The single-source immediate shifts (`LslRI`/`LsrRI`/`AsrRI`/
+            // `RorRI`) are deliberately NOT listed even though their UBFM/EXTR
+            // encodings meet the single-word proof obligation: their only
+            // register source feeds the shifter, so an in-place merge would
+            // always create the `Rm`-slot recurrence hazard, and no corpus
+            // program benefits from them.
+            A::AddRRShift as u16,
+            A::AddRRShiftLsr as u16,
+            A::SubRRShift as u16,
+            A::EorRRShift as u16,
+            A::EorRRLsl as u16,
+            A::EorRRLsr as u16,
+        ]
+        .into_iter()
+        .collect();
+        let kill_def_rn_only_producers = [
+            A::AddRRShift as u16,
+            A::AddRRShiftLsr as u16,
+            A::SubRRShift as u16,
+            A::EorRRShift as u16,
+            A::EorRRLsl as u16,
+            A::EorRRLsr as u16,
         ]
         .into_iter()
         .collect();
@@ -138,6 +200,7 @@ impl CoalesceTuning {
             reg_move_ops,
             vec_move_ops,
             kill_def_producers,
+            kill_def_rn_only_producers,
         }
     }
 
@@ -183,6 +246,7 @@ impl CoalesceTuning {
             reg_move_ops: BTreeMap::new(),
             vec_move_ops: BTreeSet::new(),
             kill_def_producers,
+            kill_def_rn_only_producers: BTreeSet::new(),
         }
     }
 }
@@ -293,6 +357,25 @@ pub fn coalesce_copies_tuned(
     intervals: &mut BTreeMap<u32, LiveInterval>,
     tuning: &CoalesceTuning,
 ) -> CoalesceResult {
+    let inst_numbering = number_insts(func);
+    coalesce_copies_tuned_with_numbering(func, intervals, tuning, &inst_numbering)
+}
+
+/// [`coalesce_copies_tuned`] when the caller ALREADY holds the instruction
+/// numbering for this exact `func`.
+///
+/// The allocator computes liveness once and keeps `inst_numbering` alongside the
+/// intervals it passes here, so recomputing it inside was a whole redundant
+/// liveness pass per function. The numbering MUST have been computed against the
+/// same, unmutated `func` the intervals were built from — a stale numbering
+/// would misplace the copy position in the overlap acceptances and silently
+/// change coalescing decisions.
+pub fn coalesce_copies_tuned_with_numbering(
+    func: &MachFunction,
+    intervals: &mut BTreeMap<u32, LiveInterval>,
+    tuning: &CoalesceTuning,
+    inst_numbering: &BTreeMap<InstId, u32>,
+) -> CoalesceResult {
     // Dense id-indexed union-find (`parent[id]`, `None` = self-root) instead of
     // a BTreeMap<VReg,VReg> — vreg ids are a contiguous 0..next_vreg range, so
     // find/union become O(1)-per-step. `seen` accumulates every queried vreg
@@ -318,7 +401,7 @@ pub fn coalesce_copies_tuned(
     // same physical storage at that instruction; the apparent overlap
     // does not reflect actual interference. Pre-compute the
     // per-instruction numbering so we can recognize and accept this case.
-    let inst_numbering = compute_live_intervals(func).inst_numbering;
+    // Numbering supplied by the caller: see `coalesce_copies_tuned_with_numbering`.
     // Reverse map (position -> inst) for the kill-at-def / pass-through-copy
     // overlap acceptances, which must inspect the instruction AT an overlap
     // position. Built only when a tuning extension is active.
@@ -634,6 +717,20 @@ fn overlap_positions_all_mergeable(q: OverlapMergeQuery<'_>) -> bool {
             // Case 2: kill-at-def of a whitelisted single-instruction producer.
             if !q.tuning.kill_def_producers.contains(&inst.opcode) {
                 return false;
+            }
+            // Rn-only producers: the merge would make dst the producer's
+            // in-place register, so dst must not be the SHIFTED second source
+            // (`uses[1]`) — a loop-carried dependence through the shifter port
+            // is a measured recurrence-latency hazard (see
+            // `CoalesceTuning::kill_def_rn_only_producers`). Fail closed on a
+            // malformed shape (missing/non-vreg `uses[1]`).
+            if q.tuning.kill_def_rn_only_producers.contains(&inst.opcode) {
+                let Some(rm_v) = inst.uses.get(1).and_then(MachOperand::as_vreg) else {
+                    return false;
+                };
+                if resolve_root_readonly(q.parent, rm_v) == q.dst_root {
+                    return false;
+                }
             }
             if inst.flags.is_call()
                 || !inst.implicit_defs.is_empty()
@@ -1062,6 +1159,7 @@ impl CopyCoalescer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::liveness::compute_live_intervals;
     use crate::machine_types::{
         BlockId, InstFlags, MachBlock, MachFunction, MachInst, MachOperand, RegClass, VReg,
     };
@@ -1139,6 +1237,51 @@ mod tests {
             next_vreg: 32,
             next_stack_slot: 0,
             stack_slots: BTreeMap::new(),
+        }
+    }
+
+    /// `number_insts` must agree EXACTLY with the numbering the full liveness
+    /// pass produces, on every shape.
+    ///
+    /// Coalescing used to open by running a second whole-function
+    /// `compute_live_intervals` purely to re-derive this map, throwing away the
+    /// intervals. It now takes the caller's. If the two ever diverge, the copy
+    /// position in the kill-at-def / pass-through overlap acceptances would be
+    /// misidentified and coalescing decisions would silently change — so pin the
+    /// equivalence rather than assume it.
+    #[test]
+    fn numbering_matches_full_liveness() {
+        let cases = vec![
+            // Single block.
+            vec![vec![
+                generic_inst(1, vec![vreg(7)], vec![]),
+                copy_inst(vreg(1), vreg(0)),
+                generic_inst(2, vec![], vec![vreg(1)]),
+            ]],
+            // Several blocks of differing lengths.
+            vec![
+                vec![generic_inst(1, vec![vreg(0)], vec![])],
+                vec![
+                    copy_inst(vreg(1), vreg(0)),
+                    generic_inst(2, vec![vreg(2)], vec![vreg(1)]),
+                    generic_inst(3, vec![], vec![vreg(2)]),
+                ],
+                vec![generic_inst(4, vec![], vec![vreg(0)])],
+            ],
+            // A block with no instructions at all.
+            vec![
+                vec![generic_inst(1, vec![vreg(0)], vec![])],
+                vec![],
+                vec![generic_inst(2, vec![], vec![vreg(0)])],
+            ],
+        ];
+        for (i, blocks) in cases.into_iter().enumerate() {
+            let func = make_function(blocks);
+            assert_eq!(
+                number_insts(&func),
+                compute_live_intervals(&func).inst_numbering,
+                "case {i}: number_insts diverged from the full liveness numbering"
+            );
         }
     }
 
@@ -2121,6 +2264,7 @@ mod tests {
 #[cfg(test)]
 mod tuning_tests {
     use super::*;
+    use crate::liveness::compute_live_intervals;
     use crate::machine_types::*;
     use crate::phi_elim::IR_COPY_OPCODE;
 
@@ -2312,6 +2456,118 @@ mod tuning_tests {
         assert_eq!(
             tuned.copies_removed, 0,
             "non-whitelisted producer must fail closed"
+        );
+    }
+
+    /// Rn-only producers (the shifted-register ALU forms): the kill-at-def
+    /// merge is allowed when the loop-carried value feeds the UN-shifted `Rn`
+    /// slot (`uses[0]`), and refused when it feeds the shifted `Rm` slot
+    /// (`uses[1]`) — the measured m2_call_heavy recurrence hazard (the merged
+    /// in-place update would route the loop-carried dependence through the
+    /// shifter).
+    #[test]
+    fn kill_at_def_rn_only_producer_slot_gating() {
+        let eor_lsr: u16 = trust_cg_ir::inst::AArch64Opcode::EorRRLsr as u16;
+        // Loop shape (m2_call_heavy latch, carrier v0, invariant-ish v1):
+        //   b0: v0=..; v1=..
+        //   b1: v2 = EorRRLsr(rn, rm, #11); copy v0<-v2; br b1/b2
+        //   b2: use v0
+        // Parameterized over which slot the carrier v0 occupies.
+        let build = |rn: u32, rm: u32| {
+            let insts = vec![
+                mk(
+                    1,
+                    vec![MachOperand::VReg(v32(0))],
+                    vec![MachOperand::Imm(0)],
+                ),
+                mk(
+                    1,
+                    vec![MachOperand::VReg(v32(1))],
+                    vec![MachOperand::Imm(9)],
+                ),
+                mk(
+                    eor_lsr,
+                    vec![MachOperand::VReg(v32(2))],
+                    vec![
+                        MachOperand::VReg(v32(rn)),
+                        MachOperand::VReg(v32(rm)),
+                        MachOperand::Imm(11),
+                    ],
+                ),
+                // Filler between producer and latch copy (the real latch has
+                // the IV update here); without it the conflated-position
+                // liveness model fuses the carrier's kill and redef into one
+                // range and the overlap is multi-position for BOTH slots.
+                mk(2, vec![], vec![MachOperand::VReg(v32(1))]),
+                mk(
+                    IR_COPY_OPCODE,
+                    vec![MachOperand::VReg(v32(0))],
+                    vec![MachOperand::VReg(v32(2))],
+                ),
+                MachInst {
+                    opcode: 0xBB,
+                    defs: vec![],
+                    uses: vec![
+                        MachOperand::VReg(v32(0)),
+                        MachOperand::VReg(v32(1)),
+                        MachOperand::Block(BlockId(1)),
+                        MachOperand::Block(BlockId(2)),
+                    ],
+                    implicit_defs: vec![],
+                    implicit_uses: vec![],
+                    flags: InstFlags::IS_BRANCH.union(InstFlags::IS_TERMINATOR),
+                    tied_operands: vec![],
+                },
+                mk(2, vec![], vec![MachOperand::VReg(v32(0))]),
+            ];
+            MachFunction {
+                name: "rnonly".into(),
+                insts,
+                blocks: vec![
+                    MachBlock {
+                        insts: vec![InstId(0), InstId(1)],
+                        preds: vec![],
+                        succs: vec![BlockId(1)],
+                        loop_depth: 0,
+                    },
+                    MachBlock {
+                        insts: vec![InstId(2), InstId(3), InstId(4), InstId(5)],
+                        preds: vec![BlockId(0), BlockId(1)],
+                        succs: vec![BlockId(1), BlockId(2)],
+                        loop_depth: 1,
+                    },
+                    MachBlock {
+                        insts: vec![InstId(6)],
+                        preds: vec![BlockId(1)],
+                        succs: vec![],
+                        loop_depth: 0,
+                    },
+                ],
+                block_order: vec![BlockId(0), BlockId(1), BlockId(2)],
+                entry_block: BlockId(0),
+                next_vreg: 3,
+                next_stack_slot: 0,
+                stack_slots: std::collections::BTreeMap::new(),
+            }
+        };
+
+        // Carrier in the un-shifted Rn slot: merge (p5_struct_acc shape).
+        let func = build(0, 1);
+        let mut intervals = compute_live_intervals(&func).intervals;
+        let tuned = coalesce_copies_tuned(&func, &mut intervals, &CoalesceTuning::aarch64());
+        assert_eq!(
+            tuned.copies_removed, 1,
+            "carrier in the un-shifted Rn slot must merge"
+        );
+        assert_eq!(tuned.rewrites.get(&v32(2)), Some(&v32(0)));
+
+        // Carrier in the shifted Rm slot: refuse (m2_call_heavy hazard).
+        let func = build(1, 0);
+        let mut intervals = compute_live_intervals(&func).intervals;
+        let tuned = coalesce_copies_tuned(&func, &mut intervals, &CoalesceTuning::aarch64());
+        assert_eq!(
+            tuned.copies_removed, 0,
+            "carrier in the shifted Rm slot must fail closed"
         );
     }
 

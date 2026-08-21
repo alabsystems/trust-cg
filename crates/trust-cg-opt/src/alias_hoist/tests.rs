@@ -204,6 +204,107 @@ fn refuses_unbounded_store_index() {
     );
 }
 
+/// A load base produced by a CSEL is NOT loop-invariant: `CSEL` consumes NZCV,
+/// which is not in its operand list, so the flag writer in the body changes the
+/// selected pointer every iteration.
+///
+/// The operand-only invariance test admitted it (both explicit sources are
+/// invariant) and `MemoryEffect::Pure` let it through the purity gate, so the
+/// pass hoisted `ldr [csel_result]` into the fast preheader AND
+/// re-materialized the CSEL in the preamble, where NO compare has run — it
+/// then selects on the CALLER's leftover NZCV. Reproduced end-to-end: a raw
+/// pointer kernel `p = if s & 1 == 0 { a } else { b }; s += *p; *out = s;`
+/// returned 30 under trust-cg vs 39 under LLVM and under
+/// `TRUST_CG_DISABLE_PASSES=aliashoist`.
+#[test]
+fn refuses_flag_reading_load_base() {
+    let mut func = MachFunction::new("csel_base".to_string(), Signature::new(vec![], vec![]));
+    let ph = func.entry;
+    let hdr = func.create_block();
+    let exit = func.create_block();
+
+    // Preheader: two candidate load bases, a store base, the bound, idx init.
+    push(&mut func, ph, AArch64Opcode::Movz, vec![g64(0), i(4096)]); // cand A
+    push(&mut func, ph, AArch64Opcode::Movz, vec![g64(1), i(8192)]); // cand B
+    push(&mut func, ph, AArch64Opcode::Movz, vec![g64(3), i(65536)]); // store base
+    push(&mut func, ph, AArch64Opcode::Movz, vec![g64(2), i(4)]); // bound
+    push(&mut func, ph, AArch64Opcode::Movz, vec![g64(10), i(0)]); // idx init
+    push(&mut func, ph, AArch64Opcode::B, vec![blk(hdr)]);
+    func.add_edge(ph, hdr);
+
+    // Body: a LOOP-VARIANT compare feeding a CSEL that picks the load base.
+    push(&mut func, hdr, AArch64Opcode::CmpRI, vec![g64(10), i(2)]);
+    push(
+        &mut func,
+        hdr,
+        AArch64Opcode::Csel,
+        vec![g64(4), g64(0), g64(1), i(0)], // v4 = (idx == 2) ? v0 : v1
+    );
+    push(
+        &mut func,
+        hdr,
+        AArch64Opcode::LdrRI,
+        vec![g64(20), g64(4), i(0)], // ldr v20, [v4] -- base is the CSEL result
+    );
+    push(
+        &mut func,
+        hdr,
+        AArch64Opcode::StrRI,
+        vec![g64(20), g64(3), i(0)], // boundable fixed store
+    );
+    push(
+        &mut func,
+        hdr,
+        AArch64Opcode::AddRI,
+        vec![g64(11), g64(10), i(1)],
+    );
+    push(&mut func, hdr, AArch64Opcode::MovR, vec![g64(10), g64(11)]);
+    push(&mut func, hdr, AArch64Opcode::CmpRR, vec![g64(11), g64(2)]);
+    push(&mut func, hdr, AArch64Opcode::BCond, vec![i(0), blk(exit)]);
+    push(&mut func, hdr, AArch64Opcode::B, vec![blk(hdr)]);
+    func.add_edge(hdr, exit);
+    func.add_edge(hdr, hdr);
+    push(&mut func, exit, AArch64Opcode::Ret, vec![]);
+
+    let before = nblocks(&func);
+    let mut pass = AliasVersionedLoadHoist;
+    assert!(
+        !pass.run(&mut func),
+        "a CSEL result is not loop-invariant: NZCV is an unmodelled input"
+    );
+    assert_eq!(nblocks(&func), before);
+}
+
+/// The movement contract itself: every flag READER that `opcode_effect`
+/// classifies as memory-pure must still be refused, so a future opcode cannot
+/// silently re-open the hole above.
+#[test]
+fn flag_readers_are_never_invariance_movable() {
+    for op in [
+        AArch64Opcode::Csel,
+        AArch64Opcode::CSet,
+        AArch64Opcode::Csinc,
+        AArch64Opcode::Csinv,
+        AArch64Opcode::Csneg,
+        AArch64Opcode::FcselRR,
+        AArch64Opcode::Adc,
+        AArch64Opcode::Sbc,
+    ] {
+        assert!(
+            crate::effects::opcode_effect(op).is_pure(),
+            "{op:?} is memory-pure, which is exactly why the weaker gate let it through"
+        );
+        let inst = MachInst::new(op, vec![]);
+        assert!(
+            !super::is_invariance_movable(&inst),
+            "{op:?} reads NZCV and must fail the invariance movement contract"
+        );
+    }
+    // A genuinely movable pure op still passes.
+    let add = MachInst::new(AArch64Opcode::AddRR, vec![]);
+    assert!(super::is_invariance_movable(&add));
+}
+
 #[test]
 fn no_loops_is_noop() {
     let mut func = MachFunction::new("flat".to_string(), Signature::new(vec![], vec![]));

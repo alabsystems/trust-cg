@@ -304,6 +304,17 @@ fn hoist_loop_invariants(
     let Some(preheader) = lp.preheader else {
         return false;
     };
+    // FAIL-CLOSED, and it must happen HERE: the hoist removes instructions from
+    // their source blocks before splicing them into the preheader, so a decline
+    // discovered at the splice point would DELETE code. Validate the preheader
+    // shape up front and bail before touching anything.
+    let Some(ph_insert_pos) = func
+        .blocks
+        .get(&preheader)
+        .and_then(|ph| preheader_insert_pos(ph, lp.header))
+    else {
+        return false;
+    };
 
     // Lever-B (flag-writing-arithmetic tier) is admitted for this loop only when
     // the preheader insertion point is provably flag-dead: inserting a flag
@@ -467,7 +478,7 @@ fn hoist_loop_invariants(
         .blocks
         .get_mut(&preheader)
         .expect("preheader block exists");
-    let insert_pos = preheader_insert_pos(ph);
+    let insert_pos = ph_insert_pos;
     for (offset, (_order, inst)) in hoisted_insts.into_iter().enumerate() {
         ph.insts.insert(insert_pos + offset, inst);
     }
@@ -483,10 +494,48 @@ fn hoist_loop_invariants(
 /// Compute the splice point in the preheader: immediately before the trailing
 /// terminator, if any. Hoisted instructions are pure and value-producing, so
 /// they must precede the control transfer to the header.
-fn preheader_insert_pos(block: &trust_cg_lower::X86ISelBlock) -> usize {
+/// Where hoisted instructions may be spliced into the loop's preheader, or
+/// `None` if no such position exists and the loop must be declined.
+///
+/// FAIL-CLOSED (2026-08-18). This used to return `block.insts.len() - 1`
+/// whenever the last instruction was a terminator or branch — i.e. it assumed
+/// "before the last instruction" is executed on exactly the paths entering the
+/// header. `find_preheader` does NOT guarantee that: it only requires the
+/// preheader to be the UNIQUE non-body predecessor of the header, with no
+/// constraint on successor count or terminator target.
+///
+/// x86 ISel emits two-terminator tails (`x86_loop_unroll::analyze_counted_loop`
+/// models `Jcc ...; Jmp ...` literally). For a preheader `Jcc header ; Jmp
+/// other`, `insts.len() - 1` is the index of the `Jmp`, so hoisted definitions
+/// land AFTER the `Jcc` — skipped on precisely the path INTO the loop, leaving
+/// the body reading a vreg that was never defined on that path.
+///
+/// Inserting before the `Jcc` instead is NOT a safe general repair: it would
+/// execute the hoisted code on the path that does not enter the loop, which
+/// breaks the pure-call tier's `loop_runs_at_least_once` precondition (a pure
+/// call may diverge or trap, so it may only be relocated ahead of a loop that
+/// definitely runs). So we require the shape that makes the position
+/// unambiguous, exactly as the region-LICM tier in this file already demands
+/// of its own preheaders ("P: explicit unconditional Jmp terminators").
+fn preheader_insert_pos(block: &trust_cg_lower::X86ISelBlock, header: Block) -> Option<usize> {
     match block.insts.last() {
-        Some(last) if last.flags.is_terminator() || last.flags.is_branch() => block.insts.len() - 1,
-        _ => block.insts.len(),
+        // Explicit unconditional `Jmp header`: the only successor is the
+        // header, so the slot before it runs on exactly the entering path.
+        Some(last)
+            if last.opcode == X86Opcode::Jmp
+                && matches!(
+                    last.operands.first(),
+                    Some(X86ISelOperand::Block(b)) if *b == header
+                ) =>
+        {
+            Some(block.insts.len() - 1)
+        }
+        // Any other terminator/branch tail: ambiguous or actively wrong.
+        Some(last) if last.flags.is_terminator() || last.flags.is_branch() => None,
+        // No terminator at all: the block falls through to its single
+        // successor, which (being the header's unique non-body predecessor) is
+        // the header. Appending at the end is on the entering path.
+        _ => Some(block.insts.len()),
     }
 }
 
@@ -875,6 +924,23 @@ fn hoist_pure_call_clusters(
         }
         return false;
     };
+    // FAIL-CLOSED, before any mutation (see `preheader_insert_pos`): a
+    // two-terminator preheader tail has no position that runs on exactly the
+    // entering path, and this tier removes instructions from their source
+    // blocks before splicing, so a late decline would DELETE code.
+    let Some(ph_insert_pos) = func
+        .blocks
+        .get(&preheader)
+        .and_then(|ph| preheader_insert_pos(ph, lp.header))
+    else {
+        if dbg && n_pure_calls(func) > 0 {
+            eprintln!(
+                "[pure-call-hoist] header={:?} DECLINE: preheader {:?} lacks an explicit Jmp to the header",
+                lp.header, preheader
+            );
+        }
+        return false;
+    };
     // Soundness precondition: a pure call may diverge/trap, so it may only be
     // relocated ahead of a loop guaranteed to have executed it at least once.
     if !loop_runs_at_least_once(func, lp, preheader, idom) {
@@ -985,7 +1051,7 @@ fn hoist_pure_call_clusters(
         .blocks
         .get_mut(&preheader)
         .expect("preheader block exists");
-    let insert_pos = preheader_insert_pos(ph);
+    let insert_pos = ph_insert_pos;
     for (offset, (_order, inst)) in hoisted.into_iter().enumerate() {
         ph.insts.insert(insert_pos + offset, inst);
     }
@@ -3932,6 +3998,127 @@ mod tests {
         assert_eq!(ph.len(), 2);
         assert_eq!(ph[0].opcode, X86Opcode::MovRI);
         assert_eq!(ph[0].operands, vec![vreg(10), imm(0x9e37_79b1)]);
+        assert_eq!(ph[1].opcode, X86Opcode::Jmp);
+    }
+
+    /// Build the same self-loop but give the PREHEADER a two-terminator tail
+    /// `Jcc header ; Jmp other`, the shape x86 ISel really emits (see
+    /// `x86_loop_unroll::analyze_counted_loop`, which models it literally).
+    ///
+    /// bb0 = preheader: `Jcc bb1 ; Jmp bb3`   (bb1 = loop header, bb3 = other)
+    /// bb1 = self-loop header, bb2 = exit, bb3 = the non-loop path.
+    fn make_self_loop_jcc_preheader(body: Vec<X86ISelInst>) -> X86ISelFunction {
+        let sig = Signature {
+            params: vec![],
+            returns: vec![Type::I64],
+        };
+        let mut func = X86ISelFunction::new("x86_licm_jcc_ph".to_string(), sig);
+        let (bb0, bb1, bb2, bb3) = (Block(0), Block(1), Block(2), Block(3));
+        for b in [bb0, bb1, bb2, bb3] {
+            func.ensure_block(b);
+        }
+        func.next_vreg = 64;
+
+        // Preheader branches INTO the loop on the Jcc-taken edge, elsewhere on
+        // the trailing Jmp.
+        func.blocks.get_mut(&bb0).unwrap().successors = vec![bb1, bb3];
+        func.push_inst(
+            bb0,
+            X86ISelInst::new(
+                X86Opcode::Jcc,
+                vec![
+                    X86ISelOperand::CondCode(trust_cg_ir::X86CondCode::B),
+                    X86ISelOperand::Block(bb1),
+                ],
+            ),
+        );
+        func.push_inst(
+            bb0,
+            X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(bb3)]),
+        );
+
+        func.blocks.get_mut(&bb1).unwrap().successors = vec![bb1, bb2];
+        for inst in body {
+            func.push_inst(bb1, inst);
+        }
+        func.push_inst(
+            bb1,
+            X86ISelInst::new(
+                X86Opcode::Jcc,
+                vec![
+                    X86ISelOperand::CondCode(trust_cg_ir::X86CondCode::B),
+                    X86ISelOperand::Block(bb1),
+                ],
+            ),
+        );
+        func.push_inst(bb2, X86ISelInst::new(X86Opcode::Ret, vec![]));
+        func.push_inst(bb3, X86ISelInst::new(X86Opcode::Ret, vec![]));
+        func
+    }
+
+    /// WRONG-CODE REGRESSION (2026-08-18): a preheader whose tail is
+    /// `Jcc header ; Jmp other` has NO position that executes on exactly the
+    /// paths entering the loop, so the loop must be DECLINED.
+    ///
+    /// `preheader_insert_pos` used to return `insts.len() - 1` for any
+    /// terminator tail — the index of the trailing `Jmp` — so hoisted
+    /// definitions landed AFTER the `Jcc`, i.e. were skipped on precisely the
+    /// edge into the loop, and the body then read a vreg never defined on that
+    /// path. `find_preheader` permits this shape: it only requires the unique
+    /// non-body predecessor, with no constraint on successors or terminator
+    /// target.
+    ///
+    /// Inserting before the `Jcc` is not a safe general repair either — it
+    /// would run the hoisted code on the path that does NOT enter the loop,
+    /// breaking the pure-call tier's `loop_runs_at_least_once` precondition.
+    /// Hence: decline, matching region-LICM's precondition P in this same file.
+    #[test]
+    fn x86_licm_declines_two_terminator_preheader() {
+        let body = vec![X86ISelInst::new(
+            X86Opcode::MovRI,
+            vec![vreg(10), imm(0x9e37_79b1)],
+        )];
+        let mut func = make_self_loop_jcc_preheader(body);
+        let mut pass = X86LoopInvariantCodeMotion::pure_only();
+
+        let fired = pass.run_on_function(&mut func);
+
+        // The invariant must still be in the header, and NOTHING may have been
+        // spliced into the preheader (whose two terminators stay adjacent).
+        let header = block_insts(&func, Block(1));
+        assert!(
+            header.iter().any(|i| i.opcode == X86Opcode::MovRI),
+            "the invariant must remain in the loop when the preheader shape \
+             admits no correct insertion point (got {:?})",
+            header.iter().map(|i| i.opcode).collect::<Vec<_>>()
+        );
+        let ph = block_insts(&func, Block(0));
+        assert_eq!(
+            ph.iter().map(|i| i.opcode).collect::<Vec<_>>(),
+            vec![X86Opcode::Jcc, X86Opcode::Jmp],
+            "nothing may be spliced between the preheader's two terminators"
+        );
+        assert!(!fired, "the pass must report no change for this loop");
+    }
+
+    /// POSITIVE CONTROL — the guard must not disable x86 LICM generally. The
+    /// ordinary `Jmp header` preheader still hoists (this is the same shape as
+    /// `x86_licm_hoists_invariant_constant_materialization`, asserted here
+    /// alongside the decline so over-gating cannot pass unnoticed).
+    #[test]
+    fn x86_licm_still_hoists_with_explicit_jmp_preheader() {
+        let body = vec![X86ISelInst::new(
+            X86Opcode::MovRI,
+            vec![vreg(10), imm(0x9e37_79b1)],
+        )];
+        let mut func = make_self_loop(body);
+        let mut pass = X86LoopInvariantCodeMotion::pure_only();
+        assert!(
+            pass.run_on_function(&mut func),
+            "a preheader ending in an explicit Jmp to the header must still hoist"
+        );
+        let ph = block_insts(&func, Block(0));
+        assert_eq!(ph[0].opcode, X86Opcode::MovRI);
         assert_eq!(ph[1].opcode, X86Opcode::Jmp);
     }
 

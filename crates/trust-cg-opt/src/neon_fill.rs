@@ -90,6 +90,16 @@ mod tests;
 /// `NeonStpQPost` writes `2 * 16 = 32` bytes per iteration.
 const BYTES_PER_ITER: i64 = 32;
 
+/// Store-pair instructions issued per vector iteration. Two `STP qb, qb`
+/// (64 bytes) halves the loop overhead per byte relative to the original
+/// single pair — glibc's hand-tuned `memset` (what LLVM lowers this shape
+/// to) runs a 64-byte inner loop, and the measured v2_memfill gap (1.104x
+/// vs LLVM) was the 32-byte kernel's extra add/cmp/branch per block. The
+/// in-bounds license scales unchanged: the vector header admits only
+/// `iv <u bound - (BLOCK_ELEMS - 1)`, so every element of the whole
+/// 64-byte block is `< bound`.
+const STORE_PAIRS_PER_ITER: i64 = 2;
+
 /// AArch64 condition code for unsigned lower (`LO`) — the vector header's
 /// `iv <u main_bound` guard.
 const CC_LO: i64 = 3;
@@ -359,17 +369,19 @@ impl Recognized {
             bail!("no forward iv<bound loop-continue test");
         };
 
-        // Vector-benefit / wrap-freedom: fire only when at least one full 32-byte
-        // block can exist. Const `N >= WIDTH_ELEMS`; runtime `n` is guarded by the
-        // `n < WIDTH_ELEMS` precheck at apply time.
+        // Vector-benefit / wrap-freedom: fire only when at least one full
+        // iteration block (STORE_PAIRS_PER_ITER * 32 bytes) can exist. Const
+        // `N >= BLOCK_ELEMS`; runtime `n` is guarded by the `n < BLOCK_ELEMS`
+        // precheck at apply time.
         let width_elems = BYTES_PER_ITER / elem_size;
+        let block_elems = STORE_PAIRS_PER_ITER * width_elems;
         if let Bound::Const(n) = bound {
-            if n < width_elems {
-                bail!("const bound {} < WIDTH_ELEMS {}", n, width_elems);
+            if n < block_elems {
+                bail!("const bound {} < BLOCK_ELEMS {}", n, block_elems);
             }
-            // main_bound = N-(width-1) is materialized directly; keep it inside
+            // main_bound = N-(block-1) is materialized directly; keep it inside
             // the range our const materializer handles cleanly.
-            let mb = n - (width_elems - 1);
+            let mb = n - (block_elems - 1);
             if !(0..=i64::from(u32::MAX)).contains(&mb) {
                 bail!("const main_bound {} out of materializable range", mb);
             }
@@ -473,6 +485,28 @@ fn store_info(
     store_id: InstId,
 ) -> Option<(VReg, i64, VReg)> {
     let inst = func.inst(store_id);
+    // FAIL-CLOSED: the transfer register (operand 0) must be a GENERAL-PURPOSE
+    // register. Emission derives TWO things from it that recognition would
+    // otherwise never constrain:
+    //   * the access WIDTH for the full-width `StrRI`/`StrRO` forms — the
+    //     encoder takes it from the transfer class (`Fpr128`->16, `Fpr64`->8,
+    //     `Fpr32`->4, `Fpr16`->2), while the arms below read "not `Gpr64`" as
+    //     4 bytes. An `Fpr16` (`str h`, 2 bytes) or `Fpr64` (`str d`, 8 bytes)
+    //     transfer therefore mis-sizes the element, and the vector fill writes
+    //     the wrong number of bytes per element.
+    //   * the DUP broadcast SOURCE — `ValueSrc::Invariant` feeds this exact
+    //     register to `NeonDupGen qb, v, es`, i.e. `DUP Vd.<T>, Rn`, whose Rn
+    //     field is a GPR. `preg_hw` writes an FP register's hw number into that
+    //     GPR field with no bank check, so a `V5` value silently broadcasts
+    //     `W5` — the wrong register file. (Same hazard the `AtomicLoad`
+    //     integer-only gate in trust-cg-lower documents for `LDAR`.)
+    // A `Gpr32`/`Gpr64` transfer makes both derivations exact. Everything else
+    // BAILS. (Mirrors the `value.class != RegClass::Gpr32` gate in the sibling
+    // `neon_iota_fill::store_info`.)
+    let transfer = vreg_of(inst.operands.first()?)?;
+    if !matches!(transfer.class, RegClass::Gpr32 | RegClass::Gpr64) {
+        return None;
+    }
     match inst.opcode {
         AArch64Opcode::StrbRI | AArch64Opcode::StrhRI | AArch64Opcode::StrRI => {
             if inst.operands.len() != 3 || imm_of(&inst.operands[2]) != Some(0) {
@@ -683,7 +717,25 @@ fn recognize_loop_test(
                 }
             }
         }
-        if taken.is_some() {
+        // NATIVE additionally requires the CANONICAL top-tested shape: the
+        // latch must return to the header UNCONDITIONALLY. Only then does the
+        // header's test legitimately observe every post-increment iv
+        // (including failing ones), making its non-body successor the loop's
+        // LIVE exit. A loop whose latch back-branches CONDITIONALLY (a
+        // rotated do-while whose header carries a residual in-loop check)
+        // filters iv >= bound away from the header: the header's "exit"
+        // successor is dead in the original execution — e.g. a bounds
+        // check's abort arm — and routing the vector residual into it
+        // manufactures a state the original program never reaches
+        // (2026-08-13 v2_memfill/v3_popcount wrong-abort, caught by the
+        // 72-program exit-status gate). Such loops fall through to the
+        // ROTATED arm below, whose `rotated_exit` guard re-enters via the
+        // latch test's live exit instead.
+        let latch_backedge_unconditional = func.block(latch).insts.last().is_some_and(|&id| {
+            let t = func.inst(id);
+            t.opcode == AArch64Opcode::B && branch_targets(t).contains(&header)
+        });
+        if taken.is_some() && latch_backedge_unconditional {
             // The exit is the header successor that is NOT in the loop body.
             if let Some(&exit) = func.block(header).succs.iter().find(|s| !body.contains(s))
                 && let Some(bound) =
@@ -775,8 +827,7 @@ fn is_loop_invariant(
 ) -> bool {
     // Not defined inside the loop.
     for &id in loop_insts {
-        let inst = func.inst(id);
-        if produces_def(inst.opcode) && inst.operands.first().and_then(vreg_of) == Some(v) {
+        if crate::effects::inst_defines_vreg(func.inst(id), v) {
             return false;
         }
     }
@@ -784,8 +835,11 @@ fn is_loop_invariant(
     let Some(&d) = def.get(&v.id) else {
         // No def found (e.g. a function parameter pre-colored register): treat as
         // invariant only if it is truly never defined in the function body.
-        return !func.insts.iter().any(|inst| {
-            produces_def(inst.opcode) && inst.operands.first().and_then(vreg_of) == Some(v)
+        return !func.block_order.iter().any(|&bid| {
+            func.block(bid)
+                .insts
+                .iter()
+                .any(|&id| crate::effects::inst_defines_vreg(func.inst(id), v))
         });
     };
     let Some(db) = block_of_inst(func, d) else {
@@ -835,6 +889,7 @@ fn is_store(op: AArch64Opcode) -> bool {
 
 fn apply(func: &mut MachFunction, rec: &Recognized) -> bool {
     let width_elems = BYTES_PER_ITER / rec.elem_size;
+    let block_elems = STORE_PAIRS_PER_ITER * width_elems;
 
     // Fresh blocks: an optional runtime-bound precheck, then vh/vb/vl/vx.
     let pv = matches!(rec.bound, Bound::Runtime(_)).then(|| func.create_block());
@@ -925,13 +980,13 @@ fn apply(func: &mut MachFunction, rec: &Recognized) -> bool {
                 func,
                 pv,
                 AArch64Opcode::SubRI,
-                vec![vreg(main_bound), vreg(n), imm(width_elems - 1)],
+                vec![vreg(main_bound), vreg(n), imm(block_elems - 1)],
             );
             emit(
                 func,
                 pv,
                 AArch64Opcode::CmpRI,
-                vec![vreg(n), imm(width_elems)],
+                vec![vreg(n), imm(block_elems)],
             );
             emit(
                 func,
@@ -942,7 +997,7 @@ fn apply(func: &mut MachFunction, rec: &Recognized) -> bool {
             emit(func, pv, AArch64Opcode::B, vec![block(vh)]);
         }
         Bound::Const(n) => {
-            let mb = materialize_before(func, pre, n - (width_elems - 1));
+            let mb = materialize_before(func, pre, n - (block_elems - 1));
             emit_before(
                 func,
                 pre,
@@ -962,23 +1017,26 @@ fn apply(func: &mut MachFunction, rec: &Recognized) -> bool {
     emit(func, vh, AArch64Opcode::BCond, vec![imm(CC_LO), block(vb)]);
     emit(func, vh, AArch64Opcode::B, vec![block(vx)]);
 
-    // --- Vector body: one paired post-index store `STP qb, qb, [p], #32` — 32
-    // identical bytes = WIDTH_ELEMS elements, all the broadcast value.
-    emit(
-        func,
-        vb,
-        AArch64Opcode::NeonStpQPost,
-        vec![vreg(qb), vreg(qb), vreg(p), imm(BYTES_PER_ITER)],
-    );
+    // --- Vector body: STORE_PAIRS_PER_ITER paired post-index stores
+    // `STP qb, qb, [p], #32` — each 32 identical bytes; the block covers
+    // BLOCK_ELEMS elements, all the broadcast value.
+    for _ in 0..STORE_PAIRS_PER_ITER {
+        emit(
+            func,
+            vb,
+            AArch64Opcode::NeonStpQPost,
+            vec![vreg(qb), vreg(qb), vreg(p), imm(BYTES_PER_ITER)],
+        );
+    }
     emit(func, vb, AArch64Opcode::B, vec![block(vl)]);
 
-    // --- Vector latch: advance the scalar induction by WIDTH_ELEMS (p is
-    // advanced 32 bytes by the store's post-index, keeping p == base+iv*es).
+    // --- Vector latch: advance the scalar induction by BLOCK_ELEMS (p is
+    // advanced 32 bytes by EACH store's post-index, keeping p == base+iv*es).
     emit(
         func,
         vl,
         AArch64Opcode::AddRI,
-        vec![vreg(rec.iv), vreg(rec.iv), imm(width_elems)],
+        vec![vreg(rec.iv), vreg(rec.iv), imm(block_elems)],
     );
     emit(func, vl, AArch64Opcode::B, vec![block(vh)]);
 
@@ -1099,6 +1157,15 @@ fn same_as_iv(func: &MachFunction, def: &HashMap<u32, InstId>, v: VReg, iv: VReg
 /// Follow `MovR`/`Copy` chains to the underlying value.
 fn strip_copies(func: &MachFunction, def: &HashMap<u32, InstId>, mut v: VReg) -> VReg {
     for _ in 0..16 {
+        // A vreg with several live defs has no single reaching definition: the
+        // map is last-wins over the emitted layout, so it names whichever def
+        // comes last, which need not be the one that reaches THIS use. Stop
+        // rather than resolve through it. The frontend lowers every block
+        // parameter to one copy per predecessor into the SAME vreg, so an
+        // `if`/`match` value is multi-def by construction.
+        if crate::effects::live_def_count(func, v.id) != 1 {
+            return v;
+        }
         let Some(&d) = def.get(&v.id) else {
             return v;
         };
@@ -1117,6 +1184,16 @@ fn const_value(func: &MachFunction, def: &HashMap<u32, InstId>, val: VReg) -> Op
     let inst = func.inst(id);
     match inst.opcode {
         AArch64Opcode::Movz => {
+            // Same hazard as in `strip_copies`, reached directly rather than
+            // through a copy chain: for a merge vreg the map names the arm that
+            // comes last in layout order. Broadcasting that arm's constant
+            // across the whole fill is wrong on every other path. (The `Movk`
+            // arm below is not reachable for a merge vreg — its def is a copy,
+            // not a `Movk` — and does its own same-block accumulation, so a
+            // legitimate `Movz`+`Movk` materialization is unaffected.)
+            if crate::effects::live_def_count(func, v.id) != 1 {
+                return None;
+            }
             let (dst, value) = crate::reaching_const::movz_value(inst)?;
             if dst != v {
                 return None;
@@ -1131,7 +1208,7 @@ fn const_value(func: &MachFunction, def: &HashMap<u32, InstId>, val: VReg) -> Op
             let mut acc: Option<u64> = None;
             for &pid in insts[..pos].iter() {
                 let pi = func.inst(pid);
-                if pi.operands.first().and_then(vreg_of) != Some(v) {
+                if !crate::effects::inst_defines_vreg(pi, v) {
                     continue;
                 }
                 match pi.opcode {
@@ -1145,8 +1222,7 @@ fn const_value(func: &MachFunction, def: &HashMap<u32, InstId>, val: VReg) -> Op
                     AArch64Opcode::Movk => {
                         acc = Some(crate::reaching_const::apply_movk(pi, v, acc?)?);
                     }
-                    _ if produces_def(pi.opcode) => return None,
-                    _ => {}
+                    _ => return None,
                 }
             }
             let value = crate::reaching_const::apply_movk(inst, v, acc?)?;
@@ -1154,37 +1230,6 @@ fn const_value(func: &MachFunction, def: &HashMap<u32, InstId>, val: VReg) -> Op
         }
         _ => None,
     }
-}
-
-/// Conservative "operand 0 is a written def" predicate (compares/branches/guard
-/// carriers do NOT define a fresh vreg).
-fn produces_def(op: AArch64Opcode) -> bool {
-    use AArch64Opcode::*;
-    !matches!(
-        op,
-        CmpRR
-            | CmpRI
-            | BCond
-            | B
-            | Cbz
-            | Cbnz
-            | StrbRI
-            | StrhRI
-            | StrRI
-            | StrRO
-            | StrbRO
-            | StrhRO
-            | TrapBoundsCheckExact
-            | TrapBoundsCheck
-            | TrapOverflow
-            | TrapOverflowExact
-            | TrapNull
-            | TrapNullIfZero
-            | TrapDivZero
-            | TrapDivZeroIfZero
-            | TrapShiftRange
-            | TrapShiftRangeIfOOB
-    )
 }
 
 pub(crate) static FILL_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1205,15 +1250,7 @@ fn build_def_map(func: &MachFunction) -> HashMap<u32, InstId> {
 }
 
 fn build_def_map_inner(func: &MachFunction) -> HashMap<u32, InstId> {
-    let mut map = HashMap::new();
-    for (idx, inst) in func.insts.iter().enumerate() {
-        if let Some(MachOperand::VReg(v)) = inst.operands.first()
-            && produces_def(inst.opcode)
-        {
-            map.insert(v.id, InstId(idx as u32));
-        }
-    }
-    map
+    crate::effects::build_reaching_def_map(func)
 }
 
 fn block_of_inst(func: &MachFunction, target: InstId) -> Option<BlockId> {

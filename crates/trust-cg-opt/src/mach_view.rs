@@ -263,11 +263,7 @@ impl MachIrView for MachFunction {
     }
 
     fn defined_vreg(&self, block: Self::Block, idx: usize) -> Option<VReg> {
-        let inst = self.view_inst(block, idx);
-        if !crate::effects::inst_produces_value(inst) {
-            return None;
-        }
-        inst.operands.first().and_then(|op| op.as_vreg())
+        crate::effects::single_inst_def(self.view_inst(block, idx))
     }
 
     fn branch_targets(&self, block: Self::Block, idx: usize) -> Vec<Self::Block> {

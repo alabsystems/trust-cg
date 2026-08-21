@@ -76,7 +76,10 @@
 // backend (`select_tls_ref` fails closed: GD/LD are unreachable-by-lane —
 // trust-cg emits main-executable objects only, no dylib/dlopen lane exists),
 // so they stay FAIL-CLOSED — not proven here, not registered in any
-// proof-required registry.
+// proof-required registry. The four kinds that ARE proven here serve as the
+// production registry value lane for the emitted TLS relocations
+// (`ObjectRelocationProofRegistry::aarch64_elf_production`), composed with
+// the per-object ELF reparse binding exactly like the ordinary rows.
 //
 // Technique mirrors the Mach-O reloc lanes (Alive2-style, PLDI 2021): encode the
 // linker-patched + runtime ADD arithmetic as the `aarch64_expr` (the "emitted"
@@ -606,7 +609,9 @@ pub fn proof_tlsie_lo12_without_alignment_refutes() -> ProofObligation {
 /// All must verify. The GD/LD (`__tls_get_addr`/TLSDESC) rows and the checked
 /// (non-`_NC`) `R_AARCH64_TLSLE_ADD_TPREL_LO12` are NOT emitted by the backend
 /// (GD/LD are unreachable-by-lane: trust-cg emits main-executable objects
-/// only), so they are intentionally NOT proven here and stay fail-closed.
+/// only), so they are intentionally NOT proven here and stay fail-closed —
+/// which is why the production registry cites this lane ONLY for the four
+/// kinds below and keeps the checked TPREL_LO12 out.
 pub fn aarch64_elf_tls_relocation_proofs() -> Vec<ProofObligation> {
     vec![
         proof_tlsle_add_tprel_hi12(),

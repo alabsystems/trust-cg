@@ -16,11 +16,11 @@
 # trust-cg: this repo. Owns the gate test targets (soundness_manifest, the 9
 # differential bridges, coverage, meta-theorems, mutation, proof-gate /
 # non-degeneracy).
-trust_cg_rev = f479927335d32ffb14002defcf9eb571d8069581
+trust_cg_rev = dadbf94aea6d88075492932f451fa2f51aa704ba
 
 # Clean checkout: the Clean kernel + the B-def / LRAT-checker .lean proofs and the
 # kernel diversity gate. The clean-check half of the constellation runs here.
-clean_rev = 93550c617865af7c17edd8dd3efad60c953fdc60
+clean_rev = bedd2e01ea7f12f7264b62a04a5502fdca63e043
 
 # AY checkout: dependency-source provenance for the release context. The local
 # soundness script does not invoke AY and this pin does not attest fixture
@@ -32,4 +32,4 @@ clean_rev = 93550c617865af7c17edd8dd3efad60c953fdc60
 # those pins or check_lock_drift.sh reports a source it no longer builds
 # against. trust_cg_rev and clean_rev are untouched: they attest gate runs and
 # are re-pinned only by scripts/soundness_check.sh --update after a green run.
-ay_rev = 1f8238bbc02432fb78380f77decf11aaddb1d651
+ay_rev = 09951c0e62934ccdec7525b0a08e37342d19aefb

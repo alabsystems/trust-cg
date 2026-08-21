@@ -48,11 +48,40 @@
 //!
 //! Per `(i, jt, k)` the fast path does `1` `a` load, `T` `b` loads and `T`
 //! `madd`s and NO `c` traffic; `c` is loaded once per tile and stored once per
-//! tile (after the whole `k`-loop). All memory is addressed with running
-//! pointers advanced by immediate `AddRI` (the `a` pointer `+= scale` per `k`,
-//! the `b` pointer `+= N*scale` per `k`, the tile pointers `+= T*scale` per
-//! tile, the row pointers `+= N*scale` per `i`) and immediate-offset
-//! `LdrRI`/`StrRI [p, #m*scale]`.
+//! tile (after the whole `k`-loop). The tile/row pointers advance by immediate
+//! `AddRI` (`+= T*scale` per tile, `+= N*scale` per `i`) and address `c` with
+//! immediate-offset `LdrRI`/`StrRI [p, #m*scale]`.
+//!
+//! ## The k-loop body: pointer-writeback shape
+//!
+//! Inside the `k`-loop the two per-`k` pointer bumps are folded INTO the loads
+//! that are their last readers (see `pair_writeback_ok` for the encodability
+//! preconditions; anything that fails them falls back to the plain
+//! `LdrRI` + two `AddRI` shape, which is what this pass emitted originally):
+//!
+//! ```text
+//!   ldr  aik, [pa], #scale              // a load + `pa += scale`
+//!   ldp  b6,b7, [pb, #(T-2)*scale]      // b lanes, DESCENDING
+//!   madd ... ; madd ...
+//!   ...
+//!   ldp  b0,b1, [pb], #N*scale          // last b pair + `pb += N*scale`
+//!   madd ... ; madd ...
+//! ```
+//!
+//! This is a pure addressing-mode rewrite: identical loads of identical
+//! addresses, identical `madd`s, and each pointer still advances exactly once
+//! per `k` by exactly the same amount — only the instruction that performs the
+//! advance changes. It costs `2*T + 4` instructions per `k` instead of
+//! `2*T + 6`, i.e. `1 + 1/T` loop-overhead instructions per multiply-accumulate
+//! instead of `1 + 3/T` (measured on `p4_matmul`, `T = 8`, Cortex-X925: 42.1ms
+//! -> 39.4ms, 1.112x -> 1.041x of LLVM `-O3`).
+//!
+//! The DESCENDING lane order is load-bearing, not cosmetic: it puts the
+//! writeback on the LAST `ldp`, so the other `T/2 - 1` pairs read the
+//! pre-update `pb` and stay off the base-update recurrence. The ascending
+//! order (writeback first, remaining pairs at negative offsets off the new
+//! base) encodes equally well and computes the same values, but chains every
+//! subsequent load behind the base write and measured ~2.5% slower.
 //!
 //! ## Why this is SOUND
 //!
@@ -80,10 +109,14 @@
 //!    terminator is redirected (at a final COMMIT) to a guard that dispatches to
 //!    the fast path (guard true for the recognized constant `N`) or the
 //!    untouched fallback nest. Recognition is closed-world and fail-closed on
-//!    every unproven precondition; every emitted opcode (`Madd`, `AddRI`,
-//!    `MovR`, `Movz`, `CmpRI`, `BCond`, `B`, `LdrRI`/`StrRI` with `#m*scale`) is
-//!    already emitted by the scalar nest — no new emittable opcode, no division,
-//!    no new proof obligation.
+//!    every unproven precondition. The emitted opcode set is `Madd`, `AddRI`,
+//!    `MovR`, `Movz`, `CmpRI`, `BCond`, `B`, `LdrRI`/`StrRI` with `#m*scale` —
+//!    all already emitted by the scalar nest — plus, in the k-loop's
+//!    pointer-writeback shape, `LdrPostIndex`, `LdpRI` and `LdpPostIndex`. Those
+//!    three are pre-existing backend opcodes with encoder support and correct
+//!    def/def-use operand roles (`effects::fill_operand_roles`); `LdpRI` is in
+//!    any case what `mem-pair-formation` already folded this loop's `LdrRI`
+//!    pairs into. No division, no new emittable opcode in the backend.
 //!
 //! Default-ON at O2/O3 (never O0/O1). Compile-time kill switch:
 //! `TCG_NO_MAC_REG_BLOCK`. Per-pass bisect:
@@ -401,8 +434,27 @@ impl Recognized {
         }
         // Encodable immediates: per-k b advance `N*scale`, per-lane offset
         // `(TILE-1)*scale`, per-tile/per-row advance `TILE*scale`/`N*scale`.
-        if scale <= 0 {
-            bail!("non-positive scale {}", scale);
+        // WRONG-CODE GUARD (2026-08-17): `apply` emits the whole kernel with
+        // `RegClass::Gpr64` lanes and 64-bit `LdrRI`/`LdpRI` loads, so it is
+        // correct ONLY for an 8-byte element. Recognition previously admitted
+        // any positive scale, so an i32 matmul (scale == 4) was rewritten into
+        // 64-bit loads at 4-byte lane strides: every lane pulled TWO adjacent
+        // i32s packed into one X register and fed them to a 64-bit `madd`, and
+        // the top lane read 4 bytes PAST the array. That miscompiled silently
+        // and NON-DETERMINISTICALLY (repeated runs of one binary disagreed,
+        // because the out-of-bounds read picks up whatever is adjacent);
+        // measured against LLVM at O2/O3 on square i32 N in {8,24,64}.
+        //
+        // Fail closed on every element width this kernel does not model. Any
+        // future non-8 support must widen `apply` (lane class, load opcode and
+        // element packing) FIRST — this gate is what makes that a deliberate
+        // change rather than a silent one.
+        if !kernel_supports_scale(scale) {
+            bail!(
+                "element scale {} unsupported; the register-blocked kernel \
+                 emits 64-bit lanes and would transfer the wrong width",
+                scale
+            );
         }
         if n.checked_mul(scale)? > 4095 || (TILE - 1).checked_mul(scale)? > 4095 {
             bail!(
@@ -769,6 +821,42 @@ fn single_latch(func: &MachFunction, header: BlockId, body: &HashSet<BlockId>) -
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_lines)]
+/// Element widths the emitted kernel actually models.
+///
+/// [`apply`] builds every lane with `RegClass::Gpr64` and 64-bit loads, so the
+/// rewrite is value-preserving ONLY for an 8-byte element. This predicate is
+/// the single place that fact is enforced; widening it REQUIRES widening
+/// `apply` (lane class, load opcode, element packing) in the same change.
+fn kernel_supports_scale(scale: i64) -> bool {
+    scale == 8
+}
+
+/// Can the k-loop body use the pointer-writeback shape (post-indexed `Ldr` for
+/// `a`, `Ldp`/`LdpPostIndex` for the `b` tile) instead of plain `LdrRI`s plus
+/// two explicit `AddRI` pointer bumps?
+///
+/// Requires, ALL checked here so the pass stays fail-closed onto the plain
+/// shape rather than emitting an unencodable instruction:
+///
+/// * `scale == 8` — the pass allocates `Gpr64` lanes and `Ldp` of a 64-bit
+///   register pair transfers 8 bytes per lane, so an element scale other than
+///   8 would silently transfer the wrong width.
+/// * `TILE` even — lanes are consumed two at a time.
+/// * every pair offset in the LDP signed-imm7 range. That immediate is scaled
+///   by 8 for a 64-bit pair, giving `[-64*8, 63*8] = [-512, 504]`, and the
+///   offsets used are `m*scale` for even `m` in `2..TILE` plus the writeback
+///   amount `N*scale`. Both are non-negative here, so the upper bound is the
+///   only binding one; the lower bound is asserted anyway for clarity.
+fn pair_writeback_ok(scale: i64, n_scale: i64, tiles: i64) -> bool {
+    const LDP64_MIN: i64 = -512;
+    const LDP64_MAX: i64 = 504;
+    if scale != 8 || tiles % 2 != 0 || tiles < 2 {
+        return false;
+    }
+    let max_lane_off = (tiles - 2) * scale;
+    (LDP64_MIN..=LDP64_MAX).contains(&max_lane_off) && (LDP64_MIN..=LDP64_MAX).contains(&n_scale)
+}
+
 fn apply(func: &mut MachFunction, rec: &Recognized) -> bool {
     let n = rec.n_const;
     let scale = rec.scale_const;
@@ -930,21 +1018,45 @@ fn apply(func: &mut MachFunction, rec: &Recognized) -> bool {
 
     // --- kbody: aik = a[pa]; for m: acc[m] += aik * b[pb + m*scale]; advance
     // pa += scale, pb += N*scale, k += 1; back to khdr.
+    //
+    // Two shapes, selected by `writeback_pairs` (see `pair_writeback_ok`):
+    //
+    // * WRITEBACK shape (the fast one, taken whenever the offsets encode):
+    //   `aik` is loaded with a post-indexed `LdrPostIndex [pa], #scale` and the
+    //   `b` tile is read as `TILE/2` `Ldp`s issued in DESCENDING lane order,
+    //   the LAST of which (`m == 0`) is an `LdpPostIndex [pb], #N*scale`. The
+    //   two separate `AddRI` pointer bumps disappear into those two loads, so
+    //   the k-loop shrinks from `2*TILE + 6` to `2*TILE + 4` instructions.
+    //   Descending order is deliberate: it keeps the three non-writeback `Ldp`s
+    //   OFF the base-update recurrence (they read the pre-bump `pb`), which
+    //   measured ~2.5% faster on p4_matmul than the ascending order that hangs
+    //   each subsequent load off the just-written base.
+    // * PLAIN shape (unchanged fallback): `LdrRI`/`LdrRI` + two `AddRI` bumps.
+    //   Kept for any recognized nest whose `scale`/`N` push a pair offset out
+    //   of the LDP signed-imm7 range, so the pass never fails to apply.
+    //
+    // Both shapes compute exactly the same values in exactly the same k-order;
+    // the writeback shape only folds the two pointer increments the plain shape
+    // performs explicitly at the END of the body into the loads that are the
+    // last readers of each pointer in the body.
+    let writeback_pairs = pair_writeback_ok(scale, n_scale, tiles);
     let aik = alloc(func, RegClass::Gpr64);
-    emit(
-        func,
-        kbody,
-        AArch64Opcode::LdrRI,
-        vec![vreg(aik), vreg(pa), imm(0)],
-    );
-    for m in 0..tiles {
-        let bm = alloc(func, RegClass::Gpr64);
+    if writeback_pairs {
+        emit(
+            func,
+            kbody,
+            AArch64Opcode::LdrPostIndex,
+            vec![vreg(aik), vreg(pa), imm(scale)],
+        );
+    } else {
         emit(
             func,
             kbody,
             AArch64Opcode::LdrRI,
-            vec![vreg(bm), vreg(pb), imm(m * scale)],
+            vec![vreg(aik), vreg(pa), imm(0)],
         );
+    }
+    let mac = |func: &mut MachFunction, m: i64, bm: VReg| {
         let cm_new = alloc(func, RegClass::Gpr64);
         emit(
             func,
@@ -959,19 +1071,53 @@ fn apply(func: &mut MachFunction, rec: &Recognized) -> bool {
             AArch64Opcode::MovR,
             vec![vreg(acc[m as usize]), vreg(cm_new)],
         );
+    };
+    if writeback_pairs {
+        // Descending pairs; the m == 0 pair carries the `pb += N*scale`
+        // writeback and is therefore emitted last.
+        let mut m = tiles - 2;
+        while m >= 0 {
+            let b0 = alloc(func, RegClass::Gpr64);
+            let b1 = alloc(func, RegClass::Gpr64);
+            let (op, off) = if m == 0 {
+                (AArch64Opcode::LdpPostIndex, n_scale)
+            } else {
+                (AArch64Opcode::LdpRI, m * scale)
+            };
+            emit(
+                func,
+                kbody,
+                op,
+                vec![vreg(b0), vreg(b1), vreg(pb), imm(off)],
+            );
+            mac(func, m, b0);
+            mac(func, m + 1, b1);
+            m -= 2;
+        }
+    } else {
+        for m in 0..tiles {
+            let bm = alloc(func, RegClass::Gpr64);
+            emit(
+                func,
+                kbody,
+                AArch64Opcode::LdrRI,
+                vec![vreg(bm), vreg(pb), imm(m * scale)],
+            );
+            mac(func, m, bm);
+        }
+        emit(
+            func,
+            kbody,
+            AArch64Opcode::AddRI,
+            vec![vreg(pa), vreg(pa), imm(scale)],
+        );
+        emit(
+            func,
+            kbody,
+            AArch64Opcode::AddRI,
+            vec![vreg(pb), vreg(pb), imm(n_scale)],
+        );
     }
-    emit(
-        func,
-        kbody,
-        AArch64Opcode::AddRI,
-        vec![vreg(pa), vreg(pa), imm(scale)],
-    );
-    emit(
-        func,
-        kbody,
-        AArch64Opcode::AddRI,
-        vec![vreg(pb), vreg(pb), imm(n_scale)],
-    );
     let k_next = alloc(func, RegClass::Gpr64);
     emit(
         func,
@@ -1471,9 +1617,11 @@ fn find_header_iv_test(
 /// the conventional-SSA `MovR`-phi form).
 fn find_all_defs(func: &MachFunction, v: VReg) -> Vec<InstId> {
     let mut out = Vec::new();
-    for (idx, inst) in func.insts.iter().enumerate() {
-        if produces_def(inst.opcode) && inst.operands.first().and_then(vreg_of) == Some(v) {
-            out.push(InstId(idx as u32));
+    for &bid in &func.block_order {
+        for &id in &func.block(bid).insts {
+            if crate::effects::inst_defines_vreg(func.inst(id), v) {
+                out.push(id);
+            }
         }
     }
     out
@@ -1488,14 +1636,16 @@ fn is_loop_invariant(
     v: VReg,
 ) -> bool {
     for &id in loop_insts {
-        let inst = func.inst(id);
-        if produces_def(inst.opcode) && inst.operands.first().and_then(vreg_of) == Some(v) {
+        if crate::effects::inst_defines_vreg(func.inst(id), v) {
             return false;
         }
     }
     let Some(&d) = def.get(&v.id) else {
-        return !func.insts.iter().any(|inst| {
-            produces_def(inst.opcode) && inst.operands.first().and_then(vreg_of) == Some(v)
+        return !func.block_order.iter().any(|&bid| {
+            func.block(bid)
+                .insts
+                .iter()
+                .any(|&id| crate::effects::inst_defines_vreg(func.inst(id), v))
         });
     };
     let Some(db) = block_of_inst(func, d) else {
@@ -1544,6 +1694,18 @@ fn same_as(func: &MachFunction, def: &HashMap<u32, InstId>, v: VReg, w: VReg) ->
 
 fn strip_copies(func: &MachFunction, def: &HashMap<u32, InstId>, mut v: VReg) -> VReg {
     for _ in 0..16 {
+        // A vreg with several live defs has no single reaching definition: the
+        // def map is LAST-WINS over the emitted layout, so it names whichever
+        // def comes last rather than the one that reaches this use. Every
+        // loop-carried variable is multi-def by construction — the frontend
+        // lowers a block parameter to one copy per predecessor, giving a
+        // preheader copy and a latch copy into the same vreg — so walking one
+        // resolves the INDUCTION VARIABLE to its latch source `iv + 1`. Then
+        // `same_as(iv + 1, iv)` is TRUE and an index of `j + 1` passes as an
+        // index of `j`, which is a wrong-address store.
+        if crate::effects::live_def_count(func, v.id) != 1 {
+            return v;
+        }
         let Some(&d) = def.get(&v.id) else {
             return v;
         };
@@ -1591,45 +1753,8 @@ fn const_value(func: &MachFunction, def: &HashMap<u32, InstId>, val: VReg) -> Op
     }
 }
 
-fn produces_def(op: AArch64Opcode) -> bool {
-    use AArch64Opcode::*;
-    !matches!(
-        op,
-        CmpRR
-            | CmpRI
-            | BCond
-            | B
-            | Cbz
-            | Cbnz
-            | StrbRI
-            | StrhRI
-            | StrRI
-            | StrRO
-            | StrbRO
-            | StrhRO
-            | TrapBoundsCheckExact
-            | TrapBoundsCheck
-            | TrapOverflow
-            | TrapOverflowExact
-            | TrapNull
-            | TrapNullIfZero
-            | TrapDivZero
-            | TrapDivZeroIfZero
-            | TrapShiftRange
-            | TrapShiftRangeIfOOB
-    )
-}
-
 fn build_def_map(func: &MachFunction) -> HashMap<u32, InstId> {
-    let mut map = HashMap::new();
-    for (idx, inst) in func.insts.iter().enumerate() {
-        if let Some(MachOperand::VReg(v)) = inst.operands.first()
-            && produces_def(inst.opcode)
-        {
-            map.insert(v.id, InstId(idx as u32));
-        }
-    }
-    map
+    crate::effects::build_reaching_def_map(func)
 }
 
 fn block_of_inst(func: &MachFunction, target: InstId) -> Option<BlockId> {

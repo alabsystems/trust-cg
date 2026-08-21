@@ -89,6 +89,7 @@ use trust_cg_ir::{
     ProvenanceMap, RegClass, StackSlotId, VReg, regs,
 };
 
+use crate::effects::{aarch64_for_each_use_position, for_each_inst_def};
 use crate::pass_manager::MachinePass;
 
 /// Kill switch for the small-constant-`memcpy`-into-slot expansion (the
@@ -225,9 +226,10 @@ fn run_impl(func: &mut MachFunction, provenance: Option<&mut ProvenanceMap>) -> 
 // Helpers: vreg bookkeeping
 // ---------------------------------------------------------------------------
 
-/// Return the defining vreg (operand[0]) if the instruction's first operand
-/// is a VReg; otherwise `None`. SROA only considers instructions whose
-/// convention is "first operand is the destination".
+/// Return operand 0 for an instruction whose already-matched opcode shape
+/// defines exactly that operand. Callers use this only after matching the
+/// supported `Add*`, `Sub*`, `Mov*`, `Ldr*`, `Str*`, `Cmp*`, or `BCond`
+/// layouts; it is deliberately not a general AArch64 definition oracle.
 fn def_vreg(inst: &MachInst) -> Option<VReg> {
     inst.operands.first().and_then(|op| match op {
         MachOperand::VReg(v) => Some(*v),
@@ -235,18 +237,16 @@ fn def_vreg(inst: &MachInst) -> Option<VReg> {
     })
 }
 
-/// Map every defined VReg to the instruction that defined it.
+/// Map every modeled VReg definition to the instruction that defined it.
 fn build_vreg_def_map(func: &MachFunction) -> HashMap<VReg, InstId> {
     let mut out = HashMap::new();
     for block_id in &func.block_order {
         let block = func.block(*block_id);
         for &inst_id in &block.insts {
             let inst = func.inst(inst_id);
-            if produces_value(inst)
-                && let Some(v) = def_vreg(inst)
-            {
+            for_each_inst_def(inst, |v| {
                 out.insert(v, inst_id);
-            }
+            });
         }
     }
     out
@@ -270,43 +270,31 @@ fn build_multidef_set(func: &MachFunction) -> HashSet<VReg> {
         let block = func.block(*block_id);
         for &inst_id in &block.insts {
             let inst = func.inst(inst_id);
-            if produces_value(inst)
-                && let Some(v) = def_vreg(inst)
-                && !seen.insert(v)
-            {
-                multi.insert(v);
-            }
+            for_each_inst_def(inst, |v| {
+                if !seen.insert(v) {
+                    multi.insert(v);
+                }
+            });
         }
     }
     multi
 }
 
-/// Count how many times each VReg appears as a *source* operand.
-///
-/// Uses the same convention as DCE: if the instruction produces a value,
-/// operands[0] is the def; otherwise every operand is a use.
+/// Count how many times each VReg appears at a modeled use position.
 fn collect_vreg_use_counts(func: &MachFunction) -> HashMap<VReg, u32> {
     let mut counts: HashMap<VReg, u32> = HashMap::new();
     for block_id in &func.block_order {
         let block = func.block(*block_id);
         for &inst_id in &block.insts {
             let inst = func.inst(inst_id);
-            let start = if produces_value(inst) { 1 } else { 0 };
-            for op in &inst.operands[start..] {
-                if let MachOperand::VReg(v) = op {
+            aarch64_for_each_use_position(inst.opcode, inst.operands.len(), |pos| {
+                if let Some(MachOperand::VReg(v)) = inst.operands.get(pos) {
                     *counts.entry(*v).or_insert(0) += 1;
                 }
-            }
+            });
         }
     }
     counts
-}
-
-/// An instruction produces a value iff its `InstFlags` predicate says so.
-/// Mirrors `effects::inst_produces_value` but we duplicate locally to keep
-/// dependencies minimal.
-fn produces_value(inst: &MachInst) -> bool {
-    crate::effects::inst_produces_value(inst)
 }
 
 // ---------------------------------------------------------------------------
@@ -1132,14 +1120,14 @@ fn collect_users_of(func: &MachFunction, vreg: VReg) -> Vec<InstId> {
         let block = func.block(*block_id);
         for &inst_id in &block.insts {
             let inst = func.inst(inst_id);
-            let start = if produces_value(inst) { 1 } else { 0 };
-            for op in &inst.operands[start..] {
-                if let MachOperand::VReg(v) = op
-                    && *v == vreg
-                {
-                    out.push(inst_id);
-                    break;
+            let mut uses = false;
+            aarch64_for_each_use_position(inst.opcode, inst.operands.len(), |pos| {
+                if matches!(inst.operands.get(pos), Some(MachOperand::VReg(v)) if *v == vreg) {
+                    uses = true;
                 }
+            });
+            if uses {
+                out.push(inst_id);
             }
         }
     }

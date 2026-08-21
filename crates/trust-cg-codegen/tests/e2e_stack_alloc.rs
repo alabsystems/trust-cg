@@ -39,6 +39,62 @@ use trust_ir::{Module as TrustIrModule, Ty};
 use trust_ir_build::ModuleBuilder;
 
 // ---------------------------------------------------------------------------
+// Host-native object support (GB10 re-baseline): these e2e tests emit objects
+// the HOST toolchain links and runs, so emission, magic checks, PIE flags and
+// disassembly must follow the host format — Mach-O on macOS, ELF elsewhere.
+// ---------------------------------------------------------------------------
+
+/// Host-native disassembly text: `otool -tv` on macOS, `objdump -d` elsewhere
+/// (both print lowercase AArch64 mnemonics).
+fn disasm_object_text(path: &str) -> String {
+    let output = if cfg!(target_os = "macos") {
+        Command::new("otool").args(["-tv", path]).output()
+    } else {
+        Command::new("objdump").args(["-d", path]).output()
+    }
+    .expect("host disassembler (otool/objdump) available");
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+#[allow(dead_code)]
+fn host_aarch64_triple() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "aarch64-apple-darwin"
+    } else {
+        "aarch64-unknown-linux-gnu"
+    }
+}
+
+#[allow(dead_code)]
+fn host_no_pie_flag() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "-Wl,-no_pie"
+    } else {
+        "-no-pie"
+    }
+}
+
+#[allow(dead_code)]
+fn host_object_magic_u32() -> u32 {
+    if cfg!(target_os = "macos") {
+        0xFEED_FACF
+    } else {
+        u32::from_le_bytes([0x7F, b'E', b'L', b'F'])
+    }
+}
+
+#[allow(dead_code)]
+fn assert_host_object_magic_bytes(obj_bytes: &[u8], context: &str) {
+    assert!(obj_bytes.len() >= 4, "{context}: object too small");
+    let expected = host_object_magic_u32().to_le_bytes();
+    assert_eq!(
+        &obj_bytes[0..4],
+        &expected,
+        "{context}: object magic must match the host-native format"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Test infrastructure
 // ---------------------------------------------------------------------------
 
@@ -89,11 +145,7 @@ fn compile_link_run(module: &TrustIrModule, test_name: &str, driver_src: &str) -
     fs::write(&obj_path, &result.object_code).expect("write .o file");
 
     // Disassemble for debugging.
-    let otool = Command::new("otool")
-        .args(["-tv", obj_path.to_str().unwrap()])
-        .output()
-        .expect("otool");
-    let disasm = String::from_utf8_lossy(&otool.stdout);
+    let disasm = disasm_object_text(obj_path.to_str().unwrap());
     eprintln!("{} disassembly:\n{}", test_name, disasm);
 
     // Check symbols.
@@ -387,9 +439,11 @@ fn e2e_stack_alloc_compiles_all_opt_levels() {
         );
         let magic = u32::from_le_bytes([obj[0], obj[1], obj[2], obj[3]]);
         assert_eq!(
-            magic, 0xFEED_FACF,
+            magic,
+            host_object_magic_u32(),
             "{:?}: invalid Mach-O magic 0x{:08X}",
-            opt, magic
+            opt,
+            magic
         );
 
         eprintln!(

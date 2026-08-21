@@ -58,6 +58,15 @@
 //!   IDENTICAL to the scalar `bitmanip_reverse_bits(n=8)` ladder the recognizer
 //!   exact-matched. `LDP`/`STP` move contiguous bytes and `RBIT` is per-byte, so
 //!   `out[iv+j] = reverse8(a[iv+j])` for every `j in 0..64`.
+//! * **The induction is the ONLY loop-carried register.** The vector loop steps
+//!   `iv` by `WIDTH` and executes NONE of the scalar body's other register
+//!   updates, so a second loop-carried value (a stealth accumulator
+//!   `acc += f(i)` in the latch, or any body register live out of the loop)
+//!   would silently lose every contribution from the vectorized prefix
+//!   `[0, V)`. [`validate_body_locality`] proves every non-`iv` register the
+//!   body defines is a per-iteration temporary — single in-loop def, no
+//!   self-use, every in-loop use strictly dominated by that def, and never
+//!   touched outside the loop. Otherwise the loop stays scalar.
 //! * **No store aliasing.** The store base `out` and the load base `a` are each
 //!   proven to be the address of a DISTINCT stack slot (`AddPCRel(sp,
 //!   StackSlot(s))` with `s_out != s_a`). Distinct stack slots occupy
@@ -73,7 +82,8 @@
 //! If ANY premise is unprovable (non-`.16B`/non-8-bit reversal, a partial or
 //! permuted ladder, a stencil `a[i±k]`, a non-constant or `< WIDTH` bound, a
 //! second store/load/call, a base not rooted at a distinct stack slot, a bound
-//! guard not materializable in 16 bits) the loop stays scalar.
+//! guard not materializable in 16 bits, a second loop-carried register) the loop
+//! stays scalar.
 
 use std::collections::{HashMap, HashSet};
 
@@ -399,6 +409,17 @@ impl Recognized {
             bail!("ladder byte source is not the recognized load");
         }
 
+        // --- LOCALITY: the induction is the ONLY loop-carried register.
+        // The vector loop replaces whole iterations WITHOUT executing any of the
+        // scalar body's register updates — it steps only `iv`. So every other
+        // register the body defines must be a per-iteration temporary, or the
+        // skipped iterations' updates to it are silently dropped (a second
+        // accumulator `acc += f(i)` updated in the latch would survive
+        // recognition and read 0 contributions from `[0, V)`).
+        if !validate_body_locality(func, dom, body, &loop_insts, iv) {
+            bail!("a non-induction register is loop-carried or escapes the loop");
+        }
+
         // --- Dominance: the store executes once per completed iteration (its
         // block dominates the latch), and the load precedes the store.
         let store_block = block_of_inst(func, store_id)?;
@@ -423,6 +444,129 @@ impl Recognized {
             store_base,
         })
     }
+}
+
+/// Prove the induction is the loop's ONLY loop-carried register.
+///
+/// The transform is additive only because the vector loop reproduces whole
+/// scalar iterations. It executes NONE of the scalar body's register updates —
+/// it advances `iv` by `WIDTH` and nothing else. Any OTHER register that carries
+/// state across the back edge (a second accumulator), or that is live out of the
+/// loop, would therefore observe zero contributions from the vectorized prefix
+/// `[0, V)`. This gate proves structurally that no such register exists, per
+/// register `r` defined by a loop-body instruction (`r != iv`, which the vector
+/// latch steps faithfully):
+///
+/// * `r` must NOT be touched (def or use) by any instruction OUTSIDE the loop
+///   body — a use outside is live-out state, a def outside is a value carried
+///   IN from the preheader and re-carried around the back edge.
+/// * `r` must have EXACTLY ONE def in the loop (several defs make the reaching
+///   value ambiguous), and that def must not read `r` itself (`r = op(r, ..)`
+///   reads the PREVIOUS iteration's value on every pass but the first).
+/// * Every in-loop use of `r` must be STRICTLY DOMINATED by that def. Because
+///   the header is reachable without entering the body, a def block `D` inside
+///   the loop that dominates a use block `U` inside the loop must lie on EVERY
+///   header-to-`U` path — so the use reads THIS iteration's def, never the
+///   previous one's. A use not so dominated is back-edge-carried and BAILS.
+///
+/// Fail-closed: anything unclassifiable bails the whole loop.
+fn validate_body_locality(
+    func: &MachFunction,
+    dom: &DomTree,
+    body: &HashSet<BlockId>,
+    loop_insts: &HashSet<InstId>,
+    iv: VReg,
+) -> bool {
+    // (block, index-in-block) of every loop-body instruction, and the in-loop
+    // defs per register id according to the shared operand-role model.
+    let mut pos: HashMap<InstId, (BlockId, usize)> = HashMap::new();
+    let mut defs: HashMap<u32, Vec<InstId>> = HashMap::new();
+    for &blk in body {
+        for (io, &id) in func.block(blk).insts.iter().enumerate() {
+            pos.insert(id, (blk, io));
+            let inst = func.inst(id);
+            crate::effects::for_each_inst_def(inst, |v| {
+                defs.entry(v.id).or_default().push(id);
+            });
+        }
+    }
+    // Register ids touched (def OR use) by any instruction outside the loop.
+    let mut outside: HashSet<u32> = HashSet::new();
+    for block in &func.blocks {
+        for &id in &block.insts {
+            if loop_insts.contains(&id) {
+                continue;
+            }
+            for op in &func.inst(id).operands {
+                if let MachOperand::VReg(v) = op {
+                    outside.insert(v.id);
+                }
+            }
+        }
+    }
+    for (&rid, dlist) in &defs {
+        if rid == iv.id {
+            continue; // the induction: stepped faithfully by the vector latch
+        }
+        if outside.contains(&rid) {
+            return false; // live-in from / live-out to outside the loop
+        }
+        if dlist.len() != 1 {
+            return false; // ambiguous reaching def
+        }
+        let def_id = dlist[0];
+        let Some(&(dblk, dix)) = pos.get(&def_id) else {
+            return false;
+        };
+        let def_inst = func.inst(def_id);
+        let mut self_use = false;
+        crate::effects::aarch64_for_each_use_position(
+            def_inst.opcode,
+            def_inst.operands.len(),
+            |pos| {
+                if matches!(def_inst.operands.get(pos), Some(MachOperand::VReg(v)) if v.id == rid) {
+                    self_use = true;
+                }
+            },
+        );
+        if self_use {
+            return false; // self-use: reads the previous iteration's value
+        }
+        for &blk in body {
+            for &uid in &func.block(blk).insts {
+                if uid == def_id {
+                    continue;
+                }
+                let user = func.inst(uid);
+                let mut uses = false;
+                crate::effects::aarch64_for_each_use_position(
+                    user.opcode,
+                    user.operands.len(),
+                    |pos| {
+                        if matches!(user.operands.get(pos), Some(MachOperand::VReg(v)) if v.id == rid)
+                        {
+                            uses = true;
+                        }
+                    },
+                );
+                if !uses {
+                    continue;
+                }
+                let Some(&(ublk, uix)) = pos.get(&uid) else {
+                    return false;
+                };
+                let dominated = if ublk == dblk {
+                    uix > dix
+                } else {
+                    dom.dominates(dblk, ublk)
+                };
+                if !dominated {
+                    return false; // back-edge-carried read
+                }
+            }
+        }
+    }
+    true
 }
 
 /// Resolve `addr` (a byte-access address) to `(base, slot)` where
@@ -881,6 +1025,21 @@ fn copy_like(inst: &MachInst) -> Option<(VReg, VReg)> {
 
 fn strip_copies(func: &MachFunction, def: &HashMap<u32, InstId>, mut v: VReg) -> VReg {
     for _ in 0..16 {
+        // A vreg with several live defs has no single reaching definition: the
+        // def map is LAST-WINS over the emitted layout, so it names whichever
+        // def comes last rather than the one that reaches this use. Every
+        // loop-carried variable is multi-def by construction (a preheader copy
+        // and a latch copy into the same vreg), and every `if`/`match` value has
+        // one def per arm — so walking one resolves an induction variable to its
+        // LATCH source, or a merge value to whichever arm came last.
+        //
+        // Confirmed wrong-code from this exact hole in neon_fill, mac_reg_block,
+        // mac_row_unroll, strided_store_unroll, neon_iota_fill and neon_bytesum.
+        // `swap_range_guard::single_def` and `neon_find`'s bound check were the
+        // in-tree precedents for doing it right.
+        if crate::effects::live_def_count(func, v.id) != 1 {
+            return v;
+        }
         let Some(&d) = def.get(&v.id) else {
             return v;
         };
@@ -921,7 +1080,7 @@ fn const_value(func: &MachFunction, def: &HashMap<u32, InstId>, val: VReg) -> Op
             let mut base = None;
             for &pid in insts[..pos].iter().rev() {
                 let pi = func.inst(pid);
-                if pi.operands.first().and_then(vreg_of) != Some(v) || !produces_def(pi.opcode) {
+                if !crate::effects::inst_defines_vreg(pi, v) {
                     continue;
                 }
                 if pi.opcode == AArch64Opcode::Movz {
@@ -943,29 +1102,6 @@ fn const_value(func: &MachFunction, def: &HashMap<u32, InstId>, val: VReg) -> Op
         }
         _ => None,
     }
-}
-
-/// Conservative "operand 0 is a written def" predicate: compares / branches /
-/// bounds-check carriers TEST operand 0, and stores READ it — none define a
-/// vreg. (`Movk` DOES define in place — last-write-wins picks it over its base
-/// `Movz`.)
-fn produces_def(op: AArch64Opcode) -> bool {
-    use AArch64Opcode::*;
-    !matches!(
-        op,
-        CmpRR
-            | CmpRI
-            | BCond
-            | B
-            | TrapBoundsCheckExact
-            | StrRI
-            | StrbRI
-            | StrhRI
-            | StrRO
-            | StrbRO
-            | StrhRO
-            | StpRI
-    )
 }
 
 /// Def map (`vreg id -> defining InstId`) over instructions still ATTACHED to a
@@ -991,22 +1127,7 @@ fn build_def_map(func: &MachFunction) -> HashMap<u32, InstId> {
 }
 
 fn build_def_map_inner(func: &MachFunction) -> HashMap<u32, InstId> {
-    let live: HashSet<InstId> = func
-        .blocks
-        .iter()
-        .flat_map(|b| b.insts.iter().copied())
-        .collect();
-    let mut map = HashMap::new();
-    for (idx, inst) in func.insts.iter().enumerate() {
-        let id = InstId(idx as u32);
-        if live.contains(&id)
-            && let Some(MachOperand::VReg(v)) = inst.operands.first()
-            && produces_def(inst.opcode)
-        {
-            map.insert(v.id, id);
-        }
-    }
-    map
+    crate::effects::build_reaching_def_map(func)
 }
 
 fn block_of_inst(func: &MachFunction, target: InstId) -> Option<BlockId> {
@@ -1107,4 +1228,159 @@ fn alloc(func: &mut MachFunction, class: RegClass) -> VReg {
         id = func.alloc_vreg();
     }
     VReg::new(id, class)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use trust_cg_ir::Signature;
+
+    fn g32(id: u32) -> MachOperand {
+        MachOperand::VReg(VReg::new(id, RegClass::Gpr32))
+    }
+    fn g64(id: u32) -> MachOperand {
+        MachOperand::VReg(VReg::new(id, RegClass::Gpr64))
+    }
+    fn i(x: i64) -> MachOperand {
+        MachOperand::Imm(x)
+    }
+    fn b(x: BlockId) -> MachOperand {
+        MachOperand::Block(x)
+    }
+    fn slot(x: u32) -> MachOperand {
+        MachOperand::StackSlot(StackSlotId(x))
+    }
+    fn count(func: &MachFunction, op: AArch64Opcode) -> usize {
+        func.blocks
+            .iter()
+            .flat_map(|blk| blk.insts.iter().copied())
+            .filter(|&id| func.inst(id).opcode == op)
+            .count()
+    }
+
+    /// Build `for iv in 0..256 { out[iv] = reverse8(a[iv]) }` in the EXACT shape
+    /// the recognizer matches: `out` = StackSlot(0), `a` = StackSlot(1), the
+    /// `bitmanip_reverse_bits(n=8)` isolate/shift/OR ladder, one `LdrbRI`, one
+    /// `StrbRI`, and a `+1` induction writeback in the latch.
+    ///
+    /// `carried`: when true, add a SECOND loop-carried value — an accumulator
+    /// `acc = acc + iv` written back in the latch and initialized outside the
+    /// loop. The vector loop never executes it, so vectorizing would drop every
+    /// contribution from the vectorized prefix.
+    fn build_bitrev_loop(carried: bool) -> MachFunction {
+        use AArch64Opcode::*;
+        let mut func = MachFunction::new("k".to_string(), Signature::new(vec![], vec![]));
+        let bb0 = func.entry;
+        let header = func.create_block();
+        let body = func.create_block();
+        let latch = func.create_block();
+        let exit = func.create_block();
+        let push = |func: &mut MachFunction, blk: BlockId, op, ops| {
+            let id = func.push_inst(MachInst::new(op, ops));
+            func.append_inst(blk, id);
+        };
+
+        // Preheader: the two distinct stack-slot bases, the bound, iv = 0.
+        push(&mut func, bb0, AddPCRel, vec![g64(100), slot(0)]); // out
+        push(&mut func, bb0, AddPCRel, vec![g64(101), slot(1)]); // a
+        push(&mut func, bb0, Movz, vec![g64(102), i(256)]); // N
+        push(&mut func, bb0, Movz, vec![g64(1), i(0)]); // iv
+        if carried {
+            push(&mut func, bb0, Movz, vec![g64(70), i(0)]); // acc
+        }
+        push(&mut func, bb0, B, vec![b(header)]);
+
+        // Header: `iv <u N`.
+        push(&mut func, header, CmpRR, vec![g64(1), g64(102)]);
+        push(&mut func, header, BCond, vec![i(CC_LO), b(body)]);
+        push(&mut func, header, B, vec![b(exit)]);
+
+        // Body: load a[iv], the 8-term reverse ladder, store out[iv].
+        push(&mut func, body, AddRR, vec![g64(10), g64(101), g64(1)]);
+        push(&mut func, body, LdrbRI, vec![g32(11), g64(10), i(0)]);
+        push(&mut func, body, Uxtb, vec![g32(12), g32(11)]);
+        for bit in 0..8u32 {
+            push(
+                &mut func,
+                body,
+                AndRI,
+                vec![g32(20 + bit), g32(12), i(1i64 << bit)],
+            );
+            // bit `i` lands at mirror position `7-i`.
+            let (op, sh) = if bit < 4 {
+                (LslRI, 7 - 2 * bit as i64)
+            } else {
+                (LsrRI, 2 * bit as i64 - 7)
+            };
+            push(
+                &mut func,
+                body,
+                op,
+                vec![g32(30 + bit), g32(20 + bit), i(sh)],
+            );
+        }
+        push(&mut func, body, OrrRR, vec![g32(40), g32(30), g32(31)]);
+        for k in 0..6u32 {
+            push(
+                &mut func,
+                body,
+                OrrRR,
+                vec![g32(41 + k), g32(40 + k), g32(32 + k)],
+            );
+        }
+        push(&mut func, body, AddRR, vec![g64(50), g64(100), g64(1)]);
+        push(&mut func, body, StrbRI, vec![g32(46), g64(50), i(0)]);
+        push(&mut func, body, B, vec![b(latch)]);
+
+        // Latch: iv += 1 (and, for `carried`, acc += iv).
+        push(&mut func, latch, AddRI, vec![g64(60), g64(1), i(1)]);
+        push(&mut func, latch, MovR, vec![g64(1), g64(60)]);
+        if carried {
+            push(&mut func, latch, AddRR, vec![g64(71), g64(70), g64(1)]);
+            push(&mut func, latch, MovR, vec![g64(70), g64(71)]);
+        }
+        push(&mut func, latch, B, vec![b(header)]);
+        push(&mut func, exit, Ret, vec![]);
+
+        func.add_edge(bb0, header);
+        func.add_edge(header, body);
+        func.add_edge(header, exit);
+        func.add_edge(body, latch);
+        func.add_edge(latch, header);
+        func.next_vreg = 512;
+        func
+    }
+
+    #[test]
+    fn vectorizes_canonical_byte_reverse_map() {
+        let mut func = build_bitrev_loop(false);
+        let mut pass = NeonBitrevPass::new();
+        assert!(pass.run(&mut func), "canonical bitrev map should vectorize");
+        assert_eq!(pass.fired(), 1);
+        assert_eq!(
+            count(&func, AArch64Opcode::NeonRbitV),
+            UNROLL_Q,
+            "one RBIT.16B per Q register"
+        );
+        assert_eq!(count(&func, AArch64Opcode::NeonLdpQPost), UNROLL_Q / 2);
+        assert_eq!(count(&func, AArch64Opcode::NeonStpQPost), UNROLL_Q / 2);
+    }
+
+    #[test]
+    fn bails_on_second_loop_carried_value() {
+        // The map is byte-for-byte identical; the ONLY difference is an
+        // accumulator threaded through the latch. The vector loop steps `iv`
+        // alone, so vectorizing would silently drop the accumulator's updates
+        // for every vectorized iteration. Fail closed.
+        let mut func = build_bitrev_loop(true);
+        let before = func.blocks.len();
+        let mut pass = NeonBitrevPass::new();
+        assert!(
+            !pass.run(&mut func),
+            "a second loop-carried value must BAIL (its updates would be dropped)"
+        );
+        assert_eq!(pass.fired(), 0);
+        assert_eq!(count(&func, AArch64Opcode::NeonRbitV), 0);
+        assert_eq!(func.blocks.len(), before, "no blocks added");
+    }
 }

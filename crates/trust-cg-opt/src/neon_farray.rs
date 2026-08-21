@@ -839,11 +839,9 @@ fn collect_body_defs(func: &MachFunction, loop_insts: &HashSet<InstId>) -> HashS
     let mut defs = HashSet::new();
     for &id in loop_insts {
         let inst = func.inst(id);
-        if produces_def(inst.opcode)
-            && let Some(v) = inst.operands.first().and_then(vreg_of)
-        {
+        crate::effects::for_each_inst_def(inst, |v| {
             defs.insert(v.id);
-        }
+        });
     }
     defs
 }
@@ -2271,32 +2269,7 @@ fn build_def_map(func: &MachFunction) -> HashMap<u32, InstId> {
 }
 
 fn build_def_map_inner(func: &MachFunction) -> HashMap<u32, InstId> {
-    let mut map = HashMap::new();
-    for (idx, inst) in func.insts.iter().enumerate() {
-        if let Some(MachOperand::VReg(v)) = inst.operands.first()
-            && produces_def(inst.opcode)
-        {
-            map.insert(v.id, InstId(idx as u32));
-        }
-    }
-    map
-}
-
-/// Conservative "operand 0 is a written def" predicate. `NeonLdpQPost` also
-/// writes operand 1 (the second Q) + the pointer, but this map is only consulted
-/// for scalar single-def values the recognizer reasons about. STORE opcodes are
-/// EXCLUDED: a store's operand 0 is the stored VALUE (a USE), not a def — treating
-/// it as a def would clobber the def-map entry of a value that is both computed
-/// (e.g. by `FaddRR`) and then stored (the iota-fill store hazard).
-fn produces_def(op: AArch64Opcode) -> bool {
-    use AArch64Opcode::*;
-    !matches!(
-        op,
-        CmpRR | CmpRI | BCond | B
-        // stores write MEMORY, not operand 0's register.
-        | StrRI | StrbRI | StrhRI | StrRO | StrbRO | StrhRO | StpRI | StrPreIndex | StrPostIndex
-        | STRWui | STRXui | STRSui | STRDui | NeonSt1Post | NeonStpQPost
-    )
+    crate::effects::build_reaching_def_map(func)
 }
 
 fn branch_targets(inst: &MachInst) -> Vec<BlockId> {

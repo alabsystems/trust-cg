@@ -1,3 +1,6 @@
+#[path = "support/target_dir.rs"]
+mod target_dir_support;
+
 // Integration test (m124): the fat-pointer WRITE-THROUGH frontend arm — a WHOLE
 // `{ data, len }` slice/`str` fat pointer STORED through a thin `&mut &[T]` /
 // `*mut &str` slot. Compiled for x86_64 via the rustc_codegen_trust_cg bridge,
@@ -49,9 +52,7 @@ fn pinned_toolchain() -> String {
 
 fn ensure_dylib_built() -> PathBuf {
     let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| crate_dir.join("target"));
+    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
     let candidates = [
         target_dir
             .join("release")

@@ -38,12 +38,53 @@ fn is_aarch64() -> bool {
     cfg!(target_arch = "aarch64")
 }
 
+/// The HOST's native triple for the link-and-run lane. The pipeline's
+/// empty-triple default is the historical Mach-O emission, which the host
+/// linker on Linux can neither disambiguate flags for (`-no_pie`) nor link.
+/// Emitting the host's own object format lets these run tests exercise the
+/// full pipeline on any AArch64 host — macOS keeps its historical behavior.
+fn host_aarch64_triple() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "aarch64-apple-darwin"
+    } else {
+        "aarch64-unknown-linux-gnu"
+    }
+}
+
+/// `cc` position-independent-executable opt-out, per host linker dialect.
+fn host_no_pie_flag() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "-Wl,-no_pie"
+    } else {
+        "-no-pie"
+    }
+}
+
 fn has_cc() -> bool {
     Command::new("cc")
         .arg("--version")
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// The emitted object's expected magic for [`host_aarch64_triple`]'s format:
+/// Mach-O 64 (`0xFEEDFACF` little-endian) on macOS, `\x7FELF` elsewhere.
+fn assert_host_object_magic(obj_bytes: &[u8], context: &str) {
+    assert!(
+        obj_bytes.len() >= 4,
+        "{context}: object file should not be empty"
+    );
+    let expected: [u8; 4] = if cfg!(target_os = "macos") {
+        [0xCF, 0xFA, 0xED, 0xFE]
+    } else {
+        [0x7F, b'E', b'L', b'F']
+    };
+    assert_eq!(
+        &obj_bytes[0..4],
+        &expected,
+        "{context}: object magic must match the host-native format"
+    );
 }
 
 fn make_test_dir(test_name: &str) -> PathBuf {
@@ -72,7 +113,7 @@ fn link_with_cc(dir: &Path, driver_c: &Path, obj: &Path, output_name: &str) -> P
         .arg(&binary)
         .arg(driver_c)
         .arg(obj)
-        .arg("-Wl,-no_pie")
+        .arg(host_no_pie_flag())
         .output()
         .expect("Failed to run cc");
 
@@ -134,6 +175,7 @@ fn compile_trust_ir_function(
     let config = PipelineConfig {
         opt_level,
         emit_debug: false,
+        target_triple: host_aarch64_triple().to_string(),
         ..Default::default()
     };
     let pipeline = Pipeline::new(config);
@@ -780,11 +822,7 @@ fn test_full_pipeline_simple_add_encoding() {
 
     // Verify it produced a valid Mach-O file.
     assert!(obj_bytes.len() >= 4, "object file should not be empty");
-    assert_eq!(
-        &obj_bytes[0..4],
-        &[0xCF, 0xFA, 0xED, 0xFE],
-        "should be valid Mach-O magic"
-    );
+    assert_host_object_magic(&obj_bytes, "should be valid Mach-O magic");
 }
 
 /// Full pipeline: simple_add compiled, linked, and executed.
@@ -921,11 +959,7 @@ fn test_full_pipeline_fibonacci_encoding() {
         .expect("full pipeline should compile fibonacci");
 
     assert!(obj_bytes.len() >= 4, "object file should not be empty");
-    assert_eq!(
-        &obj_bytes[0..4],
-        &[0xCF, 0xFA, 0xED, 0xFE],
-        "should be valid Mach-O magic"
-    );
+    assert_host_object_magic(&obj_bytes, "should be valid Mach-O magic");
 }
 
 /// Full pipeline: fibonacci compiled, linked, and executed.
@@ -988,11 +1022,7 @@ fn test_full_pipeline_is_prime_encoding() {
         .expect("full pipeline should compile is_prime");
 
     assert!(obj_bytes.len() >= 4, "object file should not be empty");
-    assert_eq!(
-        &obj_bytes[0..4],
-        &[0xCF, 0xFA, 0xED, 0xFE],
-        "should be valid Mach-O magic"
-    );
+    assert_host_object_magic(&obj_bytes, "should be valid Mach-O magic");
 }
 
 /// Full pipeline: is_prime compiled, linked, and executed.
@@ -1068,11 +1098,7 @@ fn test_full_pipeline_sum_array_encoding() {
         .expect("full pipeline should compile sum_array");
 
     assert!(obj_bytes.len() >= 4, "object file should not be empty");
-    assert_eq!(
-        &obj_bytes[0..4],
-        &[0xCF, 0xFA, 0xED, 0xFE],
-        "should be valid Mach-O magic"
-    );
+    assert_host_object_magic(&obj_bytes, "should be valid Mach-O magic");
 }
 
 /// Full pipeline: sum_array compiled, linked, and executed.
@@ -1147,12 +1173,7 @@ fn test_full_pipeline_opt_levels() {
             "object file at {:?} should not be empty",
             opt_level
         );
-        assert_eq!(
-            &obj_bytes[0..4],
-            &[0xCF, 0xFA, 0xED, 0xFE],
-            "should be valid Mach-O at {:?}",
-            opt_level
-        );
+        assert_host_object_magic(&obj_bytes, &format!("object at {opt_level:?}"));
     }
 }
 
@@ -1505,11 +1526,7 @@ fn test_full_pipeline_gcd_encoding() {
         .expect("full pipeline should compile gcd");
 
     assert!(obj_bytes.len() >= 4, "object file should not be empty");
-    assert_eq!(
-        &obj_bytes[0..4],
-        &[0xCF, 0xFA, 0xED, 0xFE],
-        "should be valid Mach-O magic"
-    );
+    assert_host_object_magic(&obj_bytes, "should be valid Mach-O magic");
 }
 
 /// Full pipeline: gcd compiled, linked, and executed.
@@ -1575,11 +1592,7 @@ fn test_full_pipeline_collatz_encoding() {
         .expect("full pipeline should compile collatz_steps");
 
     assert!(obj_bytes.len() >= 4, "object file should not be empty");
-    assert_eq!(
-        &obj_bytes[0..4],
-        &[0xCF, 0xFA, 0xED, 0xFE],
-        "should be valid Mach-O magic"
-    );
+    assert_host_object_magic(&obj_bytes, "should be valid Mach-O magic");
 }
 
 /// Full pipeline: collatz_steps compiled, linked, and executed.
@@ -2152,11 +2165,7 @@ fn test_full_pipeline_power_encoding() {
         .expect("full pipeline should compile power");
 
     assert!(obj_bytes.len() >= 4, "object file should not be empty");
-    assert_eq!(
-        &obj_bytes[0..4],
-        &[0xCF, 0xFA, 0xED, 0xFE],
-        "should be valid Mach-O magic"
-    );
+    assert_host_object_magic(&obj_bytes, "should be valid Mach-O magic");
 }
 
 /// Full pipeline: power compiled, linked, and executed with multiple test cases.
@@ -2270,7 +2279,7 @@ int main(void) {
         .arg(&driver_path)
         .arg(&trust_cg_obj)
         .arg(&clang_obj)
-        .arg("-Wl,-no_pie")
+        .arg(host_no_pie_flag())
         .output()
         .expect("cc");
     assert!(
@@ -2302,11 +2311,7 @@ fn test_full_pipeline_count_digits_encoding() {
         .expect("full pipeline should compile count_digits");
 
     assert!(obj_bytes.len() >= 4, "object file should not be empty");
-    assert_eq!(
-        &obj_bytes[0..4],
-        &[0xCF, 0xFA, 0xED, 0xFE],
-        "should be valid Mach-O magic"
-    );
+    assert_host_object_magic(&obj_bytes, "should be valid Mach-O magic");
 }
 
 /// Full pipeline: count_digits compiled, linked, and executed.
@@ -2418,7 +2423,7 @@ int main(void) {
         .arg(&driver_path)
         .arg(&trust_cg_obj)
         .arg(&clang_obj)
-        .arg("-Wl,-no_pie")
+        .arg(host_no_pie_flag())
         .output()
         .expect("cc");
     assert!(
@@ -2453,11 +2458,7 @@ fn test_full_pipeline_nested_loop_sum_encoding() {
         .expect("full pipeline should compile nested_loop_sum");
 
     assert!(obj_bytes.len() >= 4, "object file should not be empty");
-    assert_eq!(
-        &obj_bytes[0..4],
-        &[0xCF, 0xFA, 0xED, 0xFE],
-        "should be valid Mach-O magic"
-    );
+    assert_host_object_magic(&obj_bytes, "should be valid Mach-O magic");
 }
 
 /// Full pipeline: nested_loop_sum compiled, linked, and executed.
@@ -2575,7 +2576,7 @@ int main(void) {
         .arg(&driver_path)
         .arg(&trust_cg_obj)
         .arg(&clang_obj)
-        .arg("-Wl,-no_pie")
+        .arg(host_no_pie_flag())
         .output()
         .expect("cc");
     assert!(

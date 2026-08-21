@@ -113,6 +113,7 @@ use trust_cg_ir::{
 };
 
 use crate::dom::DomTree;
+use crate::effects::{for_each_inst_def, inst_defines_vreg};
 use crate::pass_manager::{AnalysisCache, MachinePass};
 
 /// Kill switch: set `TCG_NO_AARCH64_BCE` (any value) to disable the pass.
@@ -218,21 +219,6 @@ impl MachinePass for AArch64BoundsCheckElimination {
 // Recognizer
 // ===========================================================================
 
-/// The value an instruction defines, if it produces one into `operand[0]`.
-/// `TrapBoundsCheckExact` and every trap/guard pseudo have
-/// `produces_value() == false`, so carriers are never counted as defs (they
-/// would otherwise poison the single-def index for exactly the bounds-checked
-/// vregs this pass reasons about).
-fn inst_def_vreg(inst: &MachInst) -> Option<VReg> {
-    if !inst.opcode.produces_value() {
-        return None;
-    }
-    match inst.operands.first() {
-        Some(MachOperand::VReg(v)) => Some(*v),
-        _ => None,
-    }
-}
-
 /// Build the single-def index (vregs with EXACTLY one definition in the
 /// function), keyed to the def's `(block, position-in-block)`. A hit means
 /// "this vreg has a unique, globally-fixed value".
@@ -241,10 +227,10 @@ fn build_single_def_index(func: &MachFunction) -> HashMap<VReg, (BlockId, usize)
     let mut single: HashMap<VReg, (BlockId, usize)> = HashMap::new();
     for &b in &func.block_order {
         for (pos, &iid) in func.block(b).insts.iter().enumerate() {
-            if let Some(v) = inst_def_vreg(func.inst(iid)) {
+            for_each_inst_def(func.inst(iid), |v| {
                 *counts.entry(v).or_insert(0) += 1;
                 single.insert(v, (b, pos));
-            }
+            });
         }
     }
     single.retain(|v, _| counts.get(v) == Some(&1));
@@ -452,14 +438,14 @@ fn region_redefines_root(
             if b == c_blk && i >= p {
                 break;
             }
-            if inst_def_vreg(func.inst(iid)) == Some(root) {
+            if inst_defines_vreg(func.inst(iid), root) {
                 return true;
             }
         }
     }
     // Defs of `root` inside `D` at/after the guard-side anchor.
     for &iid in func.block(d).insts.iter().skip(d_from) {
-        if inst_def_vreg(func.inst(iid)) == Some(root) {
+        if inst_defines_vreg(func.inst(iid), root) {
             return true;
         }
     }

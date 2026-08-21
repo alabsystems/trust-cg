@@ -366,6 +366,61 @@ const CALL_CLOBBER_FPRS: [PReg; 24] = [
 // Apple AArch64 ABI
 // ---------------------------------------------------------------------------
 
+/// Which AArch64 C calling-convention variant to classify for.
+///
+/// DarwinPCS and the base AAPCS64 agree on the register convention but differ
+/// in the layout of scalar arguments that overflow to the stack. Darwin packs
+/// narrow fixed arguments at their natural size/alignment; AAPCS64 gives every
+/// scalar stack argument at least one 8-byte, 8-aligned slot. Selecting the
+/// wrong variant is silent wrong code as soon as a call crosses a codegen
+/// boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AArch64AbiVariant {
+    /// Apple arm64 DarwinPCS.
+    #[default]
+    Darwin,
+    /// Base AAPCS64, used by AArch64 ELF targets.
+    Aapcs64,
+}
+
+impl AArch64AbiVariant {
+    /// Select the ABI from the compilation target, never from the host.
+    ///
+    /// An empty triple keeps the historical Darwin default for direct/test
+    /// construction sites; the production pipeline always supplies its target.
+    pub fn from_target_triple(triple: &str) -> Self {
+        if triple.is_empty() || triple.contains("-apple-") || triple.ends_with("-darwin") {
+            Self::Darwin
+        } else {
+            Self::Aapcs64
+        }
+    }
+}
+
+/// Place one scalar argument in the next stack slot.
+///
+/// Keep the Darwin/AAPCS64 difference centralized so integer and FP overflow
+/// paths cannot drift. The location size describes the occupied ABI slot; the
+/// caller/callee still select the transfer width from the source type.
+fn place_scalar_stack_arg(
+    variant: AArch64AbiVariant,
+    stack_offset: &mut i64,
+    natural_align: i64,
+    natural_size: u32,
+) -> ArgLocation {
+    let (align, size) = match variant {
+        AArch64AbiVariant::Darwin => (natural_align, natural_size),
+        AArch64AbiVariant::Aapcs64 => (natural_align.max(8), natural_size.max(8)),
+    };
+    *stack_offset = align_up(*stack_offset, align);
+    let loc = ArgLocation::Stack {
+        offset: *stack_offset,
+        size,
+    };
+    *stack_offset += size as i64;
+    loc
+}
+
 /// Apple AArch64 (DarwinPCS) calling convention implementation.
 ///
 /// Follows the ARM AAPCS64 base with Apple-specific modifications:
@@ -462,16 +517,25 @@ impl AppleAArch64ABI {
 
     /// Classify function parameters into register/stack locations.
     ///
-    /// Rules (Apple arm64, non-variadic):
+    /// Rules (AArch64 C ABI, non-variadic):
     /// - Integer/pointer types (I8, I16, I32, I64, B1): next available X0-X7
     /// - Float types (F32, F64): next available V0-V7
     /// - HFA (Homogeneous Floating-point Aggregate): consecutive V0-V7 registers
     /// - I128: uses two consecutive GPR slots (must start on even register for
     ///   alignment on standard AAPCS; Apple relaxes this but we follow the
     ///   conservative rule for correctness)
-    /// - Overflow to stack, 16-byte aligned slots
+    /// - Scalar overflow uses variant-specific stack slots: natural packing on
+    ///   Darwin, at least 8 bytes/alignment under AAPCS64
     /// - Aggregates > 16 bytes: indirect via pointer in next GPR
     pub fn classify_params(params: &[Type]) -> Vec<ArgLocation> {
+        Self::classify_params_with(AArch64AbiVariant::Darwin, params)
+    }
+
+    /// Classify parameters for an explicit AArch64 ABI variant.
+    ///
+    /// Caller and callee must use the same variant or narrow stack arguments
+    /// are read from different offsets.
+    pub fn classify_params_with(variant: AArch64AbiVariant, params: &[Type]) -> Vec<ArgLocation> {
         let mut result = Vec::with_capacity(params.len());
         let mut gpr_idx: usize = 0;
         let mut fpr_idx: usize = 0;
@@ -485,24 +549,14 @@ impl AppleAArch64ABI {
                         result.push(ArgLocation::Reg(GPR_ARG_REGS[gpr_idx]));
                         gpr_idx += 1;
                     } else {
-                        // Apple arm64 packs fixed stack arguments at their NATURAL
-                        // size and alignment -- unlike standard AAPCS64, which
-                        // rounds every stack argument up to an 8-byte slot. A
-                        // narrow scalar therefore occupies exactly `ty.bytes()`
-                        // bytes at the next naturally-aligned offset. Using the
-                        // 8-byte-slot rule reads the argument from the wrong stack
-                        // slot on Apple targets -- a silent miscompile for any
-                        // function with narrow arguments passed on the stack.
-                        // Reference: "Writing ARM64 Code for Apple Platforms",
-                        // Passing Arguments to Functions.
-                        let align = ty.align() as i64;
-                        stack_offset = align_up(stack_offset, align);
-                        let size = ty.bytes();
-                        result.push(ArgLocation::Stack {
-                            offset: stack_offset,
-                            size,
-                        });
-                        stack_offset += size as i64;
+                        // Darwin packs narrow fixed arguments naturally;
+                        // AAPCS64 stage C.14 gives each at least an 8-byte slot.
+                        result.push(place_scalar_stack_arg(
+                            variant,
+                            &mut stack_offset,
+                            ty.align() as i64,
+                            ty.bytes(),
+                        ));
                     }
                 }
 
@@ -539,17 +593,14 @@ impl AppleAArch64ABI {
                         result.push(ArgLocation::Reg(typed_regs[fpr_idx]));
                         fpr_idx += 1;
                     } else {
-                        // Apple arm64 packs fixed FP stack arguments at natural
-                        // size/alignment too: F32 occupies 4 bytes (4-aligned),
-                        // F16 2 bytes, F64 8 bytes -- not an 8-byte slot each.
-                        let align = ty.align() as i64;
-                        stack_offset = align_up(stack_offset, align);
-                        let size = ty.bytes();
-                        result.push(ArgLocation::Stack {
-                            offset: stack_offset,
-                            size,
-                        });
-                        stack_offset += size as i64;
+                        // Darwin packs fixed FP arguments naturally; AAPCS64
+                        // stages C.4/C.5 widen half/single slots to 8 bytes.
+                        result.push(place_scalar_stack_arg(
+                            variant,
+                            &mut stack_offset,
+                            ty.align() as i64,
+                            ty.bytes(),
+                        ));
                     }
                 }
 
@@ -3798,5 +3849,108 @@ mod tests {
         assert!(entry.needs_dwarf_fallback());
         assert_eq!(entry.personality, 0);
         assert_eq!(entry.lsda, 0);
+    }
+
+    fn stack_offsets(locs: &[ArgLocation]) -> Vec<i64> {
+        locs.iter()
+            .filter_map(|loc| match loc {
+                ArgLocation::Stack { offset, .. } => Some(*offset),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn narrow_integer_stack_args_distinguish_darwin_and_aapcs64() {
+        let mut params = vec![Type::I64; 8];
+        params.extend([Type::I16, Type::I16, Type::I32]);
+
+        assert_eq!(
+            stack_offsets(&AppleAArch64ABI::classify_params_with(
+                AArch64AbiVariant::Darwin,
+                &params,
+            )),
+            vec![0, 2, 4],
+        );
+        assert_eq!(
+            stack_offsets(&AppleAArch64ABI::classify_params_with(
+                AArch64AbiVariant::Aapcs64,
+                &params,
+            )),
+            vec![0, 8, 16],
+        );
+    }
+
+    #[test]
+    fn narrow_fp_stack_args_distinguish_darwin_and_aapcs64() {
+        let mut params = vec![Type::F64; 8];
+        params.extend([Type::F32, Type::F32, Type::F64]);
+
+        assert_eq!(
+            stack_offsets(&AppleAArch64ABI::classify_params_with(
+                AArch64AbiVariant::Darwin,
+                &params,
+            )),
+            vec![0, 4, 8],
+        );
+        assert_eq!(
+            stack_offsets(&AppleAArch64ABI::classify_params_with(
+                AArch64AbiVariant::Aapcs64,
+                &params,
+            )),
+            vec![0, 8, 16],
+        );
+    }
+
+    #[test]
+    fn classify_params_default_remains_darwin() {
+        let mut params = vec![Type::I64; 8];
+        params.extend([Type::I16, Type::I16]);
+        assert_eq!(
+            AppleAArch64ABI::classify_params(&params),
+            AppleAArch64ABI::classify_params_with(AArch64AbiVariant::Darwin, &params),
+        );
+    }
+
+    #[test]
+    fn abi_variant_is_selected_from_target_triple() {
+        for triple in [
+            "aarch64-apple-darwin",
+            "arm64-apple-ios",
+            "aarch64-apple-watchos",
+        ] {
+            assert_eq!(
+                AArch64AbiVariant::from_target_triple(triple),
+                AArch64AbiVariant::Darwin,
+                "{triple}",
+            );
+        }
+        for triple in [
+            "aarch64-unknown-linux-gnu",
+            "aarch64-unknown-linux-musl",
+            "aarch64-unknown-freebsd",
+            "aarch64-linux-android",
+        ] {
+            assert_eq!(
+                AArch64AbiVariant::from_target_triple(triple),
+                AArch64AbiVariant::Aapcs64,
+                "{triple}",
+            );
+        }
+        assert_eq!(
+            AArch64AbiVariant::from_target_triple(""),
+            AArch64AbiVariant::Darwin,
+        );
+    }
+
+    #[test]
+    fn aggregate_stack_args_are_variant_independent() {
+        let mut params = vec![Type::I64; 8];
+        params.push(Type::Struct(vec![Type::I64, Type::I64, Type::I64]));
+        params.push(Type::I64);
+        assert_eq!(
+            AppleAArch64ABI::classify_params_with(AArch64AbiVariant::Darwin, &params),
+            AppleAArch64ABI::classify_params_with(AArch64AbiVariant::Aapcs64, &params),
+        );
     }
 }

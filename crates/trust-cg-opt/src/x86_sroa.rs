@@ -125,6 +125,128 @@ impl X86MachinePass for X86ScalarReplacementOfAggregates {
 // Driver
 // ===========================================================================
 
+/// Per-slot decline tracing (`TCG_X86_SROA_TRACE`) and an ACCEPT counter
+/// (`TCG_X86_SROA_LOG`).
+///
+/// ⚑ This pass is otherwise UNOBSERVABLE from outside: it silently declines a
+/// slot and the only evidence is a load/store that failed to disappear from the
+/// disassembly. Attributing such a decline previously meant a rebuild-and-guess
+/// cycle per hypothesis. Every `continue 'slot_loop` and every `return None` in
+/// [`SlotPlan::finalise`] reports the precondition that rejected the slot, named
+/// after the module-header taxonomy, so the reason is a read rather than a
+/// deduction.
+/// Collect every `StackSlot(s)` index mentioned anywhere in an operand,
+/// including as a memory base or SIB component.
+fn collect_stack_slots_in_operand(op: &X86ISelOperand, out: &mut Vec<u32>) {
+    match op {
+        X86ISelOperand::StackSlot(s) => out.push(*s),
+        X86ISelOperand::MemAddr { base, .. } => collect_stack_slots_in_operand(base, out),
+        X86ISelOperand::SibMemAddr { base, index, .. } => {
+            collect_stack_slots_in_operand(base, out);
+            collect_stack_slots_in_operand(index, out);
+        }
+        _ => {}
+    }
+}
+
+/// Operand kind name for escape diagnostics — enough to tell a VReg
+/// destination from a PReg (ABI/scratch) one without dumping the whole operand.
+fn operand_kind(op: Option<&X86ISelOperand>) -> &'static str {
+    match op {
+        None => "none",
+        Some(X86ISelOperand::VReg(_)) => "VReg",
+        Some(X86ISelOperand::PReg(_)) => "PReg",
+        Some(X86ISelOperand::Imm(_)) => "Imm",
+        Some(X86ISelOperand::FImm(_)) => "FImm",
+        Some(X86ISelOperand::Block(_)) => "Block",
+        Some(X86ISelOperand::CondCode(_)) => "CondCode",
+        Some(X86ISelOperand::Symbol(_)) => "Symbol",
+        Some(X86ISelOperand::StackSlot(_)) => "StackSlot",
+        Some(_) => "mem/other",
+    }
+}
+
+/// Sub-reason for an `escape-envelope` decline. That label alone covers ~20
+/// distinct refusal points, so the interesting question — WHICH use form
+/// escaped — is invisible without this.
+fn sroa_escape_detail(detail: &str) {
+    if crate::env_lock::var_os("TCG_X86_SROA_TRACE").is_some() {
+        eprintln!("x86_sroa:   escape-detail: {detail}");
+    }
+}
+
+fn sroa_trace(slot: u32, reason: &str) {
+    if crate::env_lock::var_os("TCG_X86_SROA_TRACE").is_some() {
+        eprintln!(
+            "x86_sroa: DECLINE fn={} slot={slot} reason={reason}",
+            sroa_fn()
+        );
+    }
+}
+
+// Slot indices are per-function, so every trace line needs the function it came
+// from or the numbers collide silently across compilation units.
+thread_local! {
+    static SROA_FN: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+fn sroa_set_fn(name: &str) {
+    SROA_FN.with(|f| f.borrow_mut().replace_range(.., name));
+}
+
+fn sroa_fn() -> String {
+    SROA_FN.with(|f| f.borrow().clone())
+}
+
+/// Opt-in (`TCG_X86_SROA_MULTI_BLOCK=1`): admit a slot whose stores to one
+/// offset span MORE THAN ONE block — i.e. every loop-carried scalar, whose
+/// initializer sits in the preheader and whose update sits in the body.
+///
+/// # Why the extra precondition is believed unnecessary
+///
+/// The rewrite's soundness does not depend on block structure. The shadow vreg
+/// `s` is written at exactly the points memory would be written, with the same
+/// values, in the same order along EVERY path, so `s == memory[off]` holds at
+/// every program point after the first store regardless of how many blocks the
+/// stores occupy. What actually carries the argument is
+/// [`trace_addr_uses`]/[`slot_has_foreign_reference`] (nothing else can alias a
+/// non-escaped slot) plus [`accesses_have_reaching_stores`] (no load of
+/// uninitialized memory). `stores_are_single_block_per_offset` adds nothing to
+/// either.
+///
+/// The module header justifies it as a *pipeline* limit — "not merge-of-two-defs
+/// phi semantics". That is doubtful: x86 allocation runs the FULL
+/// `trust-cg-regalloc` greedy allocator via `x86_adapter`, whose documented
+/// stages include phi elimination and liveness analysis, and whose
+/// `compute_live_intervals` tracks `last_defs_in_block`/`reaching_defs`
+/// precisely to model multiple defs. Empirically, a multi-def loop-carried
+/// value is already allocated to a register today: h1_vec_push_sum's loop
+/// counter lives in `%rdx` with defs in two different blocks.
+///
+/// # 🛑 MEASURED: NULL LEVER FOR RUNTIME — do not flip this on instruction counts
+///
+/// On h1_vec_push_sum this fires and is CORRECT (checksum identical to both the
+/// flag-off build and LLVM), and it visibly improves the inner loop: the
+/// fat-pointer `(ptr,len,cap)` is promoted (`offsets=3 accesses=13`), `v.len()`
+/// stops being loaded TWICE into two registers, and a 5-instruction dead
+/// predicate block disappears — roughly 16 → 11 instructions per element.
+///
+/// **Runtime: 0.9947x. No change.** 9 interleaved paired rounds, same dylib.
+///
+/// The loop is bounded by the ACCUMULATOR's store-to-load-forward chain (~5
+/// cy/element), so deleting five *independent* instructions from it buys
+/// nothing. This both confirms the mechanism and refutes the fix: `acc` is
+/// blocked by `escape-envelope`, NOT by this precondition — the multi-block
+/// stores belong to the Vec, not the accumulator.
+///
+/// ⇒ Kept opt-in because it is sound and does fire; it may pay on a
+/// front-end-bound program. It must NOT go default-on without an 18-program
+/// paired A/B showing a suite gain. "The guard looks over-conservative, widen
+/// it" is the exact shape of the bridge→LEA change that failed 7/18 closed.
+fn multi_block_writer_allowed() -> bool {
+    crate::env_lock::var_os("TCG_X86_SROA_MULTI_BLOCK").is_some_and(|v| v != "0")
+}
+
 fn run_impl(func: &mut X86ISelFunction) -> bool {
     // Whole-function def counts: a vreg defined more than once is a
     // path-sensitive carrier (e.g. a lowered loop phi), never a pure SSA slot
@@ -136,7 +258,56 @@ fn run_impl(func: &mut X86ISelFunction) -> bool {
     let use_counts = collect_vreg_use_counts(func);
 
     // Every `lea dst, [StackSlot(s) + disp]` root, grouped by slot.
+    sroa_set_fn(&func.name);
+
     let roots = collect_stack_slot_roots(func);
+
+    // ⚑ A slot is only ever a CANDIDATE if it is reached through a
+    // `lea dst, [StackSlot(s)+0]` root. A slot touched only by direct
+    // `[StackSlot]` operands is never enumerated at all — it produces neither an
+    // ACCEPT nor a DECLINE, so it is invisible to the decline trace and looks
+    // like "the pass considered it and said no" when the pass never saw it.
+    // Report both sets so that distinction is a read, not an inference.
+    if crate::env_lock::var_os("TCG_X86_SROA_TRACE").is_some() {
+        let mut with_roots: Vec<u32> = roots.iter().map(|(s, _)| *s).collect();
+        with_roots.sort_unstable();
+        with_roots.dedup();
+        let mut all: Vec<u32> = Vec::new();
+        for block in func.blocks.values() {
+            for inst in &block.insts {
+                let mut vregs = HashSet::new();
+                for op in &inst.operands {
+                    collect_stack_slots_in_operand(op, &mut all);
+                    collect_operand_vregs(op, &mut vregs);
+                }
+            }
+        }
+        all.sort_unstable();
+        all.dedup();
+        let unrooted: Vec<u32> = all
+            .iter()
+            .copied()
+            .filter(|s| !with_roots.contains(s))
+            .collect();
+        // Slot indices are PER FUNCTION -- every function has a slot 0 -- so an
+        // unlabelled decline line cannot be attributed. Report the function and
+        // each slot's declared size: a 24-byte slot is one Vec, an 8-byte slot
+        // is one scalar, and a 16-byte slot is two locals PACKED TOGETHER, which
+        // is what makes one escaping local poison an unrelated one.
+        let sizes: Vec<String> = all
+            .iter()
+            .map(|s| match func.stack_slots.get(*s as usize) {
+                Some(info) => format!("{s}:{}b/align{}", info.size, info.align),
+                None => format!("{s}:?"),
+            })
+            .collect();
+        eprintln!(
+            "x86_sroa: fn={} slots[{}] lea-rooted {with_roots:?} NEVER-CONSIDERED {unrooted:?}",
+            func.name,
+            sizes.join(" "),
+        );
+    }
+
     if roots.is_empty() {
         return false;
     }
@@ -151,6 +322,7 @@ fn run_impl(func: &mut X86ISelFunction) -> bool {
         // access we cannot forward through — bail.
         let root_set: HashSet<Site> = root_sites.iter().copied().collect();
         if slot_has_foreign_reference(func, slot, &root_set) {
+            sroa_trace(slot, "direct-slot-foreign-reference");
             continue 'slot_loop;
         }
 
@@ -161,19 +333,43 @@ fn run_impl(func: &mut X86ISelFunction) -> bool {
             // Root `Lea` must carry no atomic/volatile marker and define a
             // single-def vreg.
             if root_inst.proof_origin.is_some() {
+                sroa_trace(slot, "root-lea-carries-proof-origin");
                 continue 'slot_loop;
             }
             let (root_vreg, base_offset) = match root_lea_vreg_and_offset(root_inst) {
                 Some(v) => v,
-                None => continue 'slot_loop,
+                None => {
+                    sroa_trace(slot, "root-lea-shape-unrecognised");
+                    continue 'slot_loop;
+                }
             };
             if def_counts.get(&root_vreg).copied().unwrap_or(0) != 1 {
+                sroa_trace(slot, "root-vreg-multi-def");
                 continue 'slot_loop;
             }
             if !plan.add_root(root_vreg, root_site) {
+                sroa_trace(slot, "root-vreg-duplicate");
                 continue 'slot_loop;
             }
             if !trace_addr_uses(func, &def_counts, root_vreg, base_offset, &mut plan) {
+                // Naming the precondition is not enough here: `escape-envelope`
+                // covers ~20 distinct refusal points. Report the opcodes that
+                // actually reference the root vreg so the offending use form is
+                // a read rather than a deduction.
+                if crate::env_lock::var_os("TCG_X86_SROA_TRACE").is_some() {
+                    let mut opcodes: Vec<String> = collect_user_sites(func, root_vreg)
+                        .into_iter()
+                        .map(|(b, i)| format!("{:?}", func.blocks[&b].insts[i].opcode))
+                        .collect();
+                    opcodes.sort();
+                    opcodes.dedup();
+                    eprintln!(
+                        "x86_sroa: DECLINE slot={slot} reason=escape-envelope users=[{}]",
+                        opcodes.join(",")
+                    );
+                } else {
+                    sroa_trace(slot, "escape-envelope");
+                }
                 continue 'slot_loop;
             }
         }
@@ -181,10 +377,18 @@ fn run_impl(func: &mut X86ISelFunction) -> bool {
         // Confirm we touched EVERY use of every owned vreg: a use we did not
         // walk is an unknown reader → bail.
         if !plan.all_uses_covered(&use_counts) {
+            sroa_trace(slot, "unwalked-use");
             continue 'slot_loop;
         }
 
-        if let Some(r) = plan.finalise(func, &mut next_scalar_vreg) {
+        if let Some(r) = plan.finalise(func, slot, &mut next_scalar_vreg) {
+            if crate::env_lock::var_os("TCG_X86_SROA_LOG").is_some() {
+                eprintln!(
+                    "x86_sroa: ACCEPT slot={slot} offsets={} accesses={}",
+                    r.scalar_vreg.len(),
+                    r.accesses.len()
+                );
+            }
             rewrites.push(r);
         }
     }
@@ -527,12 +731,15 @@ impl SlotPlan {
     fn finalise(
         &mut self,
         func: &X86ISelFunction,
+        slot: u32,
         next_scalar_vreg: &mut u32,
     ) -> Option<SlotRewrite> {
         if self.aborted {
+            sroa_trace(slot, "plan-aborted");
             return None;
         }
         if self.accesses.is_empty() && self.derived_defs.is_empty() && self.roots.is_empty() {
+            sroa_trace(slot, "empty-plan");
             return None;
         }
 
@@ -540,12 +747,22 @@ impl SlotPlan {
         // and every access's value class must match the bucket's width.
         let mut bucket_at_offset: HashMap<i64, X86Opcode> = HashMap::new();
         for a in &self.accesses {
-            let (_mov, class) = bucket_move_and_class(a.bucket)?;
+            let (_mov, class) = match bucket_move_and_class(a.bucket) {
+                Some(v) => v,
+                None => {
+                    sroa_trace(slot, "width-bucket-unmapped");
+                    return None;
+                }
+            };
             if a.value_vreg.class != class {
+                sroa_trace(slot, "width-class-mismatch");
                 return None;
             }
             match bucket_at_offset.get(&a.byte_offset) {
-                Some(existing) if *existing != a.bucket => return None,
+                Some(existing) if *existing != a.bucket => {
+                    sroa_trace(slot, "width-bucket-conflict-at-offset");
+                    return None;
+                }
                 Some(_) => {}
                 None => {
                     bucket_at_offset.insert(a.byte_offset, a.bucket);
@@ -556,9 +773,14 @@ impl SlotPlan {
         // Reaching-store + single-writer-block preconditions.
         let preds = predecessor_map(func);
         if !accesses_have_reaching_stores(func, &preds, &self.accesses) {
+            sroa_trace(slot, "no-reaching-store");
             return None;
         }
-        if !stores_are_single_block_per_offset(&self.accesses) {
+        if !multi_block_writer_allowed() && !stores_are_single_block_per_offset(&self.accesses) {
+            // ⚑ The precondition that rejects every loop-carried scalar: an
+            // accumulator's initializer and its body update are stores to the
+            // same offset in DIFFERENT blocks.
+            sroa_trace(slot, "multi-block-writer");
             return None;
         }
 
@@ -625,6 +847,12 @@ fn trace_addr_uses(
                 && matches!(inst.operands.first(), Some(X86ISelOperand::VReg(_)))
                 && matches!(inst.operands.get(1), Some(X86ISelOperand::VReg(v)) if *v == vreg);
             if !ok_shape {
+                sroa_escape_detail(&format!(
+                    "alias-shape nops={} dst={} src={}",
+                    inst.operands.len(),
+                    operand_kind(inst.operands.first()),
+                    operand_kind(inst.operands.get(1)),
+                ));
                 plan.abort();
                 return false;
             }
@@ -636,6 +864,9 @@ fn trace_addr_uses(
                 }
             };
             if def_counts.get(&dst).copied().unwrap_or(0) != 1 {
+                sroa_escape_detail(&format!(
+                    "{opcode:?}-dst-multi-def (derived address copied into a loop carrier)"
+                ));
                 plan.abort();
                 return false;
             }
@@ -669,6 +900,9 @@ fn trace_addr_uses(
                 return false;
             }
             if def_counts.get(&dst).copied().unwrap_or(0) != 1 {
+                sroa_escape_detail(&format!(
+                    "{opcode:?}-dst-multi-def (derived address copied into a loop carrier)"
+                ));
                 plan.abort();
                 return false;
             }

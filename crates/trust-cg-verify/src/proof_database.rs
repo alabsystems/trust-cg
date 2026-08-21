@@ -845,6 +845,20 @@ fn register_emission_proofs(proofs: &mut Vec<CategorizedProof>) {
     // relocation family for strict solver-backed evidence and coverage
     // accounting. Production Certified authority additionally requires the
     // per-object ELF reparse binding (see object_inventory.rs).
+    // AArch64 ELF relocation lane (branch rows, data rows, the ADRP/ADD and
+    // GOT pairs): the ELF mirror of the two AArch64 Mach-O registrations
+    // above, modeling the AArch64 psABI Rela semantics (explicit addend,
+    // `P` = r_offset, linker-resolved `S`/`G`). Registered in the shared
+    // object code-emission / relocation family for strict solver-backed
+    // evidence and coverage accounting. Production Certified authority
+    // additionally requires the per-object ELF reparse binding (see
+    // object_inventory.rs).
+    for p in crate::aarch64_elf_reloc_proofs::aarch64_elf_relocation_proofs() {
+        proofs.push(CategorizedProof {
+            obligation: p,
+            category: ProofCategory::MachOEmission,
+        });
+    }
     for p in crate::elf_data_reloc_proofs::x86_64_elf_data_relocation_proofs() {
         proofs.push(CategorizedProof {
             obligation: p,

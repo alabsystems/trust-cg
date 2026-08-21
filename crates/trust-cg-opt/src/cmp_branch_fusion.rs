@@ -247,6 +247,11 @@ fn cmp_branch_fusion_sweep(
             // Try CBZ/CBNZ fusion (compare-immediate Rn, #0).
             if let Some(mut fused) = try_fuse_cbz(cmp_inst, cond, target) {
                 fused.source_loc = bcond_inst.source_loc.or(cmp_inst.source_loc);
+                // The compare is about to be DELETED and CBZ/CBNZ writes no
+                // flags: NZCV must be dead on every path out of the branch.
+                if !nzcv_dead_after_branch(func, block_id, i + 1, &to_delete) {
+                    continue;
+                }
                 *func.inst_mut(bcond_id) = fused;
                 to_delete.insert(cmp_id);
                 fused_groups.push(FusedProvenance {
@@ -261,6 +266,11 @@ fn cmp_branch_fusion_sweep(
             // Try TBZ/TBNZ fusion (Tst Rn, #(1<<bit)).
             if let Some(mut fused) = try_fuse_tbz(cmp_inst, cond, target) {
                 fused.source_loc = bcond_inst.source_loc.or(cmp_inst.source_loc);
+                // Same requirement as the CBZ arm: the TST is deleted and
+                // TBZ/TBNZ writes no flags.
+                if !nzcv_dead_after_branch(func, block_id, i + 1, &to_delete) {
+                    continue;
+                }
                 *func.inst_mut(bcond_id) = fused;
                 to_delete.insert(cmp_id);
                 fused_groups.push(FusedProvenance {
@@ -1231,6 +1241,157 @@ fn try_fuse_tbz(
     ))
 }
 
+/// Blocks the [`nzcv_dead_after_branch`] successor walk will visit before it
+/// fails closed. Matches `and_cmp_fuse::flags_safe_after`'s budget.
+const NZCV_WALK_BUDGET: usize = 64;
+
+/// Does `inst` READ NZCV?
+///
+/// The complete set of AArch64 NZCV readers modelled by this backend: the
+/// conditional-select/set family and `ADC`/`SBC`
+/// ([`crate::effects::reads_flags`]) plus the conditional branches, which
+/// `reads_flags` tracks structurally rather than by opcode.
+fn reads_nzcv(inst: &MachInst) -> bool {
+    crate::effects::reads_flags(inst.opcode)
+        || matches!(inst.opcode, AArch64Opcode::BCond | AArch64Opcode::Bcc)
+}
+
+/// Does `inst` definitely REDEFINE NZCV, so that nothing after it can observe
+/// the flags that were live before it?
+///
+/// Only a definite kill may end the walk early, so this is the STRICT
+/// complement of [`writes_nzcv_conservative`]: architectural flag writers, and
+/// calls (NZCV is caller-saved). Everything else — including the trap carriers,
+/// which do clobber NZCV when they expand — is treated as merely transparent,
+/// which keeps walking and can only reach MORE potential readers.
+fn kills_nzcv(inst: &MachInst) -> bool {
+    if crate::effects::writes_flags(inst.opcode) {
+        return true;
+    }
+    inst.flags
+        .union(inst.opcode.default_flags())
+        .contains(InstFlags::IS_CALL)
+}
+
+/// An instruction whose NZCV behaviour this walk cannot account for: a pseudo
+/// with an unknown expansion. `Copy` lowers to a plain `MOV` and `Nop` to
+/// nothing; the trap carriers are `IS_BRANCH`/`IS_TERMINATOR`, not pseudos, and
+/// expand to sequences that produce their own flags before reading any
+/// (`BRK`, `CMP; B.LO; BRK`, `CBNZ; BRK` — see `trust-cg-codegen/src/lower.rs`).
+fn nzcv_unknown(inst: &MachInst) -> bool {
+    inst.flags
+        .union(inst.opcode.default_flags())
+        .contains(InstFlags::IS_PSEUDO)
+        && !matches!(inst.opcode, AArch64Opcode::Copy | AArch64Opcode::Nop)
+}
+
+/// A block with no successors is only safe to leave with NZCV live if control
+/// genuinely leaves the function there: a `RET` (NZCV is not part of the return
+/// value and does not survive the call boundary) or an abort (`BRK` / a trap
+/// carrier). Anything else is a shape this walk does not model.
+fn block_terminates_flag_liveness(func: &MachFunction, block: BlockId) -> bool {
+    func.block(block).insts.last().is_some_and(|&id| {
+        matches!(
+            func.inst(id).opcode,
+            AArch64Opcode::Ret
+                | AArch64Opcode::Brk
+                | AArch64Opcode::TrapOverflow
+                | AArch64Opcode::TrapOverflowExact
+                | AArch64Opcode::TrapBoundsCheck
+                | AArch64Opcode::TrapBoundsCheckExact
+                | AArch64Opcode::TrapNull
+                | AArch64Opcode::TrapNullIfZero
+                | AArch64Opcode::TrapDivZero
+                | AArch64Opcode::TrapDivZeroIfZero
+                | AArch64Opcode::TrapShiftRange
+                | AArch64Opcode::TrapShiftRangeIfOOB
+        )
+    })
+}
+
+/// Prove NZCV is DEAD everywhere reachable after the branch at
+/// `block.insts[branch_pos]`.
+///
+/// `try_fuse_cbz`/`try_fuse_tbz` DELETE the flag-setting compare and replace the
+/// `B.cc` with `CBZ`/`CBNZ`/`TBZ`/`TBNZ`, which do not write NZCV. Every
+/// downstream reader of those flags therefore loses its producer. The adjacency
+/// + immediate-shape recognition says nothing about that, and this pass's own
+/// [`try_cross_block_redundant_compare`] deliberately CREATES blocks whose
+/// conditional branch reads the live-out NZCV of their single predecessor —
+/// exactly the readers a later sweep would strand. This is the missing
+/// requirement, and it fails closed on anything it cannot account for.
+///
+/// Instructions already marked for deletion this sweep are skipped: they will
+/// not exist after the sweep's `retain`. That is the conservative direction for
+/// a KILLER (the walk keeps going and can only find more readers). No READER is
+/// ever deleted by this pass without a flag writer surviving ahead of it in the
+/// same block, so skipping cannot hide one.
+fn nzcv_dead_after_branch(
+    func: &MachFunction,
+    block: BlockId,
+    branch_pos: usize,
+    to_delete: &HashSet<InstId>,
+) -> bool {
+    // Scan the rest of the defining block, after the branch being rewritten.
+    for &id in func.block(block).insts.iter().skip(branch_pos + 1) {
+        if to_delete.contains(&id) {
+            continue;
+        }
+        let inst = func.inst(id);
+        if reads_nzcv(inst) || nzcv_unknown(inst) {
+            return false;
+        }
+        if kills_nzcv(inst) {
+            return true;
+        }
+    }
+
+    let succs = func.block(block).succs.clone();
+    if succs.is_empty() {
+        return block_terminates_flag_liveness(func, block);
+    }
+
+    let mut seen: HashSet<BlockId> = HashSet::new();
+    seen.insert(block);
+    let mut work: Vec<BlockId> = succs;
+    let mut budget = NZCV_WALK_BUDGET;
+
+    while let Some(b) = work.pop() {
+        if !seen.insert(b) {
+            continue;
+        }
+        if budget == 0 {
+            return false;
+        }
+        budget -= 1;
+
+        let mut killed = false;
+        for &id in &func.block(b).insts {
+            if to_delete.contains(&id) {
+                continue;
+            }
+            let inst = func.inst(id);
+            if reads_nzcv(inst) || nzcv_unknown(inst) {
+                return false;
+            }
+            if kills_nzcv(inst) {
+                killed = true;
+                break;
+            }
+        }
+        if !killed {
+            let next = func.block(b).succs.clone();
+            if next.is_empty() {
+                if !block_terminates_flag_liveness(func, b) {
+                    return false;
+                }
+            }
+            work.extend(next);
+        }
+    }
+    true
+}
+
 fn branch_test_register(operand: &MachOperand) -> Option<MachOperand> {
     match operand {
         MachOperand::VReg(_) | MachOperand::PReg(_) => Some(operand.clone()),
@@ -1693,6 +1854,12 @@ mod tests {
         ));
         func.append_inst(bb0, bcond_id);
         func.add_edge(bb0, bb1);
+        // Terminate bb1: the CBZ fusion's NZCV-liveness gate
+        // (`nzcv_dead_after_branch`) must be able to conclude that the flags
+        // die on this path, and a successor-less block with no RET is a shape
+        // it fails closed on.
+        let ret_id = func.push_inst(MachInst::new(AArch64Opcode::Ret, vec![]));
+        func.append_inst(bb1, ret_id);
 
         let other_block = func.create_block();
         let add_id = func.push_inst(MachInst::new(
@@ -1785,6 +1952,10 @@ mod tests {
         ));
         func.append_inst(bb0, bcond_id);
         func.add_edge(bb0, bb1);
+        // See the sibling test: terminate bb1 so the CBZ fusion's NZCV
+        // liveness gate can prove the flags die on this path.
+        let ret_id = func.push_inst(MachInst::new(AArch64Opcode::Ret, vec![]));
+        func.append_inst(bb1, ret_id);
 
         let tied_use_block = func.create_block();
         let bfm_id = func.push_inst(MachInst::new(
@@ -2945,6 +3116,251 @@ mod tests {
         assert_eq!(
             func.inst(func.block(func.entry).insts[3]).opcode,
             AArch64Opcode::Cbz
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // NZCV liveness gate on CBZ/TBZ formation.
+    //
+    // `try_fuse_cbz`/`try_fuse_tbz` DELETE the flag-setting compare, and
+    // CBZ/CBNZ/TBZ/TBNZ write no flags. The recognizer only checks adjacency +
+    // the immediate shape, so without `nzcv_dead_after_branch` the fusion
+    // strands any downstream reader of those flags — and
+    // `try_cross_block_redundant_compare`, in this very pass, deliberately
+    // CREATES such readers.
+    // ------------------------------------------------------------------
+
+    /// Build the composition:
+    ///
+    /// ```text
+    ///   A: cmp v0,#0 ; cset v1,EQ ; cmp v1,#0 ; b.ne T ; b B
+    ///   B: cmp v0,#0 ; b.lt U ; b V            (preds(B) = [A])
+    /// ```
+    ///
+    /// Sweep 1's imported-O0 window fusion rewrites A to `cmp v0,#0 ; b.eq T`
+    /// (the pair loop had already passed that window, so it does NOT see the
+    /// new adjacency), then cross-block elimination deletes B's compare so B's
+    /// `b.lt` reuses A's live-out NZCV. Sweep 2's pair loop then sees the
+    /// adjacency. If it fuses, B's branch is left with no NZCV producer on any
+    /// path.
+    fn make_cset_window_then_cross_block(
+        b_cmp: MachInst,
+        b_cond: CondCode,
+    ) -> (MachFunction, BlockId, BlockId) {
+        let mut func = MachFunction::new(
+            "cset_window_then_cross_block".to_string(),
+            Signature::new(vec![], vec![]),
+        );
+        let bb_a = func.entry;
+        let bb_t = func.create_block();
+        let bb_b = func.create_block();
+        let bb_u = func.create_block();
+        let bb_v = func.create_block();
+
+        let emit = |f: &mut MachFunction, bb: BlockId, inst: MachInst| {
+            let id = f.push_inst(inst);
+            f.append_inst(bb, id);
+        };
+
+        emit(
+            &mut func,
+            bb_a,
+            MachInst::new(AArch64Opcode::CmpRI, vec![vreg(0), imm(0)]),
+        );
+        emit(
+            &mut func,
+            bb_a,
+            MachInst::new(
+                AArch64Opcode::CSet,
+                vec![vreg(1), imm(CondCode::EQ.encoding() as i64)],
+            ),
+        );
+        emit(
+            &mut func,
+            bb_a,
+            MachInst::new(AArch64Opcode::CmpRI, vec![vreg(1), imm(0)]),
+        );
+        emit(
+            &mut func,
+            bb_a,
+            MachInst::new(
+                AArch64Opcode::BCond,
+                vec![
+                    imm(CondCode::NE.encoding() as i64),
+                    MachOperand::Block(bb_t),
+                ],
+            ),
+        );
+        emit(
+            &mut func,
+            bb_a,
+            MachInst::new(AArch64Opcode::B, vec![MachOperand::Block(bb_b)]),
+        );
+
+        emit(&mut func, bb_b, b_cmp);
+        emit(
+            &mut func,
+            bb_b,
+            MachInst::new(
+                AArch64Opcode::BCond,
+                vec![imm(b_cond.encoding() as i64), MachOperand::Block(bb_u)],
+            ),
+        );
+        emit(
+            &mut func,
+            bb_b,
+            MachInst::new(AArch64Opcode::B, vec![MachOperand::Block(bb_v)]),
+        );
+
+        for bb in [bb_t, bb_u, bb_v] {
+            emit(&mut func, bb, MachInst::new(AArch64Opcode::Ret, vec![]));
+        }
+
+        func.add_edge(bb_a, bb_t);
+        func.add_edge(bb_a, bb_b);
+        func.add_edge(bb_b, bb_u);
+        func.add_edge(bb_b, bb_v);
+
+        (func, bb_a, bb_b)
+    }
+
+    fn has_flag_producer(func: &MachFunction, bb: BlockId) -> bool {
+        func.block(bb)
+            .insts
+            .iter()
+            .any(|id| sets_flags(func.inst(*id).opcode))
+    }
+
+    /// The reported miscompile: CBZ formation must NOT strand block B's
+    /// conditional branch, which reuses A's live-out NZCV.
+    #[test]
+    fn cbz_fusion_declines_when_successor_reuses_live_flags() {
+        let (mut func, bb_a, bb_b) = make_cset_window_then_cross_block(
+            MachInst::new(AArch64Opcode::CmpRI, vec![vreg(0), imm(0)]),
+            CondCode::LT,
+        );
+        crate::env_lock::with_env_overrides_removed(
+            &["TCG_NO_CROSS_BLOCK_CMP_ELIM", "TCG_NO_CSET_BRANCH_COLLAPSE"],
+            || {
+                CmpBranchFusion.run(&mut func);
+            },
+        );
+
+        // B keeps its conditional branch...
+        assert!(
+            func.block(bb_b)
+                .insts
+                .iter()
+                .any(|id| func.inst(*id).opcode == AArch64Opcode::BCond),
+            "B must still branch conditionally"
+        );
+        // ...so SOME instruction on the path must still produce NZCV.
+        assert!(
+            has_flag_producer(&func, bb_a) || has_flag_producer(&func, bb_b),
+            "B's conditional branch was left with no NZCV producer on any path: \
+             A = {:?}, B = {:?}",
+            func.block(bb_a)
+                .insts
+                .iter()
+                .map(|id| func.inst(*id).opcode)
+                .collect::<Vec<_>>(),
+            func.block(bb_b)
+                .insts
+                .iter()
+                .map(|id| func.inst(*id).opcode)
+                .collect::<Vec<_>>(),
+        );
+        // Specifically: A's compare survives, so the CBZ was declined.
+        assert_eq!(
+            func.inst(func.block(bb_a).insts[0]).opcode,
+            AArch64Opcode::CmpRI
+        );
+        assert_eq!(
+            func.inst(func.block(bb_a).insts[1]).opcode,
+            AArch64Opcode::BCond
+        );
+    }
+
+    /// The TBZ arm has the identical structure and needs the identical guard.
+    #[test]
+    fn tbz_fusion_declines_when_flags_live_into_successor() {
+        let mut func =
+            MachFunction::new("tbz_live_flags".to_string(), Signature::new(vec![], vec![]));
+        let bb_a = func.entry;
+        let bb_t = func.create_block();
+        let bb_b = func.create_block();
+
+        let emit = |f: &mut MachFunction, bb: BlockId, inst: MachInst| {
+            let id = f.push_inst(inst);
+            f.append_inst(bb, id);
+        };
+        // A: tst v0,#4 ; b.eq T ; b B   (the TST is the only flag writer)
+        emit(
+            &mut func,
+            bb_a,
+            MachInst::new(AArch64Opcode::Tst, vec![vreg(0), imm(4)]),
+        );
+        emit(
+            &mut func,
+            bb_a,
+            MachInst::new(
+                AArch64Opcode::BCond,
+                vec![
+                    imm(CondCode::EQ.encoding() as i64),
+                    MachOperand::Block(bb_t),
+                ],
+            ),
+        );
+        emit(
+            &mut func,
+            bb_a,
+            MachInst::new(AArch64Opcode::B, vec![MachOperand::Block(bb_b)]),
+        );
+        // B reads NZCV with no producer of its own.
+        emit(
+            &mut func,
+            bb_b,
+            MachInst::new(
+                AArch64Opcode::CSet,
+                vec![vreg(9), imm(CondCode::NE.encoding() as i64)],
+            ),
+        );
+        emit(&mut func, bb_b, MachInst::new(AArch64Opcode::Ret, vec![]));
+        emit(&mut func, bb_t, MachInst::new(AArch64Opcode::Ret, vec![]));
+        func.add_edge(bb_a, bb_t);
+        func.add_edge(bb_a, bb_b);
+
+        let mut pass = CmpBranchFusion;
+        assert!(
+            !pass.run(&mut func),
+            "TST must not be folded into TBZ while B's CSET reads its flags"
+        );
+        assert_eq!(
+            func.inst(func.block(bb_a).insts[0]).opcode,
+            AArch64Opcode::Tst
+        );
+    }
+
+    /// The gate must not be blanket-conservative: with the flags dead after the
+    /// branch (a `RET` on every path), the fusion still fires.
+    #[test]
+    fn cbz_fusion_still_fires_when_flags_are_dead() {
+        let (mut func, bb_a, _bb_b) = make_cset_window_then_cross_block(
+            // B recomputes a DIFFERENT compare, so cross-block elimination
+            // declines and nothing downstream reads A's flags.
+            MachInst::new(AArch64Opcode::CmpRI, vec![vreg(3), imm(9)]),
+            CondCode::LT,
+        );
+        crate::env_lock::with_env_overrides_removed(
+            &["TCG_NO_CROSS_BLOCK_CMP_ELIM", "TCG_NO_CSET_BRANCH_COLLAPSE"],
+            || {
+                CmpBranchFusion.run(&mut func);
+            },
+        );
+        assert_eq!(
+            func.inst(func.block(bb_a).insts[0]).opcode,
+            AArch64Opcode::Cbz,
+            "flags are dead on every path out of A — the CBZ must still form"
         );
     }
 }

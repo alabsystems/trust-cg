@@ -130,7 +130,8 @@ pub use call_clobber::{
 };
 pub use coalesce::{
     CoalesceMode, CoalesceResult, CoalesceStats, CoalesceTuning, CopyCoalescer, apply_coalescing,
-    coalesce_copies, coalesce_copies_tuned, normalize_move_like_copies,
+    coalesce_copies, coalesce_copies_tuned, coalesce_copies_tuned_with_numbering,
+    normalize_move_like_copies,
 };
 pub use machine_types::{BlockId, InstId, PReg, RegClass, StackSlotId, VReg};
 pub use phi_elim::{eliminate_phis, split_critical_edges};
@@ -258,9 +259,24 @@ pub struct AllocConfig {
     /// Whether to enable spill slot reuse (default: true).
     pub enable_spill_slot_reuse: bool,
     /// CALLER-SUPPLIED register hints, honored by BOTH allocators (the older
-    /// "greedy only, ignored by linear scan" note was stale). Populated today by
-    /// the x86 adapter's `compute_call_crossing_hints`, which biases intervals
-    /// live across a call toward callee-saved registers; empty on aarch64.
+    /// "greedy only, ignored by linear scan" note was stale).
+    ///
+    /// 🛑 **Populated today with ABI ARGUMENT hints ONLY** — the x86 pipeline
+    /// fills this from `MOV vreg, PReg` patterns so an argument register is not
+    /// clobbered before it is read (#300). Empty on aarch64.
+    ///
+    /// ⚑ This doc previously claimed the map was "populated by the x86
+    /// adapter's `compute_call_crossing_hints`, which biases intervals live
+    /// across a call toward callee-saved registers". **That was false.**
+    /// [`compute_call_crossing_hints`] has NO production call site: it is
+    /// defined, re-exported here, and unit-tested in `x86_adapter`'s `mod
+    /// tests`, but never invoked during a real compilation. Values live across
+    /// a call therefore receive no callee-saved bias on any target.
+    ///
+    /// Wiring it up is not a config-time edit: the hints are derived from live
+    /// intervals, which do not exist until inside [`allocate_core`], so the
+    /// computation has to move in there rather than be assembled next to the
+    /// argument hints above.
     ///
     /// Both arms of [`allocate_core`] append the ABI copy hints from
     /// [`copy_register_hints`] AFTER these, so a caller preference is always
@@ -741,8 +757,16 @@ fn allocate_core(
     // attribution folds in that recompute — expected and intentional.)
     let t_coalesce = ra_stage_start();
     if config.enable_coalescing {
-        let coalesce_result =
-            coalesce_copies_tuned(func, &mut intervals_map, &config.coalesce_tuning);
+        // Hand coalescing the numbering we already computed at Phase 3 rather
+        // than letting it run a second whole-function liveness pass. `func` is
+        // not mutated between that computation and here, so the two numberings
+        // are identical by construction.
+        let coalesce_result = coalesce_copies_tuned_with_numbering(
+            func,
+            &mut intervals_map,
+            &config.coalesce_tuning,
+            &inst_numbering,
+        );
         if coalesce_result.copies_removed > 0 {
             apply_coalescing(func, &coalesce_result.removals, &coalesce_result.rewrites);
             coalesce_rewrites = coalesce_result.rewrites.clone();
@@ -1029,6 +1053,45 @@ fn allocate_core(
             gpr64,
             fpr,
         );
+
+        // ⚑ The COUNT alone is not enough to attribute a spill. A weight-base
+        // sweep can leave `spilled.len()` fixed while changing WHICH intervals
+        // lose, and the perf question is never "how many" — it is "was a value
+        // used in the innermost loop chosen". Emit each spilled interval's
+        // weight, live-range extent and use/def count so the SET can be
+        // compared across knob settings, and so a hot-but-long interval losing
+        // to a cold-but-short one is visible rather than inferred.
+        //
+        // Weight = sum(base^loop_depth over uses/defs) / interval_length, so a
+        // low weight on a many-use interval is the normalization penalty for a
+        // long live range -- exactly the shape a loop-carried accumulator has.
+        if !spilled.is_empty() {
+            let mut rows: Vec<String> = spilled
+                .iter()
+                .map(|v| {
+                    let key = if let Some(iv) = intervals_map.get(&v.id) {
+                        format!(
+                            "v{}[{}..{}] w={:.4} uses={} defs={}",
+                            v.id,
+                            iv.start(),
+                            iv.end(),
+                            iv.spill_weight,
+                            iv.use_positions.len(),
+                            iv.def_positions.len(),
+                        )
+                    } else {
+                        format!("v{}[?]", v.id)
+                    };
+                    key
+                })
+                .collect();
+            rows.sort();
+            eprintln!(
+                "[trust-cg-ra-spill-detail] func={} {}",
+                func.name,
+                rows.join("  "),
+            );
+        }
     }
 
     // AY live-range splitting may have MUTATED `func` (inserted PSEUDO_COPY split

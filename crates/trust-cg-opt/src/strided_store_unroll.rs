@@ -17,8 +17,11 @@
 //! loop-invariant stored `value`, and a loop-invariant REGISTER `stride` (the one
 //! generalization over `neon_fill`, which requires the unit `+1` step). The body
 //! reads NO memory (exactly one store, zero loads) so there is no aliasing
-//! question. This is exactly the p7 sieve's `while q < M { comp[q] = 1; q += p }`
-//! marking loop, which LLVM 4x-unrolls; this pass matches it.
+//! question. The store is UNCONDITIONAL: its block dominates the latch (and is
+//! not the header), so it runs on every header->latch path and never on the
+//! exiting pass — see the "unconditional-store gate" in `recognize`. This is
+//! exactly the p7 sieve's `while q < M { comp[q] = 1; q += p }` marking loop,
+//! which LLVM 4x-unrolls; this pass matches it.
 //!
 //! ## Lowering (partial-unroll-with-pre-guard; mirrors `neon_fill`)
 //!
@@ -275,6 +278,48 @@ impl Recognized {
             bail!("expected exactly one store, found {}", stores.len());
         }
         let store_id = stores[0];
+
+        // (2b) UNCONDITIONAL-STORE gate.
+        //
+        // `apply` replicates the store four times into ONE straight-line block
+        // with NO internal control flow, so recognition must PROVE the single
+        // store executes on EVERY header->latch path. Counting store
+        // *instructions* does not prove that:
+        // `while q <u N { if c { base[q] = v; } q += s; }` has exactly one store
+        // instruction that runs only under `c`, and the unrolled main loop
+        // performs all four writes unconditionally — writes the source program
+        // must skip.
+        //
+        // Gate: the store's block must DOMINATE the latch, and must not BE the
+        // header. Dominance is sufficient: take any header->latch path P and
+        // prefix it with a SHORTEST entry->header path (which enters the loop for
+        // the first time, so it contains no body block but the header). The
+        // concatenation is an entry->latch path, so it contains `store_blk`; since
+        // `store_blk` is a body block other than the header it cannot lie in that
+        // prefix, so it lies on P. Hence every completed iteration executes the
+        // store, exactly as the four unconditional replicas assume. Excluding the
+        // header is a separate necessity: the header also runs on the EXITING
+        // pass, where `iv >=u N` makes `base+iv` out of bounds.
+        //
+        // Fail-closed: an unresolvable store block bails.
+        let Some(store_blk) = body
+            .iter()
+            .copied()
+            .find(|&b| func.block(b).insts.contains(&store_id))
+        else {
+            bail!("store block unresolvable");
+        };
+        if store_blk == header {
+            bail!("store sits in the header (also runs on the exiting pass)");
+        }
+        if !dom.dominates(store_blk, latch) {
+            bail!(
+                "store block {:?} does not dominate the latch {:?}: the store is \
+                 conditional inside the loop body",
+                store_blk,
+                latch
+            );
+        }
 
         // (1) Header preds == exactly {preheader, latch}; single latch.
         let hpreds = &func.block(header).preds;
@@ -545,6 +590,23 @@ fn recognize_native_const_bound(
         return Some(n);
     }
     let rhs = reg_rhs?;
+    // The bound register must have exactly ONE live def before its constant can
+    // be believed. `const_value` resolves through a def map that is LAST-WINS
+    // over the emitted layout, so for a bound the loop REASSIGNS it reports the
+    // LATCH value rather than the value the entry test actually used — and
+    // every loop-carried variable has two live defs by construction (a
+    // preheader copy and a latch copy). Unlike the stride, base and stored
+    // value, this register had no invariance check of any kind.
+    //
+    // Confirmed miscompile before this guard:
+    //     let mut lim = 4; let mut q = 8;
+    //     while q < lim { buf[q] = 1; q += s; lim = 64; }
+    // `8 < 4` is false, so the loop never runs and the program writes NOTHING.
+    // The bound resolved to 64, and the unrolled loop wrote 56 bytes at
+    // indices 8..=63 — past a 16-byte buffer into a separate allocation.
+    if crate::effects::live_def_count(func, rhs.id) != 1 {
+        return None;
+    }
     const_value(func, def, rhs)
 }
 
@@ -577,8 +639,7 @@ fn is_loop_invariant(
 ) -> bool {
     // (a) INVARIANCE: not defined by ANY instruction in the inner loop body.
     for &id in loop_insts {
-        let inst = func.inst(id);
-        if produces_def(inst.opcode) && inst.operands.first().and_then(vreg_of) == Some(v) {
+        if crate::effects::inst_defines_vreg(func.inst(id), v) {
             return false;
         }
     }
@@ -589,13 +650,13 @@ fn is_loop_invariant(
     // defs (never the single-def map). A vreg with no def anywhere in the body
     // is available iff it is defined on the entry-side of the loop.
     let mut any_def = false;
-    for (idx, inst) in func.insts.iter().enumerate() {
-        if produces_def(inst.opcode) && inst.operands.first().and_then(vreg_of) == Some(v) {
-            any_def = true;
-            if let Some(db) = block_of_inst(func, InstId(idx as u32))
-                && dom.dominates(db, preheader)
-            {
-                return true;
+    for &bid in &func.block_order {
+        for &id in &func.block(bid).insts {
+            if crate::effects::inst_defines_vreg(func.inst(id), v) {
+                any_def = true;
+                if dom.dominates(bid, preheader) {
+                    return true;
+                }
             }
         }
     }
@@ -615,8 +676,11 @@ fn legacy_available(
     v: VReg,
 ) -> bool {
     let Some(&d) = def.get(&v.id) else {
-        return !func.insts.iter().any(|inst| {
-            produces_def(inst.opcode) && inst.operands.first().and_then(vreg_of) == Some(v)
+        return !func.block_order.iter().any(|&bid| {
+            func.block(bid)
+                .insts
+                .iter()
+                .any(|&id| crate::effects::inst_defines_vreg(func.inst(id), v))
         });
     };
     let Some(db) = block_of_inst(func, d) else {
@@ -891,6 +955,21 @@ fn same_as_iv(func: &MachFunction, def: &HashMap<u32, InstId>, v: VReg, iv: VReg
 /// Follow `MovR`/`Copy` chains to the underlying value.
 fn strip_copies(func: &MachFunction, def: &HashMap<u32, InstId>, mut v: VReg) -> VReg {
     for _ in 0..16 {
+        // A vreg with several live defs has no single reaching definition: the
+        // def map is LAST-WINS over the emitted layout, so it names whichever
+        // def comes last rather than the one that reaches this use. Every
+        // loop-carried variable is multi-def by construction (a preheader copy
+        // and a latch copy into the same vreg), and every `if`/`match` value has
+        // one def per arm — so walking one resolves an induction variable to its
+        // LATCH source, or a merge value to whichever arm came last.
+        //
+        // Confirmed wrong-code from this exact hole in neon_fill, mac_reg_block,
+        // mac_row_unroll, strided_store_unroll, neon_iota_fill and neon_bytesum.
+        // `swap_range_guard::single_def` and `neon_find`'s bound check were the
+        // in-tree precedents for doing it right.
+        if crate::effects::live_def_count(func, v.id) != 1 {
+            return v;
+        }
         let Some(&d) = def.get(&v.id) else {
             return v;
         };
@@ -923,7 +1002,7 @@ fn const_value(func: &MachFunction, def: &HashMap<u32, InstId>, val: VReg) -> Op
             let mut acc: Option<u64> = None;
             for &pid in insts[..pos].iter() {
                 let pi = func.inst(pid);
-                if pi.operands.first().and_then(vreg_of) != Some(v) {
+                if !crate::effects::inst_defines_vreg(pi, v) {
                     continue;
                 }
                 match pi.opcode {
@@ -937,8 +1016,7 @@ fn const_value(func: &MachFunction, def: &HashMap<u32, InstId>, val: VReg) -> Op
                     AArch64Opcode::Movk => {
                         acc = Some(crate::reaching_const::apply_movk(pi, v, acc?)?);
                     }
-                    _ if produces_def(pi.opcode) => return None,
-                    _ => {}
+                    _ => return None,
                 }
             }
             let value = crate::reaching_const::apply_movk(inst, v, acc?)?;
@@ -946,37 +1024,6 @@ fn const_value(func: &MachFunction, def: &HashMap<u32, InstId>, val: VReg) -> Op
         }
         _ => None,
     }
-}
-
-/// Conservative "operand 0 is a written def" predicate (compares/branches/guard
-/// carriers do NOT define a fresh vreg).
-fn produces_def(op: AArch64Opcode) -> bool {
-    use AArch64Opcode::*;
-    !matches!(
-        op,
-        CmpRR
-            | CmpRI
-            | BCond
-            | B
-            | Cbz
-            | Cbnz
-            | StrbRI
-            | StrhRI
-            | StrRI
-            | StrRO
-            | StrbRO
-            | StrhRO
-            | TrapBoundsCheckExact
-            | TrapBoundsCheck
-            | TrapOverflow
-            | TrapOverflowExact
-            | TrapNull
-            | TrapNullIfZero
-            | TrapDivZero
-            | TrapDivZeroIfZero
-            | TrapShiftRange
-            | TrapShiftRangeIfOOB
-    )
 }
 
 pub(crate) static STRIDED_NANOS: std::sync::atomic::AtomicU64 =
@@ -999,15 +1046,7 @@ fn build_def_map(func: &MachFunction) -> HashMap<u32, InstId> {
 }
 
 fn build_def_map_inner(func: &MachFunction) -> HashMap<u32, InstId> {
-    let mut map = HashMap::new();
-    for (idx, inst) in func.insts.iter().enumerate() {
-        if let Some(MachOperand::VReg(v)) = inst.operands.first()
-            && produces_def(inst.opcode)
-        {
-            map.insert(v.id, InstId(idx as u32));
-        }
-    }
-    map
+    crate::effects::build_reaching_def_map(func)
 }
 
 fn block_of_inst(func: &MachFunction, target: InstId) -> Option<BlockId> {

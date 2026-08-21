@@ -43,7 +43,8 @@ use trust_cg_ir::{
 use crate::addr_mode::is_encodable_offset;
 use crate::dom::DomTree;
 use crate::effects::{
-    aarch64_for_each_def_position, aarch64_for_each_use_position, inst_produces_value,
+    aarch64_for_each_def_position, aarch64_for_each_use_position, for_each_inst_def,
+    for_each_inst_use,
 };
 use crate::loop_iv::analyze_trip_count;
 use crate::loops::{LoopAnalysis, NaturalLoop};
@@ -230,10 +231,11 @@ impl LoopUnroll {
             })
             .collect();
 
-        // Def map for the whole function: vreg -> the instructions that define
-        // it (operand 0 of a value-producing inst). The importer's SSA-destructed
-        // MIR is NOT SSA (loop-carried vregs are defined by copies in both the
-        // preheader and the latch), so a vreg may have several defs.
+        // Def map for the whole function: vreg -> every emitted instruction
+        // that defines it per the shared operand-role model. The importer's
+        // SSA-destructed MIR is NOT SSA (loop-carried vregs are defined by
+        // copies in both the preheader and the latch), so a vreg may have
+        // several defs.
         let def_map = build_def_map(func);
 
         // Trip-count simulation cap: with the const-addr unroll enabled the
@@ -425,21 +427,10 @@ enum Rel {
     UGe,
 }
 
-/// Build a def map: vreg -> the instructions defining it (operand 0 of a
-/// value-producing instruction). Non-SSA MIR may map a vreg to several defs.
+/// Build a def map: vreg -> every emitted instruction defining it according to
+/// the shared operand-role model. Non-SSA MIR may map a vreg to several defs.
 fn build_def_map(func: &MachFunction) -> HashMap<VReg, Vec<InstId>> {
-    let mut map: HashMap<VReg, Vec<InstId>> = HashMap::new();
-    for &block_id in &func.block_order {
-        for &inst_id in &func.block(block_id).insts {
-            let inst = func.inst(inst_id);
-            if inst_produces_value(inst)
-                && let Some(v) = inst.operands.first().and_then(|op| op.as_vreg())
-            {
-                map.entry(v).or_default().push(inst_id);
-            }
-        }
-    }
-    map
+    crate::effects::build_all_defs_map(func)
 }
 
 /// The single defining instruction of `v`, or `None` if it has zero or several
@@ -1482,10 +1473,41 @@ fn plan_const_addr_unroll(
 
 /// Does `inst` read `v` (any source operand)?
 fn inst_uses_vreg(inst: &MachInst, v: VReg) -> bool {
-    let start = usize::from(inst_produces_value(inst));
-    inst.operands[start..]
-        .iter()
-        .any(|op| matches!(op, MachOperand::VReg(u) if *u == v))
+    let mut found = false;
+    for_each_inst_use(inst, |used| {
+        if used == v {
+            found = true;
+        }
+    });
+    found
+}
+
+/// Does `inst` write `v` at any position in the shared operand-role model?
+fn inst_defines_vreg(inst: &MachInst, v: VReg) -> bool {
+    let mut found = false;
+    for_each_inst_def(inst, |defined| {
+        if defined == v {
+            found = true;
+        }
+    });
+    found
+}
+
+/// Apply one clone's vreg map at every modeled use position.
+///
+/// Operand zero is not a def/use boundary: LSE atomics read operand zero and
+/// write operand one, while accumulator and writeback forms have tied uses and
+/// defs. The role model is therefore the only safe way to rewrite sources.
+fn rewrite_renamed_uses(inst: &mut MachInst, rename: &HashMap<VReg, VReg>) {
+    let opcode = inst.opcode;
+    let operand_count = inst.operands.len();
+    aarch64_for_each_use_position(opcode, operand_count, |pos| {
+        if let Some(MachOperand::VReg(v)) = inst.operands.get_mut(pos)
+            && let Some(&fresh) = rename.get(v)
+        {
+            *v = fresh;
+        }
+    });
 }
 
 /// Is `v` read by any instruction outside the loop body?
@@ -1570,19 +1592,12 @@ fn unroll_copy_based(
                     addri.source_loc = source_loc;
                     addri
                 } else {
-                    // Verbatim clone, with any renamed dst substituted in the
-                    // clone's source operands (defs are never renamed: plan
-                    // validation proved the renamed vregs are single-def).
+                    // Verbatim clone, with any renamed dst substituted at the
+                    // clone's modeled use positions. Plan validation proved
+                    // every renamed vreg is single-def.
                     let mut c = MachInst::new(opcode, operands);
                     c.source_loc = source_loc;
-                    let start = usize::from(inst_produces_value(&c));
-                    for op in &mut c.operands[start..] {
-                        if let MachOperand::VReg(v) = op
-                            && let Some(&fresh) = rename.get(v)
-                        {
-                            *v = fresh;
-                        }
-                    }
+                    rewrite_renamed_uses(&mut c, &rename);
                     c
                 }
             } else {
@@ -3427,9 +3442,7 @@ fn analyze_diamond_const_trip_loop(
             for &b in &body_blocks {
                 for &iid in &func.block(b).insts {
                     let inst = func.inst(iid);
-                    if inst_produces_value(inst)
-                        && inst.operands.first().and_then(|op| op.as_vreg()) == Some(bv)
-                    {
+                    if inst_defines_vreg(inst, bv) {
                         return None;
                     }
                 }
@@ -3976,11 +3989,9 @@ fn collect_single_def_movz_consts(func: &MachFunction) -> HashMap<VReg, i64> {
     for &blk in &func.block_order {
         for &iid in &func.block(blk).insts {
             let inst = func.inst(iid);
-            if inst_produces_value(inst)
-                && let Some(v) = inst.operands.first().and_then(|op| op.as_vreg())
-            {
+            for_each_inst_def(inst, |v| {
                 *def_count.entry(v).or_default() += 1;
-            }
+            });
         }
     }
     let mut out: HashMap<VReg, i64> = HashMap::new();
@@ -4278,6 +4289,38 @@ fn count_body_insts(func: &MachFunction, lp: &NaturalLoop) -> usize {
     count
 }
 
+/// Return the sole plain destination that the legacy simple-loop cloner may
+/// rename, or fail closed for a definition shape it cannot represent.
+///
+/// That cloner gives each iteration a fresh destination but has no way to
+/// express a tied input/output as two virtual registers. It therefore supports
+/// only zero defs or one untied def at operand 0. Paired loads, LSE results at
+/// operand 1, and every writeback/accumulator form must use a richer unroller
+/// rather than being cloned with stale cross-iteration vregs.
+fn simple_unroll_defined_vreg(inst: &MachInst) -> Option<Option<VReg>> {
+    let mut defs = Vec::new();
+    aarch64_for_each_def_position(inst.opcode, inst.operands.len(), |pos| defs.push(pos));
+    if defs.is_empty() {
+        return Some(None);
+    }
+    if defs.as_slice() != [0] {
+        return None;
+    }
+    let mut operand_zero_is_used = false;
+    aarch64_for_each_use_position(inst.opcode, inst.operands.len(), |pos| {
+        if pos == 0 {
+            operand_zero_is_used = true;
+        }
+    });
+    if operand_zero_is_used {
+        return None;
+    }
+    inst.operands
+        .first()
+        .and_then(MachOperand::as_vreg)
+        .map(Some)
+}
+
 /// Perform full loop unrolling by replicating the body `trip_count` times.
 ///
 /// Strategy: duplicate all loop body blocks for each iteration, rewriting
@@ -4345,15 +4388,16 @@ fn unroll_loop(
     // The original loop body serves as iteration 0; we add copies for 1..trip_count-1.
     // After all copies, redirect the latch's back-edge to the exit block.
 
-    // Build vreg rename map for each iteration.
-    // Collect all vregs defined in the loop body.
+    // Build the vreg rename map for each iteration. Fail closed before any
+    // mutation when an instruction has a multi-def, nonzero-def, or tied-def
+    // shape this legacy cloner cannot represent.
     let mut defined_vregs: Vec<VReg> = Vec::new();
     for &(_bid, iid) in &body_insts {
         let inst = func.inst(iid);
-        if inst_produces_value(inst)
-            && let Some(vreg) = inst.operands.first().and_then(|op| op.as_vreg())
-        {
-            defined_vregs.push(vreg);
+        match simple_unroll_defined_vreg(inst) {
+            Some(Some(vreg)) if !defined_vregs.contains(&vreg) => defined_vregs.push(vreg),
+            Some(_) => {}
+            None => return false,
         }
     }
 
@@ -4387,9 +4431,10 @@ fn unroll_loop(
                 .enumerate()
                 .map(|(idx, op)| {
                     if let MachOperand::VReg(vreg) = op {
-                        // For the def (operand 0 on value-producing insts), use this iter's rename.
+                        // The preflight above proves every supported def is one
+                        // untied operand-0 destination.
                         if idx == 0
-                            && inst_produces_value(inst)
+                            && simple_unroll_defined_vreg(inst).flatten().is_some()
                             && let Some(&new_vreg) = rename.get(vreg)
                         {
                             return MachOperand::VReg(new_vreg);
@@ -6013,6 +6058,113 @@ mod tests {
 
     fn profile_hotness_for_header(hits: u64, function_count: u64) -> ProfileHotness {
         profile_hotness_for_named_header("counting_loop", BlockId(1), hits, function_count)
+    }
+
+    #[test]
+    fn simple_unroll_cloner_refuses_multi_nonzero_and_tied_defs() {
+        let plain = MachInst::new(AArch64Opcode::AddRR, vec![vreg(0), vreg(1), vreg(2)]);
+        assert_eq!(
+            simple_unroll_defined_vreg(&plain),
+            Some(Some(VReg::new(0, RegClass::Gpr64))),
+        );
+
+        let store = MachInst::new(AArch64Opcode::StrRI, vec![vreg(0), vreg(1), imm(0)]);
+        assert_eq!(simple_unroll_defined_vreg(&store), Some(None));
+
+        for unsupported in [
+            MachInst::new(
+                AArch64Opcode::LdpRI,
+                vec![vreg(0), vreg(1), vreg(2), imm(0)],
+            ),
+            MachInst::new(
+                AArch64Opcode::LdpPostIndex,
+                vec![vreg(0), vreg(1), vreg(2), imm(16)],
+            ),
+            MachInst::new(AArch64Opcode::Ldadd, vec![vreg(0), vreg(1), vreg(2)]),
+            MachInst::new(AArch64Opcode::Movk, vec![vreg(0), imm(1), imm(0)]),
+        ] {
+            assert_eq!(
+                simple_unroll_defined_vreg(&unsupported),
+                None,
+                "legacy cloner must fail closed for {:?}",
+                unsupported.opcode,
+            );
+        }
+    }
+
+    #[test]
+    fn use_queries_and_clone_rewrites_follow_operand_roles() {
+        let update = VReg::new(0, RegClass::Gpr64);
+        let result = VReg::new(1, RegClass::Gpr64);
+        let address = VReg::new(2, RegClass::Gpr64);
+        let fresh_update = VReg::new(10, RegClass::Gpr64);
+        let fresh_address = VReg::new(12, RegClass::Gpr64);
+
+        let mut atomic = MachInst::new(
+            AArch64Opcode::Ldadd,
+            vec![
+                MachOperand::VReg(update),
+                MachOperand::VReg(result),
+                MachOperand::VReg(address),
+            ],
+        );
+        assert!(inst_uses_vreg(&atomic, update));
+        assert!(inst_uses_vreg(&atomic, address));
+        assert!(!inst_uses_vreg(&atomic, result));
+        assert!(inst_defines_vreg(&atomic, result));
+        assert!(!inst_defines_vreg(&atomic, update));
+
+        let rename = HashMap::from([(update, fresh_update), (address, fresh_address)]);
+        rewrite_renamed_uses(&mut atomic, &rename);
+        assert_eq!(atomic.operands[0].as_vreg(), Some(fresh_update));
+        assert_eq!(atomic.operands[1].as_vreg(), Some(result));
+        assert_eq!(atomic.operands[2].as_vreg(), Some(fresh_address));
+
+        let accumulator = MachInst::new(
+            AArch64Opcode::Movk,
+            vec![MachOperand::VReg(result), imm(1), imm(0)],
+        );
+        assert!(inst_uses_vreg(&accumulator, result));
+        assert!(inst_defines_vreg(&accumulator, result));
+    }
+
+    #[test]
+    fn single_def_constants_reject_nonzero_and_writeback_redefinitions() {
+        let mut func = MachFunction::new("role_defs".to_string(), Signature::new(vec![], vec![]));
+        let entry = func.entry;
+        let emit = |func: &mut MachFunction, inst: MachInst| {
+            let id = func.push_inst(inst);
+            func.append_inst(entry, id);
+        };
+
+        emit(
+            &mut func,
+            MachInst::new(AArch64Opcode::Movz, vec![vreg(1), imm(7)]),
+        );
+        emit(
+            &mut func,
+            MachInst::new(AArch64Opcode::Movz, vec![vreg(2), imm(9)]),
+        );
+        emit(
+            &mut func,
+            MachInst::new(AArch64Opcode::Movz, vec![vreg(3), imm(11)]),
+        );
+        emit(
+            &mut func,
+            MachInst::new(AArch64Opcode::Ldadd, vec![vreg(8), vreg(1), vreg(9)]),
+        );
+        emit(
+            &mut func,
+            MachInst::new(
+                AArch64Opcode::LdpPostIndex,
+                vec![vreg(10), vreg(11), vreg(2), imm(16)],
+            ),
+        );
+
+        let consts = collect_single_def_movz_consts(&func);
+        assert!(!consts.contains_key(&VReg::new(1, RegClass::Gpr64)));
+        assert!(!consts.contains_key(&VReg::new(2, RegClass::Gpr64)));
+        assert_eq!(consts.get(&VReg::new(3, RegClass::Gpr64)), Some(&11));
     }
 
     /// Build a simple counting loop:
@@ -7824,7 +7976,7 @@ mod tests {
                 {
                     *ldr_dst_defs.entry(d).or_default() += 1;
                 }
-                if inst_produces_value(inst)
+                if crate::effects::inst_produces_value(inst)
                     && inst.operands.first().and_then(|o| o.as_vreg())
                         == Some(VReg::new(7, RegClass::Gpr32))
                 {
@@ -8190,6 +8342,42 @@ mod tests {
             "each clone's store must fold to its own constant offset"
         );
         assert_eq!(madds, 0, "every IV-indexed Madd must fold away");
+    }
+
+    #[test]
+    fn test_diamond_bounded_trip_rejects_operand_one_bound_redefinition() {
+        // The loop compares against v35 on every iteration. An LSE operation
+        // writes its result at operand 1; treating only operand 0 as a def
+        // would leave the preheader Uxtw looking like the unique, invariant
+        // definition and could cap the clone chain using a stale limit.
+        let mut func = make_diamond_bounded_trip_loop(BTripShape::Sound);
+        let header = BlockId(3);
+        let redefine = func.push_inst(MachInst::new(
+            AArch64Opcode::Ldadd,
+            vec![vreg(2), vreg(35), vreg(20)],
+        ));
+        let branch_pos = func
+            .block(header)
+            .insts
+            .iter()
+            .position(|&iid| func.inst(iid).opcode == AArch64Opcode::BCond)
+            .expect("header branch");
+        func.block_mut(header).insts.insert(branch_pos, redefine);
+
+        let limit = VReg::new(35, RegClass::Gpr64);
+        assert!(inst_defines_vreg(func.inst(redefine), limit));
+        assert_eq!(
+            build_def_map(&func).get(&limit).map(Vec::len),
+            Some(2),
+            "the preheader and operand-1 body writes must both be visible",
+        );
+
+        let mut pass = LoopUnroll::default();
+        assert!(
+            !pass.run(&mut func),
+            "a per-iteration bound redefinition must fail closed"
+        );
+        assert!(func.block(BlockId(7)).succs.contains(&header));
     }
 
     #[test]

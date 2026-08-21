@@ -949,6 +949,21 @@ enum ChainBound {
 /// only on single-def bound registers, never on the multi-def induction.
 fn strip_copies(func: &MachFunction, def: &HashMap<u32, InstId>, mut v: VReg) -> VReg {
     for _ in 0..16 {
+        // A vreg with several live defs has no single reaching definition: the
+        // def map is LAST-WINS over the emitted layout, so it names whichever
+        // def comes last rather than the one that reaches this use. Every
+        // loop-carried variable is multi-def by construction (a preheader copy
+        // and a latch copy into the same vreg), and every `if`/`match` value has
+        // one def per arm — so walking one resolves an induction variable to its
+        // LATCH source, or a merge value to whichever arm came last.
+        //
+        // Confirmed wrong-code from this exact hole in neon_fill, mac_reg_block,
+        // mac_row_unroll, strided_store_unroll, neon_iota_fill and neon_bytesum.
+        // `swap_range_guard::single_def` and `neon_find`'s bound check were the
+        // in-tree precedents for doing it right.
+        if crate::effects::live_def_count(func, v.id) != 1 {
+            return v;
+        }
         let Some(&d) = def.get(&v.id) else {
             return v;
         };
@@ -1350,18 +1365,7 @@ fn walk_find_chain(
 /// break the copy/address walks. Restricting to the current CFG fixes this.
 /// Mirrors [`crate::neon_minmax`]'s `build_live_def_map`.
 fn build_live_def_map(func: &MachFunction) -> HashMap<u32, InstId> {
-    let mut map = HashMap::new();
-    for &bid in &func.block_order {
-        for &id in &func.block(bid).insts {
-            let inst = func.inst(id);
-            if let Some(MachOperand::VReg(v)) = inst.operands.first()
-                && produces_def(inst.opcode)
-            {
-                map.insert(v.id, id);
-            }
-        }
-    }
-    map
+    crate::effects::build_reaching_def_map(func)
 }
 
 /// Number of LIVE (in a `block_order` block) instructions defining `v.id`.
@@ -1370,19 +1374,7 @@ fn build_live_def_map(func: &MachFunction) -> HashMap<u32, InstId> {
 /// guard is unambiguous. Counts defs the same way [`build_live_def_map`] finds
 /// them (operand 0 of a `produces_def` opcode).
 fn unique_live_def_count(func: &MachFunction, v: VReg) -> usize {
-    let mut n = 0;
-    for &bid in &func.block_order {
-        for &id in &func.block(bid).insts {
-            let inst = func.inst(id);
-            if let Some(MachOperand::VReg(d)) = inst.operands.first()
-                && d.id == v.id
-                && produces_def(inst.opcode)
-            {
-                n += 1;
-            }
-        }
-    }
-    n
+    crate::effects::live_def_count(func, v.id)
 }
 
 /// Materialize a non-negative i32-range constant into a fresh preheader vreg of
@@ -1731,20 +1723,7 @@ fn alloc(func: &mut MachFunction, class: RegClass) -> VReg {
 }
 
 fn build_def_map(func: &MachFunction) -> HashMap<u32, InstId> {
-    let mut map = HashMap::new();
-    for (idx, inst) in func.insts.iter().enumerate() {
-        if let Some(MachOperand::VReg(v)) = inst.operands.first()
-            && produces_def(inst.opcode)
-        {
-            map.insert(v.id, InstId(idx as u32));
-        }
-    }
-    map
-}
-
-fn produces_def(op: AArch64Opcode) -> bool {
-    use AArch64Opcode::*;
-    !matches!(op, CmpRR | CmpRI | BCond | B)
+    crate::effects::build_reaching_def_map(func)
 }
 
 fn block_of_inst(func: &MachFunction, target: InstId) -> Option<BlockId> {

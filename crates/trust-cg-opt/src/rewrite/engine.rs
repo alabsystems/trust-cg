@@ -21,7 +21,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 
-use trust_cg_ir::{InstId, MachFunction, MachOperand, PassId, ProvenanceMap, VReg};
+use trust_cg_ir::{InstId, MachFunction, PassId, ProvenanceMap, VReg};
 
 use crate::rewrite::matcher::MatchCtx;
 use crate::rewrite::rewriter::RewriteAction;
@@ -235,15 +235,15 @@ fn record_definition(
     inst: &trust_cg_ir::MachInst,
     id: InstId,
 ) {
-    if inst.opcode.produces_value()
-        && let Some(MachOperand::VReg(dst)) = inst.operands.first()
-    {
-        def_map.insert(*dst, id);
-    }
+    crate::effects::for_each_inst_def(inst, |dst| {
+        def_map.insert(dst, id);
+    });
 }
 
 #[cfg(test)]
 mod tests {
+    use trust_cg_ir::MachOperand;
+
     use super::*;
     use crate::rewrite::patterns::{
         rule_add_self_to_shl, rule_lsr_lsl_to_and, rule_mul_by_one_rhs, rule_mul_by_zero_rhs,

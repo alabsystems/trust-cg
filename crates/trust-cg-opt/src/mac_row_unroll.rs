@@ -78,6 +78,17 @@
 //!    arithmetic is wrap-free: unsigned `idx <u (const)` never computes `idx+3`;
 //!    `N-3`, `L-3` are compile-time constants materialized once; `N,L in
 //!    [4, u32::MAX]`.
+//!
+//! **(2b) The MAC really is unconditional (recognition step 8).** Points 1 and
+//! 2 say what the recognized chain DOES; they do not say that it RUNS. Since
+//! the main block is straight-line, recognition additionally requires the
+//! store's block to DOMINATE THE LATCH (with the two loads and the accumulate
+//! `Madd` dominating that store), and requires the ONLY loop-exiting blocks to
+//! be the header and the three recognized bounds-check blocks — exactly the
+//! transfers the spliced guards subsume. Without this, a predicated MAC
+//! (`if p { c[..] += aik*b[..] }`) or an early `break` is unrolled into four
+//! unconditional MACs. Both BAIL.
+//!
 //! 3. **Additive:** the scalar loop's instructions are untouched; only new
 //!    blocks are spliced before it and the preheader terminator is redirected at
 //!    COMMIT (deferred so a mid-build bail cannot corrupt the CFG). The shared-iv
@@ -451,6 +462,73 @@ impl Recognized {
             bail!("array length {} out of [4, u32::MAX]", l_const);
         }
 
+        // (8) UNCONDITIONAL EXECUTION. The main block replaces FOUR scalar
+        // iterations with STRAIGHT-LINE code, so the whole soundness argument
+        // ("compute = 4 scalar iterations, bit-for-bit") silently assumes that
+        // each scalar iteration (a) always performs the recognized MAC and
+        // (b) never leaves the loop other than through a control transfer the
+        // spliced guards already prove cannot be taken. Nothing above checks
+        // either: steps (1)-(7) only constrain WHAT the recognized chain does
+        // when it runs, never THAT it runs. Two shapes slip through and are
+        // miscompiled:
+        //
+        //   * a PREDICATED MAC — `while j <u N { if p { c[..] += aik*b[..] } ;
+        //     j += 1 }` — the store block does not dominate the latch, and the
+        //     unrolled block performs all four MACs unconditionally, dropping
+        //     `p`;
+        //   * an EARLY EXIT — `while j <u N { if p { break } ; c[..] += .. }` —
+        //     the unrolled block runs four iterations without ever evaluating
+        //     `p`.
+        //
+        // Close both fail-closed:
+        //   (a) the store's block DOMINATES the latch, so every iteration that
+        //       completes performed the RMW store; and the three chain values
+        //       feeding it (the two loads and the accumulate `Madd`) dominate
+        //       that store, so the value stored is the recognized one on every
+        //       path reaching it;
+        //   (b) the ONLY loop-exiting blocks are the header (whose `j <u N`
+        //       test the `j <u N-3` guard subsumes) and blocks that ARE one of
+        //       the three recognized `idx <u L` bounds checks (whose fail edges
+        //       the `cidx <u L-3` / `bidx <u L-3` guards prove untaken for all
+        //       four lanes). An exiting block is admitted only if it has
+        //       EXACTLY two successors — one in the body, one out — so it
+        //       cannot smuggle a second, unmodeled exit alongside the check.
+        //       Any other block with a successor outside the body BAILS.
+        let Some(store_blk) = block_of_inst(func, store_id) else {
+            bail!("store has no owning block");
+        };
+        if !dom.dominates(store_blk, latch) {
+            bail!(
+                "store block {:?} does not dominate latch {:?} (predicated MAC)",
+                store_blk,
+                latch
+            );
+        }
+        for (name, v) in [("c load", cval), ("b load", bval), ("mac", store_val)] {
+            let blk = def.get(&v.id).and_then(|&d| block_of_inst(func, d));
+            if !blk.is_some_and(|b| dom.dominates(b, store_blk)) {
+                bail!("{} ({:?}) does not dominate the store block", name, v);
+            }
+        }
+        for &b in body {
+            let succs = &func.block(b).succs;
+            if !succs.iter().any(|s| !body.contains(s)) {
+                continue; // not an exiting block
+            }
+            if succs.len() != 2 || succs.iter().filter(|s| body.contains(s)).count() != 1 {
+                bail!("exiting block {:?} has an unmodeled successor set", b);
+            }
+            if b == header {
+                continue; // the recognized `j <u N` continue test
+            }
+            let is_bc = [cidx, bidx, cidx2]
+                .iter()
+                .any(|&idx| bounds_check_in(func, def, body, b, idx) == Some(l_const));
+            if !is_bc {
+                bail!("unmodeled loop-exiting block {:?} (early exit)", b);
+            }
+        }
+
         if dump {
             eprintln!(
                 "[mac-row-unroll] RECOGNIZED@{} iv={:?} N={} L={} i={:?} k={:?} c={:?} b={:?} \
@@ -578,48 +656,61 @@ fn find_bounds_check(
     body: &HashSet<BlockId>,
     idx: VReg,
 ) -> Option<i64> {
-    for &b in body {
-        // The compare on `idx`.
-        let mut bound: Option<i64> = None;
-        for &id in &func.block(b).insts {
-            let inst = func.inst(id);
-            match inst.opcode {
-                AArch64Opcode::CmpRR if inst.operands.len() == 2 => {
-                    if same_as(func, def, vreg_of(&inst.operands[0])?, idx) {
-                        bound = const_value(func, def, vreg_of(&inst.operands[1])?);
-                    }
-                }
-                AArch64Opcode::CmpRI
-                    if inst.operands.len() == 2
-                        && same_as(func, def, vreg_of(&inst.operands[0])?, idx) =>
-                {
-                    bound = imm_of(&inst.operands[1]);
-                }
-                _ => {}
-            }
-        }
-        let Some(l) = bound else { continue };
-        // The block's conditional exit must be a forward in-bounds branch.
-        let mut lo_to_body = false;
-        let mut has_exit = false;
-        for &id in &func.block(b).insts {
-            let inst = func.inst(id);
-            if inst.opcode == AArch64Opcode::BCond && inst.operands.len() == 2 {
-                let cc = imm_of(&inst.operands[0])?;
-                let tgt = *branch_targets(inst).first()?;
-                if (cc == CC_LO || cc == CC_LT) && body.contains(&tgt) {
-                    lo_to_body = true;
+    body.iter()
+        .find_map(|&b| bounds_check_in(func, def, body, b, idx))
+}
+
+/// Is block `b` a `Cmp idx, L ; B.LO/LT body ; B exit` bounds check on `idx`?
+/// Returns the compile-time `L`. Split out of `find_bounds_check` so the
+/// unconditional-execution gate can ask the same question of a SPECIFIC block
+/// (order-independent — `body` is a `HashSet`).
+fn bounds_check_in(
+    func: &MachFunction,
+    def: &HashMap<u32, InstId>,
+    body: &HashSet<BlockId>,
+    b: BlockId,
+    idx: VReg,
+) -> Option<i64> {
+    // The compare on `idx`.
+    let mut bound: Option<i64> = None;
+    for &id in &func.block(b).insts {
+        let inst = func.inst(id);
+        match inst.opcode {
+            AArch64Opcode::CmpRR if inst.operands.len() == 2 => {
+                if same_as(func, def, vreg_of(&inst.operands[0])?, idx) {
+                    bound = const_value(func, def, vreg_of(&inst.operands[1])?);
                 }
             }
+            AArch64Opcode::CmpRI
+                if inst.operands.len() == 2
+                    && same_as(func, def, vreg_of(&inst.operands[0])?, idx) =>
+            {
+                bound = imm_of(&inst.operands[1]);
+            }
+            _ => {}
         }
-        for &s in &func.block(b).succs {
-            if !body.contains(&s) {
-                has_exit = true;
+    }
+    let l = bound?;
+    // The block's conditional exit must be a forward in-bounds branch.
+    let mut lo_to_body = false;
+    let mut has_exit = false;
+    for &id in &func.block(b).insts {
+        let inst = func.inst(id);
+        if inst.opcode == AArch64Opcode::BCond && inst.operands.len() == 2 {
+            let cc = imm_of(&inst.operands[0])?;
+            let tgt = *branch_targets(inst).first()?;
+            if (cc == CC_LO || cc == CC_LT) && body.contains(&tgt) {
+                lo_to_body = true;
             }
         }
-        if lo_to_body && has_exit {
-            return Some(l);
+    }
+    for &s in &func.block(b).succs {
+        if !body.contains(&s) {
+            has_exit = true;
         }
+    }
+    if lo_to_body && has_exit {
+        return Some(l);
     }
     None
 }
@@ -641,7 +732,16 @@ fn recognize_native_const_bound(
         match inst.opcode {
             AArch64Opcode::CmpRR if inst.operands.len() == 2 => {
                 if same_as(func, def, vreg_of(&inst.operands[0])?, iv) {
-                    cmp_bound = const_value(func, def, vreg_of(&inst.operands[1])?);
+                    // Same guard, same reason as
+                    // `strided_store_unroll::recognize_native_const_bound`:
+                    // this recognizer is a copy of that one and had the same
+                    // hole. A bound the loop reassigns resolves to its LATCH
+                    // value. Not driven to a witness here — the pass fires on
+                    // the shape but stays correct — so this is defensive.
+                    let rhs = vreg_of(&inst.operands[1])?;
+                    if crate::effects::live_def_count(func, rhs.id) == 1 {
+                        cmp_bound = const_value(func, def, rhs);
+                    }
                 }
             }
             AArch64Opcode::CmpRI
@@ -689,14 +789,16 @@ fn is_loop_invariant(
     v: VReg,
 ) -> bool {
     for &id in loop_insts {
-        let inst = func.inst(id);
-        if produces_def(inst.opcode) && inst.operands.first().and_then(vreg_of) == Some(v) {
+        if crate::effects::inst_defines_vreg(func.inst(id), v) {
             return false;
         }
     }
     let Some(&d) = def.get(&v.id) else {
-        return !func.insts.iter().any(|inst| {
-            produces_def(inst.opcode) && inst.operands.first().and_then(vreg_of) == Some(v)
+        return !func.block_order.iter().any(|&bid| {
+            func.block(bid)
+                .insts
+                .iter()
+                .any(|&id| crate::effects::inst_defines_vreg(func.inst(id), v))
         });
     };
     let Some(db) = block_of_inst(func, d) else {
@@ -1003,6 +1105,18 @@ fn same_as(func: &MachFunction, def: &HashMap<u32, InstId>, v: VReg, w: VReg) ->
 /// Follow `MovR`/`Copy` chains to the underlying value.
 fn strip_copies(func: &MachFunction, def: &HashMap<u32, InstId>, mut v: VReg) -> VReg {
     for _ in 0..16 {
+        // A vreg with several live defs has no single reaching definition: the
+        // def map is LAST-WINS over the emitted layout, so it names whichever
+        // def comes last rather than the one that reaches this use. Every
+        // loop-carried variable is multi-def by construction — the frontend
+        // lowers a block parameter to one copy per predecessor, giving a
+        // preheader copy and a latch copy into the same vreg — so walking one
+        // resolves the INDUCTION VARIABLE to its latch source `iv + 1`. Then
+        // `same_as(iv + 1, iv)` is TRUE and an index of `j + 1` passes as an
+        // index of `j`, which is a wrong-address store.
+        if crate::effects::live_def_count(func, v.id) != 1 {
+            return v;
+        }
         let Some(&d) = def.get(&v.id) else {
             return v;
         };
@@ -1028,7 +1142,7 @@ fn const_value(func: &MachFunction, def: &HashMap<u32, InstId>, val: VReg) -> Op
             let mut acc: Option<i64> = None;
             for &pid in &insts[..=pos] {
                 let pi = func.inst(pid);
-                if pi.operands.first().and_then(vreg_of) != Some(v) || !produces_def(pi.opcode) {
+                if !crate::effects::inst_defines_vreg(pi, v) {
                     continue;
                 }
                 match pi.opcode {
@@ -1084,37 +1198,6 @@ fn move_wide_patch(inst: &MachInst, dst: VReg) -> Option<(i64, u32)> {
     Some((halfword, shift as u32))
 }
 
-/// Conservative "operand 0 is a written def" predicate (compares/branches/guard
-/// carriers/stores do NOT define a fresh vreg).
-fn produces_def(op: AArch64Opcode) -> bool {
-    use AArch64Opcode::*;
-    !matches!(
-        op,
-        CmpRR
-            | CmpRI
-            | BCond
-            | B
-            | Cbz
-            | Cbnz
-            | StrbRI
-            | StrhRI
-            | StrRI
-            | StrRO
-            | StrbRO
-            | StrhRO
-            | TrapBoundsCheckExact
-            | TrapBoundsCheck
-            | TrapOverflow
-            | TrapOverflowExact
-            | TrapNull
-            | TrapNullIfZero
-            | TrapDivZero
-            | TrapDivZeroIfZero
-            | TrapShiftRange
-            | TrapShiftRangeIfOOB
-    )
-}
-
 pub(crate) static MACROW_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub(crate) static MACROW_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -1133,15 +1216,7 @@ fn build_def_map(func: &MachFunction) -> HashMap<u32, InstId> {
 }
 
 fn build_def_map_inner(func: &MachFunction) -> HashMap<u32, InstId> {
-    let mut map = HashMap::new();
-    for (idx, inst) in func.insts.iter().enumerate() {
-        if let Some(MachOperand::VReg(v)) = inst.operands.first()
-            && produces_def(inst.opcode)
-        {
-            map.insert(v.id, InstId(idx as u32));
-        }
-    }
-    map
+    crate::effects::build_reaching_def_map(func)
 }
 
 fn block_of_inst(func: &MachFunction, target: InstId) -> Option<BlockId> {

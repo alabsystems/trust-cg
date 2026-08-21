@@ -4019,9 +4019,12 @@ fn test_jit_large_function() {
     assert_eq!(f(42), 42);
     assert_eq!(f(0), 0);
 
-    // Buffer should be at least 2 pages (filler + RET > 1 page on Apple Silicon).
+    // Buffer should span multiple pages. Page size is HOST-dependent (4K on
+    // most Linux kernels, 16K on Apple Silicon and some AArch64 distros), so
+    // assert against the smallest supported page size rather than hardcoding
+    // Apple's: the filler + RET exceed one page on every host either way.
     assert!(
-        buf.allocated_size() >= 2 * 16384,
+        buf.allocated_size() >= 2 * 4096,
         "buffer should span multiple pages, got {} bytes",
         buf.allocated_size()
     );

@@ -1,3 +1,6 @@
+#[path = "support/target_dir.rs"]
+mod target_dir_support;
+
 // Integration test: GENERAL-AGGREGATE memory-model lowering — by-value aggregate
 // PARAMETERS (callee side, validated cross-backend), ADDRESS-TAKEN aggregate
 // locals (mutation through `&mut`), and NESTED aggregate fields — compiled for
@@ -69,9 +72,7 @@ fn dylib_name() -> String {
 
 fn ensure_dylib_built() -> PathBuf {
     let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| crate_dir.join("target"));
+    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
     let name = dylib_name();
     let candidates = [
         target_dir.join("release").join(&name),

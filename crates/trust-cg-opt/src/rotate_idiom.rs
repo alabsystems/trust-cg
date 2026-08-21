@@ -56,6 +56,9 @@ use trust_cg_ir::{
 };
 
 use crate::dom::DomTree;
+use crate::effects::{
+    aarch64_for_each_use_position, for_each_inst_def, inst_defines_vreg, single_inst_def,
+};
 use crate::pass_manager::{AnalysisCache, MachinePass};
 
 /// Rotate-idiom recognition pass (former peephole pattern 53).
@@ -164,23 +167,23 @@ fn collect_unique_materialized_constants(func: &MachFunction) -> UniqueConstantD
     for &block_id in &func.block_order {
         for &inst_id in &func.block(block_id).insts {
             let inst = func.inst(inst_id);
-            if !inst.opcode.produces_value() {
-                continue;
-            }
-            let Some(MachOperand::VReg(dst)) = inst.operands.first() else {
-                continue;
-            };
-            match constants.entry(*dst) {
+            let sole_def = single_inst_def(inst);
+            for_each_inst_def(inst, |dst| match constants.entry(dst) {
                 std::collections::hash_map::Entry::Vacant(entry) => {
-                    entry.insert(simple_materialized_constant(inst).map(|value| ConstantDef {
-                        block: block_id,
-                        value,
-                    }));
+                    entry.insert(
+                        (sole_def == Some(dst))
+                            .then(|| simple_materialized_constant(inst))
+                            .flatten()
+                            .map(|value| ConstantDef {
+                                block: block_id,
+                                value,
+                            }),
+                    );
                 }
                 std::collections::hash_map::Entry::Occupied(mut entry) => {
                     entry.insert(None);
                 }
-            }
+            });
         }
     }
     constants
@@ -197,11 +200,9 @@ fn simple_materialized_constant(inst: &MachInst) -> Option<i64> {
 }
 
 fn record_value_def(def_map: &mut HashMap<VReg, InstId>, inst_id: InstId, inst: &MachInst) {
-    if inst.opcode.produces_value()
-        && let Some(MachOperand::VReg(dst)) = inst.operands.first()
-    {
-        def_map.insert(*dst, inst_id);
-    }
+    for_each_inst_def(inst, |dst| {
+        def_map.insert(dst, inst_id);
+    });
 }
 
 fn lookup_def<'a>(
@@ -424,22 +425,17 @@ fn match_and_mask32(inst: &MachInst, mask: i64) -> Option<VReg> {
     inst.operands[1].as_vreg()
 }
 
-/// Number of READS of `v` across all block-linked instructions (the def
-/// position — operand 0 of a value-producing opcode — is not a read).
+/// Number of reads of `v` across all block-linked instructions.
 fn count_linked_uses(func: &MachFunction, v: VReg) -> usize {
     let mut uses = 0;
     for &block_id in &func.block_order {
         for &inst_id in &func.block(block_id).insts {
             let inst = func.inst(inst_id);
-            let skip_def = inst.opcode.produces_value();
-            for (idx, op) in inst.operands.iter().enumerate() {
-                if skip_def && idx == 0 {
-                    continue;
-                }
-                if op.as_vreg() == Some(v) {
+            aarch64_for_each_use_position(inst.opcode, inst.operands.len(), |pos| {
+                if inst.operands.get(pos).and_then(MachOperand::as_vreg) == Some(v) {
                     uses += 1;
                 }
-            }
+            });
         }
     }
     uses
@@ -450,10 +446,7 @@ fn count_linked_defs(func: &MachFunction, v: VReg) -> usize {
     let mut defs = 0;
     for &block_id in &func.block_order {
         for &inst_id in &func.block(block_id).insts {
-            let inst = func.inst(inst_id);
-            if inst.opcode.produces_value()
-                && inst.operands.first().and_then(MachOperand::as_vreg) == Some(v)
-            {
+            if inst_defines_vreg(func.inst(inst_id), v) {
                 defs += 1;
             }
         }

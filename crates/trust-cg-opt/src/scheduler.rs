@@ -873,6 +873,40 @@ fn build_dag_for_insts(func: &MachFunction, inst_ids: &[InstId]) -> ScheduleDAG 
                         add_edge(use_idx, idx, &mut edges);
                     }
                 }
+
+                // ...and the case that was MISSING: an earlier VIRTUAL DEF
+                // must not be DELAYED past a fixed physical-register write.
+                // Register allocation may assign that virtual def to the same
+                // physical register, clobbering the value the write produced —
+                // and for the ABI return register that value is live all the
+                // way out of the function, so nothing in the region redefines
+                // it and no other rule catches the hazard.
+                //
+                // P0 this fixes (found by benchmarks/bridge-fuzz):
+                //     fn f(p0: u64, .., p7: u16, p8: u64, p9: u64) -> u32 { p0 as u32 }
+                // With >8 integer parameters the unused ones are stack-passed
+                // and ISel emits dead `LdrRI vN, [x29, IncomingArg(..)]` loads.
+                // Pre-regalloc the region is
+                //     LdrRI [v9, x29, IncomingArg(8)]   ; dead
+                //     Uxtw  [PReg(x0), v10]             ; the return value
+                //     Ret   [PReg(x30)]                 ; does NOT list x0
+                // Without this edge the dead load may be scheduled after the
+                // `Uxtw`, and regalloc — seeing no later reader of x0, because
+                // `Ret` does not name it — hands the dead load x0. Emitted:
+                // `mov w0,w1 ; ldr x0,[x29,#24] ; ret`, i.e. the function
+                // returns its LAST parameter. LLVM 1000, trust-cg 1009 at
+                // O1/O2/O3, and the proofs-on lane did NOT fail closed on it.
+                //
+                // The deeper defect is that `Ret` does not declare the return
+                // register as a use; fixing that is the general repair and
+                // would also cover any future consumer that reasons about
+                // live-out. This edge closes the scheduling half conservatively
+                // in the meantime.
+                for &def_idx in &vreg_defs {
+                    if def_idx < idx {
+                        add_edge(def_idx, idx, &mut edges);
+                    }
+                }
             }
         }
     }
@@ -3488,6 +3522,26 @@ mod tests {
         assert!(
             pos(InstId(0), &order) < pos(InstId(1), &order),
             "scheduler must not move fixed PReg writes before prior virtual uses"
+        );
+    }
+
+    #[test]
+    fn test_build_dag_preg_write_orders_after_prior_vreg_defs() {
+        let prior_def = MachInst::new(AArch64Opcode::MovI, vec![vreg(10), imm(7)]);
+        let write_x0 = MachInst::new(AArch64Opcode::Copy, vec![MachOperand::PReg(X0), vreg(3)]);
+        let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+        let func = make_func_with_insts(vec![prior_def, write_x0, ret]);
+
+        let mut dag = build_dag(&func, func.entry);
+        assert!(
+            dag.nodes[1].deps.contains(&0),
+            "fixed X0 writes must stay after earlier VReg defs that may allocate to X0"
+        );
+
+        let order = schedule_list(&mut dag);
+        assert!(
+            pos(InstId(0), &order) < pos(InstId(1), &order),
+            "scheduler must not delay virtual defs past fixed PReg writes"
         );
     }
 

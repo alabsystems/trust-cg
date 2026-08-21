@@ -58,7 +58,8 @@ use trust_cg_ir::{
 
 use crate::dom::DomTree;
 use crate::effects::{
-    MemoryEffect, has_tied_def_use, opcode_effect, produces_value, reads_flags, writes_flags,
+    MemoryEffect, aarch64_for_each_use_position, for_each_inst_def, has_tied_def_use,
+    opcode_effect, produces_value, reads_flags, single_inst_def, writes_flags,
 };
 use crate::pass_manager::{AnalysisCache, MachinePass};
 
@@ -305,17 +306,14 @@ fn run_cse(
             // Track VReg definitions: increment version for each def.
             // This must happen for ALL instructions (not just CSE candidates)
             // so that subsequent expressions using redefined VRegs get new keys.
-            let def_version = if produces_value(inst.opcode) {
-                if let Some(MachOperand::VReg(def_v)) = inst.operands.first() {
-                    let ver = vreg_versions.entry(*def_v).or_insert(0);
-                    *ver += 1;
-                    Some(*ver)
-                } else {
-                    None
+            let mut def_version = None;
+            for_each_inst_def(inst, |def_v| {
+                let ver = vreg_versions.entry(def_v).or_insert(0);
+                *ver += 1;
+                if inst.operands.first().and_then(MachOperand::as_vreg) == Some(def_v) {
+                    def_version = Some(*ver);
                 }
-            } else {
-                None
-            };
+            });
 
             let effect = opcode_effect(inst.opcode);
             if effect.is_barrier() || !inst.implicit_defs.is_empty() {
@@ -326,7 +324,7 @@ fn run_cse(
             if effect != MemoryEffect::Pure {
                 continue;
             }
-            if !produces_value(inst.opcode) {
+            if !produces_value(inst.opcode) || single_inst_def(inst).is_none() {
                 continue;
             }
 
@@ -507,31 +505,28 @@ fn run_cse(
         let inst_ids = func.block(block_id).insts.clone();
         for inst_id in inst_ids {
             let inst = func.inst_mut(inst_id);
-            let use_start = if produces_value(inst.opcode) { 1 } else { 0 };
             let mut rewritten = false;
-
-            for i in use_start..inst.operands.len() {
-                let vreg = match &inst.operands[i] {
-                    MachOperand::VReg(vreg) => *vreg,
-                    _ => continue,
+            let opcode = inst.opcode;
+            let operand_count = inst.operands.len();
+            aarch64_for_each_use_position(opcode, operand_count, |i| {
+                let Some(vreg) = inst.operands.get(i).and_then(MachOperand::as_vreg) else {
+                    return;
                 };
                 let version = rewrite_versions.get(&vreg).copied().unwrap_or(0);
                 if let Some(replacement) = replacements.get(&(vreg, version)) {
                     inst.operands[i] = MachOperand::VReg(*replacement);
                     rewritten = true;
                 }
-            }
+            });
 
             if rewritten {
                 rewritten_inst_ids.insert(inst_id);
             }
 
-            if produces_value(inst.opcode)
-                && let Some(MachOperand::VReg(def_v)) = inst.operands.first()
-            {
-                let ver = rewrite_versions.entry(*def_v).or_insert(0);
+            for_each_inst_def(inst, |def_v| {
+                let ver = rewrite_versions.entry(def_v).or_insert(0);
                 *ver += 1;
-            }
+            });
         }
     }
 
@@ -628,11 +623,9 @@ fn count_defs(func: &MachFunction) -> HashMap<VReg, u32> {
         let block = func.block(block_id);
         for &inst_id in &block.insts {
             let inst = func.inst(inst_id);
-            if produces_value(inst.opcode)
-                && let Some(MachOperand::VReg(vreg)) = inst.operands.first()
-            {
-                *counts.entry(*vreg).or_insert(0) += 1;
-            }
+            for_each_inst_def(inst, |vreg| {
+                *counts.entry(vreg).or_insert(0) += 1;
+            });
         }
     }
 

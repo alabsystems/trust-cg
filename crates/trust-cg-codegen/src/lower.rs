@@ -1405,6 +1405,40 @@ fn encode_inst(inst: &MachInst) -> Result<u32, LowerError> {
             preg_hw(0)?;
             preg_hw(1)?;
             preg_hw(2)?;
+            // FAIL-CLOSED (mirrors `reject_single_writeback_overlap` for the
+            // single-register forms, and the NEON pair path): for a WRITEBACK
+            // pair the architecture makes `Rn == Rt` or `Rn == Rt2` CONSTRAINED
+            // UNPREDICTABLE, and a load pair additionally forbids `Rt == Rt2`.
+            // Liveness already prevents this — the base and both transfer
+            // registers are simultaneously live at the instruction, and
+            // `effects::fill_operand_roles` models the base as DefUse so the
+            // allocator can never overlap them (audited over 6590 emitted
+            // writeback instructions: zero overlaps). This check exists so a
+            // future pass emitting these opcodes gets a hard compile error
+            // instead of silently-unpredictable bytes.
+            let base_hw = single_writeback_base_hw(2)?;
+            if base_hw != 31 {
+                for t in [0usize, 1] {
+                    if single_writeback_transfer_hw(t)? == base_hw {
+                        return Err(LowerError::EncodingFailed(format!(
+                            "pair writeback transfer/base overlap is unpredictable for {:?}",
+                            inst.opcode
+                        )));
+                    }
+                }
+            }
+            if inst.opcode == AArch64Opcode::LdpPostIndex {
+                let (t0, t1) = (
+                    single_writeback_transfer_hw(0)?,
+                    single_writeback_transfer_hw(1)?,
+                );
+                if t0 != 31 && t0 == t1 {
+                    return Err(LowerError::EncodingFailed(format!(
+                        "load pair with Rt == Rt2 is unpredictable for {:?}",
+                        inst.opcode
+                    )));
+                }
+            }
             encode_instruction(inst).map_err(map_encode_error)
         }
 

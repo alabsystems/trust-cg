@@ -98,6 +98,7 @@ use trust_cg_ir::{
 };
 
 use crate::dom::DomTree;
+use crate::effects::{aarch64_for_each_use_position, for_each_inst_def};
 use crate::loops::LoopAnalysis;
 use crate::pass_manager::{AnalysisCache, MachinePass};
 
@@ -590,6 +591,52 @@ impl Recognized {
             });
         }
 
+        // (7b) TRAVERSAL-0 REACHABILITY of the FIRST load. `trip >= 1` only
+        // proves the header's continue-branch is taken; it does NOT prove the
+        // first traversal reaches the load's position. Anything on the forced
+        // traversal BEFORE the first load that can abandon it — a `Trap*`
+        // guard carrier, or a side-exit branch out of the body — voids the
+        // "the original dereferences this address itself" argument, and the
+        // appended preheader load then runs on a path the original never took
+        // (a NEW fault). Header rank 0 is exempt: its single recognized
+        // `BCond LO/LT` IS the guard the trip proof interprets.
+        let first_load_pos = loads.iter().filter_map(|s| pos(s.load_id)).min()?;
+        for (rank, &b) in order.iter().enumerate() {
+            if rank > first_load_pos.0 {
+                break;
+            }
+            // A side exit strictly before the first load's block abandons the
+            // traversal without reaching the load.
+            if rank > 0
+                && rank < first_load_pos.0
+                && func.block(b).succs.iter().any(|s| !body.contains(s))
+                && !side_exit_not_taken_at_iv0(
+                    func,
+                    &single_def,
+                    &pos_of,
+                    &cycle_insts,
+                    body,
+                    b,
+                    iv,
+                    iv0,
+                    redef_pos,
+                )
+            {
+                bail!("side exit at rank {} precedes the first load", rank);
+            }
+            for (idx, &id) in func.block(b).insts.iter().enumerate() {
+                if (rank, idx) >= first_load_pos {
+                    break;
+                }
+                if matches!(
+                    func.inst(id).opcode,
+                    AArch64Opcode::TrapBoundsCheckExact | AArch64Opcode::TrapBoundsCheck
+                ) {
+                    bail!("trap carrier precedes the first load");
+                }
+            }
+        }
+
         if dump {
             eprintln!(
                 "[recurrence-store-forward] RECOGNIZED@{} iv={:?} base={:?} vS={:?} \
@@ -860,6 +907,162 @@ fn is_iv_copy_before(
     cur == iv
 }
 
+/// Is the side exit that ends `blk` PROVABLY not taken on traversal 0 (i.e.
+/// when `iv == iv0`)? Recognized shape (anything else fails closed):
+///
+/// ```text
+///   Cmp(x, K) ; BCond(cc, T) ; B F        with exactly one of T/F in `body`
+/// ```
+///
+/// where `x` is `iv` (or `iv+1`) read before the redefinition and `K` is a
+/// compile-time constant. The guard is evaluated concretely at `iv == iv0`;
+/// the in-body outcome must be the one taken. Both constants are range-checked
+/// into `[0, u32::MAX]` where the signed and unsigned readings agree, so the
+/// compare width cannot change the verdict.
+#[allow(clippy::too_many_arguments)]
+fn side_exit_not_taken_at_iv0(
+    func: &MachFunction,
+    single_def: &impl Fn(VReg) -> Option<InstId>,
+    pos_of: &HashMap<InstId, CyclePos>,
+    cycle_insts: &HashSet<InstId>,
+    body: &HashSet<BlockId>,
+    blk: BlockId,
+    iv: VReg,
+    iv0: i64,
+    redef_pos: CyclePos,
+) -> bool {
+    let insts = &func.block(blk).insts;
+    // Exactly one BCond, immediately preceded by the compare it reads.
+    let bconds: Vec<usize> = insts
+        .iter()
+        .enumerate()
+        .filter(|&(_, &id)| func.inst(id).opcode == AArch64Opcode::BCond)
+        .map(|(idx, _)| idx)
+        .collect();
+    let [bcond_idx] = bconds[..] else {
+        return false;
+    };
+    if bcond_idx == 0 {
+        return false;
+    }
+    let bcond = func.inst(insts[bcond_idx]);
+    if bcond.operands.len() != 2 {
+        return false;
+    }
+    let Some(cc) = imm_of(&bcond.operands[0]) else {
+        return false;
+    };
+    let Some(&taken) = branch_targets(bcond).first() else {
+        return false;
+    };
+    // The fall-through target: the block's other successor.
+    let succs = &func.block(blk).succs;
+    if succs.len() != 2 {
+        return false;
+    }
+    let Some(&fallthrough) = succs.iter().find(|&&s| s != taken) else {
+        return false;
+    };
+    // Exactly one side is the in-body continuation.
+    let taken_in_body = body.contains(&taken);
+    if taken_in_body == body.contains(&fallthrough) {
+        return false;
+    }
+    let cmp_id = insts[bcond_idx - 1];
+    let cmp = func.inst(cmp_id);
+    if !matches!(cmp.opcode, AArch64Opcode::CmpRR | AArch64Opcode::CmpRI) || cmp.operands.len() != 2
+    {
+        return false;
+    }
+    let Some(&cmp_pos) = pos_of.get(&cmp_id) else {
+        return false;
+    };
+    let Some(lhs) = vreg_of(&cmp.operands[0]) else {
+        return false;
+    };
+    // `lhs` is `iv` itself, or the in-cycle `AddRI(iv-copy, 1)` the store index
+    // uses — both have a known value at traversal 0.
+    let lhs_val = if is_iv_copy_before(
+        func,
+        single_def,
+        pos_of,
+        cycle_insts,
+        iv,
+        lhs,
+        cmp_pos,
+        redef_pos,
+    ) {
+        iv0
+    } else {
+        let Some(def) = single_def(lhs).filter(|id| cycle_insts.contains(id)) else {
+            return false;
+        };
+        let d = func.inst(def);
+        if d.opcode != AArch64Opcode::AddRI
+            || d.operands.len() != 3
+            || imm_of(&d.operands[2]) != Some(1)
+        {
+            return false;
+        }
+        let Some(src) = vreg_of(&d.operands[1]) else {
+            return false;
+        };
+        let Some(&def_pos) = pos_of.get(&def) else {
+            return false;
+        };
+        if !is_iv_copy_before(
+            func,
+            single_def,
+            pos_of,
+            cycle_insts,
+            iv,
+            src,
+            def_pos,
+            redef_pos,
+        ) {
+            return false;
+        }
+        iv0 + 1
+    };
+    let k = match cmp.opcode {
+        AArch64Opcode::CmpRI => match imm_of(&cmp.operands[1]) {
+            Some(v) => v,
+            None => return false,
+        },
+        _ => {
+            let Some(rhs) = vreg_of(&cmp.operands[1]) else {
+                return false;
+            };
+            let Some(rdef) = single_def(rhs) else {
+                return false;
+            };
+            if cycle_insts.contains(&rdef) {
+                return false;
+            }
+            match movz_const(func.inst(rdef)) {
+                Some(v) => v,
+                None => return false,
+            }
+        }
+    };
+    const MAXV: i64 = u32::MAX as i64;
+    if !(0..=MAXV).contains(&lhs_val) || !(0..=MAXV).contains(&k) {
+        return false;
+    }
+    // Evaluate `cc` on (lhs_val, k) — signed and unsigned agree in this range.
+    let cond = match cc {
+        0 => lhs_val == k,      // EQ
+        1 => lhs_val != k,      // NE
+        2 | 10 => lhs_val >= k, // HS / GE
+        3 | 11 => lhs_val < k,  // LO / LT
+        8 | 12 => lhs_val > k,  // HI / GT
+        9 | 13 => lhs_val <= k, // LS / LE
+        _ => return false,
+    };
+    // The traversal continues into the body iff the in-body edge is taken.
+    cond == taken_in_body
+}
+
 /// `Madd [dst, index, scale, base]` -> `(index, scale, base)`.
 fn madd_parts(inst: &MachInst) -> Option<(VReg, VReg, VReg)> {
     if inst.opcode != AArch64Opcode::Madd || inst.operands.len() != 4 {
@@ -1017,17 +1220,15 @@ fn apply(func: &mut MachFunction, rec: &Recognized) {
     for block_id in func.block_order.clone() {
         for inst_id in func.block(block_id).insts.clone() {
             let inst = func.inst_mut(inst_id);
-            let skip_def = inst.opcode.produces_value();
-            for (idx, op) in inst.operands.iter_mut().enumerate() {
-                if skip_def && idx == 0 {
-                    continue;
-                }
-                if let MachOperand::VReg(v) = op
+            let opcode = inst.opcode;
+            let operand_count = inst.operands.len();
+            aarch64_for_each_use_position(opcode, operand_count, |pos| {
+                if let Some(MachOperand::VReg(v)) = inst.operands.get_mut(pos)
                     && dsts.contains(v)
                 {
-                    *op = MachOperand::VReg(rec.vs);
+                    *v = rec.vs;
                 }
-            }
+            });
         }
     }
 }
@@ -1062,14 +1263,15 @@ fn copy_like(inst: &MachInst) -> Option<(VReg, VReg)> {
     }
 }
 
-/// Does `inst` READ `v` (its def position — operand 0 of a value-producing
-/// opcode — is not a read)?
+/// Does `inst` read `v` according to the shared operand-role model?
 fn reads_vreg(inst: &MachInst, v: VReg) -> bool {
-    let skip_def = inst.opcode.produces_value();
-    inst.operands
-        .iter()
-        .enumerate()
-        .any(|(idx, op)| !(skip_def && idx == 0) && vreg_of(op) == Some(v))
+    let mut reads = false;
+    aarch64_for_each_use_position(inst.opcode, inst.operands.len(), |pos| {
+        if inst.operands.get(pos).and_then(vreg_of) == Some(v) {
+            reads = true;
+        }
+    });
+    reads
 }
 
 /// Is the instruction linked into some block?
@@ -1085,11 +1287,7 @@ fn build_all_defs(func: &MachFunction) -> HashMap<VReg, Vec<InstId>> {
     for &b in &func.block_order {
         for &id in &func.block(b).insts {
             let inst = func.inst(id);
-            if inst.opcode.produces_value()
-                && let Some(MachOperand::VReg(v)) = inst.operands.first()
-            {
-                map.entry(*v).or_default().push(id);
-            }
+            for_each_inst_def(inst, |v| map.entry(v).or_default().push(id));
         }
     }
     map

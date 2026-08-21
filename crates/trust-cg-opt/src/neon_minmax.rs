@@ -1728,6 +1728,21 @@ fn same_as_iv(func: &MachFunction, def: &HashMap<u32, InstId>, mut v: VReg, iv: 
 /// only on single-def limit registers, never on the multi-def induction/acc.
 fn strip_copies(func: &MachFunction, def: &HashMap<u32, InstId>, mut v: VReg) -> VReg {
     for _ in 0..16 {
+        // A vreg with several live defs has no single reaching definition: the
+        // def map is LAST-WINS over the emitted layout, so it names whichever
+        // def comes last rather than the one that reaches this use. Every
+        // loop-carried variable is multi-def by construction (a preheader copy
+        // and a latch copy into the same vreg), and every `if`/`match` value has
+        // one def per arm — so walking one resolves an induction variable to its
+        // LATCH source, or a merge value to whichever arm came last.
+        //
+        // Confirmed wrong-code from this exact hole in neon_fill, mac_reg_block,
+        // mac_row_unroll, strided_store_unroll, neon_iota_fill and neon_bytesum.
+        // `swap_range_guard::single_def` and `neon_find`'s bound check were the
+        // in-tree precedents for doing it right.
+        if crate::effects::live_def_count(func, v.id) != 1 {
+            return v;
+        }
         let Some(&d) = def.get(&v.id) else {
             return v;
         };
@@ -2132,29 +2147,14 @@ impl ChainRecognized {
 /// each `acc`) the last in block/program order wins, which the chain walkers
 /// tolerate because they check `== iv`/`== acc` BEFORE following a def.
 fn build_live_def_map(func: &MachFunction) -> HashMap<u32, InstId> {
-    let mut map = HashMap::new();
-    for &bid in &func.block_order {
-        for &id in &func.block(bid).insts {
-            let inst = func.inst(id);
-            if let Some(MachOperand::VReg(v)) = inst.operands.first()
-                && produces_def(inst.opcode)
-            {
-                map.insert(v.id, id);
-            }
-        }
-    }
-    map
+    crate::effects::build_reaching_def_map(func)
 }
 
 /// Count the number of definitions of `v` inside `loop_insts`.
 fn count_loop_defs(func: &MachFunction, loop_insts: &HashSet<InstId>, v: VReg) -> usize {
     loop_insts
         .iter()
-        .filter(|&&id| {
-            let inst = func.inst(id);
-            produces_def(inst.opcode)
-                && matches!(inst.operands.first(), Some(MachOperand::VReg(d)) if d.id == v.id)
-        })
+        .filter(|&&id| crate::effects::inst_defines_vreg(func.inst(id), v))
         .count()
 }
 
@@ -2178,10 +2178,7 @@ fn recognize_minmax_diamond(
     let mut tails: Vec<(BlockId, VReg)> = Vec::new();
     for &id in loop_insts {
         let inst = func.inst(id);
-        if !produces_def(inst.opcode) {
-            continue;
-        }
-        if !matches!(inst.operands.first(), Some(MachOperand::VReg(d)) if d.id == result.id) {
+        if !crate::effects::inst_defines_vreg(inst, result) {
             continue;
         }
         let (d, s) = copy_like(inst)?; // both defs must be plain copies
@@ -3862,20 +3859,7 @@ fn alloc(func: &mut MachFunction, class: RegClass) -> VReg {
 }
 
 fn build_def_map(func: &MachFunction) -> HashMap<u32, InstId> {
-    let mut map = HashMap::new();
-    for (idx, inst) in func.insts.iter().enumerate() {
-        if let Some(MachOperand::VReg(v)) = inst.operands.first()
-            && produces_def(inst.opcode)
-        {
-            map.insert(v.id, InstId(idx as u32));
-        }
-    }
-    map
-}
-
-fn produces_def(op: AArch64Opcode) -> bool {
-    use AArch64Opcode::*;
-    !matches!(op, CmpRR | CmpRI | BCond | B)
+    crate::effects::build_reaching_def_map(func)
 }
 
 fn block_of_inst(func: &MachFunction, target: InstId) -> Option<BlockId> {

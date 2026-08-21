@@ -65,7 +65,10 @@ use trust_cg_ir::{
 
 use crate::cache::StableHasher;
 use crate::dom::DomTree;
-use crate::effects::{MemoryEffect, opcode_effect, produces_value, reads_flags, writes_flags};
+use crate::effects::{
+    MemoryEffect, aarch64_for_each_def_position, aarch64_for_each_use_position, for_each_inst_def,
+    has_tied_def_use, opcode_effect, reads_flags, single_inst_def, writes_flags,
+};
 use crate::loops::{LoopAnalysis, NaturalLoop};
 use crate::pass_manager::{AnalysisCache, MachinePass};
 use crate::pgo::ProfileHotness;
@@ -336,13 +339,7 @@ fn is_gpr32_vreg(operand: &MachOperand) -> bool {
 
 /// Returns the virtual register defined by an instruction, if any.
 fn def_vreg(inst: &trust_cg_ir::MachInst) -> Option<VReg> {
-    if !produces_value(inst.opcode) {
-        return None;
-    }
-    match inst.operands.first() {
-        Some(MachOperand::VReg(vreg)) => Some(*vreg),
-        _ => None,
-    }
+    single_inst_def(inst)
 }
 
 /// Returns the virtual register id defined by an instruction, if any.
@@ -360,11 +357,17 @@ fn operand_uses_exact_vreg(operand: &MachOperand, expected: VReg) -> bool {
 }
 
 fn inst_source_uses_vreg(inst: &MachInst, vreg_id: u32) -> bool {
-    let start = if produces_value(inst.opcode) { 1 } else { 0 };
-    inst.operands
-        .iter()
-        .skip(start)
-        .any(|operand| operand_uses_vreg(operand, vreg_id))
+    let mut found = false;
+    aarch64_for_each_use_position(inst.opcode, inst.operands.len(), |pos| {
+        if inst
+            .operands
+            .get(pos)
+            .is_some_and(|operand| operand_uses_vreg(operand, vreg_id))
+        {
+            found = true;
+        }
+    });
+    found
 }
 
 /// Returns the i32 equality compare idioms in a loop body.
@@ -676,21 +679,11 @@ fn find_stack_slot_ordered_sub_accumulator(
 /// the element width. Returns None if no dest or unrecognized class.
 fn infer_element_type(func: &MachFunction, inst_id: InstId) -> Option<VecElementType> {
     let inst = func.inst(inst_id);
-    if !produces_value(inst.opcode) {
-        return None;
-    }
-    if inst.operands.is_empty() {
-        return None;
-    }
-
-    match &inst.operands[0] {
-        MachOperand::VReg(vreg) => match vreg.class {
-            RegClass::Gpr32 => Some(VecElementType::I32),
-            RegClass::Gpr64 => Some(VecElementType::I64),
-            RegClass::Fpr32 => Some(VecElementType::F32),
-            RegClass::Fpr64 => Some(VecElementType::F64),
-            _ => None,
-        },
+    match single_inst_def(inst)?.class {
+        RegClass::Gpr32 => Some(VecElementType::I32),
+        RegClass::Gpr64 => Some(VecElementType::I64),
+        RegClass::Fpr32 => Some(VecElementType::F32),
+        RegClass::Fpr64 => Some(VecElementType::F64),
         _ => None,
     }
 }
@@ -715,11 +708,9 @@ fn is_dependency_free(
         let block = func.block(block_id);
         for &inst_id in &block.insts {
             let inst = func.inst(inst_id);
-            if produces_value(inst.opcode)
-                && let Some(MachOperand::VReg(vreg)) = inst.operands.first()
-            {
+            for_each_inst_def(inst, |vreg| {
                 loop_defs.insert(vreg.id, inst_id);
-            }
+            });
         }
     }
 
@@ -729,28 +720,20 @@ fn is_dependency_free(
     // defined inside the loop are also vectorizable (parallel, not recurrence).
     for &inst_id in vectorizable_insts {
         let inst = func.inst(inst_id);
-        // Source operands are operands[1..] for most instructions.
-        for operand in inst.operands.iter().skip(1) {
-            if let MachOperand::VReg(vreg) = operand
+        let mut dependency_free = true;
+        aarch64_for_each_use_position(inst.opcode, inst.operands.len(), |pos| {
+            if let Some(MachOperand::VReg(vreg)) = inst.operands.get(pos)
                 && let Some(&def_inst) = loop_defs.get(&vreg.id)
             {
-                if induction.is_some_and(|induction| vreg.id == induction.scalar_current.id) {
-                    continue;
-                }
-                if induction.is_some_and(|induction| {
-                    induction
-                        .scalar_current_alias
-                        .is_some_and(|alias| vreg.id == alias.id)
-                }) {
-                    continue;
-                }
-                if induction.is_some_and(|induction| {
-                    induction
-                        .sign_extended_current
-                        .is_some_and(|wide| vreg.id == wide.id)
-                }) {
-                    continue;
-                }
+                let is_induction = induction.is_some_and(|induction| {
+                    vreg.id == induction.scalar_current.id
+                        || induction
+                            .scalar_current_alias
+                            .is_some_and(|alias| vreg.id == alias.id)
+                        || induction
+                            .sign_extended_current
+                            .is_some_and(|wide| vreg.id == wide.id)
+                });
                 // This value is defined inside the loop.
                 // If it's NOT a vectorizable instruction, we have a
                 // dependency on a non-vectorizable computation (e.g.,
@@ -759,10 +742,13 @@ fn is_dependency_free(
                 // instructions (they'll all be vectorized together).
                 // But if an instruction uses its OWN output from a prior
                 // iteration (via phi), that's a recurrence.
-                if !vectorizable_set.contains(&def_inst) {
-                    return false;
+                if !is_induction && !vectorizable_set.contains(&def_inst) {
+                    dependency_free = false;
                 }
             }
+        });
+        if !dependency_free {
+            return false;
         }
     }
 
@@ -1412,6 +1398,30 @@ pub fn analyze_loop_with(
             .map(|(ty, _)| ty)?
     };
 
+    // Fail-closed element-type homogeneity gate.
+    //
+    // `element_type` above is only the HISTOGRAM MAJORITY, but it is the single
+    // width the rewrite commits to: `plan.arrangement` is stamped onto every
+    // rewritten instruction, `plan.vf` divides the trip count, and the
+    // reduction bridges drain `plan.vf` lanes. Nothing in recognition required
+    // the loop to be homogeneous, so a minority-width operand would be emitted
+    // at the majority's arrangement/lane count — e.g. an i64 RBIT ordered-sub
+    // reduction (a 2-lane .2D shape) inside a loop whose i32 operations win the
+    // histogram gets vf=4: the trip count is divided by 4 while the bridge
+    // drains 2 lanes, so half the reduction steps are dropped.
+    //
+    // The one deliberately mixed shape — the i32/i64 revertBits idiom — is
+    // recognized above as `mixed_width_bitreverse_induction` and rewrites each
+    // RBIT at its own width, so it stays admitted. Everything else must agree
+    // with the plan's element type or the loop is not vectorized.
+    if !mixed_width_bitreverse_induction
+        && vectorizable_insts.iter().any(|&inst_id| {
+            infer_element_type(func, inst_id).is_some_and(|ety| ety != element_type)
+        })
+    {
+        return None;
+    }
+
     let arrangement = element_type.neon_arrangement();
     let vf = element_type.lanes();
 
@@ -2052,25 +2062,19 @@ fn build_def_map(func: &MachFunction) -> HashMap<u32, InstId> {
 }
 
 fn build_def_map_inner(func: &MachFunction) -> HashMap<u32, InstId> {
-    let mut defs = HashMap::new();
-    for (idx, inst) in func.insts.iter().enumerate() {
-        if produces_value(inst.opcode)
-            && let Some(MachOperand::VReg(vreg)) = inst.operands.first()
-        {
-            defs.insert(vreg.id, InstId(idx as u32));
-        }
-    }
-    defs
+    crate::effects::build_reaching_def_map(func)
 }
 
 fn build_vreg_use_counts(func: &MachFunction) -> HashMap<u32, usize> {
     let mut uses = HashMap::new();
-    for inst in &func.insts {
-        let start = if produces_value(inst.opcode) { 1 } else { 0 };
-        for operand in inst.operands.iter().skip(start) {
-            if let MachOperand::VReg(vreg) = operand {
-                *uses.entry(vreg.id).or_insert(0) += 1;
-            }
+    for &block in &func.block_order {
+        for &iid in &func.block(block).insts {
+            let inst = func.inst(iid);
+            aarch64_for_each_use_position(inst.opcode, inst.operands.len(), |pos| {
+                if let Some(MachOperand::VReg(vreg)) = inst.operands.get(pos) {
+                    *uses.entry(vreg.id).or_insert(0) += 1;
+                }
+            });
         }
     }
     uses
@@ -2530,7 +2534,21 @@ fn match_i32_induction_store_body(
         {
             continue;
         }
-        let stride_def = defs.get(&rhs.id).copied();
+        // The def map is LAST-WINS over the emitted layout, so for a stride
+        // register with several live defs it names whichever `Movz` comes last
+        // rather than the one on the path actually taken. This is the SOLE
+        // element-size gate — the recognized loop carries no element size and
+        // the rewriter hardcodes 4 — so believing the wrong one emits a
+        // 4-byte-stride `NeonSt1Post` over data of a different width. Demonstrated
+        // at MachIR level: a diamond whose first predecessor sets stride 8 and
+        // second sets stride 4 FIRES, while 4-then-8 declines. Not reachable from
+        // any frontend today (the gate only ever sees a `Movz` when the
+        // multiplier is an IR constant, which is single-def), so this is the
+        // fail-closed guard for a hole that is real but currently unreachable.
+        let stride_def = defs
+            .get(&rhs.id)
+            .copied()
+            .filter(|_| crate::effects::live_def_count(func, rhs.id) == 1);
         let stride_is_i32 = stride_def.is_some_and(|def| {
             let def_inst = func.inst(def);
             crate::reaching_const::movz_value(def_inst)
@@ -5108,13 +5126,17 @@ fn compare_idiom_uses_are_vectorizable(
         if allowed_reducer_insts.contains(&inst_id) {
             continue;
         }
-        let start = if produces_value(inst.opcode) { 1 } else { 0 };
-        if inst
-            .operands
-            .iter()
-            .skip(start)
-            .any(|operand| operand_uses_exact_vreg(operand, result))
-        {
+        let mut uses_result = false;
+        aarch64_for_each_use_position(inst.opcode, inst.operands.len(), |pos| {
+            if inst
+                .operands
+                .get(pos)
+                .is_some_and(|operand| operand_uses_exact_vreg(operand, result))
+            {
+                uses_result = true;
+            }
+        });
+        if uses_result {
             return false;
         }
     }
@@ -5778,6 +5800,19 @@ fn apply_vectorization_impl(
     let mut regs_upgraded: u32 = 0;
     let mut reg_map: HashMap<u32, trust_cg_ir::VReg> = HashMap::new();
     let scalar_epilogue_sources = capture_scalar_epilogue_sources(func, plan);
+    let remainder = plan.trip_count.map(|tc| tc % vf).unwrap_or(0);
+    if remainder > 0
+        && !plan.vectorizable_insts.is_empty()
+        && !scalar_epilogue_sources
+            .iter()
+            .all(scalar_epilogue_source_is_supported)
+    {
+        // Validate the scalar replay shape before the first vector rewrite.
+        // Returning after mutation would leave a partially transformed
+        // function when a future vectorizable opcode adds a nonzero, tied,
+        // or second destination.
+        return None;
+    }
     let reduction_compare_result_ids: HashMap<InstId, u32> = plan
         .horizontal_any_reductions
         .iter()
@@ -5925,7 +5960,6 @@ fn apply_vectorization_impl(
     // Find the CMP immediate in the header or latch that controls the loop,
     // and divide its immediate by the vectorization factor.
     let vector_trip_count = plan.trip_count.map(|tc| tc / vf);
-    let remainder = plan.trip_count.map(|tc| tc % vf).unwrap_or(0);
 
     if let Some(tc) = plan.trip_count {
         let new_tc = tc / vf;
@@ -6067,21 +6101,33 @@ fn scalar_epilogue_vreg(
     vreg: VReg,
     is_def: bool,
     element_type: VecElementType,
-    vreg_map: &mut HashMap<u32, VReg>,
+    vreg_map: &mut HashMap<VReg, VReg>,
 ) -> VReg {
     if is_def {
         let scalar_vreg = alloc_fresh_vreg(func, scalar_reg_class_for_element(element_type));
-        vreg_map.insert(vreg.id, scalar_vreg);
+        vreg_map.insert(vreg, scalar_vreg);
         return scalar_vreg;
     }
 
-    if let Some(&scalar_vreg) = vreg_map.get(&vreg.id) {
+    if let Some(&scalar_vreg) = vreg_map.get(&vreg) {
         return scalar_vreg;
     }
 
     let scalar_vreg = alloc_fresh_vreg(func, scalar_reg_class_for_element(element_type));
-    vreg_map.insert(vreg.id, scalar_vreg);
+    vreg_map.insert(vreg, scalar_vreg);
     scalar_vreg
+}
+
+fn scalar_epilogue_source_is_supported(source: &ScalarEpilogueSource) -> bool {
+    if !is_vectorizable(source.opcode) || has_tied_def_use(source.opcode) {
+        return false;
+    }
+
+    let mut def_positions = Vec::new();
+    aarch64_for_each_def_position(source.opcode, source.operands.len(), |pos| {
+        def_positions.push(pos);
+    });
+    def_positions.as_slice() == [0]
 }
 
 fn clone_scalar_epilogue_source(
@@ -6089,15 +6135,23 @@ fn clone_scalar_epilogue_source(
     epilogue_block: BlockId,
     source: &ScalarEpilogueSource,
     element_type: VecElementType,
-    vreg_map: &mut HashMap<u32, VReg>,
-) -> InstId {
+    vreg_map: &mut HashMap<VReg, VReg>,
+) -> Option<InstId> {
+    // The scalar replay has a one-result cloning model. The vectorizable
+    // opcode whitelist currently guarantees this shape; keep an explicit
+    // fail-closed boundary so a future tied/multi-def opcode cannot inherit
+    // the old operand-0 assumption.
+    if !scalar_epilogue_source_is_supported(source) {
+        return None;
+    }
+
     let scalar_ops = source
         .operands
         .iter()
         .enumerate()
         .map(|(idx, operand)| match operand {
             MachOperand::VReg(vreg) => {
-                let is_def = idx == 0 && produces_value(source.opcode);
+                let is_def = idx == 0;
                 MachOperand::VReg(scalar_epilogue_vreg(
                     func,
                     *vreg,
@@ -6114,7 +6168,7 @@ fn clone_scalar_epilogue_source(
     epilogue_inst.source_loc = source.source_loc;
     let new_inst_id = func.push_inst(epilogue_inst);
     func.append_inst(epilogue_block, new_inst_id);
-    new_inst_id
+    Some(new_inst_id)
 }
 
 /// Create a scalar epilogue block that handles remainder iterations.
@@ -6130,6 +6184,13 @@ fn create_scalar_epilogue(
     vector_trip_count: Option<u32>,
     sources: &[ScalarEpilogueSource],
 ) -> Option<ScalarEpilogueInsts> {
+    // Keep this local check even though `apply_vectorization_impl` performs
+    // the same preflight before any rewrite. It protects this mutating helper
+    // if it gains another caller.
+    if !sources.iter().all(scalar_epilogue_source_is_supported) {
+        return None;
+    }
+
     let mut cloned = Vec::new();
     let mut generated = Vec::new();
 
@@ -6156,7 +6217,7 @@ fn create_scalar_epilogue(
             ));
             func.append_inst(epilogue_block, induction_value);
             generated.push(induction_value);
-            vreg_map.insert(induction.scalar_current.id, scalar_induction);
+            vreg_map.insert(induction.scalar_current, scalar_induction);
 
             for source in sources {
                 let clone_id = clone_scalar_epilogue_source(
@@ -6165,7 +6226,7 @@ fn create_scalar_epilogue(
                     source,
                     plan.element_type,
                     &mut vreg_map,
-                );
+                )?;
                 cloned.push((source.source_id, clone_id));
             }
         }
@@ -6197,7 +6258,7 @@ fn create_scalar_epilogue(
             source,
             plan.element_type,
             &mut vreg_map,
-        );
+        )?;
         cloned.push((source.source_id, clone_id));
     }
 
@@ -11672,6 +11733,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn scalar_epilogue_shape_rejection_precedes_every_vector_rewrite() {
+        let mut func = make_remainder_loop();
+        let dom = DomTree::compute(&func);
+        let la = LoopAnalysis::compute(&func, &dom);
+        let cost_model = MultiTargetCostModel::new(CostModelGen::M1);
+        let lp = la.all_loops().next().unwrap();
+        let plan = analyze_loop(&func, lp, &cost_model).unwrap();
+        let source = plan.vectorizable_insts[0];
+
+        // Simulate opcode-table drift after analysis: LSE atomics define
+        // operand 1 and cannot be replayed by the one-result scalar cloner.
+        *func.inst_mut(source) = MachInst::new(
+            AArch64Opcode::Ldadd,
+            vec![vreg64(30), vreg64(31), vreg64(32)],
+        );
+        let before = format!("{func:?}");
+
+        assert!(apply_vectorization(&mut func, &plan).is_none());
+        assert_eq!(
+            format!("{func:?}"),
+            before,
+            "shape rejection must not leave a partially vectorized function"
+        );
+    }
+
     // =========================================================================
     // Test: apply_vectorization with no remainder skips epilogue
     // =========================================================================
@@ -12194,6 +12281,95 @@ mod tests {
             *last,
             MachOperand::Imm(2),
             "f64 arrangement should encode as 2 (2D)"
+        );
+    }
+
+    /// A loop whose vectorizable instructions do not agree on an element width
+    /// must not be vectorized: the plan commits to ONE arrangement, ONE lane
+    /// count and ONE trip-count divisor, and recognition never required the
+    /// widths to agree. Before the homogeneity gate this loop planned
+    /// I32/S4/vf=4 and stamped the 4S arrangement encoding (5) onto a 64-bit
+    /// `AddRR`.
+    fn make_mixed_width_add_loop() -> (MachFunction, InstId) {
+        let mut func =
+            MachFunction::new("mixed_add_loop".to_string(), Signature::new(vec![], vec![]));
+        let bb0 = func.entry;
+        let bb1 = func.create_block();
+        let bb2 = func.create_block();
+        let bb3 = func.create_block();
+
+        let br0 = func.push_inst(MachInst::new(
+            AArch64Opcode::B,
+            vec![MachOperand::Block(bb1)],
+        ));
+        func.append_inst(bb0, br0);
+
+        // Two i32 adds win the element-type histogram ...
+        for (dst, lhs, rhs) in [(2u32, 0u32, 1u32), (5, 0, 1)] {
+            let add = func.push_inst(MachInst::new(
+                AArch64Opcode::AddRR,
+                vec![vreg32(dst), vreg32(lhs), vreg32(rhs)],
+            ));
+            func.append_inst(bb1, add);
+        }
+        // ... while this i64 add is the minority width.
+        let add64 = func.push_inst(MachInst::new(
+            AArch64Opcode::AddRR,
+            vec![vreg64(12), vreg64(10), vreg64(11)],
+        ));
+        func.append_inst(bb1, add64);
+
+        let cmp = func.push_inst(MachInst::new(
+            AArch64Opcode::CmpRI,
+            vec![vreg32(3), imm(100)],
+        ));
+        func.append_inst(bb1, cmp);
+        let bcond = func.push_inst(MachInst::new(
+            AArch64Opcode::BCond,
+            vec![MachOperand::Block(bb2), MachOperand::Block(bb3)],
+        ));
+        func.append_inst(bb1, bcond);
+        let br3 = func.push_inst(MachInst::new(
+            AArch64Opcode::B,
+            vec![MachOperand::Block(bb1)],
+        ));
+        func.append_inst(bb3, br3);
+        let ret = func.push_inst(MachInst::new(AArch64Opcode::Ret, vec![]));
+        func.append_inst(bb2, ret);
+
+        func.add_edge(bb0, bb1);
+        func.add_edge(bb1, bb2);
+        func.add_edge(bb1, bb3);
+        func.add_edge(bb3, bb1);
+        (func, add64)
+    }
+
+    #[test]
+    fn heterogeneous_element_widths_are_not_vectorized() {
+        let (mut func, add64) = make_mixed_width_add_loop();
+        let dom = DomTree::compute(&func);
+        let loop_analysis = LoopAnalysis::compute(&func, &dom);
+        let cost_model = MultiTargetCostModel::new(CostModelGen::M1);
+        let lp = loop_analysis
+            .all_loops()
+            .next()
+            .expect("the add loop is a natural loop")
+            .clone();
+
+        assert!(
+            analyze_loop(&func, &lp, &cost_model).is_none(),
+            "a loop mixing i32 and i64 vectorizable operations must fail closed"
+        );
+
+        // And the pass driver leaves the i64 add untouched.
+        let before = func.inst(add64).clone();
+        let mut pass = VectorizationPass::new();
+        pass.run(&mut func);
+        assert_eq!(
+            func.inst(add64).operands,
+            before.operands,
+            "the minority-width add must keep its scalar operands and gain no \
+             arrangement immediate"
         );
     }
 }

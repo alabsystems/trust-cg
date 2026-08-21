@@ -43,6 +43,7 @@ use trust_cg_ir::{
     VReg,
 };
 
+use crate::effects::{for_each_inst_def, inst_defines_vreg};
 use crate::pass_manager::{AnalysisCache, MachinePass};
 
 /// CFG simplification pass.
@@ -153,6 +154,11 @@ fn run_cfg_simplify_impl(
 
         if !config.disables("const-fold") {
             changed |= fold_constant_branches(func, provenance.as_deref_mut());
+        }
+        rebuild_cfg_edges(func);
+
+        if !config.disables("dominated-zero") {
+            changed |= resolve_dominated_zero_tests(func, provenance.as_deref_mut());
         }
         rebuild_cfg_edges(func);
 
@@ -840,13 +846,7 @@ fn same_block_constant_def_before(
     let branch_pos = block.insts.iter().position(|&id| id == before_inst_id)?;
     for &inst_id in block.insts[..branch_pos].iter().rev() {
         let inst = func.inst(inst_id);
-        if !inst.opcode.produces_value() {
-            continue;
-        }
-        let Some(def) = inst.operands.first().and_then(MachOperand::as_vreg) else {
-            continue;
-        };
-        if def != vreg {
+        if !inst_defines_vreg(inst, vreg) {
             continue;
         }
         return match inst.opcode {
@@ -878,6 +878,249 @@ fn find_block_operand(operands: &[MachOperand]) -> Option<BlockId> {
 fn get_fallthrough(func: &MachFunction, bid: BlockId) -> Option<BlockId> {
     let pos = func.block_order.iter().position(|b| *b == bid)?;
     func.block_order.get(pos + 1).copied()
+}
+
+/// The zero-ness fact a single CFG edge establishes for a register, read off
+/// the predecessor's terminating `Cbz`/`Cbnz`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ZeroFact {
+    Zero,
+    NonZero,
+}
+
+/// Per-function def counts and single-def sites for the zero-test resolver's
+/// copy-chain canonicalization (mirrors `aarch64_bounds_check_elim`'s
+/// condition 1: single-def, same-class, value-preserving links only).
+struct ZeroTestDefs {
+    def_count: HashMap<VReg, u32>,
+    single_def: HashMap<VReg, (BlockId, usize)>,
+}
+
+fn build_zero_test_defs(func: &MachFunction) -> ZeroTestDefs {
+    let mut def_count: HashMap<VReg, u32> = HashMap::new();
+    let mut single_def: HashMap<VReg, (BlockId, usize)> = HashMap::new();
+    for &bid in &func.block_order {
+        for (pos, &iid) in func.block(bid).insts.iter().enumerate() {
+            let inst = func.inst(iid);
+            for_each_inst_def(inst, |d| {
+                *def_count.entry(d).or_insert(0) += 1;
+                single_def.insert(d, (bid, pos));
+            });
+        }
+    }
+    ZeroTestDefs {
+        def_count,
+        single_def,
+    }
+}
+
+/// Follow `v` through SINGLE-DEF, SAME-CLASS `MovR`/`Copy` links (bounded) to
+/// the first vreg that is multi-def, undefined, or produced by a non-copy —
+/// the canonical root. A single-def link's value can never change, so testing
+/// any vreg in the chain tests the root's value AT THE LINK'S DEF SITE; the
+/// caller must separately prove the root itself is not redefined between the
+/// two test sites.
+fn zero_test_chain_root(func: &MachFunction, defs: &ZeroTestDefs, mut v: VReg) -> VReg {
+    for _ in 0..4 {
+        if defs.def_count.get(&v).copied() != Some(1) {
+            return v;
+        }
+        let Some(&(b, pos)) = defs.single_def.get(&v) else {
+            return v;
+        };
+        let Some(&iid) = func.block(b).insts.get(pos) else {
+            return v;
+        };
+        let inst = func.inst(iid);
+        if !matches!(inst.opcode, AArch64Opcode::MovR | AArch64Opcode::Copy) {
+            return v;
+        }
+        let Some(src) = inst.operands.get(1).and_then(MachOperand::as_vreg) else {
+            return v;
+        };
+        if src.class != v.class {
+            return v;
+        }
+        v = src;
+    }
+    v
+}
+
+/// The `(register, fact)` established on the edge `d -> p`, if `d`'s
+/// terminator is a `Cbz`/`Cbnz` whose taken/fallthrough targets are distinct
+/// and one of them is `p`.
+fn edge_zero_fact(func: &MachFunction, d: BlockId, p: BlockId) -> Option<(VReg, ZeroFact)> {
+    let insts = &func.block(d).insts;
+    let (&last_id, rest) = insts.split_last()?;
+    let last = func.inst(last_id);
+    // The conditional is either the terminator itself (layout fallthrough) or
+    // the instruction before a terminating unconditional `B`.
+    let (cond, not_taken) = if last.opcode.is_cbz() || last.opcode.is_cbnz() {
+        (last, get_fallthrough(func, d)?)
+    } else if last.opcode == AArch64Opcode::B {
+        let (&cid, _) = rest.split_last()?;
+        let c = func.inst(cid);
+        if !(c.opcode.is_cbz() || c.opcode.is_cbnz()) {
+            return None;
+        }
+        (c, find_block_operand(&last.operands)?)
+    } else {
+        return None;
+    };
+    let taken = find_block_operand(&cond.operands)?;
+    if taken == not_taken {
+        return None; // ambiguous edge — no fact.
+    }
+    let Some(MachOperand::VReg(r)) = cond.operands.first() else {
+        return None;
+    };
+    let is_cbz = cond.opcode.is_cbz();
+    if p == taken {
+        Some((
+            *r,
+            if is_cbz {
+                ZeroFact::Zero
+            } else {
+                ZeroFact::NonZero
+            },
+        ))
+    } else if p == not_taken {
+        Some((
+            *r,
+            if is_cbz {
+                ZeroFact::NonZero
+            } else {
+                ZeroFact::Zero
+            },
+        ))
+    } else {
+        None
+    }
+}
+
+/// Resolve a `Cbz`/`Cbnz` whose register's zero-ness is already established
+/// by the block's SINGLE predecessor edge — the dominated re-test shape the
+/// bridge emits for a division-by-zero guard inside a `while b != 0` loop
+/// (`cbz b, exit` at the header; `cbnz b, body; bl abort` immediately after:
+/// the guard is always-taken, and its abort arm is dead). LLVM elides these;
+/// this resolves them to unconditional branches, and the driver's
+/// unreachable-block removal then drops the orphaned trap arm.
+///
+/// Soundness: the block has exactly one predecessor and the fact holds on
+/// that edge, so it holds on every entry; the register must have no def in
+/// the block before the resolved branch (same conservative same-block
+/// discipline as `same_block_constant_def_before` — no cross-block reaching
+/// analysis is attempted).
+fn resolve_dominated_zero_tests(
+    func: &mut MachFunction,
+    provenance: Option<&mut ProvenanceMap>,
+) -> bool {
+    let mut changed = false;
+    let mut rewritten_insts = Vec::new();
+    let mut remove_after: Vec<(BlockId, InstId)> = Vec::new();
+    let defs = build_zero_test_defs(func);
+
+    for &bid in &func.block_order.clone() {
+        let block = func.block(bid);
+        if block.preds.len() != 1 || block.preds[0] == bid {
+            continue;
+        }
+        let pred = block.preds[0];
+        // Locate this block's conditional: terminal, or before a terminal `B`.
+        let Some(&last_id) = block.insts.last() else {
+            continue;
+        };
+        let last = func.inst(last_id);
+        let (cond_id, trailing_b) = if last.opcode.is_cbz() || last.opcode.is_cbnz() {
+            (last_id, None)
+        } else if last.opcode == AArch64Opcode::B && block.insts.len() >= 2 {
+            let cid = block.insts[block.insts.len() - 2];
+            let c = func.inst(cid);
+            if c.opcode.is_cbz() || c.opcode.is_cbnz() {
+                (cid, Some(last_id))
+            } else {
+                continue;
+            }
+        } else {
+            continue;
+        };
+        let cond = func.inst(cond_id);
+        let Some(r) = cond.operands.first().and_then(MachOperand::as_vreg) else {
+            continue;
+        };
+        let Some((fact_reg, fact)) = edge_zero_fact(func, pred, bid) else {
+            continue;
+        };
+        // Both tested vregs must canonicalize to the SAME root through
+        // single-def copy links (the importer emits a fresh carrier copy per
+        // test: `MovR t1, b; cbz t1` at the header, `MovR t2, b; cbnz t2` at
+        // the guard).
+        let root = zero_test_chain_root(func, &defs, r);
+        if zero_test_chain_root(func, &defs, fact_reg) != root {
+            continue;
+        }
+        // The root's value must be provably the same at both test sites.
+        // Conservative discipline, no cross-block reaching analysis:
+        //  * pred side: the fact-carrying vreg is either the root itself, or
+        //    its single def sits in `pred` with no later def of the root in
+        //    that block;
+        //  * this side: no def of the root (or of the tested vreg) before the
+        //    conditional in this block.
+        let root_def_positions = |b: BlockId, from: usize, to: usize| -> bool {
+            func.block(b).insts[from..to]
+                .iter()
+                .any(|&id| inst_defines_vreg(func.inst(id), root))
+        };
+        if fact_reg != root {
+            let Some(&(fb, fpos)) = defs.single_def.get(&fact_reg) else {
+                continue;
+            };
+            if fb != pred {
+                continue;
+            }
+            if root_def_positions(pred, fpos + 1, func.block(pred).insts.len()) {
+                continue;
+            }
+        }
+        let cond_pos = block.insts.iter().position(|&id| id == cond_id).unwrap();
+        if root_def_positions(bid, 0, cond_pos) {
+            continue;
+        }
+        // (No separate check on `r` itself: if `r` is multi-def it IS the
+        // root and the root region check above covers it; if single-def, its
+        // one def is the value-preserving chain link, whose source value the
+        // root checks pin.)
+        let taken = (matches!(fact, ZeroFact::Zero) && cond.opcode.is_cbz())
+            || (matches!(fact, ZeroFact::NonZero) && cond.opcode.is_cbnz());
+        if taken {
+            let Some(target) = find_block_operand(&cond.operands) else {
+                continue;
+            };
+            let template = func.inst(cond_id).clone();
+            *func.inst_mut(cond_id) = make_unconditional_branch_rewrite(&template, target);
+            // Any trailing unconditional `B` is now unreachable — unlink it.
+            if let Some(tb) = trailing_b {
+                remove_after.push((bid, tb));
+            }
+        } else {
+            // Not taken: control continues past the conditional — unlink it.
+            remove_after.push((bid, cond_id));
+        }
+        rewritten_insts.push(cond_id);
+        changed = true;
+    }
+
+    for (bid, id) in remove_after {
+        func.block_mut(bid).insts.retain(|&iid| iid != id);
+    }
+
+    if let Some(provenance) = provenance
+        && !rewritten_insts.is_empty()
+    {
+        record_unique_in_place_transforms(provenance, &mut rewritten_insts);
+    }
+
+    changed
 }
 
 // ---------------------------------------------------------------------------

@@ -39,8 +39,9 @@ pub mod va_list;
 pub mod x86_64_isel;
 
 pub use abi::{
-    AppleAArch64ABI, ArgLocation, ClassifyResult, CompactUnwindEntry, DwarfCfiOp, HfaBaseType,
-    PReg, SavedRegister, UnwindInfo, generate_compact_unwind, generate_dwarf_cfi, gpr,
+    AArch64AbiVariant, AppleAArch64ABI, ArgLocation, ClassifyResult, CompactUnwindEntry,
+    DwarfCfiOp, HfaBaseType, PReg, SavedRegister, UnwindInfo, generate_compact_unwind,
+    generate_dwarf_cfi, gpr,
 };
 pub use adapter::{
     AdapterError, ExtractedProofMetadata, GuardCarrierArch, LLVM_LIBM_PURE_FUNCTION_ATTR_TAG,
