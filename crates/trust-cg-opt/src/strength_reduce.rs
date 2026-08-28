@@ -1454,4 +1454,20 @@ mod tests {
         let changed2 = pass.run(&mut func);
         assert!(!changed2, "second pass should be idempotent");
     }
+
+    /// IDEMPOTENCE: the strength-reduced loop has no multiply left to reduce, so a second run must change nothing.
+    #[test]
+    fn second_run_is_a_no_op() {
+        let mut func = make_mul_in_loop();
+        assert!(StrengthReduction.run(&mut func), "first run must fire");
+        let (insts, blocks) = (func.insts.len(), func.blocks.len());
+        for again in 2..=4 {
+            assert!(
+                !(StrengthReduction.run(&mut func)),
+                "run {again} re-fired on its own output"
+            );
+            assert_eq!(func.insts.len(), insts, "run {again} added instructions");
+            assert_eq!(func.blocks.len(), blocks, "run {again} added blocks");
+        }
+    }
 }

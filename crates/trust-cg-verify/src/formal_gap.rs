@@ -5,10 +5,9 @@
 // Copyright 2026 Andrew Yates | License: Apache-2.0
 
 //! The SHARED certification-gap probe behind the solver-coupled `src/`
-//! `#[cfg(test)]` guards — the in-crate sibling of the two established
-//! precedents (`rustc-codegen-trust-cg`'s `mem_refine.rs::
-//! alethe_crosscheck_gap` and `tests/support/cegis_alethe_gap.rs`): a guarded
-//! test skips its commit assertion ONLY while the exact fail-closed
+//! `#[cfg(test)]` guards — the in-crate sibling of the established
+//! `rustc-codegen-trust-cg` `mem_refine.rs::alethe_crosscheck_gap` precedent:
+//! a guarded test skips its commit assertion ONLY while the exact fail-closed
 //! certification-gap diagnostic is reproduced live, prints a loud
 //! `certification-gap skip:` notice naming the obligation and diagnostic, and
 //! keeps every original assertion as the fall-through — so the exemption

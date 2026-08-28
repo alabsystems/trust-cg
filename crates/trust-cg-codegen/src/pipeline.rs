@@ -4903,7 +4903,37 @@ fn rebuild_ir_from_regalloc_with_map(
     ir_func: &mut IrMachFunction,
     ra_func: &trust_cg_regalloc::RegAllocFunction,
 ) -> Result<Vec<Option<InstId>>, PipelineError> {
-    let original_insts = ir_func.insts.clone();
+    // MOVE the instruction arena out rather than deep-cloning it.
+    //
+    // `MachInst` owns `operands: Vec<MachOperand>`, so `ir_func.insts.clone()`
+    // was N heap allocations + N memcpys on entry and N frees on exit, for a
+    // snapshot used strictly READ-ONLY (provenance matching and opaque-operand
+    // restore) and then discarded. Nothing between here and the `ir_func.insts =
+    // rebuilt_insts` below reads `ir_func` at all, so the arena can simply be
+    // taken.
+    //
+    // `committed` keeps the ERROR behaviour byte-identical to the clone version:
+    // the rebuild can fail part-way (`regalloc_opcode_to_ir` and the two operand
+    // conversions all `?`), and under the clone a failure BEFORE the assignment
+    // left `ir_func` exactly as it was found. A bare `take` would instead leave
+    // it with an EMPTY arena — a state no caller has ever seen — so restore it
+    // on any failure that has not yet overwritten it. (Emptiness is not usable
+    // as the signal: a legitimately-empty rebuilt arena is reachable.)
+    let original_insts: Vec<IrMachInst> = std::mem::take(&mut ir_func.insts);
+    let mut committed = false;
+    let out = rebuild_ir_from_regalloc_body(ir_func, ra_func, &original_insts, &mut committed);
+    if out.is_err() && !committed {
+        ir_func.insts = original_insts;
+    }
+    out
+}
+
+fn rebuild_ir_from_regalloc_body(
+    ir_func: &mut IrMachFunction,
+    ra_func: &trust_cg_regalloc::RegAllocFunction,
+    original_insts: &[IrMachInst],
+    committed: &mut bool,
+) -> Result<Vec<Option<InstId>>, PipelineError> {
     let mut rebuilt_insts = Vec::with_capacity(ra_func.insts.len());
     let mut inst_map: Vec<Option<InstId>> = Vec::with_capacity(ra_func.insts.len());
     let mut original_idx = 0usize;
@@ -4931,7 +4961,7 @@ fn rebuild_ir_from_regalloc_with_map(
             None
         } else {
             let indexed = indexed_regalloc_original_candidate(
-                &original_insts,
+                original_insts,
                 ra_inst_idx,
                 opcode,
                 &operands,
@@ -4941,7 +4971,7 @@ fn rebuild_ir_from_regalloc_with_map(
                 Some(original)
             } else {
                 let (matched, next_original_idx) = match_regalloc_original_candidate(
-                    &original_insts,
+                    original_insts,
                     original_idx,
                     opcode,
                     &operands,
@@ -4966,6 +4996,9 @@ fn rebuild_ir_from_regalloc_with_map(
         rebuilt_insts.push(inst);
     }
 
+    // Past this point the caller must NOT restore the original arena: the
+    // function now holds the rebuilt one, exactly as under the clone version.
+    *committed = true;
     ir_func.insts = rebuilt_insts;
     let mut rebuilt_blocks = Vec::with_capacity(ra_func.blocks.len());
     for block in &ra_func.blocks {
@@ -7259,6 +7292,32 @@ fn aarch64_formal_abi_source_regs(signature: &IrSignature) -> Vec<PReg> {
     sources
 }
 
+fn aarch64_required_return_pregs(signature: &IrSignature) -> Vec<PReg> {
+    let lower_return_types: Vec<LowerType> = signature
+        .returns
+        .iter()
+        .map(lower_type_from_ir_type)
+        .collect();
+    AppleAArch64ABI::required_return_pregs(&lower_return_types)
+}
+
+fn aarch64_preg_alias_set(regs: &[PReg]) -> Vec<PReg> {
+    let mut aliases = Vec::new();
+    for &preg in regs {
+        push_unique_overlap(&mut aliases, preg);
+    }
+    aliases
+}
+
+fn aarch64_preg_alias_sets_equal(left: &[PReg], right: &[PReg]) -> bool {
+    let left = aarch64_preg_alias_set(left);
+    let right = aarch64_preg_alias_set(right);
+    left.len() == right.len()
+        && left
+            .iter()
+            .all(|&expected| right.iter().any(|&actual| regs_overlap(expected, actual)))
+}
+
 fn aarch64_entry_formal_abi_source_regs(ir_func: &IrMachFunction) -> Vec<PReg> {
     let abi_sources = aarch64_formal_abi_source_regs(&ir_func.signature);
     if abi_sources.is_empty() {
@@ -8131,6 +8190,7 @@ fn validate_aarch64_mach_function_impl(
     };
     let block_count = func.blocks.len();
     let valid_block = |block_id: BlockId| (block_id.0 as usize) < block_count;
+    let required_return_pregs = aarch64_required_return_pregs(&func.signature);
 
     if func.eh_metadata.has_eh_info() {
         crate::exception_handling::required_personality_symbol(
@@ -8234,7 +8294,30 @@ fn validate_aarch64_mach_function_impl(
                 )));
             }
 
-            if seen.contains(&block_id) && inst.is_branch() {
+            if inst.opcode == IrOpcode::Ret
+                && !aarch64_preg_alias_sets_equal(&required_return_pregs, inst.implicit_uses)
+            {
+                let expected: Vec<_> = aarch64_preg_alias_set(&required_return_pregs)
+                    .into_iter()
+                    .map(preg_name)
+                    .collect();
+                let actual: Vec<_> = aarch64_preg_alias_set(inst.implicit_uses)
+                    .into_iter()
+                    .map(preg_name)
+                    .collect();
+                return Err(malformed(format!(
+                    "return instruction {:?} must carry exactly the ABI return-register implicit-use alias set {:?}, got {:?}; signature returns {:?}",
+                    inst_id, expected, actual, func.signature.returns
+                )));
+            }
+
+            // `is_branch()` is true for the `Trap*` guard pseudos as well, whose
+            // `Imm` is a bounds limit / shift width / overflow op-tag rather than
+            // a resolved code offset — see `AArch64Opcode::is_trap_pseudo`. The
+            // x86-64 mirror of this check (x86_64/pipeline.rs) scopes itself to
+            // `Jmp | Jcc` and so never had the false positive; this is the same
+            // safety decision, and the two copies had drifted.
+            if seen.contains(&block_id) && inst.is_branch() && !inst.opcode.is_trap_pseudo() {
                 let has_block_target = inst
                     .operands
                     .iter()
@@ -8542,6 +8625,7 @@ fn encode_function_with_fixups_and_blocks_impl(
     use crate::macho::fixup::{Fixup, FixupList};
     use trust_cg_ir::inst::AArch64Opcode;
 
+    let _phase = PhaseGuard::new(func, "encoding");
     enforce_aarch64_post_regalloc_resolved(func)?;
 
     let mut code = Vec::new();
@@ -13115,15 +13199,106 @@ fn build_debug_variables(
     variables
 }
 
+/// Buffered sink for `[trust-cg-time-pipeline]` records.
+///
+/// WHY THIS IS BUFFERED: phases NEST — `optimization` brackets
+/// `opt-pass-manager`, `cegis-superopt` and `codegen-scheduler`. An `eprintln!`
+/// per event is an unbuffered write syscall, and every inner event's syscall
+/// lands INSIDE the outer phase's measured region. The profiler was charging
+/// its own I/O to the phase it was measuring.
+///
+/// Measured before this change: `TRUST_CG_TIME_PIPELINE=1` cost **+10.1ms on a
+/// 152ms compile** (h2_vec_grow) and +3.1ms on p1_xorshift, and it manufactured
+/// an apparent ~2-3ms of "unattributed work inside optimization" that was
+/// simply the nested prints. A profiler that distorts what it measures by 6.6%
+/// cannot be used to chase a 25ms gap.
+///
+/// Records are accumulated per thread and flushed when the thread ends, so the
+/// measured region pays a `String` push instead of a syscall.
+struct PipelinePhaseLog {
+    lines: Vec<String>,
+}
+
+impl Drop for PipelinePhaseLog {
+    fn drop(&mut self) {
+        if self.lines.is_empty() {
+            return;
+        }
+        use std::io::Write;
+        let stderr = std::io::stderr();
+        let mut out = stderr.lock();
+        for line in &self.lines {
+            let _ = writeln!(out, "{line}");
+        }
+        let _ = out.flush();
+    }
+}
+
+thread_local! {
+    static PIPELINE_PHASE_LOG: std::cell::RefCell<PipelinePhaseLog> =
+        const { std::cell::RefCell::new(PipelinePhaseLog { lines: Vec::new() }) };
+}
+
+fn pipeline_phase_record(line: String) {
+    PIPELINE_PHASE_LOG.with(|log| log.borrow_mut().lines.push(line));
+}
+
+/// RAII phase timer: records on scope EXIT.
+///
+/// The explicit start/end pair cannot wrap a body full of `?` early returns,
+/// which is exactly the shape of encoding and the post-RA recheck — and those
+/// were the largest untimed blocks left. Measured budget before this: our
+/// instrumented stages accounted for only ~36-39% of trust-cg's own codegen
+/// time, so most of the gap was in code no phase timer reached.
+struct PhaseGuard<'a> {
+    func: &'a IrMachFunction,
+    phase: &'static str,
+    start: Option<Instant>,
+}
+
+impl<'a> PhaseGuard<'a> {
+    fn new(func: &'a IrMachFunction, phase: &'static str) -> Self {
+        Self {
+            func,
+            phase,
+            start: if trust_cg_time_pipeline_enabled() {
+                Some(Instant::now())
+            } else {
+                None
+            },
+        }
+    }
+}
+
+impl Drop for PhaseGuard<'_> {
+    fn drop(&mut self) {
+        let Some(start) = self.start else {
+            return;
+        };
+        // Clock first; the shape walk and the record are instrumentation.
+        let elapsed_us = start.elapsed().as_micros();
+        let (blocks, insts) = ir_function_shape(self.func);
+        let phase = self.phase;
+        pipeline_phase_record(format!(
+            "[trust-cg-time-pipeline] end func={} phase={phase} elapsed_us={elapsed_us} \
+             blocks={blocks} insts={insts}",
+            self.func.name
+        ));
+    }
+}
+
 fn log_pipeline_phase_start(func: &IrMachFunction, phase: &str) -> Option<Instant> {
     if !trust_cg_time_pipeline_enabled() {
         return None;
     }
-    let (blocks, insts) = ir_function_shape(func);
-    eprintln!(
-        "[trust-cg-time-pipeline] start func={} phase={} blocks={} insts={}",
-        func.name, phase, blocks, insts
-    );
+    // No `ir_function_shape` here: it walks the whole function, and the END
+    // record already reports the shape (the post-phase one, which is the
+    // meaningful figure anyway). Doing it on both events walked every function
+    // twice per phase, inside the enclosing phase's measured region.
+    pipeline_phase_record(format!(
+        "[trust-cg-time-pipeline] start func={} phase={phase}",
+        func.name
+    ));
     Some(Instant::now())
 }
 
@@ -13131,15 +13306,15 @@ fn log_pipeline_phase_end(func: &IrMachFunction, phase: &str, start: Option<Inst
     let Some(start) = start else {
         return;
     };
+    // Read the clock FIRST: everything below is instrumentation, and charging
+    // it to this phase is the bug this buffering exists to remove.
+    let elapsed_us = start.elapsed().as_micros();
     let (blocks, insts) = ir_function_shape(func);
-    eprintln!(
-        "[trust-cg-time-pipeline] end func={} phase={} elapsed_us={} blocks={} insts={}",
-        func.name,
-        phase,
-        start.elapsed().as_micros(),
-        blocks,
-        insts
-    );
+    pipeline_phase_record(format!(
+        "[trust-cg-time-pipeline] end func={} phase={phase} elapsed_us={elapsed_us} \
+         blocks={blocks} insts={insts}",
+        func.name
+    ));
 }
 
 impl Pipeline {
@@ -13394,6 +13569,7 @@ impl Pipeline {
     /// This is a correctness gate, so its production mode is unconditionally
     /// Enforce and any violation aborts before encoding.
     fn recheck_aarch64_post_regalloc(&self, func: &IrMachFunction) -> Result<(), PipelineError> {
+        let _phase = PhaseGuard::new(func, "post-ra-recheck");
         enforce_aarch64_post_regalloc_resolved(func)
     }
 
@@ -15386,6 +15562,16 @@ impl Pipeline {
             isel.seed_lattice_bounds_capabilities(&ctx.lattice_bounds_capabilities);
         }
 
+        // Pick the calling convention from the TARGET, not from the host.
+        // AArch64 has two incompatible conventions for stack arguments and
+        // trust-cg targets both; classifying a Linux/ELF target with DarwinPCS
+        // puts narrow stack arguments at packed offsets while every
+        // LLVM-compiled caller (std, libc, any mixed build) writes them into
+        // 8-byte slots. Must be set before formal arguments are lowered.
+        isel.set_abi_variant(AArch64AbiVariant::from_target_triple(
+            &self.config.target_triple,
+        ));
+
         // Propagate stack slot metadata from the LIR function to the ISel.
         isel.set_stack_slots(input.stack_slots.clone());
 
@@ -15746,6 +15932,12 @@ impl Pipeline {
     /// debug provenance seeding to distinguish allocated values from spills.
     fn run_regalloc(&self, ir_func: &mut IrMachFunction) -> Result<RegAllocOutcome, PipelineError> {
         rebuild_ir_cfg_edges_from_branch_operands(ir_func);
+        // This is the last signature-bearing authority boundary before
+        // `ir_to_regalloc` intentionally drops the canonical signature. Run it
+        // after every optimizer/scheduler mutation, not only at the public
+        // pre-optimization entry, so no pass can silently remove or alter a
+        // `RET`'s authenticated ABI return-register sink metadata.
+        validate_aarch64_mach_function(ir_func)?;
         // Regalloc phase-internal attribution (Task 3): the pipeline-side seams
         // that bracket the core allocator. Gated on the SAME env var as pass
         // timing (via `trust_cg_time_pipeline_enabled`, which is true under
@@ -17010,7 +17202,7 @@ pub fn build_add_test_function() -> IrMachFunction {
     func.append_inst(entry, add_id);
 
     // RET
-    let ret = IrMachInst::new(IrOpcode::Ret, vec![]);
+    let ret = IrMachInst::new(IrOpcode::Ret, vec![]).with_implicit_uses(&[X0]);
     let ret_id = func.push_inst(ret);
     func.append_inst(entry, ret_id);
 
@@ -17362,7 +17554,7 @@ mod tests {
             IrOpcode::Movz,
             vec![IrOperand::PReg(X0), IrOperand::Imm(42)],
         ));
-        let ret = func.push_inst(IrMachInst::new(IrOpcode::Ret, vec![]));
+        let ret = func.push_inst(IrMachInst::new(IrOpcode::Ret, vec![]).with_implicit_uses(&[X0]));
         func.append_inst(entry, copy);
         func.append_inst(entry, movz);
         func.append_inst(entry, ret);
@@ -18296,7 +18488,8 @@ mod tests {
             vec![IrOperand::PReg(X0), IrOperand::VReg(acc)],
         ));
         ir_func.append_inst(entry, copy);
-        let ret = ir_func.push_inst(IrMachInst::new(IrOpcode::Ret, vec![]));
+        let ret =
+            ir_func.push_inst(IrMachInst::new(IrOpcode::Ret, vec![]).with_implicit_uses(&[X0]));
         ir_func.append_inst(entry, ret);
 
         let mut provenance = trust_cg_ir::ProvenanceMap::new();
@@ -27572,11 +27765,22 @@ mod tests {
             stack_slots: BTreeMap::new(),
         };
 
+        let original_insts = func.insts.clone();
         let err = rebuild_ir_from_regalloc(&mut func, &ra_func).unwrap_err();
         let PipelineError::InvalidOperand(message) = err else {
             panic!("expected invalid operand error");
         };
         assert!(message.contains("ambiguous opaque operand provenance"));
+        assert_eq!(func.insts.len(), original_insts.len());
+        for (actual, original) in func.insts.iter().zip(&original_insts) {
+            assert_eq!(actual.opcode, original.opcode);
+            assert_eq!(actual.operands, original.operands);
+            assert_eq!(actual.implicit_defs, original.implicit_defs);
+            assert_eq!(actual.implicit_uses, original.implicit_uses);
+            assert_eq!(actual.flags, original.flags);
+            assert_eq!(actual.proof, original.proof);
+            assert_eq!(actual.source_loc, original.source_loc);
+        }
     }
 
     /// A SPLIT-RENAMED def at an index-aligned opaque candidate RESTORES the
@@ -30190,6 +30394,81 @@ mod tests {
         assert!(err.to_string().contains("outside the 0-instruction arena"));
     }
 
+    fn append_test_ret(func: &mut IrMachFunction, block: BlockId, implicit_uses: &'static [PReg]) {
+        let ret = func.push_inst(
+            IrMachInst::new(IrOpcode::Ret, vec![IrOperand::PReg(X30)])
+                .with_implicit_uses(implicit_uses),
+        );
+        func.append_inst(block, ret);
+    }
+
+    #[test]
+    fn aarch64_return_contract_requires_exact_signature_alias_set_on_every_ret() {
+        let mut alias_ok = IrMachFunction::new(
+            "ret_alias_ok".to_string(),
+            IrSignature::new(vec![], vec![Type::I64]),
+        );
+        let alias_ok_entry = alias_ok.entry;
+        append_test_ret(&mut alias_ok, alias_ok_entry, &[W0]);
+        validate_aarch64_mach_function(&alias_ok)
+            .expect("W0 and X0 denote the same authenticated return alias class");
+
+        let mut extra = IrMachFunction::new(
+            "ret_extra".to_string(),
+            IrSignature::new(vec![], vec![Type::I64]),
+        );
+        let extra_entry = extra.entry;
+        append_test_ret(&mut extra, extra_entry, &[X0, X1]);
+        let err = validate_aarch64_mach_function(&extra)
+            .expect_err("an extra implicit-use alias class must fail closed");
+        assert!(err.to_string().contains("must carry exactly"));
+
+        let mut every = IrMachFunction::new(
+            "ret_every".to_string(),
+            IrSignature::new(vec![], vec![Type::I64]),
+        );
+        let other = every.create_block();
+        let every_entry = every.entry;
+        append_test_ret(&mut every, every_entry, &[X0]);
+        append_test_ret(&mut every, other, &[]);
+        let err = validate_aarch64_mach_function(&every)
+            .expect_err("one valid return must not excuse another missing its ABI sink");
+        assert!(err.to_string().contains("return instruction InstId(1)"));
+    }
+
+    #[test]
+    fn aarch64_run_regalloc_rechecks_return_contract_after_optimization() {
+        let mut func = IrMachFunction::new(
+            "post_opt_ret_contract".to_string(),
+            IrSignature::new(vec![], vec![Type::I64]),
+        );
+        let entry = func.entry;
+        append_test_ret(&mut func, entry, &[]);
+
+        let err = Pipeline::new(PipelineConfig::default())
+            .run_regalloc(&mut func)
+            .expect_err("the final signature-bearing pre-regalloc gate must reject stale metadata");
+        assert!(matches!(
+            err,
+            PipelineError::MalformedAarch64Function { .. }
+        ));
+    }
+
+    #[test]
+    fn aarch64_nonvoid_tailcall_only_function_needs_no_ret_sink() {
+        let mut func = IrMachFunction::new(
+            "tailcall_only".to_string(),
+            IrSignature::new(vec![], vec![Type::I64]),
+        );
+        let tail = func.push_inst(IrMachInst::new(
+            IrOpcode::TailCall,
+            vec![IrOperand::Symbol("callee".to_string())],
+        ));
+        func.append_inst(func.entry, tail);
+        validate_aarch64_mach_function(&func)
+            .expect("a structural tail call has no local return-register sink");
+    }
+
     #[test]
     fn aarch64_public_encode_and_emit_rejects_invalid_branch_target() {
         let pipeline = Pipeline::new(PipelineConfig::default());
@@ -32015,7 +32294,7 @@ mod tests {
         let result_id = func.push_inst(result);
         func.append_inst(entry, result_id);
 
-        let ret = IrMachInst::new(IrOpcode::Ret, vec![]);
+        let ret = IrMachInst::new(IrOpcode::Ret, vec![]).with_implicit_uses(&[X0]);
         let ret_id = func.push_inst(ret);
         func.append_inst(entry, ret_id);
 
@@ -33815,7 +34094,7 @@ mod multiblock_pipeline_tests {
         func.append_inst(bb0, cbz_id);
 
         // bb1: Ret
-        let ret1 = IrMachInst::new(IrOpcode::Ret, vec![]);
+        let ret1 = IrMachInst::new(IrOpcode::Ret, vec![]).with_implicit_uses(&[X0]);
         let ret1_id = func.push_inst(ret1);
         func.append_inst(bb1, ret1_id);
 
@@ -33825,7 +34104,7 @@ mod multiblock_pipeline_tests {
         func.append_inst(bb2, movi2_id);
 
         // bb2: Ret
-        let ret2 = IrMachInst::new(IrOpcode::Ret, vec![]);
+        let ret2 = IrMachInst::new(IrOpcode::Ret, vec![]).with_implicit_uses(&[X0]);
         let ret2_id = func.push_inst(ret2);
         func.append_inst(bb2, ret2_id);
 
@@ -33907,7 +34186,7 @@ mod multiblock_pipeline_tests {
         func.append_inst(bb3, mov_id);
 
         // bb3: Ret
-        let ret = IrMachInst::new(IrOpcode::Ret, vec![]);
+        let ret = IrMachInst::new(IrOpcode::Ret, vec![]).with_implicit_uses(&[X0]);
         let ret_id = func.push_inst(ret);
         func.append_inst(bb3, ret_id);
 

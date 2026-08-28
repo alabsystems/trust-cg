@@ -479,6 +479,15 @@ fn validate_body_locality(
 ) -> bool {
     // (block, index-in-block) of every loop-body instruction, and the in-loop
     // defs per register id according to the shared operand-role model.
+    // `effects::for_each_inst_def` is the COMPLETE def oracle: besides the
+    // usual operand-0 result it names the second destination of a paired load,
+    // a post-index writeback base, and the LSE read-modify-write result at
+    // operand 1 — writes an "operand 0 is the def" predicate cannot see, and
+    // MISSING a def here would leave a loop-carried register unchecked. The
+    // other direction is harmless: an extra def candidate can only cause a
+    // bail, never suppress one. (Every opcode a body can contain has already
+    // passed `allowed_loop_op`, on which this model and the older operand-0
+    // blacklist classify identically.)
     let mut pos: HashMap<InstId, (BlockId, usize)> = HashMap::new();
     let mut defs: HashMap<u32, Vec<InstId>> = HashMap::new();
     for &blk in body {
@@ -519,7 +528,18 @@ fn validate_body_locality(
             return false;
         };
         let def_inst = func.inst(def_id);
-        let mut self_use = false;
+        // Self-use (`r = op(r, ..)` reads the PREVIOUS iteration's value on
+        // every pass but the first). TWO detectors, OR-ed, because neither
+        // subsumes the other: the raw scan catches any mention past operand 0
+        // whatever the model says of that position, and the role model
+        // additionally catches a TIED operand 0 — `Movk` (in the body
+        // whitelist), LSE `CAS`, NEON `INS`/`UDOT` — which READS `r` at the
+        // very position that defines it.
+        let mut self_use = def_inst
+            .operands
+            .iter()
+            .skip(1)
+            .any(|op| matches!(op, MachOperand::VReg(v) if v.id == rid));
         crate::effects::aarch64_for_each_use_position(
             def_inst.opcode,
             def_inst.operands.len(),
@@ -537,19 +557,21 @@ fn validate_body_locality(
                 if uid == def_id {
                     continue;
                 }
-                let user = func.inst(uid);
-                let mut uses = false;
-                crate::effects::aarch64_for_each_use_position(
-                    user.opcode,
-                    user.operands.len(),
-                    |pos| {
-                        if matches!(user.operands.get(pos), Some(MachOperand::VReg(v)) if v.id == rid)
-                        {
-                            uses = true;
-                        }
-                    },
-                );
-                if !uses {
+                // A "use" here is ANY operand mention of `rid` — the same
+                // touches-based over-approximation the `outside` set above
+                // uses. Every position the shared role model calls a use is
+                // one of these operands, so this is a strict SUPERSET of
+                // `effects::aarch64_for_each_use_position`; the only mentions
+                // it adds are operand-0 WRITES, which the `dlist.len() != 1`
+                // bail above has already rejected as a second def. Widening
+                // the use set only ADDS domination obligations, so it can
+                // never let a back-edge-carried read through.
+                if !func
+                    .inst(uid)
+                    .operands
+                    .iter()
+                    .any(|op| matches!(op, MachOperand::VReg(v) if v.id == rid))
+                {
                     continue;
                 }
                 let Some(&(ublk, uix)) = pos.get(&uid) else {
@@ -829,6 +851,16 @@ fn resolve_ladder_byte_load(
 // ---------------------------------------------------------------------------
 
 fn apply(func: &mut MachFunction, rec: &Recognized) -> bool {
+    // IDEMPOTENCE: never vectorize the remainder loop of a loop this pass
+    // already vectorized (see `crate::vector_remainder`).
+    if crate::vector_remainder::iv_is_vector_advanced_upstream(
+        func,
+        &std::collections::HashSet::new(),
+        rec.preheader,
+        rec.iv,
+    ) {
+        return false;
+    }
     let vh = func.create_block();
     let vb = func.create_block();
     let vl = func.create_block();
@@ -1382,5 +1414,24 @@ mod tests {
         assert_eq!(pass.fired(), 0);
         assert_eq!(count(&func, AArch64Opcode::NeonRbitV), 0);
         assert_eq!(func.blocks.len(), before, "no blocks added");
+    }
+
+    /// IDEMPOTENCE (the neon-bytesum / neon-fill bug class of 2026-08-27: a
+    /// vectorizer that keeps the scalar loop as the remainder and then
+    /// recognizes that remainder again on the next fixpoint iteration). After
+    /// the first firing, further runs must change nothing.
+    #[test]
+    fn second_run_is_a_no_op() {
+        let mut func = build_bitrev_loop(false);
+        assert!(NeonBitrevPass::new().run(&mut func), "first run must fire");
+        let (insts, blocks) = (func.insts.len(), func.blocks.len());
+        for again in 2..=4 {
+            assert!(
+                !NeonBitrevPass::new().run(&mut func),
+                "run {again}: re-fired on its own output"
+            );
+            assert_eq!(func.insts.len(), insts, "run {again} added instructions");
+            assert_eq!(func.blocks.len(), blocks, "run {again} added blocks");
+        }
     }
 }

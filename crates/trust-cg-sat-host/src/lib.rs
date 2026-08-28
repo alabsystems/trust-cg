@@ -8,6 +8,7 @@
 //   - `initCDCL(s: *mut solver, n: c_int, m: c_int)`
 //   - `parse(s: *mut solver, filename: *mut c_char) -> c_int`
 //   - `solve(s: *mut solver) -> c_int`
+//   - `microsat_destroy(s: *mut solver)`
 // Result codes (from the `enum` at the top of microsat.c):
 //   - UNSAT = 0
 //   - SAT   = 1
@@ -36,6 +37,81 @@ pub mod sys {
     pub const SAT: core::ffi::c_int = 1;
 }
 
+/// RAII owner for the database allocated by MicroSAT's `parse`/`initCDCL`.
+///
+/// MicroSAT stores all solver-owned arrays in one 4 GiB virtual allocation
+/// rooted at `solver::DB`. Moving this value is safe because the C struct only
+/// contains pointers into that allocation, never pointers into the Rust owner.
+/// Dropping it releases the allocation through the same C runtime that created
+/// it.
+pub struct OwnedMicroSatSolver {
+    inner: core::mem::MaybeUninit<sys::solver>,
+}
+
+impl OwnedMicroSatSolver {
+    /// Parse a DIMACS file into a newly owned solver.
+    ///
+    /// The returned owner is initialized even when `parse_rc == sys::UNSAT`:
+    /// upstream `parse` calls `initCDCL` before detecting a root-level
+    /// contradiction, so that path must be destroyed too.
+    ///
+    /// # Safety
+    ///
+    /// `filename` must name a readable DIMACS file accepted by the vendored
+    /// MicroSAT parser. That parser exits the process on malformed input and
+    /// does not fully validate DIMACS bounds, so callers must not pass
+    /// untrusted or malformed input here.
+    pub unsafe fn parse(filename: &core::ffi::CStr) -> (Self, core::ffi::c_int) {
+        let mut inner = core::mem::MaybeUninit::<sys::solver>::uninit();
+        // SAFETY: upheld by the caller. MicroSAT's parse initializes `inner`
+        // through initCDCL before every normal return, including UNSAT.
+        let parse_rc = unsafe {
+            sys::parse(
+                inner.as_mut_ptr(),
+                filename.as_ptr() as *mut core::ffi::c_char,
+            )
+        };
+        (Self { inner }, parse_rc)
+    }
+
+    /// Borrow the initialized native solver as a raw mutable pointer.
+    ///
+    /// The pointer is invalid after this owner is dropped and must not be used
+    /// to replace `solver::DB` or free it independently.
+    pub fn as_mut_ptr(&mut self) -> *mut sys::solver {
+        self.inner.as_mut_ptr()
+    }
+
+    /// Borrow the initialized native solver for read-only inspection.
+    pub fn as_ref(&self) -> &sys::solver {
+        // SAFETY: the only constructor returns after parse initialized every
+        // field needed by the solver, including on parse-time UNSAT.
+        unsafe { self.inner.assume_init_ref() }
+    }
+
+    /// Run MicroSAT to completion on this parsed solver.
+    ///
+    /// # Safety
+    ///
+    /// The solver must not have been corrupted through a raw pointer returned
+    /// by [`Self::as_mut_ptr`], and this must not be called after parse already
+    /// returned `sys::UNSAT`.
+    pub unsafe fn solve(&mut self) -> core::ffi::c_int {
+        // SAFETY: upheld by the caller; ownership guarantees the allocation is
+        // alive for the duration of the call.
+        unsafe { sys::solve(self.as_mut_ptr()) }
+    }
+}
+
+impl Drop for OwnedMicroSatSolver {
+    fn drop(&mut self) {
+        // SAFETY: `inner` was initialized by parse and this owner has unique
+        // responsibility for its DB allocation. The C helper is idempotent and
+        // clears every pointer after freeing DB.
+        unsafe { sys::microsat_destroy(self.inner.as_mut_ptr()) }
+    }
+}
+
 pub mod propagate;
 
 pub mod scratch_arena;
@@ -45,7 +121,6 @@ mod tests {
     use std::ffi::CString;
     use std::fs;
     use std::io::Write;
-    use std::mem::MaybeUninit;
     use std::path::Path;
     use std::process::Command;
     use std::sync::Mutex;
@@ -58,7 +133,7 @@ mod tests {
         JIT_PRIMARY_RETURNS, JIT_SCRATCH_OVERFLOW_FALLBACKS, JIT_SUCCESSFUL_RUNS, PRIMARY_JIT_MODE,
         PROPAGATE_CALL_COUNT, SHADOW_MODE, reset_jit_shadow_for_tests, trust_cg_propagate,
     };
-    use super::sys;
+    use super::{OwnedMicroSatSolver, sys};
     use crate::drat_recorder::{disable_drat_output, enable_drat_output, flush_drat_output};
 
     /// Serialises tests that toggle the process-global DRAT recorder so
@@ -83,24 +158,79 @@ mod tests {
         let path = file.path().to_path_buf();
         let c_path = CString::new(path.to_string_lossy().into_owned()).expect("path to CString");
 
-        let mut solver: MaybeUninit<sys::solver> = MaybeUninit::uninit();
-        // SAFETY: `parse` is the upstream entry point and itself calls
-        // `initCDCL`, which initialises every field of `*solver` it reads
-        // before returning. Passing an uninitialised `solver` matches how
-        // MicroSAT's own `main` constructs the struct on the stack.
-        let parse_rc = unsafe {
-            sys::parse(
-                solver.as_mut_ptr(),
-                c_path.as_ptr() as *mut std::os::raw::c_char,
-            )
-        };
+        // SAFETY: this helper writes a well-formed DIMACS file and keeps it
+        // open for the duration of parse.
+        let (mut solver, parse_rc) = unsafe { OwnedMicroSatSolver::parse(c_path.as_c_str()) };
         if parse_rc == sys::UNSAT {
             return sys::UNSAT;
         }
         // SAFETY: `parse` returned without UNSAT, meaning it ran `initCDCL`
         // and populated the solver state. Calling `solve` on that state is
         // exactly the upstream usage in microsat.c's `main`.
-        unsafe { sys::solve(solver.as_mut_ptr()) }
+        unsafe { solver.solve() }
+    }
+
+    #[test]
+    fn microsat_destroy_clears_state_and_is_idempotent() {
+        let _solver_guard = SOLVER_LOCK.lock().expect("solver lock not poisoned");
+        let _drat_guard = drat_lock();
+        disable_drat_output();
+
+        let mut file = NamedTempFile::new().expect("create tempfile");
+        file.write_all(b"p cnf 1 1\n1 0\n").expect("write cnf");
+        file.flush().expect("flush cnf");
+        let c_path = CString::new(file.path().to_string_lossy().into_owned()).expect("CString");
+
+        // SAFETY: the test file is a well-formed DIMACS instance.
+        let (mut solver, parse_rc) = unsafe { OwnedMicroSatSolver::parse(c_path.as_c_str()) };
+        assert_eq!(parse_rc, sys::SAT);
+        assert!(!solver.as_ref().DB.is_null());
+
+        // Exercise the C lifecycle function directly. The owner's eventual
+        // Drop calls it once more, which also verifies repeated destruction is
+        // harmless after the first call zeroed the struct.
+        unsafe { sys::microsat_destroy(solver.as_mut_ptr()) };
+        assert!(solver.as_ref().DB.is_null());
+        assert_eq!(solver.as_ref().mem_max, 0);
+        unsafe { sys::microsat_destroy(solver.as_mut_ptr()) };
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repeated_parse_time_unsat_does_not_leak_input_descriptors() {
+        let _solver_guard = SOLVER_LOCK.lock().expect("solver lock not poisoned");
+        let _drat_guard = drat_lock();
+        disable_drat_output();
+
+        let mut file = NamedTempFile::new().expect("create tempfile");
+        file.write_all(b"p cnf 1 1\n0\n").expect("write cnf");
+        file.flush().expect("flush cnf");
+        let path = file.path().canonicalize().expect("canonical tempfile path");
+        let c_path = CString::new(path.to_string_lossy().into_owned()).expect("CString");
+
+        let descriptor_refs = || {
+            fs::read_dir("/proc/self/fd")
+                .expect("read /proc/self/fd")
+                .filter_map(Result::ok)
+                .filter_map(|entry| fs::read_link(entry.path()).ok())
+                .filter(|target| target == &path)
+                .count()
+        };
+        let before = descriptor_refs();
+
+        for _ in 0..32 {
+            // SAFETY: the empty clause is valid DIMACS and intentionally
+            // exercises parse's early-UNSAT return.
+            let (solver, parse_rc) = unsafe { OwnedMicroSatSolver::parse(c_path.as_c_str()) };
+            assert_eq!(parse_rc, sys::UNSAT);
+            drop(solver);
+        }
+
+        assert_eq!(
+            descriptor_refs(),
+            before,
+            "parse-time UNSAT must close every FILE it opens"
+        );
     }
 
     #[test]
@@ -640,16 +770,9 @@ p cnf 6 9
         let path = file.path().to_path_buf();
         let c_path = CString::new(path.to_string_lossy().into_owned()).expect("CString");
 
-        let mut solver: MaybeUninit<sys::solver> = MaybeUninit::uninit();
-        // SAFETY: matches `run_solver`'s convention. `parse` calls
-        // `initCDCL` and fully populates the solver state before
-        // returning.
-        let parse_rc = unsafe {
-            sys::parse(
-                solver.as_mut_ptr(),
-                c_path.as_ptr() as *mut std::os::raw::c_char,
-            )
-        };
+        // SAFETY: this helper writes a well-formed DIMACS file and keeps it
+        // open for the duration of parse.
+        let (mut solver, parse_rc) = unsafe { OwnedMicroSatSolver::parse(c_path.as_c_str()) };
         let s_ptr = solver.as_mut_ptr();
         let rc = if parse_rc == sys::UNSAT {
             sys::UNSAT
@@ -707,16 +830,6 @@ p cnf 6 9
             reason_for_var.push((var as i32, r_val));
             let m_val = unsafe { *solver_ref.model.offset(var) };
             model_for_var.push((var as i32, m_val));
-        }
-
-        // Free the DB; initCDCL malloc'd it and the solver struct
-        // (on our stack) owns the pointer.
-        if !solver_ref.DB.is_null() {
-            // SAFETY: `solver_ref.DB` was malloc'd by `initCDCL` and
-            // is owned by the solver struct we are about to drop.
-            unsafe {
-                libc::free(solver_ref.DB as *mut libc::c_void);
-            }
         }
 
         PropagateStateSnapshot {
@@ -988,19 +1101,13 @@ p cnf 6 10
 
         enable_drat_output(&proof_path).expect("enable drat");
         let c_path = CString::new(cnf_path.to_string_lossy().into_owned()).expect("CString");
-        let mut solver: MaybeUninit<sys::solver> = MaybeUninit::uninit();
-        // SAFETY: same justification as in `run_solver`. `parse` runs
-        // `initCDCL` and populates the solver before any other field is
-        // read here.
+        // SAFETY: the test writes a well-formed DIMACS file at `c_path`.
+        let (mut solver, parse_rc) = unsafe { OwnedMicroSatSolver::parse(c_path.as_c_str()) };
         let rc = unsafe {
-            let parse_rc = sys::parse(
-                solver.as_mut_ptr(),
-                c_path.as_ptr() as *mut std::os::raw::c_char,
-            );
             if parse_rc == sys::UNSAT {
                 sys::UNSAT
             } else {
-                sys::solve(solver.as_mut_ptr())
+                solver.solve()
             }
         };
         flush_drat_output().expect("flush drat");

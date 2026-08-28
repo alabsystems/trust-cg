@@ -87,7 +87,55 @@ const SOLVER_CAPACITY_PENDING_ALLOWLIST: &[&str] = &[
 /// The 1,869 -> 1,877 increase is exactly the eight AArch64 ELF relocation
 /// rows named below. Keep their names live-bound so an unrelated replacement
 /// cannot inherit the cardinality credit.
-const EXPECTED_STATIC_PROOF_OBLIGATION_COUNT: usize = 1_877;
+///
+/// The 1,877 -> 1,907 increase is +30 with NO removal — audited name-by-name
+/// against the previous corpus, which is contained in the current one — and it
+/// is exactly two AArch64 families, both named below and both live-bound to
+/// the function that produces them:
+///
+///   * +10 STANDALONE ROR-IMMEDIATE lowering rows
+///     (`lowering_proof::all_ror_immediate_proofs`, registered through
+///     `all_bitwise_shift_proofs` into `ProofCategory::Arithmetic`): five
+///     rotate amounts at each of W and X, for the unfused `RorRI` the rotate
+///     recognizer emits when the following EOR does not fold. SOURCE is the
+///     frontend rotate blend, MACHINE the ROR shifted operand — the halves
+///     coincide in the opposite OR order, so the rows are non-degenerate.
+///   * +20 STANDALONE TST per-condition NZCV rows
+///     (`cmp_combine_proofs::proof_tst_nzcv_effect`, ten conditions at each of
+///     w64 and w32, registered through `all_cmp_combine_proofs_with_variants`
+///     into `ProofCategory::CmpCombine`): the consumer views an unfused `Tst`
+///     needs when it feeds a CSEL/CSINC rather than a branch. This family
+///     already existed as unregistered unit checks; what changed is that it is
+///     now CREDITED, after the degenerate direct-Z formulation was replaced by
+///     the disjointness characterization and the constant HS/LO views were
+///     replaced by the composite C-readers HI/LS.
+///
+/// The whole-instruction packed-NZCV pair (`proof_tst_packed_nzcv` at both
+/// widths) was already registered before this increase and is NOT part of the
+/// +30; do not let it absorb the credit.
+///
+/// The 1,907 -> 1,939 increase is +32 with NO removal, and it is exactly ONE
+/// family: the wasm P3 NARROW-WIDTH obligations
+/// (`wasm_value_domain::narrow_width_proofs`, registered through
+/// `register_wasm_proofs` into `ProofCategory::WasmLowering`). wasm has no value
+/// type below `i32`, so a `u8`/`i8`/`u16`/`i16` rides in an `i32` carrier and the
+/// backend must RE-NORMALIZE after each wrapping op; these rows state that
+/// obligation over inputs CONSTRUCTED to satisfy the width invariant. Four narrow
+/// domains x (6 binary ops + 1 shift + 1 renormalization-establishes-invariant)
+/// = 32. SOURCE computes at the NARROW width and lifts into the carrier, MACHINE
+/// computes at `i32` and re-normalizes, so every row is non-degenerate.
+///
+/// The wasm P3 PER-OPCODE obligations (sub-word / FP memory, the sign-extension
+/// operators) are deliberately NOT in this count: they are reconstruction-
+/// credited through `GateArch::WasmValueDomain`, the same rule that keeps every
+/// other backend's reconstructions out of the static database.
+///
+/// The 1,939 -> 1,943 increase restores the four UGE proofs
+/// (`Icmp_UGE_I32/I64`, `CondBr_UGE_I32/I64`) that #62 retracted as degenerate
+/// and that are genuine theorems again with the adder carry-out C flag
+/// (nzcv.rs). Ordinary bitvector lemmas in the strict-gate scope; the capacity
+/// allowlist is unchanged.
+const EXPECTED_STATIC_PROOF_OBLIGATION_COUNT: usize = 1_943;
 
 const AARCH64_ELF_RELOCATION_CORPUS_ADDITION: &[&str] = &[
     "ELF AArch64: R_AARCH64_CALL26 BL == S+A (PC-relative call)",
@@ -98,6 +146,49 @@ const AARCH64_ELF_RELOCATION_CORPUS_ADDITION: &[&str] = &[
     "ELF AArch64: R_AARCH64_ADD_ABS_LO12_NC ADRP+ADD == S+A",
     "ELF AArch64: R_AARCH64_ADR_GOT_PAGE ADRP == page(G+A) (GOT slot page)",
     "ELF AArch64: R_AARCH64_LD64_GOT_LO12_NC ADRP+LDR == G+A (GOT slot address)",
+];
+
+/// The ten standalone ROR-immediate rows of the 1,877 -> 1,907 increase.
+/// Exactly `lowering_proof::all_ror_immediate_proofs()`, bound live below.
+const ROR_IMMEDIATE_CORPUS_ADDITION: &[&str] = &[
+    "RorRI_I32 k=1 -> ROR #1 (32-bit): frontend rotate blend == ROR shifted operand",
+    "RorRI_I32 k=7 -> ROR #7 (32-bit): frontend rotate blend == ROR shifted operand",
+    "RorRI_I32 k=16 -> ROR #16 (32-bit): frontend rotate blend == ROR shifted operand",
+    "RorRI_I32 k=25 -> ROR #25 (32-bit): frontend rotate blend == ROR shifted operand",
+    "RorRI_I32 k=31 -> ROR #31 (32-bit): frontend rotate blend == ROR shifted operand",
+    "RorRI_I64 k=1 -> ROR #1 (64-bit): frontend rotate blend == ROR shifted operand",
+    "RorRI_I64 k=13 -> ROR #13 (64-bit): frontend rotate blend == ROR shifted operand",
+    "RorRI_I64 k=32 -> ROR #32 (64-bit): frontend rotate blend == ROR shifted operand",
+    "RorRI_I64 k=51 -> ROR #51 (64-bit): frontend rotate blend == ROR shifted operand",
+    "RorRI_I64 k=63 -> ROR #63 (64-bit): frontend rotate blend == ROR shifted operand",
+];
+
+/// The twenty standalone per-condition TST NZCV rows of the 1,877 -> 1,907
+/// increase. Exactly `cmp_combine_proofs::proof_tst_nzcv_effect(64)` followed
+/// by `(32)`, bound live below. HS/LO are deliberately absent — `eval_condition`
+/// reduces both of their sides to a bare constant, which STRICT #61 credits
+/// zero — so the C-clear fact is carried by the composite readers HI and LS.
+const TST_NZCV_CONSUMER_CORPUS_ADDITION: &[&str] = &[
+    "TST w64: EQ ≡ (Rn & Rm) == 0",
+    "TST w64: NE ≡ (Rn & Rm) != 0",
+    "TST w64: MI ≡ (Rn & Rm) <s 0",
+    "TST w64: PL ≡ (Rn & Rm) >=s 0",
+    "TST w64: GE ≡ (Rn & Rm) >=s 0 (V is cleared)",
+    "TST w64: LT ≡ (Rn & Rm) <s 0 (V is cleared)",
+    "TST w64: GT ≡ (Rn & Rm) >s 0 (V is cleared)",
+    "TST w64: LE ≡ (Rn & Rm) <=s 0 (V is cleared)",
+    "TST w64: HI is always FALSE (C is cleared)",
+    "TST w64: LS is always TRUE (C is cleared)",
+    "TST w32: EQ ≡ (Rn & Rm) == 0",
+    "TST w32: NE ≡ (Rn & Rm) != 0",
+    "TST w32: MI ≡ (Rn & Rm) <s 0",
+    "TST w32: PL ≡ (Rn & Rm) >=s 0",
+    "TST w32: GE ≡ (Rn & Rm) >=s 0 (V is cleared)",
+    "TST w32: LT ≡ (Rn & Rm) <s 0 (V is cleared)",
+    "TST w32: GT ≡ (Rn & Rm) >s 0 (V is cleared)",
+    "TST w32: LE ≡ (Rn & Rm) <=s 0 (V is cleared)",
+    "TST w32: HI is always FALSE (C is cleared)",
+    "TST w32: LS is always TRUE (C is cleared)",
 ];
 
 #[test]
@@ -183,6 +274,98 @@ fn aarch64_elf_relocation_corpus_addition_is_exact_live_and_nondegenerate() {
 
         let db = ProofDatabase::new();
         for name in AARCH64_ELF_RELOCATION_CORPUS_ADDITION {
+            let registrations: Vec<_> = db
+                .all()
+                .iter()
+                .filter(|proof| proof.obligation.name == *name)
+                .collect();
+            assert_eq!(
+                registrations.len(),
+                1,
+                "new corpus row {name:?} must identify exactly one live registration"
+            );
+            assert!(
+                registrations[0].obligation.is_genuinely_proven(),
+                "registered corpus row {name:?} must remain structurally non-degenerate"
+            );
+            assert!(
+                !SOLVER_CAPACITY_PENDING_ALLOWLIST.contains(name),
+                "new corpus row {name:?} may not silently inherit solver-capacity debt"
+            );
+        }
+    });
+}
+
+#[test]
+fn aarch64_standalone_rotate_and_tst_corpus_addition_is_exact_live_and_nondegenerate() {
+    on_large_stack(|| {
+        use std::collections::HashSet;
+        use trust_cg_verify::cmp_combine_proofs::proof_tst_nzcv_effect;
+        use trust_cg_verify::lowering_proof::all_ror_immediate_proofs;
+
+        // The +30 is TWO families, and each is pinned to the function that
+        // produces it. Checking only the union would let one family shrink
+        // while the other grew and still report a green 1,907.
+        let ror_expected: HashSet<String> = ROR_IMMEDIATE_CORPUS_ADDITION
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        assert_eq!(
+            ror_expected.len(),
+            ROR_IMMEDIATE_CORPUS_ADDITION.len(),
+            "ROR-immediate corpus ratchet contains duplicate names"
+        );
+        assert_eq!(
+            ROR_IMMEDIATE_CORPUS_ADDITION.len(),
+            10,
+            "the ROR-immediate half of the increase is five amounts x {{W, X}}"
+        );
+        let ror_lane = all_ror_immediate_proofs();
+        let ror_live: HashSet<String> = ror_lane.iter().map(|proof| proof.name.clone()).collect();
+        assert_eq!(
+            ror_live, ror_expected,
+            "the ten-obligation ROR-immediate increase must remain exactly the audited \
+             standalone rotate lane"
+        );
+
+        let tst_expected: HashSet<String> = TST_NZCV_CONSUMER_CORPUS_ADDITION
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        assert_eq!(
+            tst_expected.len(),
+            TST_NZCV_CONSUMER_CORPUS_ADDITION.len(),
+            "TST NZCV corpus ratchet contains duplicate names"
+        );
+        assert_eq!(
+            TST_NZCV_CONSUMER_CORPUS_ADDITION.len(),
+            20,
+            "the TST half of the increase is ten conditions x {{w64, w32}}"
+        );
+        let tst_lane: Vec<_> = proof_tst_nzcv_effect(64)
+            .into_iter()
+            .chain(proof_tst_nzcv_effect(32))
+            .collect();
+        let tst_live: HashSet<String> = tst_lane.iter().map(|proof| proof.name.clone()).collect();
+        assert_eq!(
+            tst_live, tst_expected,
+            "the twenty-obligation TST increase must remain exactly the audited standalone \
+             per-condition NZCV lane at both emitted widths"
+        );
+
+        assert!(
+            ror_lane
+                .iter()
+                .chain(tst_lane.iter())
+                .all(|proof| proof.is_genuinely_proven()),
+            "every newly credited rotate/TST obligation must be structurally non-degenerate"
+        );
+
+        let db = ProofDatabase::new();
+        for name in ROR_IMMEDIATE_CORPUS_ADDITION
+            .iter()
+            .chain(TST_NZCV_CONSUMER_CORPUS_ADDITION.iter())
+        {
             let registrations: Vec<_> = db
                 .all()
                 .iter()

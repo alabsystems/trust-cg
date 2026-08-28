@@ -2,6 +2,8 @@
 //
 // Part of #376: bounded O3 debug-line regression for a 200+ LOC function.
 
+mod common;
+
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -529,13 +531,12 @@ fn command_output_with_timeout(mut command: Command, timeout: Duration) -> Bound
             };
         }
         if Instant::now() >= deadline {
+            // Direct syscall, never `kill -KILL -<pid>` through util-linux `kill`:
+            // that binary parses a leading-`-` argument as a SIGNAL spec and falls
+            // through to a target of -1 = every process the user owns. See
+            // `common::rosetta::kill_process_group` for the strace evidence.
             #[cfg(unix)]
-            {
-                let process_group = format!("-{child_pid}");
-                let _ = Command::new("kill")
-                    .args(["-KILL", &process_group])
-                    .status();
-            }
+            common::rosetta::kill_process_group(child_pid);
             let _ = child.kill();
             let status = child.wait().expect("wait for timed-out command");
             let stdout = fs::read(&out_path).unwrap_or_default();

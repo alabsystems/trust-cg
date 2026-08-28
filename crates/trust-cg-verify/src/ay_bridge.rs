@@ -2258,7 +2258,13 @@ fn verify_with_cli_smt2(obligation: &ProofObligation, config: &AYConfig, smt2: &
     let result = match output {
         Ok(output) => {
             let result = parse_solver_process_output(&output, &obligation.inputs);
-            let result = promote_fresh_solver_unsat(result, &solver_path, tmp_file.path(), smt2);
+            let result = promote_fresh_solver_unsat(
+                result,
+                &solver_path,
+                tmp_file.path(),
+                smt2,
+                &obligation.name,
+            );
             let result =
                 enrich_sat_counterexample_via_fresh(&solver_path, obligation, config, smt2, result);
             if let (Some(key), AYResult::Verified) = (&cache_key, &result) {
@@ -2337,7 +2343,13 @@ fn run_fresh_authority_query(
     match run_solver_command(solver_path, tmp_file.path(), config.timeout_ms) {
         Ok(output) => {
             let result = parse_solver_process_output(&output, &obligation.inputs);
-            let result = promote_fresh_solver_unsat(result, solver_path, tmp_file.path(), smt2);
+            let result = promote_fresh_solver_unsat(
+                result,
+                solver_path,
+                tmp_file.path(),
+                smt2,
+                &obligation.name,
+            );
             enrich_sat_counterexample_via_fresh(solver_path, obligation, config, smt2, result)
         }
         Err(SolverInvocationError::Timeout) => AYResult::Timeout,
@@ -2349,9 +2361,10 @@ fn run_fresh_authority_query(
 
 fn promote_fresh_solver_unsat(
     result: AYResult,
-    _solver_path: &str,
+    solver_path: &str,
     smt2_path: &Path,
     smt2: &str,
+    obligation_name: &str,
 ) -> AYResult {
     let proof_path = default_alethe_path(smt2_path);
     if !matches!(result, AYResult::SolverUnsat) {
@@ -2382,7 +2395,9 @@ fn promote_fresh_solver_unsat(
     // responses. `clean_checker_path` capability-probes, so a checker that
     // refuses everything is reported here as unavailable-with-a-reason rather
     // than masquerading as a rejection of this particular proof.
-    let Some(checker) = crate::obligation_cert_store::clean_checker_path() else {
+    let Some((checker, checker_identity)) =
+        crate::obligation_cert_store::clean_checker_path_and_identity()
+    else {
         let _ = std::fs::remove_file(&proof_path);
         let reason = crate::obligation_cert_store::clean_checker_unavailable_reason()
             .unwrap_or_else(|| "no usable checker".to_string());
@@ -2391,9 +2406,24 @@ fn promote_fresh_solver_unsat(
              This is a toolchain problem, not evidence about the proof."
         ));
     };
-    let checked = crate::obligation_cert_store::carcara_verify(&checker, smt2, &proof);
+    let checked = crate::obligation_cert_store::carcara_verify_with_expected_checker(
+        &checker,
+        &checker_identity,
+        smt2,
+        &proof,
+    );
     let _ = std::fs::remove_file(&proof_path);
     if checked {
+        // The proof in hand was just accepted by the identity-pinned
+        // independent checker against this exact query: persist it to the
+        // per-box store so the next identical compile skips this derivation.
+        crate::obligation_cert_store::persist_verified_alethe(
+            solver_path,
+            smt2,
+            obligation_name,
+            &proof,
+            &checker_identity,
+        );
         AYResult::Verified
     } else {
         AYResult::Unknown(format!(
@@ -2502,6 +2532,12 @@ fn session_proof_cache_key(solver_path: &str, smt2: &str) -> Option<String> {
     if crate::env_lock::var_os("TCG_NO_PROOF_CACHE").is_some() {
         return None;
     }
+    // EXACT QUERY KEY. Every branch below hashes the raw SMT2 bytes. Textual
+    // rewriting is not a proof-authority boundary: an `_v<digits>` spelling
+    // can occur inside a semantic string literal (or another lexical context),
+    // where changing it can change satisfiability. A sound canonicalizer would
+    // need to parse and scope the complete SMT-LIB language; this cache instead
+    // keeps the exact query identity and accepts the small loss in reuse.
     // NOTE: the `-dirty` short-circuit lives BELOW the explicit-blocking branch,
     // not here, so that an explicit request still yields a key. See there.
     // NON-BLOCKING (CT-9). The key needs the solver's content identity, which is
@@ -2694,6 +2730,170 @@ fn solver_identity_memo() -> &'static SolverIdentityMemo {
 /// intentionally ignored: metadata such as path/size/mtime is not a secure
 /// binding to file contents and a forged hash must not influence proof reuse.
 /// Returns `None` when the binary cannot be stat'ed or read.
+/// Machine-local memo for [`solver_identity_hash`], keyed on the solver file's
+/// identity metadata.
+///
+/// # Why this exists
+///
+/// The identity is a SHA-256 over the solver BINARY, and `ay` is ~115 MB. It is
+/// recomputed once per rustc PROCESS — i.e. once per compile — and measured at
+/// **71-78 ms**, the single largest item in production `codegen_crate` (an
+/// EMPTY program pays it in full to serve one memo lookup that misses). Compile
+/// time was therefore coupled to the SOLVER's size rather than the program's.
+///
+/// # Why this is NOT the verdict cache the 2026-07-10 audit removed
+///
+/// That cache stored PROOF VERDICTS: a writable file containing `unsat` could
+/// mint `Verified` without revalidation, which is why it had to go. This stores
+/// a FILE FINGERPRINT. The identity is *correlation* in every one of its three
+/// consumers, each of which independently re-establishes authority:
+///
+/// * the session memo is in-process and only ever holds results of live solver
+///   runs made in THIS process;
+/// * a tier-0 candidate hit "can only request live revalidation; it cannot
+///   establish a verdict" ([`crate::verdict_db`]);
+/// * a CERT-SKIP hit is credited only after an INDEPENDENT DRAT re-check of the
+///   committed certificate against THIS exact SMT2 ([`crate::canary_cert`]).
+///
+/// So a WRONG identity cannot mint a verdict. It can only change which cheap
+/// paths are attempted: a wrong MATCH makes candidates/certificates be
+/// consulted, and each is then revalidated or re-checked before it can be
+/// credited; a wrong MISMATCH sends everything to live discharge. Both are
+/// sound; the second is merely slower. This is a performance cache, not a trust
+/// input.
+///
+/// # Why it is not a new equivalence
+///
+/// [`solver_identity_hash`] ALREADY memoises on `(path, size, mtime)` within a
+/// process — the code already treats that tuple as "same binary, reuse the
+/// hash". This extends the same judgement from process scope to machine scope,
+/// and tightens it: the key additionally binds the device and inode (so a
+/// replaced file is a different record) and the ctime (which changes on any
+/// metadata write and cannot be set backwards by an unprivileged user, unlike
+/// mtime).
+///
+/// Fail-safe by construction: any IO, parse, or format problem simply recomputes
+/// the hash. Opt out with `TCG_NO_SOLVER_ID_CACHE=1`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SolverFileKey {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime_ns: i128,
+    ctime_ns: i128,
+}
+
+impl SolverFileKey {
+    #[cfg(unix)]
+    fn of(meta: &std::fs::Metadata) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        Some(SolverFileKey {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            size: meta.size(),
+            mtime_ns: i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec()),
+            ctime_ns: i128::from(meta.ctime()) * 1_000_000_000 + i128::from(meta.ctime_nsec()),
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn of(_meta: &std::fs::Metadata) -> Option<Self> {
+        // No stable dev/ino/ctime: skip the machine-local cache entirely rather
+        // than key on a weaker tuple than the in-process memo already uses.
+        None
+    }
+
+    fn line(&self, hash: &str) -> String {
+        format!(
+            "v1 {} {} {} {} {} {}",
+            self.dev, self.ino, self.size, self.mtime_ns, self.ctime_ns, hash
+        )
+    }
+
+    fn matches(&self, line: &str) -> Option<String> {
+        let mut f = line.split(' ');
+        if f.next()? != "v1" {
+            return None;
+        }
+        let dev = f.next()?.parse::<u64>().ok()?;
+        let ino = f.next()?.parse::<u64>().ok()?;
+        let size = f.next()?.parse::<u64>().ok()?;
+        let mtime_ns = f.next()?.parse::<i128>().ok()?;
+        let ctime_ns = f.next()?.parse::<i128>().ok()?;
+        let hash = f.next()?;
+        if f.next().is_some() {
+            return None;
+        }
+        // Strict: only a well-formed digest is accepted, and only for an exact
+        // metadata match. Anything else recomputes.
+        if hash.len() != 64
+            || !hash
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return None;
+        }
+        let candidate = SolverFileKey {
+            dev,
+            ino,
+            size,
+            mtime_ns,
+            ctime_ns,
+        };
+        (candidate == *self).then(|| hash.to_owned())
+    }
+}
+
+/// Where the machine-local identity memo lives. `TCG_PROOF_CACHE_DIR` when set
+/// (the benchmark harness already isolates runs with it), else the user cache
+/// dir. `None` disables the memo.
+fn solver_identity_cache_path() -> Option<std::path::PathBuf> {
+    if crate::env_lock::var_os("TCG_NO_SOLVER_ID_CACHE").is_some() {
+        return None;
+    }
+    let dir = if let Some(d) = std::env::var_os("TCG_PROOF_CACHE_DIR") {
+        std::path::PathBuf::from(d)
+    } else if let Some(d) = std::env::var_os("XDG_CACHE_HOME") {
+        std::path::PathBuf::from(d).join("trust-cg")
+    } else {
+        std::path::PathBuf::from(std::env::var_os("HOME")?)
+            .join(".cache")
+            .join("trust-cg")
+    };
+    Some(dir.join("solver-identity-v1"))
+}
+
+fn solver_identity_cache_lookup(key: &SolverFileKey) -> Option<String> {
+    let path = solver_identity_cache_path()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    text.lines().find_map(|l| key.matches(l))
+}
+
+fn solver_identity_cache_store(key: &SolverFileKey, hash: &str) {
+    let Some(path) = solver_identity_cache_path() else {
+        return;
+    };
+    let Some(dir) = path.parent() else { return };
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    // Keep the newest few records (a machine may have several solver builds);
+    // rewrite atomically so a concurrent reader never sees a torn file.
+    let mut lines: Vec<String> = std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| key.matches(l).is_none())
+        .map(|l| l.to_owned())
+        .collect();
+    lines.push(key.line(hash));
+    let keep = lines.len().saturating_sub(8);
+    let body = lines[keep..].join("\n") + "\n";
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    if std::fs::write(&tmp, body).is_ok() && std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
 pub(crate) fn solver_identity_hash(solver_path: &str) -> Option<String> {
     use sha2::{Digest, Sha256};
     // COMPUTE-ONCE, not merely memoized. The entry is a per-key mutex rather
@@ -2719,6 +2919,20 @@ pub(crate) fn solver_identity_hash(solver_path: &str) -> Option<String> {
         return Some(hash.clone());
     }
 
+    // Machine-local memo (see `SolverFileKey`): the 115 MB stream-and-hash below
+    // is ~75 ms, paid once per COMPILE. A metadata-exact hit skips it entirely.
+    let file_key = SolverFileKey::of(&meta);
+    if let Some(k) = &file_key
+        && let Some(hash) = solver_identity_cache_lookup(k)
+    {
+        // Publish into the per-key slot we are already holding, NOT back into
+        // the outer map: `stat_key` was moved into `entry` above, and taking
+        // the map lock while holding a slot lock would invert the map -> slot
+        // order every other caller uses.
+        *slot = Some(hash.clone());
+        return Some(hash);
+    }
+
     // Stream rather than `fs::read`. The solver binary is ~95MB, and slurping it
     // whole costs a 95MB allocation plus the kernel work to hand it over (the
     // page-release `madvise` alone measured ~10ms) for bytes that are consumed
@@ -2741,6 +2955,9 @@ pub(crate) fn solver_identity_hash(solver_path: &str) -> Option<String> {
         hasher.update(&buf[..n]);
     }
     let hash = format!("{:x}", hasher.finalize());
+    if let Some(k) = &file_key {
+        solver_identity_cache_store(k, &hash);
+    }
     *slot = Some(hash.clone());
     Some(hash)
 }
@@ -2999,7 +3216,10 @@ fn configure_solver_command(_command: &mut std::process::Command) {}
 
 #[cfg(unix)]
 fn signal_solver_process_group(process_group_id: u32, signal: i32) {
-    if process_group_id <= i32::MAX as u32 {
+    // This value originates from `Child::id()`, but keep the signal boundary
+    // fail-closed as well: `kill(0, ..)` targets our own process group and
+    // `kill(-1, ..)` targets every process the user may signal.
+    if process_group_id > 1 && process_group_id <= i32::MAX as u32 {
         let pgid = process_group_id as i32;
         unsafe {
             let _ = kill(-pgid, signal);
@@ -4985,19 +5205,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The process-local memo key must DISCRIMINATE a binary that was modified
-    /// IN PLACE — same path, same inode, same length, mtime restored.
+    /// BOTH memo keys — the process-local one and the machine-local one — must
+    /// DISCRIMINATE a binary that was modified IN PLACE: same path, same inode,
+    /// same length, mtime restored.
     ///
-    /// The old `(path, size, mtime)` key served a stale hash after an
-    /// mtime-restoring in-place edit. The tightened key also binds dev+inode (a
-    /// replaced file is a different record) and ctime, which advances on every
-    /// write and which an unprivileged process cannot rewind (unlike mtime, via
-    /// `utimensat`).
+    /// This is the hazard a memo introduces, and the staleness window itself is
+    /// not new: `solver_identity_hash` already memoized on `(path, size, mtime)`
+    /// within a process, so an mtime-restoring in-place edit already served a
+    /// stale hash there. Two independent tightenings landed on that, and this
+    /// test covers BOTH:
+    ///
+    /// * [`SolverIdentityStatKey`] replaces the old `(path, size, mtime)` tuple
+    ///   for the PROCESS-scoped memo;
+    /// * [`SolverFileKey`] extends the same judgement from one process to the
+    ///   MACHINE, which widens the staleness window, so its key has to be at
+    ///   least as strict as the in-process one.
+    ///
+    /// Both bind dev+inode (a replaced file is a different record) and ctime,
+    /// which advances on every write and which an unprivileged process cannot
+    /// rewind (unlike mtime, via `utimensat`).
     ///
     /// Threat-model note: an attacker who can rewrite the solver binary in place
     /// already controls the solver and could simply make it answer `unsat`.
     /// Hashing is not the weak link there. This test guards the ACCIDENTAL case
     /// — a rebuild or restore that lands the same size and mtime.
+    ///
+    /// `cfg(unix)`: both keys carry dev/inode/ctime only on unix, and
+    /// `SolverFileKey::of` deliberately returns `None` elsewhere rather than key
+    /// on a tuple weaker than the in-process memo already uses.
     #[cfg(unix)]
     #[test]
     fn solver_identity_memo_key_discriminates_in_place_edit() {
@@ -5012,7 +5247,8 @@ mod tests {
         std::fs::write(&solver, b"solver bytes v1").unwrap();
         let meta_before = std::fs::metadata(&solver).unwrap();
         let solver_path = solver.to_str().unwrap();
-        let key_before =
+        let file_key_before = SolverFileKey::of(&meta_before).expect("unix metadata");
+        let stat_key_before =
             SolverIdentityStatKey::of(solver_path, &meta_before).expect("unix metadata");
         let hash_before = solver_identity_hash(solver_path).unwrap();
         let modified = meta_before.modified().unwrap();
@@ -5032,28 +5268,72 @@ mod tests {
 
         let meta_after = std::fs::metadata(&solver).unwrap();
         assert_eq!(meta_after.len(), meta_before.len(), "same length");
-        let key_after = SolverIdentityStatKey::of(solver_path, &meta_after).expect("unix metadata");
+        let file_key_after = SolverFileKey::of(&meta_after).expect("unix metadata");
+        let stat_key_after =
+            SolverIdentityStatKey::of(solver_path, &meta_after).expect("unix metadata");
 
         // Precision: dev, inode and size are all UNCHANGED and mtime was
         // restored, so ctime is the only field that can carry the difference.
         // Asserting that keeps this test from passing for the wrong reason if
-        // the key composition ever changes.
-        assert_eq!(key_before.dev, key_after.dev, "same device");
-        assert_eq!(key_before.ino, key_after.ino, "same inode");
-        assert_eq!(key_before.size, key_after.size, "same size");
-        assert_eq!(key_before.mtime_ns, key_after.mtime_ns, "mtime restored");
+        // the key composition ever changes. Checked for EACH key separately:
+        // they are independent records, and either one going stale serves a
+        // wrong content hash.
+        assert_eq!(stat_key_before.dev, stat_key_after.dev, "same device");
+        assert_eq!(stat_key_before.ino, stat_key_after.ino, "same inode");
+        assert_eq!(stat_key_before.size, stat_key_after.size, "same size");
+        assert_eq!(
+            stat_key_before.mtime_ns, stat_key_after.mtime_ns,
+            "mtime restored"
+        );
         assert_ne!(
-            key_before.ctime_ns, key_after.ctime_ns,
+            stat_key_before.ctime_ns, stat_key_after.ctime_ns,
             "ctime must advance on an in-place write",
         );
         assert!(
-            key_before != key_after,
-            "the memo key must differ after an in-place edit even with mtime restored",
+            stat_key_before != stat_key_after,
+            "the process memo key must differ after an in-place edit even with mtime restored",
         );
+
+        assert_eq!(file_key_before.dev, file_key_after.dev, "same device");
+        assert_eq!(file_key_before.ino, file_key_after.ino, "same inode");
+        assert_eq!(file_key_before.size, file_key_after.size, "same size");
+        assert_eq!(
+            file_key_before.mtime_ns, file_key_after.mtime_ns,
+            "mtime restored"
+        );
+        assert_ne!(
+            file_key_before.ctime_ns, file_key_after.ctime_ns,
+            "ctime must advance on an in-place write",
+        );
+        assert!(
+            file_key_before != file_key_after,
+            "the machine-local memo key must differ after an in-place edit even with mtime restored",
+        );
+
+        // And a record written under the old key must not answer for the new
+        // one. The positive control comes FIRST and uses a well-formed 64-hex
+        // digest on purpose: `matches` ALSO rejects a malformed hash, so a
+        // short placeholder would make the negative assertion below pass
+        // without ever exercising key discrimination.
+        let digest = "ab".repeat(32);
+        let record = file_key_before.line(&digest);
+        let matched = file_key_before.matches(&record);
+        assert_eq!(
+            matched.as_deref(),
+            Some(digest.as_str()),
+            "a well-formed record must match the key that wrote it",
+        );
+        assert!(
+            file_key_after.matches(&record).is_none(),
+            "a record stored under the pre-edit key must not match the post-edit key",
+        );
+
+        // End to end through BOTH layers: the next call must re-hash the bytes
+        // rather than serve either stale record.
         assert_ne!(
             solver_identity_hash(solver_path).unwrap(),
             hash_before,
-            "the process memo must re-hash bytes after the in-place edit",
+            "the memo must re-hash bytes after the in-place edit",
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -5119,11 +5399,11 @@ mod tests {
     }
 
     /// The certification-gap-guarded spelling of the tests' standard
-    /// `assert_eq!(result, AYResult::Verified, …)` (crate::formal_gap; same
-    /// discipline as `mem_refine.rs::alethe_crosscheck_gap` and
-    /// `tests/support/cegis_alethe_gap.rs`): `Verified` passes (returns
-    /// `true`); ONLY the exact fail-closed certification-gap diagnostics skip
-    /// — LOUDLY, naming the obligation and diagnostic — returning `false`,
+    /// `assert_eq!(result, AYResult::Verified, …)` (`crate::formal_gap`; same
+    /// discipline as `mem_refine.rs::alethe_crosscheck_gap`): `Verified`
+    /// passes (returns `true`); ONLY the exact fail-closed certification-gap
+    /// diagnostics skip — LOUDLY, naming the obligation and diagnostic —
+    /// returning `false`,
     /// with a server-truncated bare `unknown` first re-confirmed through the
     /// fresh one-shot transcript; every other outcome (`CounterExample`,
     /// `Timeout`, `Error`, an unrecognized `Unknown`) panics with the
@@ -6496,7 +6776,13 @@ mod tests {
             "the independent checker must reject invalid proof text"
         );
         assert_eq!(
-            promote_fresh_solver_unsat(unsat_candidate, &solver, unsat_file.path(), &unsat_smt2,),
+            promote_fresh_solver_unsat(
+                unsat_candidate,
+                &solver,
+                unsat_file.path(),
+                &unsat_smt2,
+                "test:cli-contract-unsat",
+            ),
             AYResult::Verified,
             "the exact complete proof must be independently accepted"
         );
@@ -6617,6 +6903,7 @@ mod tests {
             &solver,
             hard_file.path(),
             &hard_smt2,
+            "test:cli-contract-hard",
         );
         if matches!(hard_result, AYResult::Verified) {
             assert_eq!(hard_candidate, AYResult::SolverUnsat);
@@ -6761,6 +7048,12 @@ mod tests {
 
     #[cfg(unix)]
     fn process_exists(pid: u32) -> bool {
+        // Keep every test cleanup path fail-closed too: external `kill` treats
+        // PID 0 as the caller's process group, so malformed fixture output must
+        // never reach it even though real child IDs are always greater than 1.
+        if pid <= 1 {
+            return false;
+        }
         std::process::Command::new("kill")
             .arg("-0")
             .arg(pid.to_string())
@@ -6808,6 +7101,13 @@ mod tests {
             process_status_is_running(""),
             "unknown state must fail closed"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_exists_rejects_group_special_ids() {
+        assert!(!process_exists(0));
+        assert!(!process_exists(1));
     }
 
     #[cfg(unix)]
@@ -6971,8 +7271,11 @@ mod tests {
         // Resident mode can report only a candidate UNSAT. The fresh replay
         // emits an explicitly holey proof, which must remain Unknown and must
         // not seed the process-local Verified memo. A second identical call
-        // therefore performs another fresh replay (invocation count 3: one
-        // resident + two fresh), rather than returning a cached success.
+        // therefore performs another fresh replay, rather than returning a
+        // cached success. The process-global resident slot can legitimately
+        // be replaced by a parallel query for a different solver binary, so
+        // this test pins the additional invocation instead of assuming the
+        // first resident process necessarily survives between both calls.
         let solver_path = write_temp_solver_script(
             "#!/bin/sh\n\
              count_file=\"$0.count\"\n\
@@ -7013,15 +7316,17 @@ mod tests {
 
         let first = verify_with_cli_raw(&obligation, &config);
         assert!(matches!(first, AYResult::Unknown(_)), "got {first:?}");
-        assert_eq!(fake_solver_invocation_count(&solver_path), 2);
+        let first_invocation_count = fake_solver_invocation_count(&solver_path);
+        assert_eq!(first_invocation_count, 2);
 
         let second = verify_with_cli_raw(&obligation, &config);
         let invocation_count = fake_solver_invocation_count(&solver_path);
         remove_temp_solver_and_count(&solver_path);
         assert!(matches!(second, AYResult::Unknown(_)), "got {second:?}");
-        assert_eq!(
-            invocation_count, 3,
-            "holey UNSAT must not be promoted into the Verified session cache"
+        assert!(
+            invocation_count > first_invocation_count,
+            "holey UNSAT must not be promoted into the Verified session cache; \
+             the second query must invoke the solver again"
         );
     }
 
@@ -7033,7 +7338,14 @@ mod tests {
         // solver test so it cannot evict a sibling test's live process and
         // perturb that test's invocation-count assertions.
         let _batch_lock = ay_batch_test_lock();
-        let solver_path = write_temp_solver_script("#!/bin/sh\nsleep 5\necho unsat\n");
+        // Keep the fixture far beyond the assertion budget. The full verifier
+        // suite saturates the host with thousands of proof tests, so a
+        // sub-second wall-clock bound measures scheduler latency rather than
+        // the configured 50 ms solver deadline. A 30-second sleeper paired
+        // with a 10-second outer bound still proves that timeout teardown did
+        // not wait for natural process exit, while remaining stable under
+        // publication-suite load.
+        let solver_path = write_temp_solver_script("#!/bin/sh\nsleep 30\necho unsat\n");
 
         let x = SmtExpr::var("x", 8);
         let obligation = ProofObligation {
@@ -7062,7 +7374,7 @@ mod tests {
 
         assert_eq!(result, AYResult::Timeout);
         assert!(
-            elapsed < Duration::from_secs(2),
+            elapsed < Duration::from_secs(10),
             "solver subprocess timeout should be enforced promptly, elapsed {:?}",
             elapsed
         );
@@ -7519,7 +7831,7 @@ mod tests {
         for obligation in &proofs {
             let result = verify_with_cli(obligation, &config);
             assert_verified_or_certification_gap_skip(
-                &obligation,
+                obligation,
                 &config,
                 &result,
                 format_args!(
@@ -7562,7 +7874,7 @@ mod tests {
         for obligation in proofs_i32.iter().chain(proofs_i64.iter()) {
             let result = verify_with_cli(obligation, &config);
             assert_verified_or_certification_gap_skip(
-                &obligation,
+                obligation,
                 &config,
                 &result,
                 format_args!(
@@ -7594,7 +7906,7 @@ mod tests {
         for obligation in &proofs {
             let result = verify_with_cli(obligation, &config);
             assert_verified_or_certification_gap_skip(
-                &obligation,
+                obligation,
                 &config,
                 &result,
                 format_args!(
@@ -7814,7 +8126,7 @@ mod tests {
         for obligation in &proofs {
             let result = verify_with_cli(obligation, &config);
             assert_verified_or_certification_gap_skip(
-                &obligation,
+                obligation,
                 &config,
                 &result,
                 format_args!(
@@ -7848,7 +8160,7 @@ mod tests {
         for obligation in &proofs {
             let result = verify_with_cli(obligation, &config);
             assert_verified_or_certification_gap_skip(
-                &obligation,
+                obligation,
                 &config,
                 &result,
                 format_args!(
@@ -7978,7 +8290,7 @@ mod tests {
             );
             let result = verify_with_cli(obligation, &config);
             assert_verified_or_certification_gap_skip(
-                &obligation,
+                obligation,
                 &config,
                 &result,
                 format_args!(
@@ -8125,7 +8437,7 @@ mod tests {
             );
             let result = verify_with_cli(obligation, &config);
             assert_verified_or_certification_gap_skip(
-                &obligation,
+                obligation,
                 &config,
                 &result,
                 format_args!(
@@ -8189,7 +8501,7 @@ mod tests {
             );
             let result = verify_with_cli(obligation, &config);
             assert_verified_or_certification_gap_skip(
-                &obligation,
+                obligation,
                 &config,
                 &result,
                 format_args!(
@@ -8253,7 +8565,7 @@ mod tests {
             );
             let result = verify_with_cli(obligation, &config);
             assert_verified_or_certification_gap_skip(
-                &obligation,
+                obligation,
                 &config,
                 &result,
                 format_args!(
@@ -8318,7 +8630,7 @@ mod tests {
             );
             let result = verify_with_cli(obligation, &config);
             assert_verified_or_certification_gap_skip(
-                &obligation,
+                obligation,
                 &config,
                 &result,
                 format_args!(
@@ -8381,7 +8693,7 @@ mod tests {
             );
             let result = verify_with_cli(obligation, &config);
             assert_verified_or_certification_gap_skip(
-                &obligation,
+                obligation,
                 &config,
                 &result,
                 format_args!(
@@ -8735,7 +9047,7 @@ mod tests {
             );
             let result = verify_with_cli(obligation, &config);
             assert_verified_or_certification_gap_skip(
-                &obligation,
+                obligation,
                 &config,
                 &result,
                 format_args!(
@@ -8799,7 +9111,7 @@ mod tests {
             );
             let result = verify_with_cli(obligation, &config);
             assert_verified_or_certification_gap_skip(
-                &obligation,
+                obligation,
                 &config,
                 &result,
                 format_args!(
@@ -8860,7 +9172,7 @@ mod tests {
             );
             let result = verify_with_cli(obligation, &config);
             assert_verified_or_certification_gap_skip(
-                &obligation,
+                obligation,
                 &config,
                 &result,
                 format_args!(
@@ -8920,7 +9232,7 @@ mod tests {
             );
             let result = verify_with_cli(obligation, &config);
             assert_verified_or_certification_gap_skip(
-                &obligation,
+                obligation,
                 &config,
                 &result,
                 format_args!(
@@ -8973,7 +9285,7 @@ mod tests {
             );
             let result = verify_with_cli(obligation, &config);
             assert_verified_or_certification_gap_skip(
-                &obligation,
+                obligation,
                 &config,
                 &result,
                 format_args!(
@@ -9030,7 +9342,7 @@ mod tests {
             );
             let result = verify_with_cli(obligation, &config);
             assert_verified_or_certification_gap_skip(
-                &obligation,
+                obligation,
                 &config,
                 &result,
                 format_args!(
@@ -9089,7 +9401,7 @@ mod tests {
             );
             let result = verify_with_cli(obligation, &config);
             assert_verified_or_certification_gap_skip(
-                &obligation,
+                obligation,
                 &config,
                 &result,
                 format_args!(
@@ -9148,7 +9460,7 @@ mod tests {
             );
             let result = verify_with_cli(obligation, &config);
             assert_verified_or_certification_gap_skip(
-                &obligation,
+                obligation,
                 &config,
                 &result,
                 format_args!(
@@ -9207,7 +9519,7 @@ mod tests {
             );
             let result = verify_with_cli(obligation, &config);
             assert_verified_or_certification_gap_skip(
-                &obligation,
+                obligation,
                 &config,
                 &result,
                 format_args!(
@@ -9266,7 +9578,7 @@ mod tests {
             );
             let result = verify_with_cli(obligation, &config);
             assert_verified_or_certification_gap_skip(
-                &obligation,
+                obligation,
                 &config,
                 &result,
                 format_args!(

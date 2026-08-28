@@ -38,7 +38,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 
-use clap::{Parser, ValueEnum};
+use clap::parser::ValueSource;
+use clap::{CommandFactory, FromArgMatches, Parser, ValueEnum};
 use rayon::prelude::*;
 use trust_cg_codegen::jit_diagnostics::sha256_hex;
 
@@ -52,6 +53,7 @@ use trust_cg_codegen::pipeline::{self, FormatMode, OptLevel};
 use trust_cg_codegen::target::{
     Target, TargetOperatingSystem, TargetSpec, TargetSpecParseErrorKind,
 };
+use trust_cg_codegen::wasm;
 use trust_cg_verify::AYConfig;
 use trust_cg_verify::fsym_summary::{
     FsymSolverEscalationConfig, FsymSolverEscalationResult, FsymSolverStatus, FsymSummary,
@@ -125,7 +127,8 @@ enum FsymSolverArg {
         Compiles trust_ir modules to native object files and records the\n\
         available evidence for supported lowering and optimization paths.\n\n\
         Targets: aarch64 (primary), x86-64 (x86_64 only; no 32-bit x86/i686), \
-        riscv64 (scaffold).\n\n\
+        riscv64 (scaffold), wasm32-unknown-unknown (closed-module .wasm via \
+        the wasm backend; raw module bytes written to -o).\n\n\
         Input format: binary trust_ir bitcode (.tmbc) is the default.\n\
         JSON wire-format input is retained as a debug-only flag; pass\n\
         `--format=json` to enable it. Pass `--format=text` to read a\n\
@@ -223,8 +226,12 @@ struct Cli {
 
     /// Target architecture or triple. x86 support is x86_64 only:
     /// x86/i386/i486/i586/i686 aliases and triples are rejected.
-    #[arg(long = "target", value_parser = parse_target, default_value = "aarch64")]
-    target: TargetSpec,
+    ///
+    /// `wasm32-unknown-unknown` (alias `wasm32`) routes through the wasm
+    /// backend: the output is the raw `.wasm` module bytes written to `-o`,
+    /// and object-file/linker options are refused with named diagnostics.
+    #[arg(long = "target", value_parser = parse_cli_target, default_value = "aarch64")]
+    target: CliTarget,
 
     /// Compile only -- produce object files, do not link.
     #[arg(short = 'c')]
@@ -368,10 +375,44 @@ fn parse_target(s: &str) -> Result<TargetSpec, String> {
         ),
         _ => format!(
             "{err}; supported targets include aarch64, x86_64 (64-bit x86 only; \
-             aliases x86-64 and x64), riscv64, x86_64-unknown-linux-gnu, \
-             x86_64-pc-windows-msvc, x86_64-apple-darwin"
+             aliases x86-64 and x64), riscv64, wasm32-unknown-unknown (alias \
+             wasm32), x86_64-unknown-linux-gnu, x86_64-pc-windows-msvc, \
+             x86_64-apple-darwin"
         ),
     })
+}
+
+/// A `--target` request: either a register-machine native spec, or the wasm32
+/// stack-machine lane.
+///
+/// WebAssembly is deliberately not a [`Target`] variant (see
+/// `trust_cg_codegen::wasm::target`): it is recognized here, at the dispatch
+/// boundary, and routed to `trust_cg_codegen::wasm::compile_module` instead of
+/// the native object pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CliTarget {
+    /// aarch64 / x86-64 / riscv64 — the native object/linker pipeline.
+    Native(TargetSpec),
+    /// wasm32-unknown-unknown — the closed-module wasm backend; the output is
+    /// the raw `.wasm` module bytes written to `-o`.
+    Wasm32,
+}
+
+/// The wasm32 spellings the CLI accepts: the canonical triple and the bare
+/// architecture alias (matching the aarch64/x86_64 alias convention).
+fn parse_cli_target(s: &str) -> Result<CliTarget, String> {
+    let normalized = s.trim().to_ascii_lowercase();
+    if wasm::is_wasm32_target(&normalized) {
+        return match normalized.as_str() {
+            "wasm32" | "wasm32-unknown-unknown" => Ok(CliTarget::Wasm32),
+            other => Err(format!(
+                "unsupported wasm target '{other}': the wasm backend is the closed-module \
+                 wasm32-unknown-unknown lane (no WASI or emscripten imports); use \
+                 --target wasm32-unknown-unknown (alias wasm32)"
+            )),
+        };
+    }
+    parse_target(s).map(CliTarget::Native)
 }
 
 /// The result of compiling a single input file.
@@ -1348,11 +1389,11 @@ fn run_profile_generate_jit(
     );
 }
 
-/// Build a CompilerConfig from CLI flags.
-fn build_config(cli: &Cli) -> CompilerConfig {
+/// Build a CompilerConfig from CLI flags for a native target spec.
+fn build_config(cli: &Cli, target_spec: TargetSpec) -> CompilerConfig {
     CompilerConfig {
         opt_level: cli.opt_level,
-        target: cli.target.architecture,
+        target: target_spec.architecture,
         emit_proofs: cli.emit_proofs.is_some(),
         trace_level: if cli.trace {
             CompilerTraceLevel::Full
@@ -1378,8 +1419,12 @@ fn build_config(cli: &Cli) -> CompilerConfig {
     }
 }
 
-fn build_config_for_input_count(cli: &Cli, input_count: usize) -> CompilerConfig {
-    let mut config = build_config(cli);
+fn build_config_for_input_count(
+    cli: &Cli,
+    input_count: usize,
+    target_spec: TargetSpec,
+) -> CompilerConfig {
+    let mut config = build_config(cli, target_spec);
     if input_count > 1 {
         // Multi-file CLI compilation already fans out across files. Keep each
         // module internally sequential so large modules do not multiply peak
@@ -1775,8 +1820,369 @@ fn cleanup_temps(files: &[FileCompilationResult]) {
     }
 }
 
+/// Named refusals for options that make no sense in the closed-module wasm32
+/// lane. Fail-closed: an inapplicable option is refused with a diagnostic
+/// naming the flag and the reason — never silently ignored.
+///
+/// `-c` is deliberately NOT refused: the wasm lane always behaves as
+/// compile-only (one module in, raw `.wasm` bytes out, no linker), so `-c`
+/// requests exactly what the lane does. IR-level options (`--fsym`,
+/// `--emit-json`, `--emit-trust_ir`) also stay usable. An EXPLICIT `-O` is
+/// refused: this route never reads `opt_level`, so an explicit optimization
+/// request would be dropped, and dropped requests are named, not ignored. The
+/// default `-O` value is not a request and is not refused; what the route does
+/// not run is stated in the compile-evidence summary.
+///
+/// `opt_level_explicit` is the caller's clap `ValueSource` answer: an
+/// explicitly-passed `-O` is a DROPPED REQUEST on this lane (the wasm route
+/// runs no optimization passes and never reads `opt_level`), so it is refused
+/// by name rather than silently ignored. The default value is not refused.
+fn wasm32_flag_refusals(cli: &Cli, input_count: usize, opt_level_explicit: bool) -> Vec<String> {
+    let mut refusals: Vec<String> = Vec::new();
+    let mut refuse = |flag: &str, reason: &str| refusals.push(format!("{flag}: {reason}"));
+
+    if opt_level_explicit {
+        refuse(
+            "-O/--opt-level",
+            "the wasm lane runs no optimization passes; the emitted bytes are a \
+             pure function of the module (drop the flag, or use the native lane)",
+        );
+    }
+
+    if input_count != 1 {
+        refuse(
+            "<INPUT>...",
+            "the wasm32 lane compiles exactly one trust_ir module into one .wasm module; \
+             there is no linker to combine several inputs",
+        );
+    }
+    if !cli.lib_paths.is_empty() {
+        refuse(
+            "-L",
+            "linker library search paths do not apply; the wasm32 lane emits a single \
+             closed module and never invokes a linker",
+        );
+    }
+    if !cli.libs.is_empty() {
+        refuse(
+            "-l",
+            "libraries cannot be linked; the wasm32 lane emits a single closed module \
+             and never invokes a linker",
+        );
+    }
+    if cli.debug_info {
+        refuse(
+            "-g",
+            "DWARF debug-info emission is not wired for the wasm backend",
+        );
+    }
+    if cli.panic_unwind {
+        refuse(
+            "--panic-unwind",
+            "whole-program unwind FDE coverage is an x86-64 Mach-O object concern; \
+             the wasm lane emits no native objects",
+        );
+    }
+    if cli.emit_proofs.is_some() {
+        refuse(
+            "--emit-proofs",
+            "the wasm lane emits no proof certificates (its verification route is \
+             not_run per the compile-evidence summary); refusing rather than writing \
+             an empty proof directory",
+        );
+    }
+    if cli.profile_generate.is_some() {
+        refuse(
+            "--profile-generate",
+            "PGO capture is the native host-JIT path; the wasm lane has no JIT",
+        );
+    }
+    if cli.profile_use.is_some() {
+        refuse(
+            "--profile-use",
+            "profile-guided optimization is the native pipeline; the wasm lane runs \
+             no optimization passes",
+        );
+    }
+    if cli.cegis_superopt.is_some() {
+        refuse(
+            "--cegis-superopt",
+            "CEGIS superoptimization is native-only; the wasm lane runs no \
+             optimization passes",
+        );
+    }
+    if cli.compile_artifact_cache.is_some() {
+        refuse(
+            "--compile-artifact-cache",
+            "the compile artifact cache is keyed to the native object pipeline",
+        );
+    }
+    if cli.trace {
+        refuse(
+            "--trace",
+            "per-phase compilation tracing is not implemented for the wasm lane",
+        );
+    }
+    if cli.metrics {
+        refuse(
+            "--metrics",
+            "native compilation metrics are not produced by the wasm lane; the \
+             compile-evidence summary on stderr carries the module facts",
+        );
+    }
+    refusals
+}
+
+/// The `.wasm` destination for the wasm32 lane: `-o` when given, else the
+/// input path with a `.wasm` extension.
+fn wasm_output_path(cli: &Cli, input: &Path) -> PathBuf {
+    cli.output
+        .clone()
+        .unwrap_or_else(|| input.with_extension("wasm"))
+}
+
+/// Identity key for an artifact path, so aliased spellings of one file
+/// (`out.json`, `./out.json`, `dir/../out.json`) compare equal.
+///
+/// An existing path canonicalizes directly. A path that does not exist yet —
+/// the normal case for an output — canonicalizes through its parent
+/// directory, which is the part that can be resolved, and the file name is
+/// appended verbatim. If neither resolves, the path is its own key: that can
+/// only miss an alias, never invent one.
+fn output_alias_key(path: &Path) -> PathBuf {
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical;
+    }
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    match (parent.canonicalize(), path.file_name()) {
+        (Ok(dir), Some(name)) => dir.join(name),
+        _ => path.to_path_buf(),
+    }
+}
+
+/// Named refusals for wasm32-lane output paths that alias — an output that
+/// names an input, or two requested outputs that name one file.
+///
+/// Fail-closed for the same reason the flag refusals are: writing an artifact
+/// over the input module destroys the module the compile must read, and two
+/// requests resolving to one file mean one of them is silently lost. Both are
+/// refused by name before anything is read or written.
+///
+/// Paths are compared by [`output_alias_key`], so `out.json`, `./out.json` and
+/// `dir/../out.json` are recognised as one file even before it exists.
+fn wasm32_output_alias_refusals(cli: &Cli, inputs: &[PathBuf]) -> Vec<String> {
+    // A missing / multi-input invocation is already refused by name; the
+    // default output path is only defined for the single-input lane.
+    let Some(first_input) = inputs.first() else {
+        return Vec::new();
+    };
+    let out_path = wasm_output_path(cli, first_input);
+
+    let mut requested: Vec<(&str, &Path)> = Vec::new();
+    if let Some(path) = cli.emit_json.as_deref() {
+        requested.push(("--emit-json", path));
+    }
+    if let Some(path) = cli.emit_trust_ir.as_deref() {
+        requested.push(("--emit-trust_ir", path));
+    }
+    if let Some(path) = cli.fsym_report_json.as_deref() {
+        requested.push(("--fsym-report-json", path));
+    }
+    requested.push((
+        if cli.output.is_some() {
+            "-o/--output"
+        } else {
+            "-o/--output (defaulted to <INPUT>.wasm)"
+        },
+        out_path.as_path(),
+    ));
+
+    let keys: Vec<PathBuf> = requested
+        .iter()
+        .map(|(_, path)| output_alias_key(path))
+        .collect();
+    let input_keys: Vec<PathBuf> = inputs.iter().map(|path| output_alias_key(path)).collect();
+
+    let mut refusals: Vec<String> = Vec::new();
+    for (i, (label, path)) in requested.iter().enumerate() {
+        for (input, input_key) in inputs.iter().zip(&input_keys) {
+            if keys[i] == *input_key {
+                refusals.push(format!(
+                    "{label}: '{}' is the input module '{}'; writing it would destroy the \
+                     module this compile reads (give the artifact its own path)",
+                    path.display(),
+                    input.display(),
+                ));
+            }
+        }
+    }
+    for i in 0..requested.len() {
+        for j in (i + 1)..requested.len() {
+            if keys[i] == keys[j] {
+                refusals.push(format!(
+                    "{}: '{}' is also written by {}; two requested outputs naming one file \
+                     would clobber each other (give each its own path)",
+                    requested[i].0,
+                    requested[i].1.display(),
+                    requested[j].0,
+                ));
+            }
+        }
+    }
+    refusals
+}
+
+/// Load one trust_ir module for a single-input request, failing closed with
+/// the CLI's standard read diagnostic.
+fn load_single_input_module(input: &Path, format: FormatMode) -> trust_ir::Module {
+    match pipeline::load_module_as(input, format) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!(
+                "trust-cg: error: failed to read trust_ir module from '{}': {}",
+                input.display(),
+                e,
+            );
+            process::exit(1);
+        }
+    }
+}
+
+/// Write the `--emit-json` round-trip artifact for an already-loaded module.
+fn write_emit_json_artifact(module: &trust_ir::Module, emit_path: &Path) {
+    match serde_json::to_string_pretty(module)
+        .map_err(|e| e.to_string())
+        .and_then(|json| fs::write(emit_path, json).map_err(|e| e.to_string()))
+    {
+        Ok(()) => {
+            eprintln!("trust-cg: wrote trust_ir JSON to {}", emit_path.display());
+        }
+        Err(e) => {
+            eprintln!(
+                "trust-cg: error: failed to write trust_ir JSON to '{}': {}",
+                emit_path.display(),
+                e,
+            );
+            process::exit(1);
+        }
+    }
+}
+
+/// Write the `--emit-trust_ir` round-trip artifact for an already-loaded
+/// module (#413).
+fn write_emit_trust_ir_artifact(module: &trust_ir::Module, emit_path: &Path) {
+    match pipeline::save_module_to_trust_ir_text(module, emit_path) {
+        Ok(()) => {
+            eprintln!("trust-cg: wrote trust_ir text to {}", emit_path.display());
+        }
+        Err(e) => {
+            eprintln!(
+                "trust-cg: error: failed to write trust_ir text to '{}': {}",
+                emit_path.display(),
+                e,
+            );
+            process::exit(1);
+        }
+    }
+}
+
+/// Compile one trust_ir module through the wasm backend
+/// (`--target wasm32-unknown-unknown`).
+///
+/// The output is the raw `.wasm` module bytes written to `-o` (default: the
+/// input path with a `.wasm` extension). The machine-readable
+/// [`wasm::WasmCompileEvidence`] summary — naming what ran and what did NOT on
+/// this route (verification route: not_run) — is printed to stderr as one
+/// `trust-cg: wasm-evidence:` line.
+///
+/// PUBLICATION ORDER: this lane publishes nothing until the compile has
+/// SUCCEEDED. Every refusal (inapplicable options, aliased output paths) fires
+/// before the input is read; the module is then loaded ONCE, preflighted, and
+/// compiled; only then are the requested artifacts written (`--emit-json`,
+/// `--emit-trust_ir`, then the `.wasm` module). A refused invocation and a
+/// failed compile — a target-free module, a refused call contract, an fsym
+/// rejection — leave the filesystem as they found it, so a partial artifact
+/// can never outlive a failed run. The one deliberate exception is
+/// `--fsym-report-json`: that report is the record of the preflight itself and
+/// is written by the preflight, including when the preflight rejects.
+fn run_wasm32_compile(cli: &Cli, inputs: &[PathBuf], format: FormatMode, opt_level_explicit: bool) {
+    let mut refusals = wasm32_flag_refusals(cli, inputs.len(), opt_level_explicit);
+    refusals.extend(wasm32_output_alias_refusals(cli, inputs));
+    if !refusals.is_empty() {
+        for refusal in &refusals {
+            eprintln!("trust-cg: error: --target wasm32-unknown-unknown: {refusal}");
+        }
+        process::exit(1);
+    }
+
+    let input = &inputs[0];
+    let module = load_single_input_module(input, format);
+    run_fsym_preflight(
+        input,
+        &module,
+        cli.fsym,
+        cli.fsym_solver,
+        cli.fsym_report_json.as_deref(),
+    );
+
+    let (bytes, evidence) = match wasm::compile_module_with_evidence(&module) {
+        Ok(compiled) => compiled,
+        Err(e) => {
+            eprintln!(
+                "trust-cg: error: wasm32 compilation of '{}' failed: {}",
+                input.display(),
+                e,
+            );
+            process::exit(1);
+        }
+    };
+
+    // The compile succeeded: publish the requested artifacts, module bytes
+    // last.
+    if let Some(emit_path) = cli.emit_json.as_deref() {
+        write_emit_json_artifact(&module, emit_path);
+    }
+    if let Some(emit_path) = cli.emit_trust_ir.as_deref() {
+        write_emit_trust_ir_artifact(&module, emit_path);
+    }
+
+    let out_path = wasm_output_path(cli, input);
+    if let Err(e) = fs::write(&out_path, &bytes) {
+        eprintln!(
+            "trust-cg: error: cannot write '{}': {}",
+            out_path.display(),
+            e,
+        );
+        process::exit(1);
+    }
+
+    eprintln!("trust-cg: wasm-evidence: {}", evidence.to_json());
+    eprintln!(
+        "trust-cg: compiled {} function(s), {} bytes -> {} (wasm32-unknown-unknown)",
+        evidence.function_count,
+        bytes.len(),
+        out_path.display(),
+    );
+}
+
 fn main() {
-    let cli = Cli::parse();
+    // Parse through `ArgMatches` so the CLI can tell an EXPLICITLY-PASSED
+    // option from a default one: an explicit `-O` on the wasm lane (see
+    // `wasm32_flag_refusals`) and an explicit `--fsym-solver` under
+    // `--fsym=off` are both dropped requests — options the selected route
+    // never reads — and the CLI refuses dropped requests by name rather than
+    // ignoring them.
+    let matches = Cli::command().get_matches();
+    let opt_level_explicit = matches.value_source("opt_level") == Some(ValueSource::CommandLine);
+    let fsym_solver_explicit =
+        matches.value_source("fsym_solver") == Some(ValueSource::CommandLine);
+    let cli = match Cli::from_arg_matches(&matches) {
+        Ok(cli) => cli,
+        Err(e) => e.exit(),
+    };
     let inputs = resolve_inputs(&cli);
     let format = resolve_format(&cli);
 
@@ -1797,6 +2203,15 @@ fn main() {
         eprintln!("trust-cg: error: --fsym-report-json requires --fsym=warn or --fsym=error");
         process::exit(1);
     }
+    // `--fsym-solver` is read only while the preflight runs: under the default
+    // `--fsym=off` the preflight returns before the solver is consulted, so an
+    // explicitly-passed solver is a DROPPED REQUEST (the same class the wasm
+    // lane's explicit `-O` refusal names). The default value is not a request
+    // and is not refused.
+    if fsym_solver_explicit && cli.fsym == FsymModeArg::Off {
+        eprintln!("trust-cg: error: --fsym-solver requires --fsym=warn or --fsym=error");
+        process::exit(1);
+    }
     if cli.profile_generate.is_some() && inputs.len() > 1 {
         eprintln!(
             "trust-cg: error: --profile-generate JIT capture currently requires exactly one input file"
@@ -1810,63 +2225,36 @@ fn main() {
         process::exit(1);
     }
 
+    // wasm32 dispatch boundary (see `trust_cg_codegen::wasm::target`): the
+    // wasm lane compiles one module to raw `.wasm` bytes and returns — the
+    // native object/linker pipeline below never runs for it.
+    //
+    // It dispatches BEFORE the emit-json / emit-trust_ir publication below
+    // because that lane publishes nothing until its compile has succeeded: it
+    // runs its own refusals, loads the module once, compiles, and only then
+    // writes the artifacts requested here (see `run_wasm32_compile`).
+    // Otherwise a `--target wasm32 --emit-json out.json` invocation that the
+    // backend goes on to refuse would still leave `out.json` behind. The
+    // native lane's order is unchanged: it publishes these round-trip
+    // artifacts before compiling, exactly as before.
+    let target_spec = match cli.target {
+        CliTarget::Wasm32 => {
+            run_wasm32_compile(&cli, &inputs, format, opt_level_explicit);
+            return;
+        }
+        CliTarget::Native(spec) => spec,
+    };
+
     // Emit JSON round-trip output if requested (single input only).
     if let Some(ref emit_path) = cli.emit_json {
-        let module: trust_ir::Module = match pipeline::load_module_as(&inputs[0], format) {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!(
-                    "trust-cg: error: failed to read trust_ir module from '{}': {}",
-                    inputs[0].display(),
-                    e,
-                );
-                process::exit(1);
-            }
-        };
-        match serde_json::to_string_pretty(&module)
-            .map_err(|e| e.to_string())
-            .and_then(|json| fs::write(emit_path, json).map_err(|e| e.to_string()))
-        {
-            Ok(()) => {
-                eprintln!("trust-cg: wrote trust_ir JSON to {}", emit_path.display());
-            }
-            Err(e) => {
-                eprintln!(
-                    "trust-cg: error: failed to write trust_ir JSON to '{}': {}",
-                    emit_path.display(),
-                    e,
-                );
-                process::exit(1);
-            }
-        }
+        let module = load_single_input_module(&inputs[0], format);
+        write_emit_json_artifact(&module, emit_path);
     }
 
     // Emit .trust_ir text round-trip output if requested (#413, single input only).
     if let Some(ref emit_path) = cli.emit_trust_ir {
-        let module: trust_ir::Module = match pipeline::load_module_as(&inputs[0], format) {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!(
-                    "trust-cg: error: failed to read trust_ir module from '{}': {}",
-                    inputs[0].display(),
-                    e,
-                );
-                process::exit(1);
-            }
-        };
-        match pipeline::save_module_to_trust_ir_text(&module, emit_path) {
-            Ok(()) => {
-                eprintln!("trust-cg: wrote trust_ir text to {}", emit_path.display());
-            }
-            Err(e) => {
-                eprintln!(
-                    "trust-cg: error: failed to write trust_ir text to '{}': {}",
-                    emit_path.display(),
-                    e,
-                );
-                process::exit(1);
-            }
-        }
+        let module = load_single_input_module(&inputs[0], format);
+        write_emit_trust_ir_artifact(&module, emit_path);
     }
 
     // Parse PGO flags. `--profile-use` is header-validated here and then
@@ -1883,8 +2271,8 @@ fn main() {
         None => None,
     };
 
-    let config = build_config_for_input_count(&cli, inputs.len());
-    let compiler_config_bytes = canonical_compiler_config_bytes(&config, cli.target);
+    let config = build_config_for_input_count(&cli, inputs.len(), target_spec);
+    let compiler_config_bytes = canonical_compiler_config_bytes(&config, target_spec);
     let compile_artifact_cache = compile_artifact_cache_config(&cli, &config);
 
     // Determine whether we need temp files (linking mode) or permanent files
@@ -1903,7 +2291,7 @@ fn main() {
         vec![compile_one(
             input,
             &config,
-            cli.target,
+            target_spec,
             format,
             &obj_path,
             is_temp,
@@ -1936,7 +2324,7 @@ fn main() {
                     compile_one(
                         input,
                         &config,
-                        cli.target,
+                        target_spec,
                         format,
                         &obj_path,
                         is_temp,
@@ -1966,7 +2354,7 @@ fn main() {
                 compile_one(
                     input,
                     &config,
-                    cli.target,
+                    target_spec,
                     format,
                     &obj_path,
                     is_temp,
@@ -2000,7 +2388,7 @@ fn main() {
             match emit_proof_artifacts(
                 dir,
                 &fr.result,
-                cli.target,
+                target_spec,
                 &fr.trust_ir_bytes,
                 &compiler_config_bytes,
             ) {
@@ -2055,7 +2443,7 @@ fn main() {
     link(
         &object_paths,
         &output_path,
-        cli.target,
+        target_spec,
         &cli.lib_paths,
         &cli.libs,
     );
@@ -2155,14 +2543,206 @@ mod tests {
 
     #[test]
     fn multi_input_cli_config_disables_inner_function_parallelism() {
+        let spec = TargetSpec::unknown_for_architecture(Target::Aarch64);
         let single = Cli::parse_from(["trust-cg", "one.tmbc"]);
-        assert!(build_config_for_input_count(&single, 1).parallel);
+        assert!(build_config_for_input_count(&single, 1, spec).parallel);
 
         let multiple = Cli::parse_from(["trust-cg", "one.tmbc", "two.tmbc"]);
-        assert!(!build_config_for_input_count(&multiple, 2).parallel);
+        assert!(!build_config_for_input_count(&multiple, 2, spec).parallel);
 
         let explicit_serial = Cli::parse_from(["trust-cg", "--no-parallel", "one.tmbc"]);
-        assert!(!build_config_for_input_count(&explicit_serial, 1).parallel);
+        assert!(!build_config_for_input_count(&explicit_serial, 1, spec).parallel);
+    }
+
+    #[test]
+    fn parse_cli_target_accepts_the_two_wasm32_spellings_only() {
+        assert_eq!(parse_cli_target("wasm32").unwrap(), CliTarget::Wasm32);
+        assert_eq!(
+            parse_cli_target("wasm32-unknown-unknown").unwrap(),
+            CliTarget::Wasm32
+        );
+
+        // Other wasm32 triples are wasm32 per `is_wasm32_target`, but the
+        // closed-module lane refuses them with a named diagnostic.
+        for target in ["wasm32-wasip1", "wasm32-wasi", "wasm32-unknown-emscripten"] {
+            let err = parse_cli_target(target).unwrap_err();
+            assert!(err.contains("closed-module"), "{target}: {err}");
+            assert!(err.contains("wasm32-unknown-unknown"), "{target}: {err}");
+        }
+
+        // wasm64 is not a wasm32 target and falls through to the native
+        // parser's unsupported-architecture rejection.
+        let err = parse_cli_target("wasm64-unknown-unknown").unwrap_err();
+        assert!(err.contains("unsupported architecture"), "{err}");
+    }
+
+    #[test]
+    fn parse_cli_target_keeps_native_targets_native() {
+        for target in ["aarch64", "x86_64-unknown-linux-gnu", "riscv64"] {
+            match parse_cli_target(target).unwrap() {
+                CliTarget::Native(spec) => {
+                    assert_eq!(spec, parse_target(target).unwrap());
+                }
+                CliTarget::Wasm32 => panic!("{target} must not route to the wasm lane"),
+            }
+        }
+    }
+
+    #[test]
+    fn wasm32_lane_refuses_object_and_linker_flags_by_name() {
+        let cli = Cli::parse_from([
+            "trust-cg",
+            "--target",
+            "wasm32",
+            "-g",
+            "-L",
+            "/lib",
+            "-l",
+            "m",
+            "--panic-unwind",
+            "--emit-proofs",
+            "proofs/",
+            "--trace",
+            "--metrics",
+            "one.tmbc",
+        ]);
+        let refusals = wasm32_flag_refusals(&cli, 1, false);
+        let joined = refusals.join("\n");
+        for flag in [
+            "-g",
+            "-L",
+            "-l",
+            "--panic-unwind",
+            "--emit-proofs",
+            "--trace",
+            "--metrics",
+        ] {
+            assert!(
+                refusals.iter().any(|r| r.starts_with(&format!("{flag}:"))),
+                "expected a named refusal for {flag}:\n{joined}"
+            );
+        }
+
+        // Two inputs: refused (no linker to combine them).
+        let plain = Cli::parse_from(["trust-cg", "--target", "wasm32", "a.tmbc", "b.tmbc"]);
+        let refusals = wasm32_flag_refusals(&plain, 2, false);
+        assert!(
+            refusals.iter().any(|r| r.starts_with("<INPUT>...:")),
+            "expected a named multi-input refusal: {refusals:?}"
+        );
+
+        // A plain single-input wasm32 compile carries no refusals.
+        let ok = Cli::parse_from(["trust-cg", "--target", "wasm32", "a.tmbc"]);
+        assert!(wasm32_flag_refusals(&ok, 1, false).is_empty());
+        let ok_compile_only = Cli::parse_from(["trust-cg", "--target", "wasm32", "-c", "a.tmbc"]);
+        assert!(wasm32_flag_refusals(&ok_compile_only, 1, false).is_empty());
+
+        // An EXPLICIT -O is a dropped request on this lane; the default is not.
+        let explicit_opt = Cli::parse_from(["trust-cg", "--target", "wasm32", "-O3", "a.tmbc"]);
+        let refusals = wasm32_flag_refusals(&explicit_opt, 1, true);
+        assert!(
+            refusals.iter().any(|r| r.starts_with("-O/--opt-level:")),
+            "expected a named explicit -O refusal: {refusals:?}"
+        );
+        assert!(wasm32_flag_refusals(&explicit_opt, 1, false).is_empty());
+    }
+
+    #[test]
+    fn wasm32_lane_refuses_aliased_output_paths_by_name() {
+        // An output that names the input would destroy the module the compile
+        // reads (`--format=text --emit-json <input> <input>`).
+        let over_input = Cli::parse_from([
+            "trust-cg",
+            "--target",
+            "wasm32",
+            "--format=text",
+            "--emit-json",
+            "m.trust_ir",
+            "m.trust_ir",
+        ]);
+        let refusals = wasm32_output_alias_refusals(&over_input, &[PathBuf::from("m.trust_ir")]);
+        assert!(
+            refusals
+                .iter()
+                .any(|r| r.starts_with("--emit-json:") && r.contains("input module")),
+            "expected a named emit-over-input refusal: {refusals:?}"
+        );
+
+        // Two outputs naming one file: one of them would be clobbered. The
+        // aliased spelling (`./out.json`) must be recognised as the same file.
+        let colliding = Cli::parse_from([
+            "trust-cg",
+            "--target",
+            "wasm32",
+            "--emit-json",
+            "out.json",
+            "-o",
+            "./out.json",
+            "m.tmbc",
+        ]);
+        let refusals = wasm32_output_alias_refusals(&colliding, &[PathBuf::from("m.tmbc")]);
+        assert!(
+            refusals
+                .iter()
+                .any(|r| r.starts_with("--emit-json:") && r.contains("-o/--output")),
+            "expected a named output-collision refusal: {refusals:?}"
+        );
+
+        // Distinct outputs and a distinct input: nothing is refused.
+        let ok = Cli::parse_from([
+            "trust-cg",
+            "--target",
+            "wasm32",
+            "--emit-json",
+            "out.json",
+            "--emit-trust_ir",
+            "out.trust_ir",
+            "-o",
+            "out.wasm",
+            "m.tmbc",
+        ]);
+        assert!(
+            wasm32_output_alias_refusals(&ok, &[PathBuf::from("m.tmbc")]).is_empty(),
+            "distinct paths must not be refused"
+        );
+
+        // The DEFAULT output path aliases the input when the input itself ends
+        // in `.wasm`; that is still a destroyed input, and it is named.
+        let default_over_input = Cli::parse_from(["trust-cg", "--target", "wasm32", "m.wasm"]);
+        let refusals =
+            wasm32_output_alias_refusals(&default_over_input, &[PathBuf::from("m.wasm")]);
+        assert!(
+            refusals
+                .iter()
+                .any(|r| r.starts_with("-o/--output (defaulted to <INPUT>.wasm):")),
+            "expected the defaulted output path to be named: {refusals:?}"
+        );
+    }
+
+    #[test]
+    fn output_alias_key_identifies_aliased_spellings_of_one_path() {
+        let dir = std::env::temp_dir().join(format!("trust_cg_alias_key_{}", process::id()));
+        let inner = dir.join("inner");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&inner).expect("create alias-key scratch dirs");
+
+        // The file does not exist yet — the normal case for an output — so the
+        // key resolves through the parent directory.
+        let plain = dir.join("probe.json");
+        let dotted = dir.join(".").join("probe.json");
+        let via_parent = inner.join("..").join("probe.json");
+        assert_eq!(output_alias_key(&plain), output_alias_key(&dotted));
+        assert_eq!(output_alias_key(&plain), output_alias_key(&via_parent));
+        assert_ne!(
+            output_alias_key(&plain),
+            output_alias_key(&dir.join("other.json")),
+        );
+
+        // An existing file canonicalizes directly, to the same key.
+        fs::write(&plain, b"{}").expect("write alias-key probe");
+        assert_eq!(output_alias_key(&plain), output_alias_key(&via_parent));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

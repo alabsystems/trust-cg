@@ -1071,6 +1071,24 @@ fn register_wasm_proofs(proofs: &mut Vec<CategorizedProof>) {
             category: ProofCategory::WasmLowering,
         });
     }
+    // P3 (the value domain): the 32 NARROW-WIDTH obligations — an `i32`-carried
+    // `u8`/`i8`/`u16`/`i16` respects its width invariant across the backend's
+    // wrapping arithmetic, and the re-normalization sequence establishes that
+    // invariant. Registered here (rather than in `all_wasm_lowering_proofs`,
+    // whose documented set is the 54 scalar-op witnesses) so the P3 additions
+    // are a separately auditable block. Every one is non-degenerate: the source
+    // computes at the NARROW width and lifts, the machine computes at i32 and
+    // re-normalizes. The per-OPCODE P3 obligations (sub-word / FP memory, the
+    // sign-extension operators) are reconstruction-credited through
+    // `GateArch::WasmValueDomain` instead — the same rule that keeps every other
+    // reconstruction out of the static database.
+    for mut p in crate::wasm_value_domain::narrow_width_proofs() {
+        p.category = Some(ProofCategory::WasmLowering.transval_check_kind());
+        proofs.push(CategorizedProof {
+            obligation: p,
+            category: ProofCategory::WasmLowering,
+        });
+    }
 }
 
 #[inline(never)]
@@ -1363,6 +1381,54 @@ impl ProofDatabase {
         register_checked_overflow_proofs(&mut proofs);
         register_i128_carry_chain_proofs(&mut proofs);
         register_widening_multiply_proofs(&mut proofs);
+        register_bitfield_extract_proofs(&mut proofs);
+        ProofDatabase { proofs }
+    }
+
+    /// Like [`ProofDatabase::new`], but WITHOUT the x86-64 registry.
+    ///
+    /// `register_x86_64_proofs` builds 531 proofs and costs **40.6 ms of the
+    /// 50.2 ms** total database construction — 81% — and the database is built
+    /// once per rustc process, i.e. once per compile. An AArch64 compile can
+    /// never discharge an x86-64 obligation, so on that target the work is pure
+    /// overhead.
+    ///
+    /// This is deliberately a SEPARATE constructor rather than a change to
+    /// [`ProofDatabase::new`]: the full database's contents are pinned by the
+    /// published coverage ratios, and `new()` keeps returning exactly what it
+    /// always did.
+    ///
+    /// SAFETY NOTE FOR FUTURE READERS. The AArch64 verifier finds a proof by
+    /// `by_category(category)` followed by a SUBSTRING match on the obligation
+    /// NAME, taking the first hit in registration order. Dropping the x86-64
+    /// rows can therefore only change behaviour if some AArch64 instruction was
+    /// matching an x86-64-named proof and nothing earlier — which would be a
+    /// soundness smell in itself. That this does not happen is checked, not
+    /// assumed: all 18 beat-llvm programs are `.text` byte-identical with
+    /// matching exit codes either way.
+    pub fn new_without_x86_64() -> Self {
+        let mut proofs = Vec::new();
+        register_arithmetic_proofs(&mut proofs);
+        register_fp_proofs(&mut proofs);
+        register_comparison_branch_proofs(&mut proofs);
+        register_peephole_opt_proofs(&mut proofs);
+        register_analysis_proofs(&mut proofs);
+        register_backend_proofs(&mut proofs);
+        register_target_proofs(&mut proofs);
+        register_emission_proofs(&mut proofs);
+        register_strength_reduce_proofs(&mut proofs);
+        register_cmp_combine_proofs(&mut proofs);
+        register_gvn_proofs(&mut proofs);
+        register_if_convert_proofs(&mut proofs);
+        register_fp_convert_proofs(&mut proofs);
+        register_ext_trunc_proofs(&mut proofs);
+        register_atomic_proofs(&mut proofs);
+        register_call_lowering_proofs(&mut proofs);
+        register_riscv_proofs(&mut proofs);
+        register_wasm_proofs(&mut proofs);
+        register_switch_proofs(&mut proofs);
+        register_checked_overflow_proofs(&mut proofs);
+        register_i128_carry_chain_proofs(&mut proofs);
         register_bitfield_extract_proofs(&mut proofs);
         ProofDatabase { proofs }
     }
@@ -2411,18 +2477,18 @@ mod tests {
     fn test_comparison_proofs_count() {
         let db = ProofDatabase::new();
         let count = db.count_by_category(ProofCategory::Comparison);
-        // 9 genuine conditions x 2 widths = 18 (the degenerate UGE/HS pair was
-        // retracted in #62; CSet is reconstruction-credited).
-        assert_eq!(count, 18, "expected 18 comparison proofs, got {}", count);
+        // 10 conditions x 2 widths = 20: the UGE/HS pair #62 retracted as
+        // degenerate is genuine again with the adder carry-out C flag (nzcv.rs).
+        assert_eq!(count, 20, "expected 20 comparison proofs, got {}", count);
     }
 
     #[test]
     fn test_branch_proofs_count() {
         let db = ProofDatabase::new();
         let count = db.count_by_category(ProofCategory::Branch);
-        // 9 genuine conditions x 2 widths = 18 (the degenerate UGE/B.HS pair was
-        // retracted in #62; Bcc is reconstruction-credited).
-        assert_eq!(count, 18, "expected 18 branch proofs, got {}", count);
+        // 10 conditions x 2 widths = 20: the UGE/HS pair #62 retracted as
+        // degenerate is genuine again with the adder carry-out C flag (nzcv.rs).
+        assert_eq!(count, 20, "expected 20 branch proofs, got {}", count);
     }
 
     #[test]
@@ -2829,7 +2895,9 @@ mod tests {
         // +10 for the ADD-LSR shifted-register obligations (5 amounts x {W,X},
         // all_add_lsr_shift_proofs — the shift-ALU fusion peephole's
         // AddRRShiftLsr, the srem/sdiv magic sign-bit correction) = 74.
-        assert_eq!(count, 74, "expected 74 bitwise/shift proofs, got {}", count);
+        // +10 for the standalone ROR-immediate obligations (5 amounts x {W,X},
+        // all_ror_immediate_proofs — the rotate recognizer's unfused RorRI) = 84.
+        assert_eq!(count, 84, "expected 84 bitwise/shift proofs, got {}", count);
     }
 
     // =======================================================================

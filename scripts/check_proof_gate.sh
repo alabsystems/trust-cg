@@ -26,12 +26,15 @@
 # never a pass. Only five audited wide x86 bit-vector obligations may remain
 # pending (Sdiv I32/I64, Srem I32/I64, and V2I64 widening Umul); an entry may
 # graduate to Verified, but any new pending name hard-fails the floor. The
-# registry contains exactly 1,877 unique obligations, so the five-row capacity
-# ceiling requires at least 1,872 formally Verified rows and 0 soundness
-# failures. Several minutes; quick smoke via
+# registry contains exactly 1,907 unique obligations, so the five-row capacity
+# ceiling requires at least 1,902 formally Verified rows and 0 soundness
+# failures. (These two numbers are PROSE — this script asserts neither. The
+# authority is EXPECTED_STATIC_PROOF_OBLIGATION_COUNT in
+# crates/trust-cg-verify/tests/proof_gate_strict.rs, which does assert it.
+# They read 1,877/1,872 until 2026-08-26, one corpus growth out of date.) Several minutes; quick smoke via
 # `--test representative_arithmetic_is_formally_verified`.
 #
-# v0.1.0 intentionally exposes only the external solver lane. It uses an `ay`
+# trust-cg intentionally exposes only the external solver lane. It uses an `ay`
 # binary on PATH (`z3_available()` retains its legacy compatibility name);
 # there is no native-AY Cargo feature in this release.
 #

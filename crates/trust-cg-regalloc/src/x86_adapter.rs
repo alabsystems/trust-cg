@@ -327,6 +327,7 @@ pub fn x86_64_alloc_config() -> crate::AllocConfig {
         enable_spill_code: true,
         enable_spill_slot_reuse: true,
         hints: BTreeMap::new(),
+        callee_saved_regs: x86_64_callee_saved_regs(),
         coalesce_tuning: x86_64_coalesce_tuning(),
     }
 }
@@ -343,6 +344,7 @@ pub fn x86_64_greedy_alloc_config() -> crate::AllocConfig {
         enable_spill_code: true,
         enable_spill_slot_reuse: true,
         hints: BTreeMap::new(),
+        callee_saved_regs: x86_64_callee_saved_regs(),
         coalesce_tuning: x86_64_coalesce_tuning(),
     }
 }

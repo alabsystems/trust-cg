@@ -178,6 +178,17 @@ impl AnalysisCache {
     }
 
     /// Current cache reuse statistics.
+    /// Both CFG analyses from one borrow, so a pass can hold the dominator
+    /// tree and the loop analysis together while it mutates the function
+    /// (the analyses belong to the cache, not to the function).
+    pub fn domtree_and_loops(&mut self, func: &MachFunction) -> (&DomTree, &LoopAnalysis) {
+        self.loop_analysis(func);
+        (
+            self.domtree.as_ref().unwrap(),
+            self.loop_analysis.as_ref().unwrap(),
+        )
+    }
+
     pub fn stats(&self) -> AnalysisCacheStats {
         self.stats
     }
@@ -476,15 +487,57 @@ fn diag_changed_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("TCG_DIAG_CHANGED").is_some())
 }
 
+/// Buffered sink for `[trust-cg-time-pass]` records.
+///
+/// This logger fires PER PASS, PER ITERATION, PER FUNCTION — with ~148 passes
+/// in the O2 ladder that is thousands of events per compile, and each one did a
+/// `function_shape` walk of the whole function plus an unbuffered `eprintln!`
+/// write syscall. All of it landed inside the enclosing `opt-pass-manager` and
+/// `optimization` phase timers.
+///
+/// That is why enabling `TRUST_CG_TIME_PASSES` alongside
+/// `TRUST_CG_TIME_PIPELINE` once reported 167ms of phases inside a ~120ms
+/// compile, including a fictional 147ms "opt-pass-manager". Records now
+/// accumulate per thread and flush when the thread ends.
+struct PassTimeLog {
+    lines: Vec<String>,
+}
+
+impl Drop for PassTimeLog {
+    fn drop(&mut self) {
+        if self.lines.is_empty() {
+            return;
+        }
+        use std::io::Write;
+        let stderr = std::io::stderr();
+        let mut out = stderr.lock();
+        for line in &self.lines {
+            let _ = writeln!(out, "{line}");
+        }
+        let _ = out.flush();
+    }
+}
+
+thread_local! {
+    static PASS_TIME_LOG: std::cell::RefCell<PassTimeLog> =
+        const { std::cell::RefCell::new(PassTimeLog { lines: Vec::new() }) };
+}
+
+fn pass_time_record(line: String) {
+    PASS_TIME_LOG.with(|log| log.borrow_mut().lines.push(line));
+}
+
 fn log_pass_start(func: &MachFunction, iteration: u32, pass_name: &str) -> Option<Instant> {
     if !should_time_passes() {
         return None;
     }
-    let (blocks, insts) = function_shape(func);
-    eprintln!(
-        "[trust-cg-time-pass] start func={} iter={} pass={} blocks={} insts={}",
-        func.name, iteration, pass_name, blocks, insts
-    );
+    // No `function_shape` here: it walks the whole function, once per pass per
+    // iteration. The END record reports the post-pass shape, which is the
+    // figure that actually says what the pass did.
+    pass_time_record(format!(
+        "[trust-cg-time-pass] start func={} iter={iteration} pass={pass_name}",
+        func.name
+    ));
     Some(Instant::now())
 }
 
@@ -498,17 +551,14 @@ fn log_pass_end(
     let Some(start) = start else {
         return;
     };
+    // Clock first: the shape walk and the record below are instrumentation.
+    let elapsed_us = start.elapsed().as_micros();
     let (blocks, insts) = function_shape(func);
-    eprintln!(
-        "[trust-cg-time-pass] end func={} iter={} pass={} changed={} elapsed_us={} blocks={} insts={}",
-        func.name,
-        iteration,
-        pass_name,
-        changed,
-        start.elapsed().as_micros(),
-        blocks,
-        insts
-    );
+    pass_time_record(format!(
+        "[trust-cg-time-pass] end func={} iter={iteration} pass={pass_name} changed={changed} \
+         elapsed_us={elapsed_us} blocks={blocks} insts={insts}",
+        func.name
+    ));
 }
 
 fn collect_proof_optimization_certificates(stats: &mut PassStats, pass: &mut dyn MachinePass) {
@@ -652,10 +702,16 @@ impl PassManager {
         let mut mutation_epoch: u64 = 0;
         let mut nochange_epoch: Vec<Option<u64>> = vec![None; self.passes.len()];
 
+        // The CFG analyses (dominators, loops) are pure functions of the CFG, and
+        // `update_cache_after_changed_pass` already keeps them across passes
+        // whose CFG fingerprint is unchanged. Nothing runs between one
+        // iteration's end and the next one's start, so the cache is carried
+        // across iterations too instead of being rebuilt — same analyses, same
+        // answers, one dominator/loop computation fewer per iteration.
+        let mut cache = AnalysisCache::new();
         for iteration in 0..max_iterations {
             stats.iterations = iteration + 1;
             let mut any_changed = false;
-            let mut cache = AnalysisCache::new();
             // One fingerprint maintained across pass runs. Computing it before
             // EVERY invocation was pure waste for the changed=false majority —
             // measured at 15.6 -> 27.5ms of non-pass-body optimization-phase
@@ -684,16 +740,26 @@ impl PassManager {
                 let pass_changed = pass.run_with_analyses(func, &mut cache);
                 log_pass_end(func, iteration + 1, &pass_name, pass_changed, timer);
                 if let Some(pre) = diag_pre {
-                    if pass_changed {
-                        let post = format!("{func:?}");
-                        if pre == post {
-                            eprintln!(
-                                "TCG_DIAG_CHANGED FALSE-CHANGED iter={} pass={} func={}",
-                                iteration + 1,
-                                pass_name,
-                                func.name
-                            );
-                        }
+                    let post = format!("{func:?}");
+                    if pass_changed && pre == post {
+                        eprintln!(
+                            "TCG_DIAG_CHANGED FALSE-CHANGED iter={} pass={} func={}",
+                            iteration + 1,
+                            pass_name,
+                            func.name
+                        );
+                    }
+                    // The dangerous direction: a pass that MUTATED the function
+                    // but reported no change. The epoch skip above would then
+                    // leave later passes running on stale assumptions, and the
+                    // fixpoint could stop early.
+                    if !pass_changed && pre != post {
+                        eprintln!(
+                            "TCG_DIAG_CHANGED SILENT-MUTATION iter={} pass={} func={}",
+                            iteration + 1,
+                            pass_name,
+                            func.name
+                        );
                     }
                 }
                 let bk = log_pass_start(func, iteration + 1, &bookkeeping_name(&pass_name));

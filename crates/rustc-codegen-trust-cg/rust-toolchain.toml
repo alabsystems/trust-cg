@@ -1,4 +1,4 @@
-# rustc_codegen_trust_cg v0.1.0 nightly pin.
+# rustc_codegen_trust_cg nightly pin.
 #
 # This standalone research-preview bridge links rustc internals through
 # `#![feature(rustc_private)]`; both those APIs and the `CodegenBackend` dylib

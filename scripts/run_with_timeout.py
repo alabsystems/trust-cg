@@ -73,6 +73,11 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 
 
 def group_exists(process_group: int) -> bool:
+    # Popen.pid should always be positive, but never let a malformed value
+    # reach killpg: group 0 is this runner's own process group and group 1 may
+    # contain an unrelated session leader.
+    if process_group <= 1:
+        return False
     try:
         os.killpg(process_group, 0)
     except ProcessLookupError:
@@ -83,6 +88,8 @@ def group_exists(process_group: int) -> bool:
 
 
 def signal_group(process_group: int, signum: int) -> None:
+    if process_group <= 1:
+        return
     try:
         os.killpg(process_group, signum)
     except ProcessLookupError:

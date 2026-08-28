@@ -642,6 +642,11 @@ impl LowerCtx {
 const UNROLL: usize = 4;
 
 fn apply(func: &mut MachFunction, rec: &Recognized) -> bool {
+    // IDEMPOTENCE: never vectorize the remainder loop of a loop this pass
+    // already vectorized (see `crate::vector_remainder`).
+    if crate::vector_remainder::preheader_folds_neon_lane_into(func, rec.preheader, rec.acc) {
+        return false;
+    }
     let width = UNROLL as i64 * VF; // lanes per vector iteration (16)
     let vh = func.create_block();
     let vb = func.create_block();
@@ -1991,6 +1996,13 @@ impl BitChainRecognized {
 /// header and never edits the scalar chain, so the scalar loop finishes the
 /// `< width` tail unchanged.
 fn apply_chain(func: &mut MachFunction, rec: &BitChainRecognized) -> bool {
+    // IDEMPOTENCE: never vectorize the remainder loop of a loop this pass
+    // already vectorized (see `crate::vector_remainder`).
+    if rec.reductions.iter().any(|r| {
+        crate::vector_remainder::preheader_folds_neon_lane_into(func, rec.preheader, r.acc)
+    }) {
+        return false;
+    }
     let (vf, elem_bytes, elem_code, const_class) = if rec.is_i64 {
         (VF_I64, ELEM_BYTES_I64, ELEM_D, RegClass::Gpr64)
     } else {
@@ -2104,6 +2116,9 @@ fn apply_chain(func: &mut MachFunction, rec: &BitChainRecognized) -> bool {
             let Some(&vterm) = loaded.get(&(red.base.id, k)) else {
                 return false;
             };
+            // `vacc[ri]` was collected from `(0..UNROLL)` in the preheader
+            // above, and `k` ranges over that same `0..UNROLL` — same constant,
+            // same function, no resize in between.
             let acc = vacc[ri]
                 .get(k)
                 .copied()
@@ -2554,5 +2569,59 @@ mod tests {
         assert!(!changed, "a store in the loop body must BAIL fail-closed");
         assert_eq!(pass.fired(), 0);
         assert_eq!(count(&func, AArch64Opcode::NeonMovi), 0, "no NEON emitted");
+    }
+
+    /// IDEMPOTENCE (the neon-bytesum / neon-fill bug class of 2026-08-27: a
+    /// vectorizer that keeps the scalar loop as the remainder and then
+    /// recognizes that remainder again on the next fixpoint iteration). After
+    /// the first firing, further runs must change nothing.
+    #[test]
+    fn second_run_is_a_no_op() {
+        let mut func = build_loop(1);
+        assert!(NeonReducePass::new().run(&mut func), "first run must fire");
+        let (insts, blocks) = (func.insts.len(), func.blocks.len());
+        for again in 2..=4 {
+            assert!(
+                !NeonReducePass::new().run(&mut func),
+                "run {again}: re-fired on its own output"
+            );
+            assert_eq!(func.insts.len(), insts, "run {again} added instructions");
+            assert_eq!(func.blocks.len(), blocks, "run {again} added blocks");
+        }
+    }
+
+    /// IDEMPOTENCE over every firing shape the builders offer (the primary
+    /// `second_run_is_a_no_op` covers one; today's bug class hid in shapes
+    /// the primary test did not exercise).
+    #[test]
+    fn second_run_is_a_no_op_for_every_firing_variant() {
+        let cases: Vec<(&str, Box<dyn Fn() -> MachFunction>)> = vec![
+            ("isq", Box::new(|| build_loop(1))),
+            ("dual-bitwise-chain", Box::new(|| build_chain_loop(false))),
+        ];
+        for (label, build) in cases {
+            let mut func = build();
+            assert!(
+                NeonReducePass::new().run(&mut func),
+                "{label}: first run must fire"
+            );
+            let (insts, blocks) = (func.insts.len(), func.blocks.len());
+            for again in 2..=4 {
+                assert!(
+                    !NeonReducePass::new().run(&mut func),
+                    "{label}: run {again} re-fired on its own output"
+                );
+                assert_eq!(
+                    func.insts.len(),
+                    insts,
+                    "{label}: run {again} added instructions"
+                );
+                assert_eq!(
+                    func.blocks.len(),
+                    blocks,
+                    "{label}: run {again} added blocks"
+                );
+            }
+        }
     }
 }

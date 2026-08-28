@@ -2316,6 +2316,69 @@ impl X86Encoder {
             }
 
             // =================================================================
+            // Memory-destination RMW ALU (XOR/ADD [mem], r64)
+            // =================================================================
+            // XOR [base+disp], r64: REX.W + 31 /r — the same ALU `/r` byte as
+            // XorRR, with a memory-destination ModRM (mod != 11).
+            X86Opcode::XorMR => {
+                let src = self.require_dst(ops, opcode)?; // dst field holds src for stores
+                let base = ops.base.ok_or_else(|| {
+                    X86EncodeError::InvalidOperands(format!("{:?}: missing base register", opcode))
+                })?;
+                self.encode_mov_mr_width(src, base, ops.disp, 0x31, true, false, false)?;
+            }
+            // ADD [base+disp], r64: REX.W + 01 /r — the same ALU `/r` byte as
+            // AddRR, memory-destination form.
+            X86Opcode::AddMR => {
+                let src = self.require_dst(ops, opcode)?; // dst field holds src for stores
+                let base = ops.base.ok_or_else(|| {
+                    X86EncodeError::InvalidOperands(format!("{:?}: missing base register", opcode))
+                })?;
+                self.encode_mov_mr_width(src, base, ops.disp, 0x01, true, false, false)?;
+            }
+            // XOR [base+index*scale+disp], r64: REX.W + 31 /r + SIB. Same
+            // shape as MovMRSib with the ALU opcode byte.
+            X86Opcode::XorMRSib => {
+                let src = self.require_dst(ops, opcode)?; // dst field holds src for stores
+                let base = ops.base.ok_or_else(|| {
+                    X86EncodeError::InvalidOperands(format!("{:?}: missing base register", opcode))
+                })?;
+                let index = ops.index.ok_or_else(|| {
+                    X86EncodeError::InvalidOperands(format!("{:?}: missing index register", opcode))
+                })?;
+                Self::validate_sib_mem_operand(opcode, index, ops.scale)?;
+                let rex = RexPrefix {
+                    w: true,
+                    r: src.hw_enc() >= 8,
+                    x: index.hw_enc() >= 8,
+                    b: base.hw_enc() >= 8,
+                };
+                self.emit_rex(rex);
+                self.emit_byte(0x31);
+                self.emit_sib_mem_operand(src.hw_enc(), base, index, ops.scale, ops.disp)?;
+            }
+            // ADD [base+index*scale+disp], r64: REX.W + 01 /r + SIB.
+            X86Opcode::AddMRSib => {
+                let src = self.require_dst(ops, opcode)?; // dst field holds src for stores
+                let base = ops.base.ok_or_else(|| {
+                    X86EncodeError::InvalidOperands(format!("{:?}: missing base register", opcode))
+                })?;
+                let index = ops.index.ok_or_else(|| {
+                    X86EncodeError::InvalidOperands(format!("{:?}: missing index register", opcode))
+                })?;
+                Self::validate_sib_mem_operand(opcode, index, ops.scale)?;
+                let rex = RexPrefix {
+                    w: true,
+                    r: src.hw_enc() >= 8,
+                    x: index.hw_enc() >= 8,
+                    b: base.hw_enc() >= 8,
+                };
+                self.emit_rex(rex);
+                self.emit_byte(0x01);
+                self.emit_sib_mem_operand(src.hw_enc(), base, index, ops.scale, ops.disp)?;
+            }
+
+            // =================================================================
             // MOVZX / MOVSX
             // =================================================================
             // MOVZX r64, r/m8: REX.W + 0F B6 /r (mod=11 for reg-reg)
@@ -7055,6 +7118,113 @@ mod tests {
             },
         );
         assert_eq!(bytes, vec![0x48, 0x89, 0x4C, 0xD3, 0x20]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Memory-destination RMW ALU (XOR/ADD [mem], r64)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_xor_mr_sib_store() {
+        // XOR [RBX + RCX*4], RAX: REX.W(48) + 31 + ModRM(00 000 100) + SIB —
+        // byte-identical to the MovMRSib shape (test_mov_mr_sib_store) with
+        // the ALU /r byte 0x31 in place of 0x89.
+        let bytes = encode(
+            X86Opcode::XorMRSib,
+            &X86InstOperands {
+                dst: Some(RAX), // src register stored in dst field for stores
+                base: Some(RBX),
+                index: Some(RCX),
+                scale: 4,
+                disp: 0,
+                ..X86InstOperands::none()
+            },
+        );
+        assert_eq!(bytes, vec![0x48, 0x31, 0x04, 0x8B]);
+    }
+
+    #[test]
+    fn test_add_mr_sib_store_disp8() {
+        // ADD [RBX + RDX*8 + 32], RCX: REX.W(48) + 01 + ModRM(01 001 100) +
+        // SIB + disp8 — mirrors test_mov_mr_sib_store_disp8 with 0x01.
+        let bytes = encode(
+            X86Opcode::AddMRSib,
+            &X86InstOperands {
+                dst: Some(RCX),
+                base: Some(RBX),
+                index: Some(RDX),
+                scale: 8,
+                disp: 32,
+                ..X86InstOperands::none()
+            },
+        );
+        assert_eq!(bytes, vec![0x48, 0x01, 0x4C, 0xD3, 0x20]);
+    }
+
+    #[test]
+    fn test_xor_mr_sib_extended_regs() {
+        // XOR [R12 + R9*2], R8: REX.WRXB(4F) + 31 + ModRM(00 000 100) +
+        // SIB(01 001 100) — the same REX fields as test_mov_rm_sib_r8_r12_r9_scale2.
+        let bytes = encode(
+            X86Opcode::XorMRSib,
+            &X86InstOperands::rm_sib(R8, R12, R9, 2, 0),
+        );
+        assert_eq!(bytes, vec![0x4F, 0x31, 0x04, 0x4C]);
+    }
+
+    #[test]
+    fn test_xor_mr_base_disp() {
+        // XOR [RBP - 8], RAX: REX.W(48) + 31 + ModRM(01 000 101) + disp8.
+        // (`xorq %rax, -8(%rbp)` -> 48 31 45 f8.)
+        let bytes = encode(
+            X86Opcode::XorMR,
+            &X86InstOperands {
+                dst: Some(RAX), // src register stored in dst field for stores
+                base: Some(RBP),
+                disp: -8,
+                ..X86InstOperands::none()
+            },
+        );
+        assert_eq!(bytes, vec![0x48, 0x31, 0x45, 0xF8]);
+    }
+
+    #[test]
+    fn test_add_mr_base_no_disp() {
+        // ADD [RBX], RCX: REX.W(48) + 01 + ModRM(00 001 011).
+        // (`addq %rcx, (%rbx)` -> 48 01 0b.)
+        let bytes = encode(
+            X86Opcode::AddMR,
+            &X86InstOperands {
+                dst: Some(RCX),
+                base: Some(RBX),
+                disp: 0,
+                ..X86InstOperands::none()
+            },
+        );
+        assert_eq!(bytes, vec![0x48, 0x01, 0x0B]);
+    }
+
+    #[test]
+    fn test_rmw_is_not_the_plain_store_and_ops_differ() {
+        // Negative controls: the RMW forms must differ from the plain MOV
+        // store at the same operands (0x31/0x01 vs 0x89) and from each other.
+        let ops = X86InstOperands {
+            dst: Some(RAX),
+            base: Some(RBX),
+            index: Some(RCX),
+            scale: 4,
+            disp: 0,
+            ..X86InstOperands::none()
+        };
+        let xor = encode(X86Opcode::XorMRSib, &ops);
+        let add = encode(X86Opcode::AddMRSib, &ops);
+        let mov = encode(X86Opcode::MovMRSib, &ops);
+        assert_ne!(xor, mov, "XorMRSib must not encode as the plain store");
+        assert_ne!(add, mov, "AddMRSib must not encode as the plain store");
+        assert_ne!(xor, add, "XorMRSib and AddMRSib must differ (0x31 vs 0x01)");
+        // Same shape, only the opcode byte differs.
+        assert_eq!(xor[0], mov[0]);
+        assert_eq!(&xor[2..], &mov[2..]);
     }
 
     // -----------------------------------------------------------------------

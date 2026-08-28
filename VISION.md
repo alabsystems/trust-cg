@@ -1,6 +1,7 @@
 # trust-cg vision
 
-This document describes the direction of travel, not the guarantees of v0.1.0.
+This document describes the direction of travel, not the guarantees of any
+shipped 0.x release.
 For current behavior and trust boundaries, use the top-level
 [`README`](README.md) and [`LIMITATIONS`](LIMITATIONS.md).
 
@@ -54,5 +55,5 @@ Among other work, the project must complete:
 - certificate generation and independent replay on every claimed path;
 - robust differential validation across targets and operating systems.
 
-v0.1.0 implements useful pieces of this architecture, but does not provide an
-unbroken source-to-binary proof or a binary with no trust assumptions.
+trust-cg implements useful pieces of this architecture, but does not provide
+an unbroken source-to-binary proof or a binary with no trust assumptions.

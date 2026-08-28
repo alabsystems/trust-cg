@@ -168,6 +168,13 @@ fn run_loop_latch_layout_combine(
     // by adding a dedicated latch block, so stale loop info is deliberately
     // avoided even for O2's single pipeline iteration.
     for _ in 0..func.blocks.len() {
+        refresh_block_order_index(func);
+        // Rebuilt per iteration, which is exactly as fresh as `dom`/`loops`
+        // below: the driver rewrites at most ONE loop and then breaks to
+        // re-derive everything. A tier that declines must not mutate `func` —
+        // the same contract the existing stale-analysis reasoning already
+        // depends on.
+        let vreg_uses = VregUseIndex::build(func);
         let dom = DomTree::compute(func);
         let loops = LoopAnalysis::compute(func, &dom);
         // The EXTENDED tier rotates INNERMOST loops only: rotating a loop
@@ -177,19 +184,32 @@ fn run_loop_latch_layout_combine(
         // +5% on p7_sieve when its 60k-iteration outer loop rotated).
         // Innermost bodies are where the per-iteration savings live
         // (b1_mispredict -11%); the legacy tiers keep their own admission.
-        let candidates: Vec<(NaturalLoop, bool)> = loops
-            .all_loops()
-            .map(|lp| {
-                let innermost = loops
-                    .all_loops()
-                    .all(|o| o.header == lp.header || !lp.body.contains(&o.header));
-                (lp.clone(), innermost)
-            })
-            .collect();
+        //
+        // Innermost test, without the nested scan or the clone.
+        //
+        // It was `all_loops()` inside `all_loops()` — O(L^2) per driver
+        // iteration, and the driver runs up to `blocks.len()` of them — plus a
+        // full `NaturalLoop` clone (body `HashSet` and all) for every loop, when
+        // at most ONE is rewritten before the driver breaks.
+        //
+        // "no other loop's header lies in my body" is the same predicate as
+        // "my body contains no loop header except possibly my own", which one
+        // header set answers in O(|body|).
+        let loop_headers: HashSet<BlockId> = loops.all_loops().map(|l| l.header).collect();
 
         let mut rewrote_one = false;
-        for (lp, innermost) in candidates {
-            if rewrite_loop(func, &lp, provenance.as_deref_mut(), extended && innermost) {
+        for lp in loops.all_loops() {
+            let innermost = !lp
+                .body
+                .iter()
+                .any(|b| *b != lp.header && loop_headers.contains(b));
+            if rewrite_loop(
+                func,
+                lp,
+                provenance.as_deref_mut(),
+                extended && innermost,
+                &vreg_uses,
+            ) {
                 changed = true;
                 rewrote_one = true;
                 break;
@@ -209,6 +229,7 @@ fn rewrite_loop(
     lp: &NaturalLoop,
     mut provenance: Option<&mut ProvenanceMap>,
     extended: bool,
+    vreg_uses: &VregUseIndex,
 ) -> bool {
     if rewrite_counted_two_block_loop(func, lp, provenance.as_deref_mut()) {
         return true;
@@ -226,7 +247,13 @@ fn rewrite_loop(
         // duplicating that test into each in-loop backedge predecessor, so the
         // steady state skips the header round-trip (ackermann's countdown loop
         // with two backedges, header `cbz M, exit`).
-        if duplicate_header_test_into_latches(func, lp, provenance.as_deref_mut(), extended) {
+        if duplicate_header_test_into_latches(
+            func,
+            lp,
+            provenance.as_deref_mut(),
+            extended,
+            vreg_uses,
+        ) {
             return true;
         }
     }
@@ -1027,6 +1054,7 @@ fn parse_test_only_header(
     func: &MachFunction,
     lp: &NaturalLoop,
     extended: bool,
+    vreg_uses: &VregUseIndex,
 ) -> Option<TestOnlyHeader> {
     let header = func.block(lp.header);
     if header.succs.len() != 2 {
@@ -1111,22 +1139,11 @@ fn parse_test_only_header(
     // Every carrier dest must be consumed ONLY inside this header: a use
     // anywhere else would read the original vreg while the rotated latches
     // define fresh renames, changing the value it sees.
-    if !carrier_dsts.is_empty() {
-        let header_ids: HashSet<InstId> = header.insts.iter().copied().collect();
-        for block in func.blocks.iter() {
-            for &iid in &block.insts {
-                if header_ids.contains(&iid) {
-                    continue;
-                }
-                for op in &func.inst(iid).operands {
-                    if let MachOperand::VReg(v) = op
-                        && carrier_dsts.contains(&v.id)
-                    {
-                        return None;
-                    }
-                }
-            }
-        }
+    if carrier_dsts
+        .iter()
+        .any(|&dst| vreg_uses.used_outside(dst, lp.header))
+    {
+        return None;
     }
 
     // The header's last instruction is its unconditional branch; each latch
@@ -1192,6 +1209,7 @@ fn duplicate_header_test_into_latches(
     lp: &NaturalLoop,
     provenance: Option<&mut ProvenanceMap>,
     extended: bool,
+    vreg_uses: &VregUseIndex,
 ) -> bool {
     if block_contains_phi(func, lp.header) {
         return false;
@@ -1202,7 +1220,7 @@ fn duplicate_header_test_into_latches(
             return false;
         }
     }
-    let Some(header) = parse_test_only_header(func, lp, extended) else {
+    let Some(header) = parse_test_only_header(func, lp, extended, vreg_uses) else {
         return false;
     };
     if block_contains_phi(func, header.body) || block_contains_phi(func, header.exit) {
@@ -1433,10 +1451,24 @@ fn tail_duplicate_pure_latch_chain(
     lp: &NaturalLoop,
     mut provenance: Option<&mut ProvenanceMap>,
 ) -> bool {
-    // Deterministic candidate order: current layout order.
-    let order = func.block_order.clone();
+    // Deterministic candidate order: current layout order — but over the LOOP
+    // BODY (typically a handful of blocks), not the whole function.
+    //
+    // This used to clone `block_order` and walk all N of them, skipping every
+    // block not in `lp.body`. Inside the rotation driver — one call per
+    // candidate loop, per iteration — that is O(function) work to look at three
+    // blocks: ~194k clones of a 2863-element vector on the stress shape.
+    // Filtering to body blocks that are present in `block_order` and sorting by
+    // position yields exactly the same blocks in exactly the same order.
+    let mut ordered_body: Vec<(usize, BlockId)> = lp
+        .body
+        .iter()
+        .filter_map(|&b| block_order_position(func, b).map(|pos| (pos, b)))
+        .collect();
+    ordered_body.sort_unstable();
+    let order: Vec<BlockId> = ordered_body.into_iter().map(|(_, b)| b).collect();
     for &pred in &order {
-        if !lp.body.contains(&pred) || pred == lp.header {
+        if pred == lp.header {
             continue;
         }
         let pred_block = func.block(pred);
@@ -1552,7 +1584,127 @@ fn add_edge_unique(func: &mut MachFunction, from: BlockId, to: BlockId) {
     }
 }
 
+/// Where each vreg is USED, summarised so "is this vreg used outside block B?"
+/// is an O(1) question.
+///
+/// `parse_test_only_header` has to prove every carrier-copy destination is
+/// consumed only inside the loop header. It did that with a scan of EVERY
+/// block, EVERY instruction and EVERY operand of the whole function, plus a
+/// linear `Vec::contains` per operand — and the rotation driver calls it once
+/// per candidate loop, on every one of its up-to-`blocks.len()` iterations. On
+/// a 2863-block function that is ~194k whole-function scans: measured 8.26s of
+/// a 16.8s pass.
+///
+/// Built ONCE per driver iteration instead. For each vreg it records the first
+/// block seen using it and whether more than one distinct block does, which is
+/// exactly enough to answer the question without losing precision.
+#[derive(Default)]
+struct VregUseIndex {
+    /// vreg id -> (first using block, used by two or more distinct blocks)
+    ///
+    /// Fixed-seed hashing: this map is INSERTED INTO and LOOKED UP, never
+    /// iterated, so the hasher cannot reach the output. It is rebuilt once per
+    /// driver iteration over every operand of every instruction, which is the
+    /// only reason it is worth the swap.
+    uses: crate::fast_hash::FxHashMap<u32, (BlockId, bool)>,
+}
+
+impl VregUseIndex {
+    fn build(func: &MachFunction) -> Self {
+        let mut uses: crate::fast_hash::FxHashMap<u32, (BlockId, bool)> =
+            crate::fast_hash::FxHashMap::default();
+        for (index, block) in func.blocks.iter().enumerate() {
+            let bid = BlockId(index as u32);
+            for &iid in &block.insts {
+                for op in &func.inst(iid).operands {
+                    if let MachOperand::VReg(v) = op {
+                        uses.entry(v.id)
+                            .and_modify(|(first, multi)| {
+                                if *first != bid {
+                                    *multi = true;
+                                }
+                            })
+                            .or_insert((bid, false));
+                    }
+                }
+            }
+        }
+        Self { uses }
+    }
+
+    /// Is `vreg` used by any instruction outside `block`?
+    ///
+    /// Exactly the predicate the whole-function scan computed: no uses at all is
+    /// fine, uses confined to `block` are fine, anything else is not. (The scan
+    /// skipped instructions belonging to the header block by id, and an
+    /// instruction belongs to exactly one block, so "not in header.insts" and
+    /// "in some other block" are the same set.)
+    fn used_outside(&self, vreg: u32, block: BlockId) -> bool {
+        match self.uses.get(&vreg) {
+            None => false,
+            Some((first, multi)) => *multi || *first != block,
+        }
+    }
+}
+
+thread_local! {
+    /// `block_order` position index for [`next_block`].
+    ///
+    /// `next_block` was an O(N) `position()` scan, and the rotation driver calls
+    /// it from the DECLINING paths of every tier, for every candidate loop, on
+    /// every one of its up-to-`blocks.len()` outer iterations. On a 2863-block
+    /// function that is ~194k scans of a 2863-element vector: measured 10.5s of
+    /// a 16.8s pass (the pass itself being 88% of a 19s compile).
+    ///
+    /// The index is refreshed once per outer iteration. It does not need to be
+    /// perfectly fresh to be CORRECT — see `next_block`.
+    static BLOCK_ORDER_POS: std::cell::RefCell<crate::fast_hash::FxHashMap<BlockId, usize>> =
+        std::cell::RefCell::new(crate::fast_hash::FxHashMap::default());
+}
+
+/// Rebuild the `block_order` position index. Cheap (one pass) and called once
+/// per rotation-driver iteration, where the order is then constant: the driver
+/// rewrites at most one loop and immediately re-derives its analyses.
+fn refresh_block_order_index(func: &MachFunction) {
+    BLOCK_ORDER_POS.with(|index| {
+        let mut index = index.borrow_mut();
+        index.clear();
+        index.reserve(func.block_order.len());
+        for (position, &block) in func.block_order.iter().enumerate() {
+            index.insert(block, position);
+        }
+    });
+}
+
+/// Layout position of `block`, O(1) via the index when it is fresh.
+///
+/// The cached position is VERIFIED against the live order before it is used: if
+/// `block_order[pos]` is still `block` the answer is right whatever else moved.
+/// A stale or missing entry falls back to the original linear scan, so this can
+/// never return something the scan would not have.
+fn block_order_position(func: &MachFunction, block: BlockId) -> Option<usize> {
+    let cached = BLOCK_ORDER_POS.with(|index| index.borrow().get(&block).copied());
+    if let Some(pos) = cached
+        && func.block_order.get(pos) == Some(&block)
+    {
+        return Some(pos);
+    }
+    func.block_order.iter().position(|&bid| bid == block)
+}
+
 fn next_block(func: &MachFunction, block: BlockId) -> Option<BlockId> {
+    // The cached position is VERIFIED against the live order before it is used:
+    // if `block_order[pos]` is still `block`, then `block_order[pos + 1]` is its
+    // successor by definition, whatever else may have moved. A stale or missing
+    // entry falls back to the original scan. So the index can never produce an
+    // answer the linear scan would not have produced — it only makes the common
+    // case O(1).
+    let cached = BLOCK_ORDER_POS.with(|index| index.borrow().get(&block).copied());
+    if let Some(pos) = cached
+        && func.block_order.get(pos) == Some(&block)
+    {
+        return func.block_order.get(pos + 1).copied();
+    }
     let pos = func.block_order.iter().position(|&bid| bid == block)?;
     func.block_order.get(pos + 1).copied()
 }
@@ -2788,5 +2940,22 @@ mod tests {
             panic!()
         };
         assert_ne!(d.id, 12, "cloned carrier dest renamed to a fresh vreg");
+    }
+
+    /// IDEMPOTENCE: the latch-conditional-fallthrough form is its own fixpoint;
+    /// a second run must change nothing.
+    #[test]
+    fn second_run_is_a_no_op() {
+        let (mut func, _ids) = make_counted_loop();
+        assert!(run_pass(&mut func), "first run must fire");
+        let (insts, blocks) = (func.insts.len(), func.blocks.len());
+        for again in 2..=4 {
+            assert!(
+                !run_pass(&mut func),
+                "run {again} re-fired on its own output"
+            );
+            assert_eq!(func.insts.len(), insts, "run {again} added instructions");
+            assert_eq!(func.blocks.len(), blocks, "run {again} added blocks");
+        }
     }
 }

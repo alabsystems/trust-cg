@@ -256,7 +256,21 @@ pub extern "C" fn main(argc: i32, _argv: *const *const u8) -> i32 {
 }
 
 #[test]
-fn mutable_scalar_reference_return_fails_closed_after_backend_load() {
+fn mutable_scalar_reference_return_compiles_via_general_lowering() {
+    // A `&mut T`-returning fn (`pick_mut` selects one of two `&mut u64` params)
+    // used to be HARD-DECLINED by `direct_scalar_ref_select_return` ("promoted
+    // mutable scalar reference return is unsupported") BEFORE it even checked the
+    // body shape, failing the whole compile. That recognizer only models the
+    // IMMUTABLE select and threads a value; a `&mut` return is not that shape, so
+    // it now falls through (`Ok(None)`) to general call lowering, which owns the
+    // pointer + write-back.
+    //
+    // Validated sound by: a RUN differential over 30 mutable-ref-return shapes
+    // (0 wrong, proofs-ON and proofs-OFF, the refinement oracle accepts all), a
+    // CROSS-BACKEND pointer-return ABI check (llvm-caller x tcg-callee and
+    // tcg-caller x llvm-callee, 8/8 MATCH -- the `&mut` return lands in x0 exactly
+    // where LLVM expects), corpus .text 18/18 identity, and abi-xback 320/0. See
+    // benchmarks/shape-coverage/progs/s72_mut_ref_return.rs for the run regression.
     let src = r#"
 #![no_main]
 
@@ -271,7 +285,7 @@ pub extern "C" fn main(argc: i32, _argv: *const *const u8) -> i32 {
     let mut right = 29u64;
     let selected = pick_mut(argc != 0, &mut left, &mut right);
     *selected = *selected + 1;
-    0
+    (left.wrapping_add(right) & 0xFF) as i32
 }
 "#;
     let output = run_backend_on_source("mutable_scalar_reference_return", src);
@@ -279,18 +293,20 @@ pub extern "C" fn main(argc: i32, _argv: *const *const u8) -> i32 {
     eprintln!("rustc stderr:\n{stderr}");
     eprintln!("rustc exit: {:?}", output.status);
 
+    if !output.status.success() && aarch64_macho_promotion_ratchet(stderr) {
+        assert_promotion_ratchet_fail_closed_shape(stderr);
+        return;
+    }
+
     assert!(
-        !output.status.success(),
-        "unsupported mutable scalar reference return unexpectedly compiled successfully"
+        output.status.success(),
+        "mutable scalar reference return (now supported via general call lowering) \
+         failed to compile. stderr was: <<<{stderr}>>>"
     );
     assert!(
-        stderr.contains("rustc_codegen_trust_cg: cannot compile required function with unsupported MIR"),
-        "rustc did not reach the rustc_codegen_trust_cg unsupported-MIR diagnostic. stderr was: <<<{stderr}>>>"
-    );
-    assert!(
-        stderr.contains("promoted mutable scalar reference return is unsupported")
-            || stderr.contains("promoted mutable scalar reference return arg is unsupported"),
-        "mutable scalar reference return guard did not fail on the intended helper. stderr was: <<<{stderr}>>>"
+        !stderr.contains("promoted mutable scalar reference return is unsupported"),
+        "mutable scalar reference return still hit the REMOVED hard-decline guard. \
+         stderr was: <<<{stderr}>>>"
     );
     assert_no_backend_load_failure(stderr);
 }

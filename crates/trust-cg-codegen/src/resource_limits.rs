@@ -31,6 +31,34 @@ const PARALLELISM_MEMORY_BUDGET_PER_WORKER: u64 = 1024 * 1024 * 1024;
 
 const DEFAULT_MAX_INPUT_BYTES: u64 = 512 * 1024 * 1024;
 
+/// Fewest work items a worker must be given before spawning it is worth it.
+///
+/// The width used to be `min(memory_cap, item_count)` — one worker per item,
+/// however small the item. That is a memory-headroom answer to a
+/// work-scheduling question, and on ordinary crates it LOSES. Measured on the
+/// 18-program `beat-llvm` corpus (median-of-11, interleaved, aarch64, one CGU
+/// of 9-11 functions), against the same compile pinned to one worker:
+///
+/// ```text
+/// workers   CPU      wall
+/// 1         1.000    1.000
+/// 2         1.017    0.999
+/// 9-11      1.081    1.002
+/// ```
+///
+/// The full-width fanout burns 8% more CPU and finishes no sooner — the
+/// functions are ~0.5ms each, so spawning ten OS threads (twice: two pools are
+/// built per compile) costs more than the overlap saves. For a compiler invoked
+/// by cargo under `-j N`, that CPU is taken from other crates, so it is a real
+/// loss and not just a metric artifact.
+///
+/// 16 keeps ordinary crates serial while a genuinely large module still fans
+/// out (a 129-function module gets 8 workers). It bounds the waste rather than
+/// claiming an optimum: the crossover is workload-dependent, and the fanout's
+/// own efficiency is a separate open question — a 128-function module measured
+/// only 1.03x concurrency, which no width can fix.
+const MIN_ITEMS_PER_WORKER: usize = 16;
+
 /// Effective Rayon worker count for a parallel operation over `item_count`
 /// independent work items.
 #[must_use]
@@ -38,40 +66,92 @@ pub fn worker_count_for_items(item_count: usize) -> Option<usize> {
     if item_count < 2 {
         return None;
     }
-    let workers = configured_parallelism_limit().min(item_count);
+    // Width is bounded by the WORK as well as by memory and item count: a
+    // worker that would be handed fewer than `MIN_ITEMS_PER_WORKER` items does
+    // not pay for its own spawn. See the constant's note for the measurement.
+    let by_work = item_count / MIN_ITEMS_PER_WORKER;
+    let workers = configured_parallelism_limit().min(item_count).min(by_work);
     (workers >= 2).then_some(workers)
 }
 
 /// Effective Rayon worker count for the per-function PROOF-CERTIFICATE lane
 /// (CT-7).
 ///
-/// Unlike [`worker_count_for_items`] — whose conservative default cap of
-/// [`DEFAULT_MAX_PARALLELISM`] bounds the memory-hungry regalloc+encode
-/// fanout — the certificate lane is pure read-only CPU work over the shared
-/// `&'static` verifier (small per-worker footprint, no I/O), and it is the
-/// dominant proofs-on compile-time cost. Its default cap is therefore the
-/// host's available parallelism. An EXPLICIT `TRUST_CG_MAX_PARALLELISM`
-/// still bounds this lane exactly like every other fanout (the operator's
-/// stated limit wins). Worker count never affects output: the cert lane
-/// collects into a function-ordered vector, so the bundle is byte-identical
-/// at any width (`test_x86_parallel_and_serial_multi_function_byte_identical`).
+/// Proof evaluation recursively walks SMT trees and therefore runs on the
+/// shared 32 MiB-stack pool owned by `trust-cg-verify`. Function-level fanout
+/// uses the SAME worker limit so concurrent functions submit to that fixed pool
+/// instead of spawning one large-stack OS thread per function. The default is
+/// deliberately small and memory-bounded; the rustc bridge lowers it to one
+/// because Cargo already parallelizes across compiler processes. An explicit
+/// `TRUST_CG_MAX_PARALLELISM` still wins. Worker count never affects output: the
+/// cert lane collects into a function-ordered vector, so the bundle is
+/// byte-identical at any width
+/// (`test_x86_parallel_and_serial_multi_function_byte_identical`).
 #[must_use]
 pub fn verification_worker_count_for_items(item_count: usize) -> Option<usize> {
-    if item_count < 2 {
-        return None;
-    }
+    verification_worker_count_for_items_with_limit(
+        item_count,
+        trust_cg_verify::resource_limits::proof_verifier_worker_limit(),
+    )
+}
+
+fn verification_worker_count_for_items_with_limit(
+    item_count: usize,
+    worker_limit: usize,
+) -> Option<usize> {
+    let workers = worker_limit.max(1).min(item_count);
+    (workers >= 2).then_some(workers)
+}
+
+/// Bound Rayon's GLOBAL pool, once, at backend startup.
+///
+/// Every other fanout in this crate runs inside a pool built by
+/// [`build_rayon_pool`], so `TRUST_CG_MAX_PARALLELISM` bounds it. Rayon's
+/// GLOBAL pool is different: it is created lazily, at
+/// `available_parallelism()` wide, by the first unscoped parallel iterator
+/// anywhere in the process — including in DEPENDENCIES we do not control.
+/// `trust_ir_build::validate_module` has one (`validate.rs`, the enum-layout
+/// walk), and that runs on every compile, so every compile was spawning a
+/// full-width global pool no matter what the operator asked for.
+///
+/// The cost is not the work — it is the idling. Measured on `fn main(){}`,
+/// aarch64, 20 cores, via `strace -c`:
+///
+/// ```text
+/// backend            sched_yield   threads spawned
+/// LLVM                         1                 5
+/// trust-cg                  2126                24
+/// trust-cg, bounded           88                 5
+/// ```
+///
+/// Those ~2100 yields per compile are pure `sys` time, and sys was where the
+/// remaining compile-time deficit lived: +103ms of +130ms CPU across the
+/// 18-program corpus. Bounding the global pool moved the corpus from 1.086x
+/// LLVM to 0.959x on CPU and 1.002x to 0.962x on wall.
+///
+/// An explicit `TRUST_CG_MAX_PARALLELISM` wins, exactly as for every other
+/// fanout; otherwise this uses [`DEFAULT_MAX_PARALLELISM`], which is both the
+/// documented default and the width that measured best (corpus CPU 0.959 at 2
+/// workers, against 0.967 at 1 and 1.000 at 4).
+///
+/// Idempotent and non-fatal: `build_global` errors if the global pool already
+/// exists, which means something else — plausibly the host compiler — got there
+/// first and owns the policy. We defer to it rather than fight over it.
+pub fn bound_global_rayon_pool() {
     let available = std::thread::available_parallelism().map_or(1, usize::from);
-    let cap = match std::env::var(TRUST_CG_MAX_PARALLELISM_ENV)
+    let workers = match std::env::var(TRUST_CG_MAX_PARALLELISM_ENV)
         .ok()
         .as_deref()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
     {
-        Some(explicit) => explicit.min(available).max(1),
-        None => available,
+        Some(explicit) => explicit,
+        None => DEFAULT_MAX_PARALLELISM,
     };
-    let workers = cap.min(item_count);
-    (workers >= 2).then_some(workers)
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(workers.min(available).max(1))
+        .thread_name(|idx| format!("trust-cg-global-{idx}"))
+        .build_global();
 }
 
 /// Build a bounded Rayon pool for Trust Codegen-owned fanout.
@@ -238,6 +318,44 @@ mod tests {
     fn worker_count_disables_parallelism_below_two_workers() {
         assert_eq!(worker_count_for_items(0), None);
         assert_eq!(worker_count_for_items(1), None);
+        // Work-aware width: a handful of items stays SERIAL rather than
+        // spawning a thread per item. An ordinary crate's CGU is this size, and
+        // the full-width fanout measured 8% more CPU for no wall gain there.
+        assert_eq!(worker_count_for_items(2), None, "2 items must not fan out");
+        assert_eq!(
+            worker_count_for_items(9),
+            None,
+            "corpus-sized CGU stays serial"
+        );
+        assert_eq!(
+            worker_count_for_items(31),
+            None,
+            "under 2 workers' worth of items"
+        );
+        // Genuinely large modules still fan out, bounded by items/16.
+        assert!(
+            worker_count_for_items(32).is_some_and(|w| w >= 2),
+            "32 items is two workers' worth"
+        );
+        assert!(
+            worker_count_for_items(129).is_some_and(|w| w >= 2 && w <= 8),
+            "129 items yields at most items/16 workers"
+        );
+    }
+
+    #[test]
+    fn verification_worker_count_is_deterministically_limit_bounded() {
+        assert_eq!(verification_worker_count_for_items_with_limit(0, 8), None);
+        assert_eq!(verification_worker_count_for_items_with_limit(1, 8), None);
+        assert_eq!(verification_worker_count_for_items_with_limit(8, 1), None);
+        assert_eq!(
+            verification_worker_count_for_items_with_limit(8, 2),
+            Some(2)
+        );
+        assert_eq!(
+            verification_worker_count_for_items_with_limit(3, 8),
+            Some(3)
+        );
     }
 
     /// An explicit operator limit ALWAYS wins over the host-adaptive default —

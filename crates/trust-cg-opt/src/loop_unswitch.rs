@@ -1059,4 +1059,18 @@ mod tests {
             "versions contain no invariant conditional branch; must not re-fire"
         );
     }
+
+    /// IDEMPOTENCE / CONVERGENCE: the unswitched copies carry no invariant
+    /// test, so a second run must change nothing.
+    #[test]
+    fn second_run_is_a_no_op() {
+        let mut f = make_unswitchable_loop();
+        assert!(run_pass(&mut f), "first run must fire");
+        let (insts, blocks) = (f.insts.len(), f.blocks.len());
+        for again in 2..=4 {
+            assert!(!run_pass(&mut f), "run {again} re-fired on its own output");
+            assert_eq!(f.insts.len(), insts, "run {again} added instructions");
+            assert_eq!(f.blocks.len(), blocks, "run {again} added blocks");
+        }
+    }
 }

@@ -367,7 +367,8 @@ impl std::hash::Hash for CacheKey {
 /// Implementations must be safe to share across threads: the compiler
 /// threads per-function compilation jobs via rayon, so concurrent gets
 /// and puts are expected. Values are opaque byte blobs; callers choose
-/// their own payload format (e.g. `rmp-serde` for structured data).
+/// their own payload format (e.g. `trust_cg_verify::cegis_cache_codec` for the
+/// CEGIS rewrite plan). A backend never inspects a value.
 pub trait CacheBackend: Send + Sync {
     /// Look up a key. Returns `None` on miss or recoverable I/O failure.
     fn get(&self, key: &CacheKey) -> Option<Vec<u8>>;

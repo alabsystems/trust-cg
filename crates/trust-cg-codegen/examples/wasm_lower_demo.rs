@@ -687,7 +687,9 @@ fn main() {
         }
     }
 
-    let module = mb.build();
+    let mut module = mb.build();
+    // compile_module fail-closes on target-free modules: pin the wasm32 shape.
+    module.target_info = Some(wasm::wasm32_target_info());
     let bytes = wasm::compile_module(&module).expect("Slice 0 lowering failed");
 
     let path = std::env::args()

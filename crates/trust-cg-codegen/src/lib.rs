@@ -184,8 +184,13 @@ pub use jit_ay_canary_allowlist::{
 };
 pub use jit_cert::{JitCertificate, TrustIrPair};
 pub use jit_contract::{
+    HOST_JIT_SELECTED_CODEGEN_AUTHORITY_SCOPE, HOST_JIT_SELECTED_CODEGEN_EVIDENCE_BASIS,
+    HOST_JIT_SELECTED_CODEGEN_FEATURE_DOMAIN, HOST_JIT_SELECTED_CODEGEN_PROFILE_SCHEMA,
+    HOST_JIT_SELECTED_CODEGEN_PROFILE_SCHEMA_VERSION, HOST_JIT_SELECTED_CODEGEN_SELECTION_POLICY,
+    HostJitSelectedCodegenProfile, HostJitSelectedCodegenProfileError,
     KERNEL_ARTIFACT_CONTRACT_SCHEMA, KERNEL_ARTIFACT_CONTRACT_SCHEMA_VERSION,
     KernelArtifactContract, KernelArtifactKind, KernelStateDomain,
+    X86_64_DETECTED_HOST_FEATURE_DOMAIN,
 };
 pub use jit_control_plane::{
     ControlPlaneCandidate, ControlPlaneConsumerAdmissionProductDecision, ControlPlaneDecision,

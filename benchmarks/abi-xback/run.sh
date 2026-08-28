@@ -1,8 +1,53 @@
 #!/usr/bin/env bash
-# Cross-backend AArch64 calling-convention differential.
+# run.sh <first-seed> <count> [opt-levels...]
+#
+# CROSS-BACKEND calling-convention differential.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache-2.0
+#
+# WHY THIS EXISTS: bridge-fuzz, shape-coverage and the beat-llvm corpus all
+# compile a WHOLE PROGRAM with one backend. A calling-convention disagreement is
+# structurally invisible to them -- caller and callee are both trust-cg, both
+# wrong the same way, and they agree. The AArch64 stack-argument layout bug
+# (DarwinPCS natural-size packing applied to an ELF target, where AAPCS64 stage
+# C.14 mandates 8-byte slots) survived every one of those gates and was found
+# only by LINKING ACROSS BACKENDS.
+#
+# For each seed we build a callee and a caller whose signature overflows the
+# argument registers onto the stack, then link three ways:
+#
+#   llvm x llvm   the ORACLE
+#   llvm x tcg    LLVM caller  -> trust-cg callee   (callee reads its args)
+#   tcg  x llvm   trust-cg caller -> LLVM callee    (caller writes its args)
+#
+# Any exit-code difference from the oracle is a P0 ABI mismatch.
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
+
+gate_result() {
+  local expected="$1"
+  local observed_match="$2"
+  local observed_mismatch="$3"
+  local observed_declined="$4"
+  local observed_skipped="$5"
+  [ "$observed_match" -eq "$expected" ] \
+    && [ "$observed_mismatch" -eq 0 ] \
+    && [ "$observed_declined" -eq 0 ] \
+    && [ "$observed_skipped" -eq 0 ]
+}
+
+if [[ "${1:-}" == "--selftest" ]]; then
+  gate_result 2 2 0 0 0 || exit 1
+  ! gate_result 2 1 0 1 0 || exit 1
+  ! gate_result 2 1 0 0 1 || exit 1
+  ! gate_result 2 2 1 0 0 || exit 1
+  ! gate_result 2 1 0 0 0 || exit 1
+  echo "abi-xback result-contract selftest: positive arm + 4 rejection arms"
+  exit 0
+fi
+
 FIRST=1
 COUNT=25
 if [ "$#" -gt 0 ]; then
@@ -18,8 +63,25 @@ OPTS=("$@")
 
 OUT="${ABI_XBACK_OUT:-$(mktemp -d)}"
 mkdir -p "$OUT/fail"
-DYLIB="${ABI_XBACK_DYLIB:-$HERE/../../crates/rustc-codegen-trust-cg/target/release/librustc_codegen_trust_cg.so}"
-RUSTC="$(rustup which --toolchain nightly-2026-04-20 rustc 2>/dev/null || echo rustc)"
+if [ -n "${ABI_XBACK_DYLIB:-}" ]; then
+  DYLIB="$ABI_XBACK_DYLIB"
+elif [ -f "$HERE/../../crates/rustc-codegen-trust-cg/target/release/librustc_codegen_trust_cg.so" ]; then
+  DYLIB="$HERE/../../crates/rustc-codegen-trust-cg/target/release/librustc_codegen_trust_cg.so"
+else
+  DYLIB="$HERE/../../crates/rustc-codegen-trust-cg/target/release/librustc_codegen_trust_cg.dylib"
+fi
+# cargo and the bundled gcc-ld shim are NOT on a non-interactive PATH; without
+# this the rustup lookup below silently falls back to `rustc` and every link
+# fails as a "skip", turning the gate green for the wrong reason.
+export PATH="$HOME/.cargo/bin:$HOME/.rustup/toolchains/stable-aarch64-unknown-linux-gnu/lib/rustlib/aarch64-unknown-linux-gnu/bin/gcc-ld:$PATH"
+if ! RUSTC="$(rustup which --toolchain nightly-2026-04-20 rustc 2>/dev/null)"; then
+  echo "FAIL: nightly-2026-04-20 rustc is unavailable" >&2
+  exit 1
+fi
+if [ ! -f "$DYLIB" ]; then
+  echo "FAIL: trust-cg backend is unavailable: $DYLIB" >&2
+  exit 1
+fi
 LIB=(--edition=2021 --crate-type staticlib -Cpanic=abort -Coverflow-checks=off -Ccodegen-units=1)
 BIN=(--edition=2021 --crate-type bin -Cpanic=abort -Coverflow-checks=off -Ccodegen-units=1 -Cdefault-linker-libraries=y)
 TCG=(env TCG_NO_PROOF_CERTS=1 TCG_REFINE_SOLVER=0)
@@ -43,6 +105,7 @@ for ((seed = FIRST; seed < FIRST + COUNT; seed++)); do
     dir="$OUT/s${seed}o${opt}"
     mkdir -p "$dir"
 
+    # --- oracle halves -------------------------------------------------------
     "$RUSTC" "${LIB[@]}" -Copt-level="$opt" -o "$dir/libxl.a" "$OUT/callee$seed.rs" 2>/dev/null || {
       skipped=$((skipped + 1))
       continue
@@ -54,6 +117,7 @@ for ((seed = FIRST; seed < FIRST + COUNT; seed++)); do
     "$dir/oracle" >/dev/null 2>&1
     want=$?
 
+    # --- trust-cg callee, LLVM caller ---------------------------------------
     if "${TCG[@]}" "$RUSTC" "${LIB[@]}" -Copt-level="$opt" -Zcodegen-backend="$DYLIB" -o "$dir/libxt.a" "$OUT/callee$seed.rs" 2>/dev/null \
       && "$RUSTC" "${BIN[@]}" -Copt-level="$opt" -o "$dir/llvm_x_tcg" "$OUT/caller$seed.rs" -L "$dir" -l static=xt 2>/dev/null; then
       "$dir/llvm_x_tcg" >/dev/null 2>&1
@@ -70,6 +134,7 @@ for ((seed = FIRST; seed < FIRST + COUNT; seed++)); do
       declined=$((declined + 1))
     fi
 
+    # --- trust-cg caller, LLVM callee ---------------------------------------
     if "${TCG[@]}" "$RUSTC" "${BIN[@]}" -Copt-level="$opt" -Zcodegen-backend="$DYLIB" -o "$dir/tcg_x_llvm" "$OUT/caller$seed.rs" -L "$dir" -l static=xl 2>/dev/null; then
       "$dir/tcg_x_llvm" >/dev/null 2>&1
       got=$?
@@ -90,4 +155,8 @@ done
 
 echo "abi-xback: $match MATCH, $mismatch MISMATCH, $declined declined, $skipped skipped"
 echo "artifacts: $OUT"
-[ "$mismatch" -eq 0 ]
+expected=$((COUNT * ${#OPTS[@]} * 2))
+if ! gate_result "$expected" "$match" "$mismatch" "$declined" "$skipped"; then
+  echo "FAIL: expected exactly $expected MATCH with no mismatch, decline, or skip" >&2
+  exit 1
+fi

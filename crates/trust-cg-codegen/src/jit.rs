@@ -439,7 +439,8 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 
 use crate::jit_contract::{
-    ArtifactContractError, ArtifactManifestV1, SymbolLookupContract, TypedSymbol,
+    ArtifactContractError, ArtifactManifestV1, HostJitSelectedCodegenProfile, SymbolLookupContract,
+    TypedSymbol,
 };
 use crate::macho::fixup::{Fixup, FixupTarget};
 #[cfg(target_arch = "aarch64")]
@@ -1920,7 +1921,7 @@ fn prepare_windows_jit_unwind_registration(
     _code: &mut Vec<u8>,
     _functions: &[WindowsJitUnwindFunction],
 ) -> Result<WindowsJitUnwindRegistration, JitError> {
-    Ok(WindowsJitUnwindRegistration)
+    Ok(WindowsJitUnwindRegistration::default())
 }
 
 // ---------------------------------------------------------------------------
@@ -2251,6 +2252,7 @@ pub(crate) fn publish_raw_executable_buffer_with_profile_data(
         code_len,
         published_len,
         published_image_sha256: expected_sha256,
+        host_jit_selected_codegen_profile: None,
         publication: JitPublicationContract::published_rx(),
         windows_unwind,
         function_ranges,
@@ -2515,6 +2517,14 @@ pub enum JitError {
     ProfilePatchOutOfBounds {
         patch_offset: usize,
         code_len: usize,
+    },
+
+    #[error(
+        "JIT executable buffer already carries selected-codegen profile {existing_profile_sha256}; refusing conflicting profile {incoming_profile_sha256}"
+    )]
+    HostJitSelectedCodegenProfileConflict {
+        existing_profile_sha256: String,
+        incoming_profile_sha256: String,
     },
 }
 
@@ -3786,8 +3796,9 @@ impl JitCompiler {
             code_len: code.len(),
             published_len: code.len(),
             published_image_sha256: expected_sha256,
+            host_jit_selected_codegen_profile: None,
             publication: JitPublicationContract::published_rx(),
-            windows_unwind: WindowsJitUnwindRegistration,
+            windows_unwind: WindowsJitUnwindRegistration::default(),
             function_ranges: func_ranges,
             symbol_offsets,
             canonical_symbols,
@@ -4086,6 +4097,10 @@ pub struct ExecutableBuffer {
     /// sequence; [`Self::verify_published_code_integrity`] fails closed on
     /// an empty hash.
     published_image_sha256: String,
+    /// Exact x86 host-JIT feature profile derived from every function's final
+    /// machine-code evidence. `None` for raw JIT, non-x86 compilation, and
+    /// serialized replay, none of which supplies that evidence contract.
+    host_jit_selected_codegen_profile: Option<HostJitSelectedCodegenProfile>,
     publication: JitPublicationContract,
     windows_unwind: WindowsJitUnwindRegistration,
     function_ranges: Vec<(String, std::ops::Range<u64>)>,
@@ -4227,6 +4242,13 @@ impl std::fmt::Debug for ExecutableBuffer {
             .field("published_len", &self.published_len)
             .field("allocation_len", &self.len)
             .field("published_image_sha256", &self.published_image_sha256)
+            .field(
+                "host_jit_selected_codegen_profile_sha256",
+                &self
+                    .host_jit_selected_codegen_profile
+                    .as_ref()
+                    .map(HostJitSelectedCodegenProfile::profile_sha256),
+            )
             .field("publication", &self.publication)
             .field("symbol_count", &self.canonical_symbols.len())
             .finish_non_exhaustive()
@@ -4347,6 +4369,31 @@ impl ExecutableBuffer {
     /// buffers that never went through a publish sequence.
     pub fn published_image_sha256(&self) -> &str {
         &self.published_image_sha256
+    }
+
+    /// Exact selected-codegen profile attached by the typed x86 host-JIT
+    /// compiler after it validates uniform per-function machine-code
+    /// evidence. This record is engine evidence, not external CPUID/XCR0
+    /// authority.
+    pub fn host_jit_selected_codegen_profile(&self) -> Option<&HostJitSelectedCodegenProfile> {
+        self.host_jit_selected_codegen_profile.as_ref()
+    }
+
+    pub(crate) fn attach_host_jit_selected_codegen_profile(
+        &mut self,
+        profile: HostJitSelectedCodegenProfile,
+    ) -> Result<(), JitError> {
+        match &self.host_jit_selected_codegen_profile {
+            None => {
+                self.host_jit_selected_codegen_profile = Some(profile);
+                Ok(())
+            }
+            Some(existing) if existing == &profile => Ok(()),
+            Some(existing) => Err(JitError::HostJitSelectedCodegenProfileConflict {
+                existing_profile_sha256: existing.profile_sha256().to_owned(),
+                incoming_profile_sha256: profile.profile_sha256().to_owned(),
+            }),
+        }
     }
 
     /// Re-run the bytes-hash integrity check against the live mapping: hash
@@ -6569,7 +6616,7 @@ mod tests {
         let mov_id = func.push_inst(mov);
         func.append_inst(entry, mov_id);
 
-        let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+        let ret = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
         let ret_id = func.push_inst(ret);
         func.append_inst(entry, ret_id);
 
@@ -8522,8 +8569,9 @@ mod tests {
             code_len: 16,
             published_len: 16,
             published_image_sha256: String::new(),
+            host_jit_selected_codegen_profile: None,
             publication: JitPublicationContract::unpublished_for_tests(),
-            windows_unwind: WindowsJitUnwindRegistration,
+            windows_unwind: WindowsJitUnwindRegistration::default(),
             function_ranges: vec![("test".to_string(), 0..16)],
             symbol_offsets,
             canonical_symbols: vec!["test".to_string()],
@@ -8559,8 +8607,9 @@ mod tests {
             code_len: 16,
             published_len: 16,
             published_image_sha256: String::new(),
+            host_jit_selected_codegen_profile: None,
             publication: JitPublicationContract::unpublished_for_tests(),
-            windows_unwind: WindowsJitUnwindRegistration,
+            windows_unwind: WindowsJitUnwindRegistration::default(),
             function_ranges: vec![("test".to_string(), 0..16)],
             symbol_offsets,
             canonical_symbols: vec!["test".to_string()],
@@ -8775,8 +8824,9 @@ mod tests {
             code_len: names.len() * 4,
             published_len: names.len() * 4,
             published_image_sha256: String::new(),
+            host_jit_selected_codegen_profile: None,
             publication: JitPublicationContract::unpublished_for_tests(),
-            windows_unwind: WindowsJitUnwindRegistration,
+            windows_unwind: WindowsJitUnwindRegistration::default(),
             function_ranges,
             symbol_offsets,
             canonical_symbols,
@@ -8786,6 +8836,48 @@ mod tests {
             certificates: HashMap::new(),
             proof_optimization_certificates: Vec::new(),
         }
+    }
+
+    #[test]
+    fn executable_buffer_selected_codegen_profile_attachment_is_single_assignment() {
+        let selected = crate::x86_64::X86TargetFeatures::host();
+        let first = HostJitSelectedCodegenProfile::from_validated_x86_target_features(
+            "x86_64-first-test-host",
+            selected,
+        )
+        .expect("host selection must match the engine host detector");
+        let conflicting = HostJitSelectedCodegenProfile::from_validated_x86_target_features(
+            "x86_64-conflicting-test-host",
+            selected,
+        )
+        .expect("host selection must match the engine host detector");
+        let mut buffer = make_buf_with_symbols(&["f"]);
+
+        assert!(buffer.host_jit_selected_codegen_profile().is_none());
+        buffer
+            .attach_host_jit_selected_codegen_profile(first.clone())
+            .expect("first attachment must succeed");
+        assert_eq!(buffer.host_jit_selected_codegen_profile(), Some(&first));
+        buffer
+            .attach_host_jit_selected_codegen_profile(first.clone())
+            .expect("identical reattachment must be idempotent");
+
+        let error = buffer
+            .attach_host_jit_selected_codegen_profile(conflicting.clone())
+            .expect_err("conflicting evidence attachment must fail closed");
+        assert!(matches!(
+            error,
+            JitError::HostJitSelectedCodegenProfileConflict {
+                existing_profile_sha256,
+                incoming_profile_sha256,
+            } if existing_profile_sha256 == first.profile_sha256()
+                && incoming_profile_sha256 == conflicting.profile_sha256()
+        ));
+        assert_eq!(
+            buffer.host_jit_selected_codegen_profile(),
+            Some(&first),
+            "a rejected attachment must not replace the admitted evidence"
+        );
     }
 
     fn contract_i64_to_i64_signature() -> SymbolSignature {
@@ -9375,8 +9467,9 @@ mod tests {
             code_len: 16,
             published_len: 16,
             published_image_sha256: String::new(),
+            host_jit_selected_codegen_profile: None,
             publication: JitPublicationContract::unpublished_for_tests(),
-            windows_unwind: WindowsJitUnwindRegistration,
+            windows_unwind: WindowsJitUnwindRegistration::default(),
             function_ranges: Vec::new(),
             symbol_offsets: HashMap::new(),
             canonical_symbols: Vec::new(),

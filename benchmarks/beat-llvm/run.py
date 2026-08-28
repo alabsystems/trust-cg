@@ -322,6 +322,17 @@ class Harness:
             return Path(os.environ["TCG_PROOF_CACHE_DIR"])
         return Path(os.path.expanduser("~/.cache/trust-cg/proof-cache"))
 
+    def cert_store_dir(self):
+        """Mirror of trust-cg-verify obligation_cert_store::store_dir()."""
+        if "TCG_NO_CERT_STORE" in os.environ or "TCG_NO_PROOF_CACHE" in os.environ:
+            return None
+        if "TCG_PROOF_CERT_STORE" in os.environ:
+            return Path(os.environ["TCG_PROOF_CERT_STORE"])
+        xdg = os.environ.get("XDG_CACHE_HOME", "").strip()
+        if xdg:
+            return Path(xdg) / "trust-cg" / "alethe-certs"
+        return Path(os.path.expanduser("~/.cache/trust-cg/alethe-certs"))
+
     def cache_fingerprint(self):
         d = self.cache_dir()
         try:
@@ -329,7 +340,46 @@ class Harness:
         except OSError:
             names = []
         fp = hashlib.sha256("\n".join(names).encode()).hexdigest()
-        return {"dir": str(d), "verdict_count": len(names), "fingerprint_sha256": fp}
+        out = {"dir": str(d), "verdict_count": len(names), "fingerprint_sha256": fp}
+        cd = self.cert_store_dir()
+        if cd is None:
+            out["cert_store"] = {"dir": None, "cert_count": 0, "disabled": True}
+        else:
+            try:
+                certs = sorted(p.name for p in cd.iterdir() if p.name.endswith(".alethecert"))
+            except OSError:
+                certs = []
+            cfp = hashlib.sha256("\n".join(certs).encode()).hexdigest()
+            out["cert_store"] = {
+                "dir": str(cd),
+                "cert_count": len(certs),
+                "fingerprint_sha256": cfp,
+            }
+        return out
+
+    def check_invariant_sweep_kinds(self):
+        """Run scripts/check_invariant_sweep_kinds.sh for the aarch64 bridge:
+        'ok' | 'drifted' | 'skipped' (not aarch64 / script missing / failed to run).
+        Prints the diff on drift so the row's reader sees which kinds moved."""
+        if not str(self.args.target).startswith("aarch64"):
+            return "skipped"
+        script = self.repo / "scripts" / "check_invariant_sweep_kinds.sh"
+        if not script.exists():
+            return "skipped"
+        try:
+            r = subprocess.run([str(script), self.rustc, str(self.dylib)],
+                               capture_output=True, text=True, env=self.env, timeout=120)
+        except (OSError, subprocess.TimeoutExpired):
+            return "skipped"
+        if r.returncode == 0:
+            return "ok"
+        if r.returncode == 1:
+            print("beat-llvm: WARNING: AARCH64_INVARIANT_SWEEP_KINDS has DRIFTED from what fn main(){} "
+                  "sweeps — the init-time speculative sweep is warming the wrong kinds (perf only):",
+                  file=sys.stderr)
+            print(r.stdout.strip(), file=sys.stderr)
+            return "drifted"
+        return "skipped"
 
     def provenance(self):
         sha = self.git("rev-parse", "HEAD").strip()
@@ -366,6 +416,14 @@ class Harness:
                       f"at {r['duty_cycle'] * 100:.0f}% duty  {r['comm']}", file=sys.stderr)
             print(f"  kill -9 {' '.join(str(r['pid']) for r in runaways)}", file=sys.stderr)
         tcg_env = {k: v for k, v in os.environ.items() if k.startswith("TCG_") or k.startswith("TRUST_CG_")}
+        # The init-time speculative sweep warms a NAMED list of registry kinds
+        # (trust-cg-codegen `AARCH64_INVARIANT_SWEEP_KINDS`). Its unit test only
+        # pins that every name resolves; whether the list still matches what an
+        # empty program actually sweeps is checked by
+        # scripts/check_invariant_sweep_kinds.sh against THIS dylib and rustc.
+        # Drift is a performance defect, never a soundness one (the memo is
+        # content-keyed), so it is stamped, not fatal.
+        invariant_kinds = self.check_invariant_sweep_kinds()
         return {
             "schema": SCHEMA,
             "harness": "benchmarks/beat-llvm/run.py",
@@ -416,6 +474,7 @@ class Harness:
             # Named culprits, not just a load number — see detect_runaways().
             "runaway_processes": runaways,
             "tcg_env": tcg_env,
+            "invariant_sweep_kinds": invariant_kinds,
             "cache": {"mode": "warm", **self.cache_fingerprint(), "verdict_count_after": None},
             "n_compile": self.args.n_compile,
             "n_run": self.args.n_run,
@@ -472,12 +531,18 @@ class Harness:
         return rec
 
     def compile_cold(self, src, out, n):
-        """True cold: fresh empty TCG_PROOF_CACHE_DIR per measured compile (store cost included)."""
+        """True cold: disable every persistent proof-reuse tier for the measured
+        compile (TCG_NO_PROOF_CACHE kills the session/verdict tiers AND, via
+        store_dir(), the default-on per-box Alethe cert store; TCG_NO_CERT_STORE
+        is the store-only belt). The old TCG_PROOF_CACHE_DIR env is dead — no
+        Rust code reads it — so pointing it at an empty dir measured WARM
+        compiles while claiming cold."""
         rec = {"ok": False, "times_s": [], "median_s": None, "err": ""}
         for _ in range(n):
-            cold_dir = Path(tempfile.mkdtemp(prefix="beatllvm-coldcache-"))
-            ok, dt, err = self.compile_once(src, out, 3, True, {"TCG_PROOF_CACHE_DIR": str(cold_dir)})
-            shutil.rmtree(cold_dir, ignore_errors=True)
+            ok, dt, err = self.compile_once(
+                src, out, 3, True,
+                {"TCG_NO_PROOF_CACHE": "1", "TCG_NO_CERT_STORE": "1"},
+            )
             if not ok:
                 rec["err"] = err
                 return rec

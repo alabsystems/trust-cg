@@ -74,7 +74,7 @@ use crate::effects::{
     reads_flags, single_inst_def,
 };
 use crate::loops::{LoopAnalysis, NaturalLoop};
-use crate::pass_manager::MachinePass;
+use crate::pass_manager::{AnalysisCache, MachinePass};
 
 // AArch64 condition codes (numeric encodings, matching the encoder contract).
 const CC_EQ: i64 = 0;
@@ -92,36 +92,45 @@ fn trace(msg: &str) {
 /// Alias-versioned loop-invariant load hoisting pass.
 pub struct AliasVersionedLoadHoist;
 
+/// The pass's whole-function pre-filter: without both a load and a store
+/// there is nothing to version-hoist.
+fn has_plain_load_and_store(func: &MachFunction) -> bool {
+    let mut any_load = false;
+    let mut any_store = false;
+    for inst in &func.insts {
+        if load_access_size(inst).is_some() {
+            any_load = true;
+        }
+        if store_access_size(inst).is_some() {
+            any_store = true;
+        }
+    }
+    any_load && any_store
+}
+
 impl MachinePass for AliasVersionedLoadHoist {
     fn name(&self) -> &str {
         "alias-hoist"
     }
 
     fn run(&mut self, func: &mut MachFunction) -> bool {
-        // Whole-function cheap pre-filter: the transform needs at least one
-        // plain load AND one boundable store somewhere. Bail before touching the
-        // dominator tree / loop analysis when either ingredient is absent (most
-        // functions), so non-candidates pay only an O(insts) scan.
-        let mut any_load = false;
-        let mut any_store = false;
-        for inst in &func.insts {
-            if load_access_size(inst).is_some() {
-                any_load = true;
-            }
-            if store_access_size(inst).is_some() {
-                any_store = true;
-            }
-        }
-        if !any_load || !any_store {
+        if !has_plain_load_and_store(func) {
             return false;
         }
-        // A single fresh dominator tree + loop analysis. `run_with_analyses` is
-        // intentionally NOT implemented: this pass runs right after ext-addr,
-        // which invalidates any cached analysis, so the cache is always cold in
-        // this slot — the shared-analysis path would only add two clones.
         let dom = DomTree::compute(func);
         let loops = LoopAnalysis::compute(func, &dom);
         run_impl(func, &dom, &loops)
+    }
+
+    fn run_with_analyses(&mut self, func: &mut MachFunction, analyses: &mut AnalysisCache) -> bool {
+        if !has_plain_load_and_store(func) {
+            return false;
+        }
+        // Borrowed from the cache (no dominator/loop recompute): the cache's
+        // analyses are the ones computed for this CFG, which no pass since has
+        // changed (the manager invalidates them when it does).
+        let (dom, loops) = analyses.domtree_and_loops(func);
+        run_impl(func, dom, loops)
     }
 
     fn run_with_provenance(

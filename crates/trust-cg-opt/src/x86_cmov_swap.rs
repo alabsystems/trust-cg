@@ -1203,6 +1203,9 @@ fn apply(func: &mut X86ISelFunction, plan: &SwapPlan) {
     func.vreg_nominal_widths.insert(lo, plan.width as u32);
     func.vreg_nominal_widths.insert(hi, plan.width as u32);
 
+    // `apply` runs only on a plan `find_one` just returned, and `try_guard`
+    // opens with `func.blocks.get(&guard)?` — nothing mutates `func` between
+    // that recognition and this call.
     let guard = func
         .blocks
         .get_mut(&plan.guard)
@@ -1259,6 +1262,9 @@ fn apply(func: &mut X86ISelFunction, plan: &SwapPlan) {
     func.block_order.retain(|b| !plan.arm_blocks.contains(b));
 
     // Structural self-check.
+    // Still present after the arm-chain deletion just above: the arm walk in
+    // `try_guard` refuses any `cur == guard`, so `guard` is never a member of
+    // `arm_blocks`.
     let guard = func.blocks.get(&plan.guard).expect("guard present");
     let gn = guard.insts.len();
     assert!(

@@ -114,6 +114,9 @@ fn coverage(op: X86Opcode) -> Coverage {
             Covered
         }
         O::AddRM | O::SubRM | O::CmpRM | O::TestRM => Covered,
+        // Memory-destination RMW ALU: 0x31/0x01 mem-ModRM (+SIB) forms — the
+        // independent decoder's `alu_mr` map already decodes them.
+        O::XorMR | O::AddMR | O::XorMRSib | O::AddMRSib => Covered,
         O::ImulRR | O::ImulRRI | O::ImulRM | O::ImulRMSib => Covered,
         O::Neg | O::Not | O::Inc | O::Dec | O::Idiv | O::Div | O::Mul | O::Cdq | O::Cqo => Covered,
         O::ShlRR | O::ShlRI | O::ShrRR | O::ShrRI | O::SarRR | O::SarRI | O::RolRI => Covered,
@@ -1394,6 +1397,11 @@ fn render_intent(intent: &X86IntentInst) -> Result<Canon, String> {
         // SIB byte generically (exactly as 0x89 does for MovMR32Sib).
         O::MovRM8Sib => mem_load(Mnem::Mov, 8, ops)?,
         O::MovMR8Sib => mem_store(Mnem::Mov, 8, ops)?,
+        // Memory-destination RMW ALU: canonical `[mem, reg]` — exactly the
+        // shape the independent decoder's `alu_mr` map (0x31/0x01 with a
+        // memory ModRM, SIB handled generically by `read_modrm`) produces.
+        O::XorMR | O::XorMRSib => mem_store(Mnem::Xor, 64, ops)?,
+        O::AddMR | O::AddMRSib => mem_store(Mnem::Add, 64, ops)?,
         O::MovRipRel | O::MovRipRelTlv => {
             let d = dst()?;
             let mut c = base_canon(Mnem::Mov, 64);

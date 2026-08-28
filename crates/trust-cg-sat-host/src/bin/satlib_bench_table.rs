@@ -33,7 +33,6 @@
 use std::error::Error;
 use std::ffi::CString;
 use std::fmt;
-use std::mem::MaybeUninit;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::Ordering;
@@ -49,7 +48,7 @@ use trust_cg_sat_host::propagate::{
     JIT_KERNEL_WATCHED_LITERAL, JIT_PRIMARY_RETURNS, PRIMARY_JIT_MODE, PROPAGATE_CALL_COUNT,
     SHADOW_MODE, reset_jit_shadow_for_tests,
 };
-use trust_cg_sat_host::sys;
+use trust_cg_sat_host::{OwnedMicroSatSolver, sys};
 
 /// Name of the JIT kernel this binary times. Pinned to
 /// `watched-literal` because that is the default `JIT_KERNEL_CHOICE`
@@ -152,19 +151,13 @@ fn solve_path(cnf_path: &Path) -> Result<i32, AnyError> {
     let path_str = cnf_path.to_string_lossy().into_owned();
     let c_path =
         CString::new(path_str).map_err(|err| bench_err(format!("cnf path contains NUL: {err}")))?;
-    let mut solver: MaybeUninit<sys::solver> = MaybeUninit::uninit();
-    // SAFETY: matches the upstream MicroSAT `main` pattern (see
-    // `sys::parse` + `sys::solve` docs). `parse` runs `initCDCL` and
-    // fully populates the solver before any read happens.
+    // SAFETY: benchmark inputs are committed, well-formed DIMACS fixtures.
+    let (mut solver, parse_rc) = unsafe { OwnedMicroSatSolver::parse(c_path.as_c_str()) };
     let rc = unsafe {
-        let parse_rc = sys::parse(
-            solver.as_mut_ptr(),
-            c_path.as_ptr() as *mut std::os::raw::c_char,
-        );
         if parse_rc == sys::UNSAT {
             sys::UNSAT
         } else {
-            sys::solve(solver.as_mut_ptr())
+            solver.solve()
         }
     };
     Ok(rc)

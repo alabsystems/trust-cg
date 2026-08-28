@@ -855,12 +855,17 @@ fn apply(func: &mut MachFunction, rec: &Recognized, pressure_tune: bool) -> bool
             vec![
                 vreg(vi0),
                 vreg(dupv),
+                // `c01` is assigned in the `if pressure_tune` preheader branch
+                // above, on the same `pressure_tune` this arm tests — an `apply`
+                // parameter, never reassigned in the body.
                 vreg(c01.expect("tuned scheme materializes [0,1]")),
                 imm(ARR_D2),
             ],
         );
         vi0
     } else {
+        // Mirror of the above: `carried` is assigned in the `else` branch of
+        // the same `if pressure_tune` that built the preheader offsets.
         carried.expect("untuned scheme carries vidx0").0
     };
     let mut ctx = LowerCtx {

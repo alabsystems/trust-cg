@@ -117,9 +117,16 @@ fn kill_recorded_pid(pid_path: &Path) {
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(3) {
         if let Ok(raw) = fs::read_to_string(pid_path) {
-            let pid = raw.trim();
-            if !pid.is_empty() {
-                let _ = Command::new("kill").args(["-KILL", pid]).status();
+            // Parse, never pass raw text to `kill`: a corrupted or partially
+            // written pid file containing `-1` would otherwise become
+            // `kill -KILL -1`, which util-linux `kill` turns into a signal to
+            // EVERY process the user owns (see `common::rosetta::kill_process_group`).
+            if let Ok(pid) = raw.trim().parse::<u32>() {
+                if pid > 1 {
+                    let _ = Command::new("kill")
+                        .args(["-KILL", &pid.to_string()])
+                        .status();
+                }
                 return;
             }
         }

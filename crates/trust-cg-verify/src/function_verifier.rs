@@ -31,7 +31,7 @@
 //! ```
 
 use std::sync::Arc;
-use trust_cg_ir::aarch64_regs::{SP, W16, W17, WSP, X16, X17, X29, preg_class};
+use trust_cg_ir::aarch64_regs::{SP, W16, W17, WSP, WZR, X16, X17, X29, XZR, preg_class};
 use trust_cg_ir::cc::OperandSize;
 use trust_cg_ir::{
     AArch64Opcode, InstId, MachFunction, MachInst, MachOperand, PReg, SpecialReg, X86Opcode,
@@ -803,6 +803,12 @@ enum SourceOp {
     /// LSLV/LSRV/ASRV encoder, paired with a LOAD-BEARING `amount < width`
     /// precondition (task #57).
     Shift(trust_cg_lower::instructions::Opcode),
+    /// Standalone immediate rotate-right. The source side is the frontend's
+    /// shift/OR idiom and the machine side is the architectural `EXTR Rn,Rn`
+    /// alias emitted for `RorRI`. The baked immediate is reconstructed from
+    /// the real instruction and must be in `1..width`; rotate-by-zero is a move
+    /// alias and deliberately remains outside this non-degenerate lane.
+    RotateRightImmediate,
     /// Unary integer negate (trust_ir `Ineg`), dischargeable via
     /// `encode_trust_ir_neg`.
     ///
@@ -995,6 +1001,11 @@ fn opcode_to_source_op(opcode: AArch64Opcode) -> Option<(SourceOp, AluArity, Ope
         AArch64Opcode::AsrRR | AArch64Opcode::AsrRI => Some((
             SourceOp::Shift(Opcode::Sshr),
             AluArity::Binary,
+            OperandSize::S32,
+        )),
+        AArch64Opcode::RorRI => Some((
+            SourceOp::RotateRightImmediate,
+            AluArity::Unary,
             OperandSize::S32,
         )),
 
@@ -1228,6 +1239,7 @@ fn aarch64_emitted_op_class(inst: &MachInst) -> Option<OpClass> {
         SourceOp::Bitwise(_) => Some(OpClass::Bitwise),
         SourceOp::BitwiseShifted { .. } => Some(OpClass::Bitwise),
         SourceOp::Shift(_) => Some(OpClass::Shift),
+        SourceOp::RotateRightImmediate => Some(OpClass::Bitwise),
         SourceOp::Neg => Some(OpClass::IntNeg),
         // Universal glue: exempt from the class check (never from integrity).
         SourceOp::Sextend { .. } | SourceOp::Uextend { .. } | SourceOp::FmovImm => None,
@@ -1271,13 +1283,32 @@ fn operand_is_fp_reg(op: &MachOperand) -> bool {
     )
 }
 
+/// Width of a scalar GPR operand that denotes a value-bearing register.
+///
+/// SP/WSP, ZR, and FP/SIMD registers are intentionally rejected. A
+/// reconstruction that binds a fresh symbolic value must not silently treat a
+/// fixed zero register, stack pointer, or differently typed register as that
+/// unconstrained source.
+fn operand_plain_gpr_width_bits(op: &MachOperand) -> Option<u32> {
+    use trust_cg_ir::RegClass;
+    let class = match op {
+        MachOperand::VReg(v) => v.class,
+        MachOperand::PReg(p) if !matches!(*p, SP | WSP | XZR | WZR) => preg_class(*p),
+        _ => return None,
+    };
+    matches!(class, RegClass::Gpr32 | RegClass::Gpr64).then(|| class.size_bits())
+}
+
 /// True iff `op` is the AArch64 zero register (`XZR`/`WZR`).
 ///
 /// Used to recognize the `MVN` (`Bnot`) alias of `OrnRR` (`ORN Rd, ZR, Rm`): an
 /// `OrnRR` whose `rn` slot is the zero register computes `ZR | ~Rm = ~Rm`, i.e.
 /// a unary bitwise NOT of `Rm`, not a binary OR-NOT.
 fn is_zero_reg(op: &MachOperand) -> bool {
-    matches!(op, MachOperand::Special(SpecialReg::XZR | SpecialReg::WZR))
+    matches!(
+        op,
+        MachOperand::Special(SpecialReg::XZR | SpecialReg::WZR) | MachOperand::PReg(XZR | WZR)
+    )
 }
 
 /// Width in bits of a register-bearing [`MachOperand`].
@@ -1392,6 +1423,9 @@ pub fn reconstruct_alu_obligation(inst: &MachInst) -> Option<ProofObligation> {
         SourceOp::BitwiseShifted { op, kind } => {
             return reconstruct_bitwise_shifted(inst, op, *kind, from_opcode);
         }
+        SourceOp::RotateRightImmediate => {
+            return reconstruct_ror_immediate(inst, from_opcode);
+        }
         // Integer ALU / bitwise / shift / extend / neg fall through to the
         // generic logic below.
         SourceOp::Binary(_)
@@ -1404,7 +1438,11 @@ pub fn reconstruct_alu_obligation(inst: &MachInst) -> Option<ProofObligation> {
 
     // Destination is always operand slot 0 and fixes the operation width.
     let dst = inst.operands.first()?;
-    let dst_width = operand_reg_width_bits(dst)?;
+    // The generic reconstruction models the result as a value produced into a
+    // normal scalar GPR. A zero-register destination discards that value and a
+    // stack-pointer destination has distinct architectural semantics, so
+    // neither may inherit this ordinary-register obligation.
+    let dst_width = operand_plain_gpr_width_bits(dst)?;
     let size = width_to_operand_size(dst_width)?;
     let ty = crate::aarch64_semantics::operand_size_to_type(size);
 
@@ -1422,6 +1460,9 @@ pub fn reconstruct_alu_obligation(inst: &MachInst) -> Option<ProofObligation> {
             // NOT of Rm, not a binary OR-NOT. Re-route to the Bnot reconstruction
             // over src2 so the proof models the actual (unary) semantics.
             if matches!(source_op, SourceOp::Bitwise(Opcode::BorNot)) && is_zero_reg(src1) {
+                if operand_reg_width_bits(src1)? != dst_width {
+                    return None;
+                }
                 let rm_width = operand_reg_width_bits(src2)?;
                 if rm_width != dst_width {
                     return None;
@@ -1520,6 +1561,7 @@ pub fn reconstruct_alu_obligation(inst: &MachInst) -> Option<ProofObligation> {
                 // reach here either.
                 SourceOp::Neg
                 | SourceOp::BitwiseShifted { .. }
+                | SourceOp::RotateRightImmediate
                 | SourceOp::Sextend { .. }
                 | SourceOp::Uextend { .. }
                 | SourceOp::IntDiv(_)
@@ -1649,6 +1691,7 @@ pub fn reconstruct_alu_obligation(inst: &MachInst) -> Option<ProofObligation> {
                 | SourceOp::Bitwise(_)
                 | SourceOp::BitwiseShifted { .. }
                 | SourceOp::Shift(_)
+                | SourceOp::RotateRightImmediate
                 | SourceOp::IntDiv(_)
                 | SourceOp::MulAdd { .. }
                 | SourceOp::FpFma { .. }
@@ -1664,6 +1707,52 @@ pub fn reconstruct_alu_obligation(inst: &MachInst) -> Option<ProofObligation> {
         // never reaches the generic GPR logic. Fail closed.
         AluArity::Ternary => None,
     }
+}
+
+/// Reconstruct standalone `ROR Rd, Rn, #k` from its real three-operand form.
+///
+/// SOURCE is the frontend shift/OR rotate idiom. MACHINE directly decodes the
+/// `EXTR Rd, Rn, Rn, #k` alias emitted by the code generator. The two formulas
+/// are structurally distinct but equivalent; perturbing the EXTR amount or
+/// either concatenated source refutes. Only W/X same-width GPRs and non-zero
+/// in-range immediates receive authority. `#0` encodes as a move alias and must
+/// not inherit this rotate proof.
+fn reconstruct_ror_immediate(inst: &MachInst, from_opcode: String) -> Option<ProofObligation> {
+    use crate::aarch64_semantics::{encode_ror_imm_extr, encode_ror_imm_source};
+
+    if inst.opcode != AArch64Opcode::RorRI || inst.operands.len() != 3 {
+        return None;
+    }
+    let dst_width = operand_plain_gpr_width_bits(inst.operands.first()?)?;
+    let src_width = operand_plain_gpr_width_bits(inst.operands.get(1)?)?;
+    if src_width != dst_width {
+        return None;
+    }
+    let size = width_to_operand_size(dst_width)?;
+    let MachOperand::Imm(amount) = inst.operands.get(2)? else {
+        return None;
+    };
+    if *amount < 1 || *amount >= i64::from(dst_width) {
+        return None;
+    }
+    let amount = *amount as u32;
+    let src = SmtExpr::var("recon_src", dst_width);
+    Some(ProofObligation {
+        name: format!(
+            "RECONSTRUCTED Ror_{} #{} -> {:?} (EXTR alias, real-operand)",
+            dst_width, amount, inst.opcode
+        ),
+        trust_ir_expr: encode_ror_imm_source(size, src.clone(), amount),
+        aarch64_expr: encode_ror_imm_extr(size, src, amount),
+        inputs: vec![("recon_src".to_string(), dst_width)],
+        preconditions: vec![],
+        fp_inputs: vec![],
+        category: Some(crate::lowering_proof::TransvalCheckKind::InstructionLowering),
+        machine_side_provenance: MachineSideProvenance::Reconstructed {
+            from_opcode,
+            arity: AluArity::Unary.as_u8(),
+        },
+    })
 }
 
 /// Reconstruct `EOR Rd, Rn, Rm, LSL|LSR #k` from its real four-operand form.
@@ -2687,6 +2776,10 @@ pub fn representative_reconstructable_inst(opcode: AArch64Opcode) -> Option<Mach
             vec![w(0), w(1), w(2), MachOperand::Imm(7)]
         }
 
+        // ROR-immediate / EXTR alias: [dst, Rn, Imm(k)]. Use a non-zero
+        // in-range amount because #0 is encoded as the separate move alias.
+        AArch64Opcode::RorRI => vec![w(0), w(1), MachOperand::Imm(7)],
+
         // Other unary (Neg): [dst, src].
         _ if arity == AluArity::Unary => vec![w(0), w(1)],
         // Binary register form: [dst, src1, src2].
@@ -2705,24 +2798,42 @@ pub fn representative_reconstructable_inst(opcode: AArch64Opcode) -> Option<Mach
 /// the obligation being `Reconstructed` (its machine side came from the REAL
 /// opcode) AND discharging `Valid` — the exact same dual criterion the function
 /// verifier's `try_reconstruct` uses, so the gate measures precisely the
-/// coverage the per-instruction walk would credit.
+/// coverage the per-instruction walk would credit. `RorRI` additionally checks
+/// an X64 representative: its EXTR immediate field and concatenation width are
+/// width-sensitive, so opcode-level credit requires both emitted W32 and X64
+/// forms to discharge.
 pub fn reconstruction_discharges_valid(opcode: AArch64Opcode, config: &VerificationConfig) -> bool {
     let Some(inst) = representative_reconstructable_inst(opcode) else {
         return false;
     };
-    let Some(obligation) = reconstruct_alu_obligation(&inst) else {
-        return false;
+    let discharges = |inst: &MachInst| {
+        let Some(obligation) = reconstruct_alu_obligation(inst) else {
+            return false;
+        };
+        if !obligation.is_reconstructed() {
+            return false;
+        }
+        // Routed through the shared CONTENT-keyed memo (PROOF-2): sound by
+        // construction (the key embeds the full obligation, never just its
+        // name) and skips re-sweeping the same representative obligation per
+        // compile.
+        matches!(
+            memoized_verify_by_evaluation(&obligation, config),
+            VerificationResult::Valid
+        )
     };
-    if !obligation.is_reconstructed() {
+    if !discharges(&inst) {
         return false;
     }
-    // Routed through the shared CONTENT-keyed memo (PROOF-2): sound by
-    // construction (the key embeds the full obligation, never just its name)
-    // and skips re-sweeping the same representative obligation per compile.
-    matches!(
-        memoized_verify_by_evaluation(&obligation, config),
-        VerificationResult::Valid
-    )
+    if opcode != AArch64Opcode::RorRI {
+        return true;
+    }
+
+    use trust_cg_ir::RegClass;
+    use trust_cg_ir::regs::VReg;
+    let x = |id: u32| MachOperand::VReg(VReg::new(id, RegClass::Gpr64));
+    let x64 = MachInst::new(AArch64Opcode::RorRI, vec![x(0), x(1), MachOperand::Imm(7)]);
+    discharges(&x64)
 }
 
 // ---------------------------------------------------------------------------
@@ -2730,9 +2841,44 @@ pub fn reconstruction_discharges_valid(opcode: AArch64Opcode, config: &Verificat
 // ---------------------------------------------------------------------------
 
 /// Verifier that maps MachFunction instructions to proof obligations.
+/// Which registry family a precise citation names (see `refine_citation`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PreciseFamily {
+    Icmp,
+    CondBr,
+}
+
+/// `TCG_PRECISE_CITATIONS=1`: cite the instruction's own family member
+/// instead of the category's first match. Opt-in until the owner accepts the
+/// certificate-content change (verdicts and code are unaffected).
+fn precise_citations_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("TCG_PRECISE_CITATIONS").is_some())
+}
+
+/// `TCG_TIME_WALK=1`: per-function split of the certificate walk's time by arm.
+fn walk_timing_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("TCG_TIME_WALK").is_some())
+}
+
+/// `TCG_TRACE_CITATIONS=1`: one line per refined / fallen-back citation.
+fn citation_trace_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("TCG_TRACE_CITATIONS").is_some())
+}
+
 pub struct FunctionVerifier {
     db: ProofDatabase,
     config: VerificationConfig,
+    /// `(category, query)` → index into `db.all()` of the registry proof the
+    /// walk's query resolves to (or `None`). The queries are a fixed set of
+    /// `&'static str`s chosen per opcode/operand shape; resolving one meant
+    /// collecting the category's proofs into a fresh `Vec` and lowercasing
+    /// every candidate's name, per instruction of every certificate walk and
+    /// pre-warm enumeration. Resolved once per process instead.
+    query_memo:
+        std::sync::Mutex<std::collections::HashMap<(ProofCategory, &'static str), Option<usize>>>,
 }
 
 impl FunctionVerifier {
@@ -2765,7 +2911,23 @@ impl FunctionVerifier {
     /// Create a new function verifier with default configuration.
     pub fn new() -> Self {
         Self {
+            // AArch64 never discharges an x86-64 obligation, and skipping that
+            // one registry is already worth 40.6 ms of the 50.2 ms database
+            // build, once per compile (see `ProofDatabase::new_without_x86_64`).
+            // `for_categories(CONSULTED_CATEGORIES)` SUBSUMES that saving — it
+            // runs only the registrars whose categories this verifier can
+            // actually consult, x86-64 included — and, unlike a hand-maintained
+            // second registrar list, it is CHECKED rather than assumed:
+            // `registrar_category_table_matches_reality`,
+            // `for_categories_matches_full_database` and
+            // `aarch64_database_matches_full_database_for_consulted_categories`
+            // fail closed if the manifest ever under-requests. That check is
+            // load-bearing, not ceremony: `new_without_x86_64` has ALREADY
+            // drifted from `new()` — it omits `register_widening_multiply_proofs`,
+            // whose obligation the `Umull => "-> umull xd"` binding below
+            // consults — so building through it would silently drop that credit.
             db: ProofDatabase::for_categories(Self::CONSULTED_CATEGORIES),
+            query_memo: std::sync::Mutex::new(std::collections::HashMap::new()),
             config: VerificationConfig::default(),
         }
     }
@@ -2773,7 +2935,10 @@ impl FunctionVerifier {
     /// Create a new function verifier with custom verification configuration.
     pub fn with_config(config: VerificationConfig) -> Self {
         Self {
+            // Same category-filtered database as `new`; see the note there for
+            // why this is the checked form of "don't build x86-64 obligations".
             db: ProofDatabase::for_categories(Self::CONSULTED_CATEGORIES),
+            query_memo: std::sync::Mutex::new(std::collections::HashMap::new()),
             config,
         }
     }
@@ -2819,10 +2984,19 @@ impl FunctionVerifier {
             CmpRR | CmpRI | CMPWrr | CMPXrr | CMPWri | CMPXri => {
                 Some(("cmp", ProofCategory::Comparison))
             }
-            // TST produces the complete NZCV state. Concrete instructions are
-            // width/shape-bound below; this opcode-level token is used only by
-            // callers that do not have operands (the coverage gate separately
-            // demands both registered widths).
+            // TST produces the COMPLETE NZCV state, and the packed-NZCV
+            // theorem (`cmp_combine_proofs::proof_tst_packed_nzcv`) pins all
+            // four flags — N, Z and the architecturally CLEARED C/V — against
+            // the encoder, so this is NOT the #62 unfaithful-inheritance hazard.
+            // (Crediting ONE condition's theorem for all conditions WOULD be:
+            // the faithful per-condition obligations from `proof_tst_nzcv_effect`
+            // are a narrower authority and are bound CONTEXT-SENSITIVELY by
+            // `tst_nzcv_consumer_query` in the in-block chain, which runs first.)
+            // Concrete instructions are width/shape-bound below by
+            // `operand_sensitive_or_opcode_query`; this opcode-level token is
+            // used only by callers that do not have operands (the coverage gate
+            // separately demands BOTH registered widths discharge). Fusion forms
+            // TST;B.EQ ≡ TBZ stay covered under CmpCombine.
             Tst => Some(("tst packed nzcv", ProofCategory::CmpCombine)),
 
             // Branch
@@ -3016,11 +3190,12 @@ impl FunctionVerifier {
             // width-sensitive binding happens below; opcode-wide credit would
             // incorrectly include W-form zero-extension semantics.
             Movn => None,
-            // MOVK remains emittable as the repair step in canonical
-            // materialization chains, but the registered "MOVK idempotent"
-            // theorem proves only double application of the hw0 operation. It
-            // is not a general per-instruction lowering/encoding proof and must
-            // not be credited opcode-wide.
+            // MOVK is credited ONLY through the operand-sensitive per-(width,
+            // halfword) splice binding in `operand_sensitive_or_opcode_query`
+            // (`const_materialize_proofs::movk_halfword_query`): opcode-wide
+            // credit would let a malformed or wrong-slot MOVK inherit another
+            // slot's proof. The historical "MOVK idempotent" theorem remains
+            // registered but is not a lowering proof and is never bound here.
             Movk => None,
 
             // PC-relative address materialization (ADRP page + ADD lo12 pair
@@ -3162,8 +3337,14 @@ impl FunctionVerifier {
             // Query MUST be lowercase: verify() does name.to_lowercase().contains(query)
             // WITHOUT lowercasing the query. The "ubfm"/"sbfm" prefix keeps the two
             // disjoint (and clear of the sextend/uextend extends in the same
-            // category). BFM (insert), RORV (RorRI, not isel-emitted), and RBIT
-            // stay fail-closed — no faithful per-opcode obligation yet.
+            // category). BFM (insert) and RBIT stay fail-closed — no faithful
+            // per-opcode obligation yet. RorRI has no static mapping HERE
+            // either, but for the opposite reason: it is now emitted standalone
+            // by the rotate recognizer and binds per DESTINATION WIDTH in
+            // `operand_sensitive_or_opcode_query` to `all_ror_immediate_proofs`
+            // ("rorri_i32"/"rorri_i64"), while its real immediate and EXTR alias
+            // are credited by operand reconstruction. An opcode-wide entry here
+            // would let a malformed RorRI inherit the wrong width's credit.
             Ubfm => Some(("ubfm extract w", ProofCategory::ExtensionTruncation)),
             Sbfm => Some(("sbfm extract w", ProofCategory::ExtensionTruncation)),
 
@@ -3815,6 +3996,7 @@ impl FunctionVerifier {
             .or_else(|| Self::generated_frame_address_materialization_query(inst))
             .or_else(|| Self::generated_fp_sp_relative_addressing_query(inst))
             .or_else(|| Self::i128_carry_chain_low_limb_query(func, block_insts, block_pos))
+            .or_else(|| Self::tst_nzcv_consumer_query(func, block_insts, block_pos))
             .or_else(|| Self::frame_pair_restore_query(inst))
             .or_else(|| Self::operand_sensitive_or_opcode_query(inst))
     }
@@ -3874,6 +4056,34 @@ impl FunctionVerifier {
             };
         }
 
+        // ROR-immediate shares one opcode across W and X. Bind the concrete
+        // instruction to the matching width's rotate theorems
+        // (`all_ror_immediate_proofs`) and accept only the reg-reg-imm form
+        // the rotate recognizer emits, with the ROR amount inside [1, width).
+        // Malformed shapes never fall back to opcode-wide credit.
+        if inst.opcode == AArch64Opcode::RorRI {
+            if inst.operands.len() != 3 {
+                return None;
+            }
+            let dst_width = operand_reg_width_bits(inst.operands.first()?)?;
+            if !matches!(dst_width, 32 | 64)
+                || operand_reg_width_bits(inst.operands.get(1)?)? != dst_width
+            {
+                return None;
+            }
+            let MachOperand::Imm(k) = inst.operands.get(2)? else {
+                return None;
+            };
+            if *k < 1 || *k >= i64::from(dst_width) {
+                return None;
+            }
+            let query = if dst_width == 64 {
+                "rorri_i64"
+            } else {
+                "rorri_i32"
+            };
+            return Some((query, ProofCategory::BitwiseShift));
+        }
         // UBFM/SBFM share one opcode across W and X. Bind the concrete
         // instruction to the matching symbolic-width theorem and accept only
         // the non-wrapping extract form emitted by isel and LsrAndUbfx. The old
@@ -3984,22 +4194,26 @@ impl FunctionVerifier {
             let query = crate::const_materialize_proofs::movn_halfword_query(width, shift as u32)?;
             return Some((query, ProofCategory::ConstantMaterialization));
         }
-        // MOVK binds to the (width, halfword)-SPECIFIC splice obligation rather
-        // than an opcode-wide credit: the proof pins both the 16 written bits and
-        // the preservation of the remaining bits at exactly this slot, so a MOVK
-        // emitted at the wrong halfword cannot inherit another slot's proof.
         if inst.opcode == AArch64Opcode::Movk {
-            // A MOVK to WZR/XZR architecturally discards the write; the
-            // splice theorem models a real register destination, so a
-            // zero-register MOVK earns no credit (review hardening — no
-            // producer emits it, and a malformed dead-splice chain must not
-            // verify).
+            // A MOVK to WZR/XZR architecturally discards the write; the splice
+            // theorem models a REAL register destination, so a zero-register
+            // MOVK earns no credit (review hardening — no producer emits it,
+            // and a malformed dead-splice chain must not verify).
             if matches!(
                 inst.operands.first(),
                 Some(MachOperand::Special(SpecialReg::WZR | SpecialReg::XZR))
             ) {
                 return None;
             }
+            // MOVK binds to the (width, halfword)-SPECIFIC splice obligation
+            // rather than an opcode-wide credit: the proof pins BOTH the 16
+            // written bits AND the preservation of the remaining bits at
+            // exactly this slot, so a MOVK emitted at the wrong halfword (or an
+            // illegal W-form shift, already rejected above) can never inherit
+            // another slot's credit. The splice obligations are FAITHFUL per
+            // #62: the trust-ir side is an independent concat/extract splice,
+            // the machine side the encoder's shift/mask semantics, so a wrong
+            // shift or mask REFUTES.
             let width = if is_w_form { 32 } else { 64 };
             let query = crate::const_materialize_proofs::movk_halfword_query(width, shift as u32)?;
             return Some((query, ProofCategory::ConstantMaterialization));
@@ -4027,6 +4241,504 @@ impl FunctionVerifier {
             (SubsRR, Sbc) => Some(("isub_i128 whole-chain", ProofCategory::Arithmetic)),
             _ => None,
         }
+    }
+
+    /// Standalone-TST credit is CONTEXT-SENSITIVE: bind the TST to the
+    /// registered per-condition NZCV-effect obligations of the conditions its
+    /// consumers actually read (`proof_tst_nzcv_effect`, names
+    /// "TST w{64,32}: {cc} …").
+    ///
+    /// TST alone does not identify which flag combination matters, and
+    /// opcode-wide credit from one condition's theorem is the unfaithful
+    /// inheritance #62 retracted. The binding therefore collects EVERY
+    /// consumer of THIS TST's flags — not just the first (review finding:
+    /// CSel-family consumers do not write NZCV, so a second consumer reading
+    /// an uncovered condition would otherwise escape unvouched) — scanning
+    /// forward (bounded) while the flags are live:
+    ///
+    ///   * consumer candidates: the `CSet`/`CSEL` family (incl. `FcselRR` —
+    ///     the FP select reads NZCV exactly like `Csel`) and conditional
+    ///     branches `BCond`/`Bcc` (the unfusible multi-bit-mask `TST #m; B.cc`
+    ///     shape TBZ/TBNZ cannot express). Each recorded condition must map
+    ///     to a registered obligation via `tst_condition_query`, else fail
+    ///     closed.
+    ///   * a flag WRITER kills the TST's NZCV: collection ends successfully.
+    ///   * fail closed on anything not provably flag-transparent while the
+    ///     flags are live: an `Adc`/`Sbc` C-reader, a call (the callee may or
+    ///     may not preserve NZCV), a non-Nop pseudo (later expansion could
+    ///     touch flags), a malformed condition operand, or the scan cap.
+    ///   * if control can LEAVE the block with the flags still live (any
+    ///     branch/terminator, or block end), every successor path must be
+    ///     provably NZCV-dead-on-entry (`nzcv_dead_on_entry`) — otherwise a
+    ///     cross-block consumer would escape the net. A conditional-branch
+    ///     consumer's TAKEN edge carries the flags out unconditionally, so
+    ///     its presence forces the all-successors check even when a LATER
+    ///     in-block flags writer kills the fallthrough copy (review round 2;
+    ///     the target operand is a resolved immediate post-layout, so the
+    ///     superset over `block.succs` stands in for the exact edge); the
+    ///     scan continues past a conditional-branch consumer only to find
+    ///     the fallthrough.
+    ///
+    /// The TST cites the first consumer's obligation (all recorded conditions
+    /// are rows of the same per-width family and every one is required to be
+    /// covered). A TST with NO consumer earns nothing.
+    fn tst_nzcv_consumer_query(
+        func: &MachFunction,
+        block_insts: &[InstId],
+        block_pos: usize,
+    ) -> Option<(&'static str, ProofCategory)> {
+        use trust_cg_ir::target_info::{AArch64Target, TargetInfo};
+        const TST_CONSUMER_SCAN_CAP: usize = 16;
+        let cur = Self::inst_at_block_pos(func, block_insts, block_pos)?;
+        if cur.opcode != AArch64Opcode::Tst {
+            return None;
+        }
+        // Width of the tested value = register width of the first operand
+        // (TST is emitted as `[rn, rm]` or `[rn, #imm]`; both flag models are
+        // width-specific).
+        let width = operand_reg_width_bits(cur.operands.first()?)?;
+
+        let mut ccs: Vec<i64> = Vec::new();
+        let mut flags_die_in_block = false;
+        // A conditional-branch CONSUMER carries NZCV out on its taken edge
+        // REGARDLESS of what the fallthrough path later does to the flags
+        // (review round 2: an in-block flags writer after the BCond must not
+        // skip the successor check). Post-layout the branch target operand is
+        // a resolved immediate, not `MachOperand::Block`, so the taken edge
+        // cannot be extracted per-instruction — instead this flag forces the
+        // CONSERVATIVE superset check over ALL of the block's successors (the
+        // taken edge is necessarily among them).
+        let mut cond_branch_consumer = false;
+        let mut pos = block_pos + 1;
+        loop {
+            if pos > block_pos + TST_CONSUMER_SCAN_CAP {
+                // Flags still live past the scan bound: unknown readers may
+                // follow. Fail closed.
+                return None;
+            }
+            let Some(inst) = Self::inst_at_block_pos(func, block_insts, pos) else {
+                // Block ended with the flags live: treat as live-out and
+                // require the successor check below.
+                break;
+            };
+            if let Some(cc_pos) = Self::nzcv_consumer_cc_pos(inst.opcode) {
+                let MachOperand::Imm(found) = inst.operands.get(cc_pos)? else {
+                    return None;
+                };
+                ccs.push(*found);
+                if matches!(inst.opcode, AArch64Opcode::BCond | AArch64Opcode::Bcc) {
+                    cond_branch_consumer = true;
+                }
+                // Consumers do not write NZCV — keep collecting (a
+                // conditional-branch consumer is followed by its fallthrough
+                // branch, which ends the scan as a terminator below).
+                pos += 1;
+                continue;
+            }
+            let op = inst.opcode;
+            if <AArch64Target as TargetInfo>::writes_flags(op) {
+                // The TST's NZCV is shadowed from here on; nothing later on
+                // the FALLTHROUGH path can read it (taken edges recorded
+                // above are still checked below).
+                flags_die_in_block = true;
+                break;
+            }
+            if <AArch64Target as TargetInfo>::reads_flags(op)
+                || inst.is_call()
+                || (op.is_pseudo() && op != AArch64Opcode::Nop)
+            {
+                return None;
+            }
+            if inst.is_branch() || inst.is_terminator() {
+                // Control leaves the block with the flags live.
+                break;
+            }
+            pos += 1;
+        }
+
+        if !flags_die_in_block || cond_branch_consumer {
+            // NZCV is (potentially) LIVE-OUT — on the fallthrough when no
+            // in-block writer killed it, and on a conditional-branch
+            // consumer's taken edge UNCONDITIONALLY. Every successor path
+            // must be provably flag-dead-on-entry, or an unseen consumer
+            // escapes. (When the flags die in-block this over-approximates
+            // the taken edge with all successors — conservative, sound.)
+            let block = func
+                .blocks
+                .iter()
+                .find(|b| std::ptr::eq(b.insts.as_slice(), block_insts))?;
+            let mut visited = std::collections::HashSet::new();
+            for &succ in &block.succs {
+                if !Self::nzcv_dead_on_entry(func, succ, &mut visited) {
+                    return None;
+                }
+            }
+        }
+
+        // EVERY consumer's condition must have a registered obligation; the
+        // TST cites the first (any uncovered condition fails the whole TST
+        // closed). Zero consumers: a dead TST earns nothing.
+        let queries = ccs
+            .iter()
+            .map(|&cc| Self::tst_condition_query(width, cc))
+            .collect::<Option<Vec<&'static str>>>()?;
+        let first = *queries.first()?;
+        Some((first, ProofCategory::CmpCombine))
+    }
+
+    /// NZCV-consumer candidates for the TST binding, with the operand index
+    /// of the ISel `CondCode` immediate each carries (isel.rs encoding:
+    /// EQ=0 NE=1 HS=2 LO=3 MI=4 PL=5 VS=6 VC=7 HI=8 LS=9 GE=10 LT=11 GT=12
+    /// LE=13). `FcselRR` reads NZCV exactly like `Csel` (cc at operand 3);
+    /// `BCond`/`Bcc` carry `[Imm(cc), Block(target)]`.
+    fn nzcv_consumer_cc_pos(opcode: AArch64Opcode) -> Option<usize> {
+        use AArch64Opcode::{BCond, Bcc, CSet, Csel, Csinc, Csinv, Csneg, FcselRR};
+        match opcode {
+            CSet => Some(1),
+            Csel | Csinc | Csinv | Csneg | FcselRR => Some(3),
+            BCond | Bcc => Some(0),
+            _ => None,
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Precise citations (opt-in: TCG_PRECISE_CITATIONS=1)
+    //
+    // A bare CMP is credited by the `"cmp"` fragment, which resolves to the
+    // FIRST `Icmp_*` proof in the category (Eq, 32-bit) whatever the CMP's
+    // width and whatever condition its consumer reads; a conditional branch
+    // likewise cites `CondBr_Eq_I32`. The registry has the full family
+    // (Eq NE SGE SGT SLE SLT UGE UGT ULE ULT x I32/I64) for both. With the
+    // flag on, the walk names the family member that IS this instruction's
+    // lowering — the CMP's own width and the single condition its NZCV
+    // consumers read — and falls back to the fragment (unchanged behaviour)
+    // whenever that is not determinable: no consumer in the block, consumers
+    // disagreeing on the condition, a condition with no integer family
+    // member (MI/PL/VS/VC), or a branch whose flags come from something other
+    // than a CMP. Verdicts never change (every family member is Valid); the
+    // certificate's `rule_name` becomes the instruction's own proof.
+    // ------------------------------------------------------------------
+
+    /// `Icmp_<cond>_I<w>` / `CondBr_<cond>_I<w>` as the lowercase query that
+    /// matches exactly that registry entry (pinned by
+    /// `precise_citation_families_are_unique`).
+    fn icmp_family_query(kind: PreciseFamily, cc: i64, width: u32) -> Option<&'static str> {
+        // AArch64 condition-code encoding -> the registry's trust-ir spelling.
+        // 10 conditions x 2 widths per family (UGE/HS returned with the adder
+        // carry-out flag model; MI/PL/VS/VC have no integer family member).
+        Some(match (kind, cc, width) {
+            (PreciseFamily::Icmp, 0, 32) => "icmp_eq_i32",
+            (PreciseFamily::Icmp, 0, 64) => "icmp_eq_i64",
+            (PreciseFamily::Icmp, 1, 32) => "icmp_ne_i32",
+            (PreciseFamily::Icmp, 2, 32) => "icmp_uge_i32",
+            (PreciseFamily::Icmp, 1, 64) => "icmp_ne_i64",
+            (PreciseFamily::Icmp, 2, 64) => "icmp_uge_i64",
+
+            (PreciseFamily::Icmp, 3, 32) => "icmp_ult_i32",
+            (PreciseFamily::Icmp, 3, 64) => "icmp_ult_i64",
+            (PreciseFamily::Icmp, 8, 32) => "icmp_ugt_i32",
+            (PreciseFamily::Icmp, 8, 64) => "icmp_ugt_i64",
+            (PreciseFamily::Icmp, 9, 32) => "icmp_ule_i32",
+            (PreciseFamily::Icmp, 9, 64) => "icmp_ule_i64",
+            (PreciseFamily::Icmp, 10, 32) => "icmp_sge_i32",
+            (PreciseFamily::Icmp, 10, 64) => "icmp_sge_i64",
+            (PreciseFamily::Icmp, 11, 32) => "icmp_slt_i32",
+            (PreciseFamily::Icmp, 11, 64) => "icmp_slt_i64",
+            (PreciseFamily::Icmp, 12, 32) => "icmp_sgt_i32",
+            (PreciseFamily::Icmp, 12, 64) => "icmp_sgt_i64",
+            (PreciseFamily::Icmp, 13, 32) => "icmp_sle_i32",
+            (PreciseFamily::Icmp, 13, 64) => "icmp_sle_i64",
+            (PreciseFamily::CondBr, 0, 32) => "condbr_eq_i32",
+            (PreciseFamily::CondBr, 0, 64) => "condbr_eq_i64",
+            (PreciseFamily::CondBr, 1, 32) => "condbr_ne_i32",
+            (PreciseFamily::CondBr, 2, 32) => "condbr_uge_i32",
+            (PreciseFamily::CondBr, 1, 64) => "condbr_ne_i64",
+            (PreciseFamily::CondBr, 2, 64) => "condbr_uge_i64",
+
+            (PreciseFamily::CondBr, 3, 32) => "condbr_ult_i32",
+            (PreciseFamily::CondBr, 3, 64) => "condbr_ult_i64",
+            (PreciseFamily::CondBr, 8, 32) => "condbr_ugt_i32",
+            (PreciseFamily::CondBr, 8, 64) => "condbr_ugt_i64",
+            (PreciseFamily::CondBr, 9, 32) => "condbr_ule_i32",
+            (PreciseFamily::CondBr, 9, 64) => "condbr_ule_i64",
+            (PreciseFamily::CondBr, 10, 32) => "condbr_sge_i32",
+            (PreciseFamily::CondBr, 10, 64) => "condbr_sge_i64",
+            (PreciseFamily::CondBr, 11, 32) => "condbr_slt_i32",
+            (PreciseFamily::CondBr, 11, 64) => "condbr_slt_i64",
+            (PreciseFamily::CondBr, 12, 32) => "condbr_sgt_i32",
+            (PreciseFamily::CondBr, 12, 64) => "condbr_sgt_i64",
+            (PreciseFamily::CondBr, 13, 32) => "condbr_sle_i32",
+            (PreciseFamily::CondBr, 13, 64) => "condbr_sle_i64",
+            _ => return None,
+        })
+    }
+
+    fn is_cmp_opcode(opcode: AArch64Opcode) -> bool {
+        use AArch64Opcode::{CMPWri, CMPWrr, CMPXri, CMPXrr, CmpRI, CmpRR};
+        matches!(opcode, CmpRR | CmpRI | CMPWrr | CMPXrr | CMPWri | CMPXri)
+    }
+
+    /// The single condition every NZCV consumer of the CMP at `block_pos`
+    /// reads, scanning forward until the flags die; `None` when there is no
+    /// consumer, consumers disagree, or something else reads the flags.
+    fn cmp_consumer_cc(
+        func: &MachFunction,
+        block_insts: &[InstId],
+        block_pos: usize,
+    ) -> Result<i64, &'static str> {
+        use trust_cg_ir::target_info::{AArch64Target, TargetInfo};
+        const SCAN_CAP: usize = 16;
+        let mut cc: Option<i64> = None;
+        let mut pos = block_pos + 1;
+        while pos <= block_pos + SCAN_CAP {
+            let Some(inst) = Self::inst_at_block_pos(func, block_insts, pos) else {
+                break;
+            };
+            if let Some(cc_pos) = Self::nzcv_consumer_cc_pos(inst.opcode) {
+                let Some(MachOperand::Imm(found)) = inst.operands.get(cc_pos) else {
+                    return Err("cc operand not an immediate");
+                };
+                match cc {
+                    None => cc = Some(*found),
+                    Some(seen) if seen == *found => {}
+                    Some(_) => return Err("consumers disagree"),
+                }
+                if inst.is_branch() || inst.is_terminator() {
+                    break;
+                }
+                pos += 1;
+                continue;
+            }
+            let op = inst.opcode;
+            if <AArch64Target as TargetInfo>::writes_flags(op) {
+                break;
+            }
+            if <AArch64Target as TargetInfo>::reads_flags(op) {
+                return Err("flags read by a non-cc consumer");
+            }
+            // A call or an opaque pseudo ends the flags' live range: fine after
+            // a consumer was seen, undeterminable before one.
+            if inst.is_call() {
+                return cc.ok_or("call before any consumer");
+            }
+            if op.is_pseudo() && op != AArch64Opcode::Nop {
+                return cc.ok_or("pseudo before any consumer");
+            }
+            if inst.is_branch() || inst.is_terminator() {
+                break;
+            }
+            pos += 1;
+        }
+        cc.ok_or("no nzcv consumer in block")
+    }
+
+    /// `Icmp_<cond>_I<w>` for the CMP at `block_pos`: its compared register's
+    /// width and its consumers' single condition.
+    /// `Err` carries the reason it could not refine (for the trace).
+    fn precise_cmp_query_why(
+        func: &MachFunction,
+        block_insts: &[InstId],
+        block_pos: usize,
+        inst: &MachInst,
+    ) -> Result<&'static str, String> {
+        if !Self::is_cmp_opcode(inst.opcode) {
+            return Err("not a cmp".into());
+        }
+        let width = inst
+            .operands
+            .first()
+            .and_then(operand_reg_width_bits)
+            .ok_or_else(|| "operand width unknown".to_string())?;
+        let cc = Self::cmp_consumer_cc(func, block_insts, block_pos)
+            .map_err(|e| format!("w{width}: {e}"))?;
+        Self::icmp_family_query(PreciseFamily::Icmp, cc, width)
+            .ok_or_else(|| format!("w{width} cc{cc}: no family member"))
+    }
+
+    /// The conditional branch at `block_pos` cites the obligation of the flag
+    /// writer it consumes: `CondBr_<cond>_I<w>` (Branch) after a CMP of width
+    /// `w`, or the standalone-TST obligation for its condition (CmpCombine)
+    /// after a TST — scanning back to the nearest flag writer; any other
+    /// writer, or none in the block, keeps the fragment.
+    /// `Err` carries the reason it could not refine (for the trace).
+    fn precise_condbr_query_why(
+        func: &MachFunction,
+        block_insts: &[InstId],
+        block_pos: usize,
+        inst: &MachInst,
+    ) -> Result<(&'static str, ProofCategory), String> {
+        use trust_cg_ir::target_info::{AArch64Target, TargetInfo};
+        if !matches!(inst.opcode, AArch64Opcode::BCond | AArch64Opcode::Bcc) {
+            return Err("not a conditional branch".into());
+        }
+        let Some(MachOperand::Imm(cc)) = inst.operands.first() else {
+            return Err("cc operand not an immediate".into());
+        };
+        let mut pos = block_pos;
+        while pos > 0 && block_pos - pos <= 16 {
+            pos -= 1;
+            let prev = Self::inst_at_block_pos(func, block_insts, pos)
+                .ok_or_else(|| "block position out of range".to_string())?;
+            if <AArch64Target as TargetInfo>::writes_flags(prev.opcode) {
+                let width = prev
+                    .operands
+                    .first()
+                    .and_then(operand_reg_width_bits)
+                    .ok_or_else(|| "flag writer operand width unknown".to_string())?;
+                if prev.opcode == AArch64Opcode::Tst {
+                    return Self::tst_condition_query(width, *cc)
+                        .map(|q| (q, ProofCategory::CmpCombine))
+                        .ok_or_else(|| format!("tst w{width} cc{cc}: no TST obligation"));
+                }
+                if !Self::is_cmp_opcode(prev.opcode) {
+                    return Err(format!("flags from {:?}", prev.opcode));
+                }
+                return Self::icmp_family_query(PreciseFamily::CondBr, *cc, width)
+                    .map(|q| (q, ProofCategory::Branch))
+                    .ok_or_else(|| format!("w{width} cc{cc}: no family member"));
+            }
+        }
+        Err("no flag writer in block window".into())
+    }
+
+    /// With `TCG_PRECISE_CITATIONS` set, replace the `"cmp"` / `"condbr"`
+    /// fragment by the instruction's own family member when it resolves;
+    /// otherwise (or with the flag unset) return the query unchanged.
+    fn refine_citation(
+        &self,
+        func: &MachFunction,
+        block_insts: &[InstId],
+        block_pos: usize,
+        inst: &MachInst,
+        query: &'static str,
+        category: ProofCategory,
+    ) -> (&'static str, ProofCategory) {
+        if !precise_citations_enabled() {
+            return (query, category);
+        }
+        let refined = match (query, category) {
+            ("cmp", ProofCategory::Comparison) => {
+                Self::precise_cmp_query_why(func, block_insts, block_pos, inst)
+                    .map(|q| (q, category))
+            }
+            ("condbr", ProofCategory::Branch) => {
+                Self::precise_condbr_query_why(func, block_insts, block_pos, inst)
+            }
+            _ => return (query, category),
+        };
+        match refined {
+            Ok((r, cat)) if self.registry_proof_for_query(r, cat).is_some() => {
+                if citation_trace_enabled() {
+                    eprintln!(
+                        "TCG_CITE refined opcode={:?} {query} -> {r} [{cat:?}]",
+                        inst.opcode
+                    );
+                }
+                (r, cat)
+            }
+            Ok((r, cat)) => {
+                if citation_trace_enabled() {
+                    eprintln!(
+                        "TCG_CITE fallback opcode={:?} {query} ({r} not in registry [{cat:?}])",
+                        inst.opcode
+                    );
+                }
+                (query, category)
+            }
+            Err(why) => {
+                if citation_trace_enabled() {
+                    let shape: Vec<String> = block_insts
+                        .iter()
+                        .filter_map(|id| func.insts.get(id.0 as usize))
+                        .map(|i| format!("{:?}{:?}", i.opcode, i.operands))
+                        .collect();
+                    eprintln!(
+                        "TCG_CITE fallback opcode={:?} {query} ({why}) fn={} pos={block_pos} block=[{}]",
+                        inst.opcode,
+                        func.name,
+                        shape.join(" ; ")
+                    );
+                }
+                (query, category)
+            }
+        }
+    }
+
+    /// Map a (width, consumer condition) pair to the registered standalone-TST
+    /// obligation query, or None for conditions that must FAIL CLOSED.
+    ///
+    /// Covered: the N/Z-derived conditions EQ/NE/MI/PL/GE/LT/GT/LE (GE/LT and
+    /// GT/LE are well-defined because TST clears V; their obligations pin that
+    /// V-clear). NEVER covered: the C/V-OBSERVERS HS/LO/HI/LS/VS/VC — after
+    /// TST those conditions are architecturally CONSTANT, so a consumer
+    /// reading one is exactly the miscompile shape `and_cmp_fuse`'s carry
+    /// guard (`cond_reads_carry`) forbids; crediting the TST through the
+    /// true-but-constant HI/LS model pins would stamp wrong code Verified
+    /// (review, CRITICAL). Failing closed keeps it a compile error.
+    fn tst_condition_query(width: u32, cc: i64) -> Option<&'static str> {
+        Some(match (width, cc) {
+            (64, 0) => "tst w64: eq",
+            (64, 1) => "tst w64: ne",
+            (64, 4) => "tst w64: mi",
+            (64, 5) => "tst w64: pl",
+            (64, 10) => "tst w64: ge",
+            (64, 11) => "tst w64: lt",
+            (64, 12) => "tst w64: gt",
+            (64, 13) => "tst w64: le",
+            (32, 0) => "tst w32: eq",
+            (32, 1) => "tst w32: ne",
+            (32, 4) => "tst w32: mi",
+            (32, 5) => "tst w32: pl",
+            (32, 10) => "tst w32: ge",
+            (32, 11) => "tst w32: lt",
+            (32, 12) => "tst w32: gt",
+            (32, 13) => "tst w32: le",
+            _ => return None,
+        })
+    }
+
+    /// Conservatively decide whether NZCV is DEAD on entry to `block_id`:
+    /// every path from its top must reach a flag WRITER before any flag
+    /// reader. Anything unknown (a consumer candidate, an `Adc`/`Sbc`, a
+    /// non-Nop pseudo, a malformed instruction reference) answers `false` and
+    /// the caller fails closed. Calls are neutral: a callee may or may not
+    /// preserve NZCV, so a reader after a call on the same path still counts
+    /// as a potential read of the TST's flags. Cycles are handled by the
+    /// visited set: re-entering a block already on the checked set is fine —
+    /// its readers (if any) were found when it was first entered.
+    fn nzcv_dead_on_entry(
+        func: &MachFunction,
+        block_id: trust_cg_ir::BlockId,
+        visited: &mut std::collections::HashSet<trust_cg_ir::BlockId>,
+    ) -> bool {
+        use trust_cg_ir::target_info::{AArch64Target, TargetInfo};
+        if !visited.insert(block_id) {
+            return true;
+        }
+        let Some(block) = func.blocks.get(block_id.0 as usize) else {
+            return false;
+        };
+        for &inst_id in &block.insts {
+            let Some(inst) = func.insts.get(inst_id.0 as usize) else {
+                return false;
+            };
+            let op = inst.opcode;
+            if Self::nzcv_consumer_cc_pos(op).is_some()
+                || <AArch64Target as TargetInfo>::reads_flags(op)
+            {
+                return false;
+            }
+            if <AArch64Target as TargetInfo>::writes_flags(op) {
+                return true;
+            }
+            if op.is_pseudo() && op != AArch64Opcode::Nop {
+                return false;
+            }
+        }
+        block
+            .succs
+            .iter()
+            .all(|&s| Self::nzcv_dead_on_entry(func, s, visited))
     }
 
     fn trap_skip_reason(opcode: AArch64Opcode) -> Option<&'static str> {
@@ -4349,6 +5061,170 @@ impl FunctionVerifier {
     /// `name.contains` lookup — the reconstructed machine side is built by a
     /// typed exhaustive opcode match plus a typed positional operand schema
     /// (anti-f81e45b; asserted by `tests/reconstruction_alu.rs`).
+    /// The fixed-registry proof the DB-lookup arm binds for `(query, category)`:
+    /// category-filtered, first name containing `query` (case-insensitive), in
+    /// registration order. This is the walk's selection AND the pre-warm's, by
+    /// construction — there is no second copy to drift.
+    fn registry_proof_for_query(
+        &self,
+        query: &'static str,
+        category: ProofCategory,
+    ) -> Option<&crate::proof_database::CategorizedProof> {
+        let key = (category, query);
+        if let Some(hit) = self
+            .query_memo
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+        {
+            return hit.map(|i| &self.db.all()[i]);
+        }
+        // The original resolution, in the database's category order.
+        let index = self
+            .db
+            .all()
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.category == category)
+            .find(|(_, p)| p.obligation.name.to_lowercase().contains(query))
+            .map(|(i, _)| i);
+        self.query_memo
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key, index);
+        index.map(|i| &self.db.all()[i])
+    }
+
+    /// The registry obligations whose names are EXACTLY `names`, in registry
+    /// order. Names with no registry entry are silently absent — callers that
+    /// need every name to resolve (the invariant-kind list's test) count the
+    /// result. Used by the speculative init-time sweep, which knows the kinds
+    /// every aarch64 program needs by name and has no `MachFunction` yet.
+    pub fn registry_obligations_named(&self, names: &[&str]) -> Vec<&ProofObligation> {
+        self.db
+            .all()
+            .iter()
+            .map(|p| &p.obligation)
+            .filter(|ob| names.contains(&ob.name.as_str()))
+            .collect()
+    }
+
+    /// Every DISTINCT fixed-registry obligation the DB-lookup arm would discharge
+    /// across `funcs`, in first-seen order. Pure selection — nothing is
+    /// discharged here — so the caller can fan the sweeps out.
+    ///
+    /// Only the DB arm is enumerated. The reconstruction arm builds its
+    /// obligation from real operands and discharges inline; those are the cheap
+    /// ALU sweeps, while the expensive first-touch kinds (LDP memory model,
+    /// MOVK splices, MachO/ELF relocation proofs, frame-layout proofs) are all
+    /// registry obligations reached through this arm.
+    pub fn registry_obligations_for_functions<'a>(
+        &'a self,
+        funcs: &[&MachFunction],
+    ) -> (
+        Vec<&'a ProofObligation>,
+        Vec<(ProofObligation, ProofObligation)>,
+    ) {
+        let mut seen: std::collections::HashSet<*const ProofObligation> =
+            std::collections::HashSet::new();
+        let mut seen_recon: std::collections::HashSet<ProofObligation> =
+            std::collections::HashSet::new();
+        let mut out = Vec::new();
+        let mut recon: Vec<(ProofObligation, ProofObligation)> = Vec::new();
+        let trace = std::env::var_os("TCG_TIME_SWEEP").is_some();
+        let (mut t_recon, mut t_query, mut t_lookup) = (
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+        );
+        let (mut n_insts, mut n_recon_built) = (0usize, 0usize);
+        for func in funcs {
+            for block in &func.blocks {
+                for (block_pos, &inst_id) in block.insts.iter().enumerate() {
+                    let Some(inst) = func.insts.get(inst_id.0 as usize) else {
+                        continue;
+                    };
+                    if Self::trap_skip_reason(inst.opcode).is_some() || inst.opcode.is_pseudo() {
+                        continue;
+                    }
+                    // Mirror the walk's arm ORDER: reconstruction wins first. Its
+                    // gate is EXACTLY `try_reconstruct_pilot`'s two `?`s, and its
+                    // memo key is the (instance, canonical) pair that
+                    // `discharge_reconstructed_obligation` hashes — so pre-warming
+                    // the same pair fills the same cell.
+                    n_insts += 1;
+                    if opcode_to_source_op(inst.opcode).is_some() {
+                        let t0 = std::time::Instant::now();
+                        let built = reconstruct_alu_obligation(inst);
+                        t_recon += t0.elapsed();
+                        if let Some(ob) = built {
+                            n_recon_built += 1;
+                            if seen_recon.insert(ob.clone()) {
+                                let canonical = canonical_reconstruct_obligation(inst)
+                                    .unwrap_or_else(|| ob.clone());
+                                recon.push((ob, canonical));
+                            }
+                            continue;
+                        }
+                    }
+                    let t1 = std::time::Instant::now();
+                    let q = Self::inst_to_proof_query_in_block(func, &block.insts, block_pos, inst);
+                    t_query += t1.elapsed();
+                    let Some((query, category)) = q else {
+                        continue;
+                    };
+                    let (query, category) =
+                        self.refine_citation(func, &block.insts, block_pos, inst, query, category);
+                    let t2 = std::time::Instant::now();
+                    let found = self.registry_proof_for_query(query, category);
+                    t_lookup += t2.elapsed();
+                    if let Some(cp) = found {
+                        if seen.insert(&cp.obligation as *const _) {
+                            out.push(&cp.obligation);
+                        }
+                    }
+                }
+            }
+        }
+        if trace {
+            eprintln!(
+                "TCG_ENUM_SPLIT insts={n_insts} recon_built={n_recon_built} recon_distinct={} \
+                 reconstruct={:.2}ms query={:.2}ms lookup={:.2}ms",
+                recon.len(),
+                t_recon.as_secs_f64() * 1000.0,
+                t_query.as_secs_f64() * 1000.0,
+                t_lookup.as_secs_f64() * 1000.0
+            );
+        }
+        (out, recon)
+    }
+
+    /// Discharge one reconstruction-arm obligation exactly as
+    /// `try_reconstruct_pilot` would — same (instance, canonical, config), same
+    /// memo cell. See `discharge_registry_obligation_now`.
+    pub fn discharge_reconstructed_obligation_now(
+        &self,
+        instance: &ProofObligation,
+        canonical: &ProofObligation,
+    ) {
+        let _ = crate::lowering_proof::discharge_reconstructed_obligation(
+            instance,
+            canonical,
+            &self.config,
+        );
+    }
+
+    /// Discharge one registry obligation exactly as the walk would. Exposed so a
+    /// caller can run these CONCURRENTLY before the serial per-function walk:
+    /// `discharge_registry_obligation` ends in the process-wide content-keyed
+    /// memo, so whichever thread computes a cell first fills it and every later
+    /// reader — the walk included — gets a hit. The verdict is a pure function
+    /// of (obligation content, config), so the report is byte-identical whether
+    /// the cell was filled here or in the walk.
+    pub fn discharge_registry_obligation_now(&self, obligation: &ProofObligation) {
+        let _ = crate::lowering_proof::discharge_registry_obligation(obligation, &self.config);
+    }
+
     fn try_reconstruct_pilot(&self, inst: &MachInst) -> Option<InstructionVerificationResult> {
         // Not a pilot opcode at all -> leave on the existing path.
         opcode_to_source_op(inst.opcode)?;
@@ -4445,6 +5321,7 @@ impl FunctionVerifier {
         // TV-2: index the replayed LIR function. A name mismatch means the
         // caller mis-zipped functions — loudly report and run without the
         // cross-check rather than judging stamps against the wrong spec.
+        let t_index = walk_timing_enabled().then(std::time::Instant::now);
         let lir_index: Option<LirSourceIndex> = match xcheck_mode {
             ProvenanceXCheckMode::Off => None,
             _ => lir_source.and_then(|lir| {
@@ -4460,6 +5337,13 @@ impl FunctionVerifier {
                 }
             }),
         };
+        if let Some(t) = t_index {
+            eprintln!(
+                "TCG_TIME_WALK fn={} lir_index_build={:.2}ms",
+                func.name,
+                t.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         let mut attributed_count: usize = 0;
         let mut synthetic_count: usize = 0;
         let mut mismatch_count: usize = 0;
@@ -4467,6 +5351,10 @@ impl FunctionVerifier {
         let mut instructions = Vec::new();
 
         // Walk all blocks and their instructions.
+        // `TCG_TIME_WALK=1`: attribute this walk's time to its arms.
+        let walk_timing = walk_timing_enabled();
+        let mut walk_split = [std::time::Duration::ZERO; 6]; // skip, recon, query, lookup+discharge, xcheck, push
+        let mut walk_arm_counts = [0u32; 6];
         for block in &func.blocks {
             for (block_pos, &inst_id) in block.insts.iter().enumerate() {
                 let idx = inst_id.0 as usize;
@@ -4474,6 +5362,8 @@ impl FunctionVerifier {
                     continue;
                 }
                 let inst = &func.insts[idx];
+                let t_arm = walk_timing.then(std::time::Instant::now);
+                let mut arm = 0usize;
 
                 let result = if let Some(reason) = Self::trap_skip_reason(inst.opcode) {
                     InstructionVerificationResult::Skipped {
@@ -4483,7 +5373,10 @@ impl FunctionVerifier {
                     InstructionVerificationResult::Skipped {
                         reason: format!("{:?} is a pseudo-instruction", inst.opcode),
                     }
-                } else if let Some(recon_result) = self.try_reconstruct_pilot(inst) {
+                } else if let Some(recon_result) = {
+                    arm = 1;
+                    self.try_reconstruct_pilot(inst)
+                } {
                     // PHASE-2 OPERAND RECONSTRUCTION (PILOT, task #63).
                     //
                     // Pilot ALU opcodes (Add/Sub/Mul/Neg) with a real operand
@@ -4501,14 +5394,24 @@ impl FunctionVerifier {
                     // DB-substring path below runs unchanged — no regression on
                     // any path that previously verified.
                     recon_result
-                } else if let Some((query, category)) =
+                } else if let Some((query, category)) = {
+                    arm = 2;
                     Self::inst_to_proof_query_in_block(func, &block.insts, block_pos, inst)
-                {
-                    // Search the proof database for a matching proof.
-                    let matching_proofs = self.db.by_category(category);
-                    let proof = matching_proofs
-                        .iter()
-                        .find(|p| p.obligation.name.to_lowercase().contains(query));
+                } {
+                    let (query, category) =
+                        self.refine_citation(func, &block.insts, block_pos, inst, query, category);
+                    if let Some(t) = t_arm {
+                        walk_split[2] += t.elapsed();
+                        walk_arm_counts[2] += 1;
+                    }
+                    let t_lookup = walk_timing.then(std::time::Instant::now);
+                    arm = 3;
+                    // Search the proof database for a matching proof. The
+                    // selection lives in ONE place — `registry_proof_for_query` —
+                    // shared with `prewarm_registry_obligations`, so the
+                    // pre-warm cannot drift from what the walk discharges.
+                    let proof = self.registry_proof_for_query(query, category);
+                    let _ = t_lookup;
 
                     match proof {
                         Some(cp) => {
@@ -4575,6 +5478,13 @@ impl FunctionVerifier {
                     }
                 };
 
+                if let Some(t) = t_arm
+                    && arm != 2
+                {
+                    walk_split[arm] += t.elapsed();
+                    walk_arm_counts[arm] += 1;
+                }
+                let t_xcheck = walk_timing.then(std::time::Instant::now);
                 // TV-2: cross-check the TV-1 provenance sidecar entry against
                 // the replayed LIR function. Runs for EVERY stamped
                 // instruction (including Skipped pseudos/trap carriers — a
@@ -4617,12 +5527,39 @@ impl FunctionVerifier {
                     result
                 };
 
+                if let Some(t) = t_xcheck {
+                    walk_split[4] += t.elapsed();
+                    walk_arm_counts[4] += 1;
+                }
+                let t_push = walk_timing.then(std::time::Instant::now);
                 instructions.push(InstructionReport {
                     inst_index: idx,
                     opcode: InstructionOpcode::AArch64(inst.opcode),
                     result,
                 });
+                if let Some(t) = t_push {
+                    walk_split[5] += t.elapsed();
+                }
             }
+        }
+        if walk_timing {
+            let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+            eprintln!(
+                "TCG_TIME_WALK fn={} insts={} skip={:.2}ms/{} recon={:.2}ms/{} query={:.2}ms/{} lookup+discharge={:.2}ms/{} xcheck={:.2}ms/{} push={:.2}ms",
+                func.name,
+                instructions.len(),
+                ms(walk_split[0]),
+                walk_arm_counts[0],
+                ms(walk_split[1]),
+                walk_arm_counts[1],
+                ms(walk_split[2]),
+                walk_arm_counts[2],
+                ms(walk_split[3]),
+                walk_arm_counts[3],
+                ms(walk_split[4]),
+                walk_arm_counts[4],
+                ms(walk_split[5]),
+            );
         }
 
         if lir_index.is_some() {
@@ -4681,7 +5618,7 @@ mod tests {
         MachFunction::new("test_func".to_string(), Signature::new(vec![], vec![]))
     }
 
-    fn make_func_with_insts(insts: Vec<MachInst>) -> MachFunction {
+    pub(super) fn make_func_with_insts(insts: Vec<MachInst>) -> MachFunction {
         let mut func = make_empty_func();
         for (i, inst) in insts.into_iter().enumerate() {
             func.insts.push(inst);
@@ -4692,6 +5629,78 @@ mod tests {
 
     fn inst(opcode: AArch64Opcode) -> MachInst {
         MachInst::new(opcode, vec![])
+    }
+
+    /// Review round 2 regression: a conditional-branch CONSUMER's taken edge
+    /// carries the TST's NZCV out of the block even when a LATER in-block
+    /// flags writer kills the fallthrough copy. If the taken-edge block reads
+    /// flags again (here a `CSET HI` — a C-observer, constant after TST), the
+    /// TST must FAIL CLOSED rather than earn credit from the covered `B.EQ`;
+    /// with a flag-dead taken edge the same shape must still bind.
+    #[test]
+    fn tst_bcond_taken_edge_reader_fails_closed_despite_inblock_flags_writer() {
+        use trust_cg_ir::aarch64_regs::{X0, X1, X2};
+
+        let build = |taken_block_reads_flags: bool| {
+            let mut func = make_empty_func();
+            let b1 = func.create_block();
+            let b2 = func.create_block();
+            let entry = func.entry;
+
+            let tst = func.push_inst(MachInst::new(
+                AArch64Opcode::Tst,
+                vec![MachOperand::PReg(X0), MachOperand::PReg(X1)],
+            ));
+            let bcond = func.push_inst(MachInst::new(
+                AArch64Opcode::BCond,
+                vec![MachOperand::Imm(0), MachOperand::Block(b1)], // B.EQ
+            ));
+            let cmp = func.push_inst(MachInst::new(
+                AArch64Opcode::CmpRR,
+                vec![MachOperand::PReg(X0), MachOperand::PReg(X1)],
+            ));
+            let b = func.push_inst(MachInst::new(
+                AArch64Opcode::B,
+                vec![MachOperand::Block(b2)],
+            ));
+            for id in [tst, bcond, cmp, b] {
+                func.append_inst(entry, id);
+            }
+            if taken_block_reads_flags {
+                let cset = func.push_inst(MachInst::new(
+                    AArch64Opcode::CSet,
+                    vec![MachOperand::PReg(X2), MachOperand::Imm(8)], // HI
+                ));
+                func.append_inst(b1, cset);
+            }
+            let ret1 = func.push_inst(inst(AArch64Opcode::Ret));
+            func.append_inst(b1, ret1);
+            let ret2 = func.push_inst(inst(AArch64Opcode::Ret));
+            func.append_inst(b2, ret2);
+            func.block_mut(entry).succs = vec![b1, b2];
+            func
+        };
+
+        // Pass the block's OWN insts slice (as the production walk does) —
+        // the binder identifies the enclosing block by slice identity.
+        let adversarial = build(true);
+        assert!(
+            FunctionVerifier::tst_nzcv_consumer_query(
+                &adversarial,
+                &adversarial.blocks[0].insts,
+                0
+            )
+            .is_none(),
+            "a taken-edge CSET HI reads the TST's live NZCV: the in-block CMP \
+             kills only the FALLTHROUGH copy, so the TST must fail closed"
+        );
+
+        let benign = build(false);
+        assert_eq!(
+            FunctionVerifier::tst_nzcv_consumer_query(&benign, &benign.blocks[0].insts, 0),
+            Some(("tst w64: eq", ProofCategory::CmpCombine)),
+            "with a flag-dead taken edge the B.EQ consumer must still bind"
+        );
     }
 
     fn inst_with_operands(opcode: AArch64Opcode, operands: Vec<MachOperand>) -> MachInst {
@@ -6266,7 +7275,10 @@ mod tests {
                 1,
                 "X-form MOVK LSL #{shift} splice proof must be non-degenerate"
             );
-            let expected = format!("LSL #{shift} splices halfword");
+            // Pin the EXACT registered proof name for this slot, not just a
+            // width tag: the bound obligation must be THIS (width, halfword)
+            // row and no neighbouring one.
+            let expected = format!("MOVK Xd #imm16, LSL #{shift} splices halfword");
             assert!(
                 matches!(
                     &report.instructions[0].result,
@@ -6426,6 +7438,324 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn ror_immediate_reconstruction_verifies_w32_and_x64() {
+        use crate::lowering_proof::verify_by_evaluation;
+
+        for (class, width) in [
+            (trust_cg_ir::RegClass::Gpr32, 32i64),
+            (trust_cg_ir::RegClass::Gpr64, 64),
+        ] {
+            let reg = |id| MachOperand::VReg(trust_cg_ir::VReg::new(id, class));
+            for amount in [1i64, 7, width - 1] {
+                let ror = inst_with_operands(
+                    AArch64Opcode::RorRI,
+                    vec![reg(0), reg(1), MachOperand::Imm(amount)],
+                );
+                assert_eq!(
+                    aarch64_emitted_op_class(&ror),
+                    Some(OpClass::Bitwise),
+                    "RorRI must cross-check as the bitwise rotate idiom"
+                );
+                let obligation = reconstruct_alu_obligation(&ror)
+                    .expect("well-formed RorRI must reconstruct from its EXTR alias");
+                assert!(obligation.is_reconstructed());
+                assert!(
+                    obligation.is_genuinely_proven(),
+                    "shift/OR source and EXTR machine decode must be structurally distinct"
+                );
+                assert!(matches!(
+                    verify_by_evaluation(&obligation),
+                    VerificationResult::Valid
+                ));
+
+                let report = verify_function(&make_func_with_insts(vec![ror]));
+                assert_eq!(
+                    report.genuinely_verified_count(),
+                    1,
+                    "RorRI #{amount} at width {width}: {:?}",
+                    report.instructions[0].result
+                );
+                assert!(matches!(
+                    &report.instructions[0].result,
+                    InstructionVerificationResult::Verified {
+                        category: ProofCategory::Arithmetic,
+                        degenerate: false,
+                        ..
+                    }
+                ));
+                assert!(
+                    report.emitted_opcode_inventory().is_promotable(),
+                    "a proof-backed RorRI must not block opcode-inventory promotion"
+                );
+            }
+        }
+
+        for (dst, src, width) in [
+            (MachOperand::PReg(W16), MachOperand::PReg(W17), 32),
+            (MachOperand::PReg(X16), MachOperand::PReg(X17), 64),
+        ] {
+            let ror = inst_with_operands(AArch64Opcode::RorRI, vec![dst, src, MachOperand::Imm(7)]);
+            let obligation = reconstruct_alu_obligation(&ror)
+                .expect("ordinary physical W/X registers must reconstruct");
+            assert!(matches!(
+                verify_by_evaluation(&obligation),
+                VerificationResult::Valid
+            ));
+            assert_eq!(
+                verify_function(&make_func_with_insts(vec![ror])).genuinely_verified_count(),
+                1,
+                "physical-register RorRI must verify at width {width}"
+            );
+        }
+    }
+
+    #[test]
+    fn ror_immediate_live_checker_is_verified_or_exact_bv_certificate_gap() {
+        use crate::ay_bridge::{AYConfig, AYResult, verify_with_ay};
+
+        if std::env::var_os("AY_SOLVER_PATH").is_none()
+            || std::env::var_os("TCG_EXTERNAL_CLEAN_CHECKER").is_none()
+        {
+            return;
+        }
+        assert!(
+            crate::ay_bridge::resolved_solver_path().is_some(),
+            "explicit AY + Clean/Carcara paths must resolve to a usable proof authority"
+        );
+        let _solver_lock = crate::ay_bridge::formal_solver_test_lock();
+        let config = AYConfig {
+            solver_path: None,
+            timeout_ms: 5_000,
+            produce_models: true,
+        };
+
+        for (class, width) in [
+            (trust_cg_ir::RegClass::Gpr32, 32u32),
+            (trust_cg_ir::RegClass::Gpr64, 64),
+        ] {
+            let reg = |id| MachOperand::VReg(trust_cg_ir::VReg::new(id, class));
+            let ror = inst_with_operands(
+                AArch64Opcode::RorRI,
+                vec![reg(0), reg(1), MachOperand::Imm(7)],
+            );
+            let obligation = reconstruct_alu_obligation(&ror).unwrap();
+            let result = verify_with_ay(&obligation, &config);
+            // The resident protocol intentionally drops stderr, so its exact
+            // `unknown` reason can be unavailable. A bare unknown has zero
+            // exemption authority: re-run this same obligation through the
+            // fresh transcript path, then apply the exact matcher below.
+            let result = match result {
+                AYResult::Unknown(ref reason) if reason == "unknown" => {
+                    crate::ay_bridge::verify_fresh_transcript_for_gap_probe(&obligation, &config)
+                }
+                other => other,
+            };
+            match result {
+                AYResult::Verified => {}
+                AYResult::Unknown(reason)
+                    if reason.starts_with(
+                        "incomplete AY proof certificate: c ay.proof.certificate path=",
+                    ) && reason.ends_with(if width == 32 {
+                        " unproved_steps=1 foreign_assumes=no trust_free=no ay_self_checkable=yes"
+                    } else {
+                        " unproved_steps=1 foreign_assumes=no trust_free=no ay_self_checkable=no"
+                    }) && reason.matches("unproved_steps=").count() == 1 =>
+                {
+                    // Exact, live, fail-closed upstream capability gap: AY
+                    // established UNSAT but disclosed one unproved BvBitBlast
+                    // certificate step, so Clean/Carcara correctly withheld
+                    // Formal authority. This guard is scoped to this concrete
+                    // RorRI/EXTR schema and automatically resumes the strict
+                    // assertion as soon as AY emits a complete proof.
+                    crate::formal_gap::print_gap_skip(
+                        &format!("RorRI EXTR-alias reconstruction at width {width}"),
+                        &reason,
+                    );
+                }
+                other => panic!(
+                    "RorRI EXTR-alias reconstruction at width {width} must either be \
+                     independently certified or reproduce the exact one-step BV certificate \
+                     gap; got {other:?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn ror_immediate_reconstruction_refutes_wrong_extr_fields() {
+        use crate::aarch64_semantics::encode_ror_imm_extr;
+        use crate::smt::EvalEnv;
+
+        for (class, size, width) in [
+            (trust_cg_ir::RegClass::Gpr32, OperandSize::S32, 32u32),
+            (trust_cg_ir::RegClass::Gpr64, OperandSize::S64, 64u32),
+        ] {
+            let reg = |id| MachOperand::VReg(trust_cg_ir::VReg::new(id, class));
+            let valid = inst_with_operands(
+                AArch64Opcode::RorRI,
+                vec![reg(0), reg(1), MachOperand::Imm(7)],
+            );
+            let obligation = reconstruct_alu_obligation(&valid).unwrap();
+            let mut env = EvalEnv::default();
+            env.insert("recon_src".to_string(), 1);
+
+            let correct_extr = encode_ror_imm_extr(size, SmtExpr::var("recon_src", width), 7);
+            assert_eq!(
+                obligation.trust_ir_expr.eval(&env),
+                correct_extr.eval(&env),
+                "the direct EXTR alias decode must agree with ROR at width {width}"
+            );
+
+            let wrong_amount = encode_ror_imm_extr(size, SmtExpr::var("recon_src", width), 8);
+            assert_ne!(
+                obligation.trust_ir_expr.eval(&env),
+                wrong_amount.eval(&env),
+                "an EXTR immediate-field error must refute at width {width}"
+            );
+
+            // Wrong source field: decode EXTR from two different registers
+            // instead of the required same-register pair. A non-zero wrong high
+            // half is observable in the wrapped bits selected by #7.
+            let wrong_source = SmtExpr::var("wrong_src", width)
+                .concat(SmtExpr::var("recon_src", width))
+                .extract(7 + width - 1, 7);
+            env.insert("wrong_src".to_string(), u64::MAX);
+            assert_ne!(
+                obligation.trust_ir_expr.eval(&env),
+                wrong_source.eval(&env),
+                "an EXTR source-register field error must refute at width {width}"
+            );
+        }
+    }
+
+    #[test]
+    fn ror_immediate_reconstruction_fails_closed_on_alias_and_shape() {
+        let w = |id| MachOperand::VReg(trust_cg_ir::VReg::new(id, trust_cg_ir::RegClass::Gpr32));
+        let x = |id| MachOperand::VReg(trust_cg_ir::VReg::new(id, trust_cg_ir::RegClass::Gpr64));
+        let s = |id| MachOperand::VReg(trust_cg_ir::VReg::new(id, trust_cg_ir::RegClass::Fpr32));
+
+        let malformed = [
+            // #0 is encoded as MOV and needs a separate copy-alias proof.
+            vec![w(0), w(1), MachOperand::Imm(0)],
+            vec![w(0), w(1), MachOperand::Imm(-1)],
+            vec![w(0), w(1), MachOperand::Imm(32)],
+            vec![w(0), w(1)],
+            vec![w(0), w(1), w(2)],
+            vec![w(0), x(1), MachOperand::Imm(7)],
+            vec![s(0), s(1), MachOperand::Imm(7)],
+            vec![MachOperand::PReg(SP), x(1), MachOperand::Imm(7)],
+            vec![x(0), MachOperand::PReg(SP), MachOperand::Imm(7)],
+            vec![MachOperand::PReg(WSP), w(1), MachOperand::Imm(7)],
+            vec![w(0), MachOperand::PReg(WSP), MachOperand::Imm(7)],
+            vec![MachOperand::PReg(WZR), w(1), MachOperand::Imm(7)],
+            vec![w(0), MachOperand::PReg(WZR), MachOperand::Imm(7)],
+            vec![MachOperand::PReg(XZR), x(1), MachOperand::Imm(7)],
+            vec![x(0), MachOperand::PReg(XZR), MachOperand::Imm(7)],
+            vec![
+                MachOperand::Special(SpecialReg::SP),
+                x(1),
+                MachOperand::Imm(7),
+            ],
+            vec![
+                x(0),
+                MachOperand::Special(SpecialReg::SP),
+                MachOperand::Imm(7),
+            ],
+            vec![
+                w(0),
+                MachOperand::Special(SpecialReg::WZR),
+                MachOperand::Imm(7),
+            ],
+            vec![
+                MachOperand::Special(SpecialReg::XZR),
+                x(1),
+                MachOperand::Imm(7),
+            ],
+            vec![
+                x(0),
+                MachOperand::Special(SpecialReg::XZR),
+                MachOperand::Imm(7),
+            ],
+            vec![
+                MachOperand::Special(SpecialReg::WZR),
+                w(1),
+                MachOperand::Imm(7),
+            ],
+        ];
+        for operands in malformed {
+            let malformed = inst_with_operands(AArch64Opcode::RorRI, operands);
+            assert!(
+                reconstruct_alu_obligation(&malformed).is_none(),
+                "malformed RorRI must fail closed: {:?}",
+                malformed.operands
+            );
+        }
+    }
+
+    #[test]
+    fn physical_zero_register_mvn_alias_and_generic_destinations_fail_closed() {
+        use crate::lowering_proof::verify_by_evaluation;
+
+        for (class, zero, width) in [
+            (trust_cg_ir::RegClass::Gpr32, MachOperand::PReg(WZR), 32),
+            (trust_cg_ir::RegClass::Gpr64, MachOperand::PReg(XZR), 64),
+            (
+                trust_cg_ir::RegClass::Gpr32,
+                MachOperand::Special(SpecialReg::WZR),
+                32,
+            ),
+            (
+                trust_cg_ir::RegClass::Gpr64,
+                MachOperand::Special(SpecialReg::XZR),
+                64,
+            ),
+        ] {
+            let reg = |id| MachOperand::VReg(trust_cg_ir::VReg::new(id, class));
+            let mvn = inst_with_operands(AArch64Opcode::OrnRR, vec![reg(0), zero, reg(1)]);
+            let obligation = reconstruct_alu_obligation(&mvn)
+                .expect("both physical and special ZR forms must select the MVN alias");
+            assert!(obligation.name.contains(&format!("Bnot_{width}")));
+            assert_eq!(obligation.inputs.len(), 1);
+            assert!(matches!(
+                verify_by_evaluation(&obligation),
+                VerificationResult::Valid
+            ));
+        }
+
+        let w = |id| MachOperand::VReg(trust_cg_ir::VReg::new(id, trust_cg_ir::RegClass::Gpr32));
+        let x = |id| MachOperand::VReg(trust_cg_ir::VReg::new(id, trust_cg_ir::RegClass::Gpr64));
+        for malformed in [
+            // A zero-register alias with the wrong W/X tag is not a well-typed
+            // MVN instruction and must not inherit the other width's proof.
+            vec![w(0), MachOperand::PReg(XZR), w(1)],
+            vec![x(0), MachOperand::PReg(WZR), x(1)],
+        ] {
+            assert!(
+                reconstruct_alu_obligation(&inst_with_operands(AArch64Opcode::OrnRR, malformed,))
+                    .is_none()
+            );
+        }
+
+        for (dst, src1, src2) in [
+            (MachOperand::PReg(WZR), w(1), w(2)),
+            (MachOperand::PReg(XZR), x(1), x(2)),
+            (MachOperand::PReg(WSP), w(1), w(2)),
+            (MachOperand::PReg(SP), x(1), x(2)),
+            (MachOperand::Special(SpecialReg::WZR), w(1), w(2)),
+            (MachOperand::Special(SpecialReg::XZR), x(1), x(2)),
+            (MachOperand::Special(SpecialReg::SP), x(1), x(2)),
+        ] {
+            let discarded_or_special_dst =
+                inst_with_operands(AArch64Opcode::AddRR, vec![dst, src1, src2]);
+            assert!(
+                reconstruct_alu_obligation(&discarded_or_special_dst).is_none(),
+                "generic reconstruction must reject non-ordinary destinations: {:?}",
+                discarded_or_special_dst.operands
+            );
         }
     }
 
@@ -6907,6 +8237,8 @@ mod tests {
         ]);
         let report = verify_function(&func);
         assert_eq!(report.total(), 5);
+        // The MOVK hw16 splice now binds per-(width, halfword): the whole
+        // MOVZ+MOVK chain verifies instruction-by-instruction.
         assert_eq!(
             report.unverified_count(),
             0,
@@ -7777,8 +9109,9 @@ mod tests {
         // (width, shift) through `const_materialize_proofs::movk_halfword_query`.
         assert!(
             FunctionVerifier::opcode_to_proof_query(AArch64Opcode::Movk).is_none(),
-            "MOVK's hw0 idempotence theorem is not a general lowering proof; \
-             per-(width,shift) credit comes from movk_halfword_query only"
+            "MOVK must NEVER be credited opcode-wide (its hw0 idempotence theorem is not a \
+             general lowering proof); per-(width, halfword) credit comes only from the \
+             operand-sensitive splice binding via movk_halfword_query"
         );
 
         assert!(
@@ -8112,6 +9445,268 @@ mod tests {
             report.statistically_credited_count() + report.formally_credited_count()
                 < report.verified_count(),
             "the credited tiers must be disjoint and neither may swallow the other"
+        );
+    }
+}
+
+/// The walk resolves an instruction to a registry proof by a short QUERY
+/// fragment matched as a lowercase SUBSTRING of proof names inside one
+/// category, first match in database order. That is fragile in exactly one
+/// way: a new registry entry earlier in a category whose name contains an
+/// existing fragment silently re-routes the walk. This pins, for every
+/// literal query in this file, which proof it resolves to and how many
+/// candidates it matched — so a change is a deliberate golden update, never
+/// a surprise. (The computed MOVK/MOVN queries have their own uniqueness
+/// tests in `const_materialize_proofs`.)
+#[cfg(test)]
+mod walk_query_resolution_golden {
+    use super::*;
+
+    const GOLDEN_PATH: &str = "tests/fixtures/walk_query_resolution.txt";
+
+    /// Every `Some(("<query>", ProofCategory::<Cat>))` literal in this file.
+    fn literal_queries() -> Vec<(String, String)> {
+        let src = include_str!("function_verifier.rs");
+        let mut out = Vec::new();
+        let needle = "Some((\"";
+        let mut rest = src;
+        while let Some(i) = rest.find(needle) {
+            rest = &rest[i + needle.len()..];
+            let Some(q_end) = rest.find('"') else { break };
+            let query = &rest[..q_end];
+            let after = &rest[q_end..];
+            const CAT: &str = "\", ProofCategory::";
+            if let Some(stripped) = after.strip_prefix(CAT) {
+                if let Some(c_end) = stripped.find("))") {
+                    let cat = &stripped[..c_end];
+                    if cat.chars().all(|c| c.is_ascii_alphanumeric()) {
+                        out.push((query.to_string(), cat.to_string()));
+                    }
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    fn category_by_name(db: &ProofDatabase, name: &str) -> Option<ProofCategory> {
+        db.all()
+            .iter()
+            .map(|p| p.category)
+            .find(|c| format!("{c:?}") == name)
+    }
+
+    #[test]
+    fn every_literal_query_resolves_as_pinned() {
+        let verifier = FunctionVerifier::new();
+        let db = ProofDatabase::new();
+        let queries = literal_queries();
+        assert!(
+            queries.len() >= 90,
+            "found only {} literal queries",
+            queries.len()
+        );
+        let mut actual = Vec::new();
+        for (query, cat_name) in &queries {
+            let Some(category) = category_by_name(&db, cat_name) else {
+                panic!("query `{query}`: category {cat_name} has no proofs in the database");
+            };
+            let query_static: &'static str = Box::leak(query.clone().into_boxed_str());
+            let resolved = verifier
+                .registry_proof_for_query(query_static, category)
+                .map(|p| p.obligation.name.clone())
+                .unwrap_or_else(|| "<unresolved>".to_string());
+            let matches = db
+                .all()
+                .iter()
+                .filter(|p| {
+                    p.category == category
+                        && p.obligation.name.to_lowercase().contains(query.as_str())
+                })
+                .count();
+            actual.push(format!("{cat_name}\t{query}\t{matches}\t{resolved}"));
+        }
+        let actual_text = actual.join("\n") + "\n";
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(GOLDEN_PATH);
+        if std::env::var_os("UPDATE_GOLDEN").is_some() {
+            std::fs::write(&path, &actual_text).expect("write golden");
+            return;
+        }
+        let golden = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "read {}: {e} (run with UPDATE_GOLDEN=1 to create)",
+                path.display()
+            )
+        });
+        if golden != actual_text {
+            let g: std::collections::BTreeSet<&str> = golden.lines().collect();
+            let a: std::collections::BTreeSet<&str> = actual_text.lines().collect();
+            let removed: Vec<_> = g.difference(&a).collect();
+            let added: Vec<_> = a.difference(&g).collect();
+            panic!(
+                "walk query resolution changed (category\\tquery\\tmatches\\tresolved):\n  was: {removed:#?}\n  now: {added:#?}\nIf intended, re-run with UPDATE_GOLDEN=1 and review the diff of {}",
+                path.display()
+            );
+        }
+        // An unresolved literal query makes the walk report the instruction
+        // `Unverified` (fail-closed under emit_proofs). Three FP opcodes have a
+        // query but no registry proof AND are never emitted by the lowering
+        // (FmaddRR, FminnmRR, FmaxnmRR); anything beyond those is a new gap.
+        const KNOWN_UNEMITTED: &[&str] = &["fmadd", "fmaxnm", "fminnm"];
+        let unresolved: Vec<_> = actual
+            .iter()
+            .filter(|l| l.ends_with("\t<unresolved>"))
+            .filter(|l| {
+                !KNOWN_UNEMITTED
+                    .iter()
+                    .any(|q| l.contains(&format!("\t{q}\t")))
+            })
+            .collect();
+        assert!(
+            unresolved.is_empty(),
+            "literal queries that resolve to nothing: {unresolved:#?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod precise_citation_tests {
+    use super::tests::make_func_with_insts;
+    use super::*;
+    use trust_cg_ir::aarch64_regs::{W0, W1, W2, W3, X3, X4};
+
+    fn cmpq(
+        f: &MachFunction,
+        insts: &[InstId],
+        pos: usize,
+        inst: &MachInst,
+    ) -> Option<&'static str> {
+        FunctionVerifier::precise_cmp_query_why(f, insts, pos, inst).ok()
+    }
+    fn brq(
+        f: &MachFunction,
+        insts: &[InstId],
+        pos: usize,
+        inst: &MachInst,
+    ) -> Option<&'static str> {
+        FunctionVerifier::precise_condbr_query_why(f, insts, pos, inst)
+            .ok()
+            .map(|(q, _)| q)
+    }
+
+    /// A B.cond fed by TST cites the standalone-TST obligation for its
+    /// condition, in the CmpCombine category; a C-observing condition after
+    /// TST has none (it fails closed elsewhere).
+    #[test]
+    fn condbr_after_tst_cites_the_tst_obligation() {
+        use AArch64Opcode::*;
+        let f = make_func_with_insts(vec![
+            MachInst::new(Tst, vec![MachOperand::PReg(X3), MachOperand::PReg(X4)]),
+            MachInst::new(
+                BCond,
+                vec![
+                    MachOperand::Imm(1),
+                    MachOperand::Block(trust_cg_ir::BlockId(0)),
+                ],
+            ), // NE
+            MachInst::new(Tst, vec![MachOperand::PReg(W0), MachOperand::PReg(W1)]),
+            MachInst::new(
+                BCond,
+                vec![
+                    MachOperand::Imm(8),
+                    MachOperand::Block(trust_cg_ir::BlockId(0)),
+                ],
+            ), // HI
+        ]);
+        let insts = &f.blocks[0].insts;
+        let at = |i: usize| f.insts.get(insts[i].0 as usize).unwrap();
+        // (built as a value, not a `Some((literal, category))` — the walk-query
+        // golden scans this file for that exact spelling)
+        let want = ("tst w64: ne", ProofCategory::CmpCombine);
+        assert_eq!(
+            FunctionVerifier::precise_condbr_query_why(&f, insts, 1, at(1)).ok(),
+            Some(want)
+        );
+        assert!(FunctionVerifier::precise_condbr_query_why(&f, insts, 3, at(3)).is_err());
+        let v = FunctionVerifier::new();
+        assert!(
+            v.registry_proof_for_query("tst w64: ne", ProofCategory::CmpCombine)
+                .is_some()
+        );
+    }
+
+    /// Every family literal the refinement can emit names exactly one registry
+    /// proof — the whole point of refining.
+    #[test]
+    fn precise_citation_families_are_unique() {
+        let db = ProofDatabase::new();
+        let mut checked = 0;
+        for (kind, category) in [
+            (PreciseFamily::Icmp, ProofCategory::Comparison),
+            (PreciseFamily::CondBr, ProofCategory::Branch),
+        ] {
+            for cc in 0..16i64 {
+                for width in [32u32, 64] {
+                    let Some(q) = FunctionVerifier::icmp_family_query(kind, cc, width) else {
+                        continue;
+                    };
+                    let n = db
+                        .all()
+                        .iter()
+                        .filter(|p| {
+                            p.category == category && p.obligation.name.to_lowercase().contains(q)
+                        })
+                        .count();
+                    assert_eq!(n, 1, "family query `{q}` matches {n} proofs");
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 40);
+    }
+
+    /// CMP + CSET(LT) at 32 bits -> Icmp_SLT_I32; CMP + B.GE at 64 -> CondBr_SGE_I64;
+    /// a CMP whose consumers disagree, or with no consumer, is not refined.
+    #[test]
+    fn cmp_and_condbr_refine_to_their_own_family_member() {
+        use AArch64Opcode::*;
+        let f = make_func_with_insts(vec![
+            MachInst::new(CmpRR, vec![MachOperand::PReg(W0), MachOperand::PReg(W1)]),
+            MachInst::new(CSet, vec![MachOperand::PReg(W2), MachOperand::Imm(11)]), // LT
+            MachInst::new(CmpRR, vec![MachOperand::PReg(X3), MachOperand::PReg(X4)]),
+            MachInst::new(
+                BCond,
+                vec![
+                    MachOperand::Imm(10),
+                    MachOperand::Block(trust_cg_ir::BlockId(0)),
+                ], // GE
+            ),
+        ]);
+        let insts = &f.blocks[0].insts;
+        let at = |i: usize| f.insts.get(insts[i].0 as usize).unwrap();
+        assert_eq!(cmpq(&f, insts, 0, at(0)), Some("icmp_slt_i32"));
+        assert_eq!(cmpq(&f, insts, 2, at(2)), Some("icmp_sge_i64"));
+        assert_eq!(brq(&f, insts, 3, at(3)), Some("condbr_sge_i64"));
+
+        let g = make_func_with_insts(vec![
+            MachInst::new(CmpRR, vec![MachOperand::PReg(W0), MachOperand::PReg(W1)]),
+            MachInst::new(CSet, vec![MachOperand::PReg(W2), MachOperand::Imm(11)]),
+            MachInst::new(CSet, vec![MachOperand::PReg(W3), MachOperand::Imm(12)]), // disagrees
+        ]);
+        let gi = &g.blocks[0].insts;
+        assert_eq!(
+            cmpq(&g, gi, 0, g.insts.get(gi[0].0 as usize).unwrap()),
+            None
+        );
+        let h = make_func_with_insts(vec![MachInst::new(
+            CmpRR,
+            vec![MachOperand::PReg(W0), MachOperand::PReg(W1)],
+        )]);
+        let hi = &h.blocks[0].insts;
+        assert_eq!(
+            cmpq(&h, hi, 0, h.insts.get(hi[0].0 as usize).unwrap()),
+            None
         );
     }
 }

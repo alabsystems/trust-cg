@@ -863,6 +863,16 @@ fn plan_ext_windows(streams: &[Stream]) -> HashMap<(u32, i64), (i64, i64)> {
 }
 
 fn apply(func: &mut MachFunction, rec: &Recognized) -> bool {
+    // IDEMPOTENCE: never vectorize the remainder loop of a loop this pass
+    // already vectorized (see `crate::vector_remainder`).
+    if crate::vector_remainder::iv_is_vector_advanced_upstream(
+        func,
+        &rec.loop_insts,
+        rec.preheader,
+        rec.iv,
+    ) {
+        return false;
+    }
     let width = UNROLL as i64 * VF; // lanes per vector iteration (16)
     let vh = func.create_block();
     let vb = func.create_block();
@@ -1829,5 +1839,82 @@ mod tests {
             "pure same-index map must BAIL (neon-map's job)"
         );
         assert_eq!(count(&func, AArch64Opcode::NeonSt1Post), 0, "no ST1");
+    }
+
+    /// IDEMPOTENCE (the neon-bytesum / neon-fill bug class of 2026-08-27: a
+    /// vectorizer that keeps the scalar loop as the remainder and then
+    /// recognizes that remainder again on the next fixpoint iteration). After
+    /// the first firing, further runs must change nothing.
+    #[test]
+    fn second_run_is_a_no_op() {
+        let mut func = build_stencil_loop(2);
+        func.noalias_params = vec![0, 1, 2];
+        assert!(NeonStencilPass::new().run(&mut func), "first run must fire");
+        let (insts, blocks) = (func.insts.len(), func.blocks.len());
+        for again in 2..=4 {
+            assert!(
+                !NeonStencilPass::new().run(&mut func),
+                "run {again}: re-fired on its own output"
+            );
+            assert_eq!(func.insts.len(), insts, "run {again} added instructions");
+            assert_eq!(func.blocks.len(), blocks, "run {again} added blocks");
+        }
+    }
+
+    /// IDEMPOTENCE over every firing shape the builders offer (the primary
+    /// `second_run_is_a_no_op` covers one; today's bug class hid in shapes
+    /// the primary test did not exercise).
+    #[test]
+    fn second_run_is_a_no_op_for_every_firing_variant() {
+        let cases: Vec<(&str, Box<dyn Fn() -> MachFunction>)> = vec![
+            (
+                "3point",
+                Box::new(|| {
+                    let mut f = build_stencil_loop(0);
+                    f.noalias_params = vec![0, 1];
+                    f
+                }),
+            ),
+            (
+                "two-array",
+                Box::new(|| {
+                    let mut f = build_stencil_loop(2);
+                    f.noalias_params = vec![0, 1, 2];
+                    f
+                }),
+            ),
+            (
+                "5point",
+                Box::new(|| {
+                    let mut f = build_stencil_loop(4);
+                    f.noalias_params = vec![0, 1];
+                    f
+                }),
+            ),
+        ];
+        for (label, build) in cases {
+            let mut func = build();
+            assert!(
+                NeonStencilPass::new().run(&mut func),
+                "{label}: first run must fire"
+            );
+            let (insts, blocks) = (func.insts.len(), func.blocks.len());
+            for again in 2..=4 {
+                assert!(
+                    !NeonStencilPass::new().run(&mut func),
+                    "{label}: run {again} re-fired on its own output"
+                );
+                assert_eq!(
+                    func.insts.len(),
+                    insts,
+                    "{label}: run {again} added instructions"
+                );
+                assert_eq!(
+                    func.blocks.len(),
+                    blocks,
+                    "{label}: run {again} added blocks"
+                );
+            }
+        }
     }
 }

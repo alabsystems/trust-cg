@@ -96,10 +96,28 @@ const LANES_Q: i64 = 2;
 const ELEM_SIZE_Q: u8 = 8;
 
 /// The conservative SSE2 integer vectorizer pass.
-pub struct X86Vectorize;
+///
+/// RUN-ONCE: the pipeline's documented invariant is that this pass sees the
+/// RAW post-ISel loop shape, before LICM/copy-prop/CSE/rotation rename or
+/// relocate loop bodies — every recognizer's legality argument is stated
+/// against that shape. `run_once_with_stats` (O1/O2/Os) satisfies it by
+/// construction, but O3's `run_to_fixpoint` re-runs every listed pass each
+/// iteration, so from iteration 2 the recognizers would be matching
+/// TRANSFORMED IR (threaded latches from `X86LoopRotate`, hoisted headers
+/// from LICM, merged blocks) that their acceptance proofs never contemplated
+/// (the a64 2026-08-13 class: a recognizer re-running on rotated loops).
+/// The pass manager is built fresh per function, so a per-instance flag has
+/// exactly per-function lifetime; the first `run` does the work and every
+/// subsequent call inside the same fixpoint is a no-op.
+#[derive(Default)]
+pub struct X86Vectorize {
+    ran: bool,
+}
 
 impl X86Vectorize {
-    /// Convenience entry point mirroring the other x86 passes.
+    /// Convenience entry point mirroring the other x86 passes. Direct entry
+    /// deliberately bypasses the run-once flag (callers own their pipeline
+    /// position).
     pub fn run_on_function(&mut self, func: &mut X86ISelFunction) -> bool {
         run_impl(func)
     }
@@ -111,6 +129,10 @@ impl X86MachinePass for X86Vectorize {
     }
 
     fn run(&mut self, func: &mut X86ISelFunction) -> bool {
+        if self.ran {
+            return false;
+        }
+        self.ran = true;
         run_impl(func)
     }
 }
@@ -185,6 +207,8 @@ fn run_impl(func: &mut X86ISelFunction) -> bool {
             plans.push(LoopPlan::RuntimeByteFill(plan));
         } else if let Some(plan) = recognize_saxpy_loop(func, &preds, &idom, lp) {
             plans.push(LoopPlan::Saxpy(plan));
+        } else if let Some(plan) = recognize_saxpyq_rowreg_loop(func, &preds, &idom, lp, &loops) {
+            plans.push(LoopPlan::SaxpyQRowReg(plan));
         } else if let Some(plan) = recognize_saxpyq_loop(func, &preds, &idom, lp) {
             plans.push(LoopPlan::SaxpyQ(plan));
         } else if let Some(plan) = recognize_reduction_loop(func, &preds, &idom, lp) {
@@ -388,6 +412,34 @@ fn run_impl(func: &mut X86ISelFunction) -> bool {
                     );
                 }
             }
+            LoopPlan::SaxpyQRowReg(plan) => {
+                apply_saxpyq_rowreg_plan(func, &plan);
+                if trace_enabled() {
+                    eprintln!(
+                        "x86-vectorize: fn `{}` VECTORIZED saxpy-Q ROW-REGISTER nest: \
+                         c-row[slot{}] held in {} xmm accumulator(s) across k={:?} in [0,{}), \
+                         aik={:?}=a[slot{}][{:?}*{}+k], x[slot{}] {}, N={}, {} runtime row \
+                         check(s) fail-safe to the original (still saxpy-Q-vectorized) nest",
+                        func.name,
+                        plan.inner.slot_c,
+                        plan.inner.n_trip / LANES_Q,
+                        plan.k_iv,
+                        plan.k_trip,
+                        plan.aik,
+                        plan.slot_a,
+                        plan.leaf_a,
+                        plan.mult_a,
+                        plan.inner.slot_x,
+                        match plan.x_discharge {
+                            XDischarge::CompileTime =>
+                                "row advances mult_x*8 per k (compile-time discharge)",
+                            XDischarge::Runtime => "row fixed (k-invariant leaf)",
+                        },
+                        plan.inner.n_trip,
+                        plan.row_obligations.len(),
+                    );
+                }
+            }
             LoopPlan::SaxpyQ(plan) => {
                 apply_saxpyq_plan(func, &plan);
                 if trace_enabled() {
@@ -465,6 +517,14 @@ enum LoopPlan {
     /// over local i64 arrays, with runtime bound checks that fail-safe to the
     /// scalar loop.
     SaxpyQ(SaxpyQPlan),
+    /// A k-loop whose body is EXACTLY an already-recognized saxpy-Q j-loop
+    /// plus a guarded row-scalar (`aik`) load and k-IV bookkeeping — matmul's
+    /// middle loop. Rewritten to hold the c row in `N/2` XMM accumulators
+    /// across the whole k-loop (the c-row-in-register lever); the original
+    /// nest (with the coexisting inner saxpy-Q plan applied) survives as the
+    /// runtime-check fail path. Opt-in behind `TCG_X86_SAXPYQ_ROWREG`
+    /// (stage 1). See [`SaxpyQRowRegPlan`].
+    SaxpyQRowReg(SaxpyQRowRegPlan),
     /// An integer sum-reduction `for k { acc = acc + a[k] }` (Sum) or
     /// `for k { acc = acc + a[k]*b[k] }` (Dot) over local i32 arrays, with `acc`
     /// a loop-carried scalar (register) accumulator that never escapes to memory
@@ -929,6 +989,17 @@ fn is_safe_iv_bounds_carrier(
     }
     let (index, bound) = match (inst.operands.get(1), inst.operands.get(2)) {
         (Some(X86ISelOperand::VReg(index)), Some(X86ISelOperand::Imm(bound))) => (*index, *bound),
+        // A register-materialized constant bound (the GuardBoundsCheckDyn
+        // spelling of a compile-time length). `const_of` resolves through the
+        // def chain and `DefIndex` drops multi-def vregs, so a reassigned
+        // "constant" register declines — same fail-closed posture as the Imm
+        // arm, same `bound >= n_trip` proof once resolved.
+        (Some(X86ISelOperand::VReg(index)), Some(X86ISelOperand::VReg(b))) => {
+            match const_of(func, defs, canon(func, defs, *b)) {
+                Some(bound) => (*index, bound),
+                None => return false,
+            }
+        }
         _ => return false,
     };
     prov(func, defs, iv, index, memo, 0) == Prov::Iv && bound >= n_trip
@@ -2974,6 +3045,639 @@ fn recognize_saxpyq_loop(
     })
 }
 
+// ===========================================================================
+// saxpy-Q ROW-REGISTER nest (stage 1, opt-in): a k-loop whose body is exactly
+// an already-recognized saxpy-Q j-loop plus k-IV bookkeeping, rewritten to
+// hold the c row in XMM accumulators across the whole k-loop.
+// ===========================================================================
+
+/// Opt-in gate for the two-level saxpy-Q row-register tier (STAGE 1).
+/// Recognition declines unless `TCG_X86_SAXPYQ_ROWREG` is set, so default
+/// codegen is byte-identical to a build without the tier.
+fn saxpyq_rowreg_enabled() -> bool {
+    // DEFAULT-ON after the staged gate (2026-08-28): trace-verified accept on
+    // p4 with the compile-time x-discharge, exit-code MATCH vs LLVM, 54/54
+    // compile gate, and interleaved timing at PARITY (0.13s vs LLVM
+    // 0.12-0.13s; the band was 1.43-1.67 before this tier and 3.28 at the
+    // start of the p4 arc). `TCG_NO_X86_SAXPYQ_ROWREG` is the forensic
+    // opt-out; the legacy `TCG_X86_SAXPYQ_ROWREG` opt-in spelling remains
+    // accepted and redundant.
+    crate::env_lock::var_os("TCG_NO_X86_SAXPYQ_ROWREG").is_none()
+}
+
+/// How the x-row obligation of the inner saxpy-Q plan is discharged by the
+/// row-register tier.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum XDischarge {
+    /// `leaf_x` IS the k counter (matmul's `x[k*N + j]`): the flat index
+    /// `k*mult_x + j` is bounded at COMPILE TIME by
+    /// `(k_trip-1)*mult_x + (n_trip-1) < bound_x` (k init 0 is
+    /// header-verified, `mult_x >= 0` required, all checked arithmetic), so
+    /// no runtime check is emitted; the x row pointer starts at `base_x`
+    /// (k = 0) and advances by `mult_x * 8` bytes per k iteration.
+    CompileTime,
+    /// `leaf_x` is k-invariant: the x row is the SAME every k iteration; its
+    /// obligation joins the runtime row checks and the row pointer is fixed
+    /// at `base_x + inv_x*8`.
+    Runtime,
+}
+
+/// A verified-legal two-level saxpy-Q row-register plan (see
+/// [`recognize_saxpyq_rowreg_loop`] for the shape and the legality argument,
+/// [`apply_saxpyq_rowreg_plan`] for the emitted parallel CFG).
+struct SaxpyQRowRegPlan {
+    /// The inner, independently-recognized saxpy-Q j-loop plan. The inner
+    /// plan is STILL recognized and applied to the original blocks by the
+    /// normal plans chain (the two applies edit disjoint terminators), so the
+    /// runtime-check fail path is the saxpy-Q-vectorized j-loop, not scalar.
+    inner: SaxpyQPlan,
+    /// The k counter vreg (init 0 outside, +1 in the k latch).
+    k_iv: VReg,
+    /// Compile-time k trip count (from the k header's `k <u K` test).
+    k_trip: i64,
+    /// The k-loop preheader — the ONLY original block this plan edits (its
+    /// terminator is redirected to the row-vector CFG).
+    k_preheader: Block,
+    /// The original k-loop header (every failing runtime row check enters
+    /// here with all original vregs intact).
+    k_header: Block,
+    /// The k-loop exit block (the row sink jumps here).
+    k_exit: Block,
+    /// The row-scalar load `aik = a[leaf_a*mult_a + k]`: slot, unique slot
+    /// base vreg, invariant leaf, flat multiplier, and the canonical loaded
+    /// vreg (proven equal to `inner.k`, the j-loop's invariant multiplier).
+    slot_a: u32,
+    base_a: VReg,
+    leaf_a: VReg,
+    mult_a: i64,
+    aik: VReg,
+    /// Deduplicated runtime row obligations `(leaf, mult, check_limit)`; the
+    /// row preheader checks `leaf*mult <u check_limit` for each. Limits are
+    /// PRE-SUBTRACTED — `bound - (k_trip-1)` for k-chain (a) guards,
+    /// `bound - (n_trip-1)` for k-invariant inner obligations — and dedup on
+    /// `(leaf, mult)` keeps the MINIMUM limit (the strongest check).
+    row_obligations: Vec<(VReg, i64, i64)>,
+    /// How the x row access is justified (and whether its pointer advances).
+    x_discharge: XDischarge,
+}
+
+/// Push every vreg `inst` READS into `out`: every operand beyond the def slot
+/// (operand 0 iff the opcode produces a value — this ISel IR is 3-address
+/// pre-RA, so operand 0 of a value producer is a pure def), recursing into
+/// memory operands (address bases/indices are reads even in the
+/// store-destination slot). Non-value-producers (stores, compares, branches,
+/// trap carriers) read ALL their operands.
+fn inst_use_vregs(inst: &X86ISelInst, out: &mut Vec<VReg>) {
+    fn operand_vregs(op: &X86ISelOperand, out: &mut Vec<VReg>) {
+        match op {
+            X86ISelOperand::VReg(v) => out.push(*v),
+            X86ISelOperand::MemAddr { base, .. } => operand_vregs(base, out),
+            X86ISelOperand::SibMemAddr { base, index, .. } => {
+                operand_vregs(base, out);
+                operand_vregs(index, out);
+            }
+            _ => {}
+        }
+    }
+    for (idx, op) in inst.operands.iter().enumerate() {
+        if idx == 0 && x86_produces_value(inst.opcode) && matches!(op, X86ISelOperand::VReg(_)) {
+            continue; // the register def slot — a write, not a read.
+        }
+        operand_vregs(op, out);
+    }
+}
+
+/// The set of vregs READ by any instruction in a block OUTSIDE `body`
+/// (memory-operand vregs included). Used by the row-register carrier
+/// partition: a k-body def in this set is live-out, and unless it is a proven
+/// identity round-trip it blocks the loop bypass.
+fn vregs_used_outside_body(func: &X86ISelFunction, body: &BTreeSet<Block>) -> HashSet<VReg> {
+    let mut reads: HashSet<VReg> = HashSet::new();
+    let mut buf: Vec<VReg> = Vec::new();
+    for block_id in &func.block_order {
+        if body.contains(block_id) {
+            continue;
+        }
+        let Some(block) = func.blocks.get(block_id) else {
+            continue;
+        };
+        for inst in &block.insts {
+            buf.clear();
+            inst_use_vregs(inst, &mut buf);
+            reads.extend(buf.iter().copied());
+        }
+    }
+    reads
+}
+
+/// Recognizer for the TWO-LEVEL saxpy-Q row-register nest:
+///
+/// ```text
+/// for k in 0..K {                                    // this loop (`lp`)
+///     let aik = a[leaf_a*mult_a + k];                // ONE guarded i64 load
+///     for j in 0..N { c[inv_c + j] += aik * x[inv_x + j]; }  // saxpy-Q
+///     // + identity carrier round-trips and k-IV bookkeeping ONLY
+/// }
+/// ```
+///
+/// where the j-loop is EXACTLY a shape [`recognize_saxpyq_loop`] accepts. The
+/// transform holds the (k-stationary) c row in `N/2` XMM accumulators across
+/// the whole k-loop, eliding the per-(k,j) c store/reload through provably
+/// private slot memory. Returns a legal plan or `None` for anything else.
+///
+/// # Legality by construction / fail-safe
+///
+/// * **Parallel CFG.** Nothing original is consumed: only the k-preheader's
+///   terminator is redirected. The original nest — including the coexisting,
+///   independently-applied inner saxpy-Q plan (disjoint terminator edits) —
+///   survives byte-identical as the check-fail target, and the new blocks
+///   write ONLY fresh vregs, so a failing check enters it with all state
+///   intact.
+/// * **Guard elision is check-justified.** Pre-inner (a) guards classify
+///   w.r.t. the k IV and are re-quantified over k: passing
+///   `leaf*mult <u bound - (k_trip-1)` proves `leaf*mult + k < bound`,
+///   wrap-free, for ALL k in `[0, k_trip)` — the same lemma the inner tier
+///   proves with j. Inner obligations with k-INVARIANT leaves keep their
+///   `bound - (n_trip-1)` limit (the j-range is identical every k iteration
+///   precisely because the leaf is k-invariant); obligations whose leaf IS
+///   the k IV are discharged at compile time (see [`XDischarge`]); anything
+///   else rejects. Dedup on `(leaf, mult)` keeps the MINIMUM check limit, so
+///   merged checks are only ever stronger.
+/// * **Carrier hygiene (the a051240f-class step).** Every vreg defined in the
+///   k-body must be (1) a proven latch identity round-trip — `t = v_out`
+///   in-body, `v_out = t` in the latch, exactly one body def each, `t`
+///   single-def function-wide, copy-in executed before the copy-back — whose
+///   live-out value is therefore provably unchanged (the new loop never
+///   touches it), or (2) read NOWHERE outside the k-body (function-wide read
+///   scan including memory operands), so bypassing the original loop is
+///   unobservable. ANY other pattern rejects; the k IV itself must satisfy
+///   (2), so a live-out `k` rejects. This does not conflict with the
+///   loop-deleting carrier discipline: the original loop is NEVER deleted,
+///   and the accumulators are fresh pass-synthesized carriers of a
+///   pass-synthesized loop (the `apply_reduction_plan` vacc standing).
+/// * **Aliasing.** `slot_x != slot_c` and `slot_a != slot_c` (register-
+///   resident c must not be observable through x/a reads), and slot_c is
+///   touched by NOTHING in the k-body outside the j-loop (the pre-inner
+///   chain admits exactly the one aik load and no store; the post-inner
+///   chain and both headers admit no memory op at all).
+/// * **Value identity.** Per element, the new loop performs the IDENTICAL
+///   sequence of wrapping ops in identical k-order; only the intermediate
+///   store/reload of c through private non-aliased slot memory is elided.
+///
+/// Emitted-opcode perimeter: every opcode `apply_saxpyq_rowreg_plan` emits is
+/// already emitted by default-on proof-gated tiers — zero new surface.
+fn recognize_saxpyq_rowreg_loop(
+    func: &X86ISelFunction,
+    preds: &HashMap<Block, Vec<Block>>,
+    idom: &HashMap<Block, Block>,
+    lp: &LoopInfo,
+    all_loops: &[LoopInfo],
+) -> Option<SaxpyQRowRegPlan> {
+    if !saxpyq_rowreg_enabled() {
+        return None;
+    }
+    let k_header = lp.header;
+    let k_latch = lp.latch;
+    let body = &lp.body;
+    let k_preheader = lp.preheader?;
+
+    // No PHI pseudo anywhere in the loop (non-SSA at this stage).
+    for block_id in body {
+        let block = func.blocks.get(block_id)?;
+        if block.insts.iter().any(|i| i.opcode == X86Opcode::Phi) {
+            return None;
+        }
+    }
+
+    // (a) Exactly ONE nested natural loop strictly inside this one (the
+    // window-scan step-0 pattern), and it must be an accepted saxpy-Q loop.
+    let mut inner_lp: Option<&LoopInfo> = None;
+    for lp2 in all_loops {
+        if lp2.header != k_header && lp2.body.is_subset(body) {
+            if inner_lp.is_some() {
+                return None; // two inner loops
+            }
+            inner_lp = Some(lp2);
+        }
+    }
+    let inner_lp = inner_lp?;
+    if inner_lp.body.contains(&k_header) {
+        return None;
+    }
+    let inner = recognize_saxpyq_loop(func, preds, idom, inner_lp)?;
+    let inner_pre = inner.preheader;
+    if !body.contains(&inner_pre) || !body.contains(&inner.header) {
+        return None;
+    }
+
+    // (g) Admission: no scalar j-remainder element (an odd N would need a
+    // 13th scalar carrier) and 2..=12 accumulators — 12 + 2-3 group temps of
+    // the 16 allocatable XMMs leaves allocator headroom; 13 leaves zero.
+    if inner.n_trip % LANES_Q != 0 {
+        return None;
+    }
+    let n_acc = inner.n_trip / LANES_Q;
+    if !(2..=12).contains(&n_acc) {
+        return None;
+    }
+
+    let defs = DefIndex::build(func);
+    let mut memo: HashMap<VReg, Prov> = HashMap::new();
+
+    // (b) k header: unit counter (init-0 outside / +1 inside, verified by
+    // `is_counter` via `recognize_header`) against a compile-time trip count;
+    // exactly one exit successor; the preheader is the only outside pred.
+    let (k_iv, k_trip) = recognize_header(func, &defs, k_header, body)?;
+    if k_trip < 1 || k_iv == inner.iv {
+        return None;
+    }
+    let k_exit = {
+        let hsuccs = &func.blocks.get(&k_header)?.successors;
+        let non_body: Vec<Block> = hsuccs
+            .iter()
+            .copied()
+            .filter(|s| !body.contains(s))
+            .collect();
+        if non_body.len() != 1 {
+            return None;
+        }
+        let empty = Vec::new();
+        let hpreds = preds.get(&k_header).unwrap_or(&empty);
+        let non_body_preds: Vec<Block> = hpreds
+            .iter()
+            .copied()
+            .filter(|p| !body.contains(p))
+            .collect();
+        if non_body_preds != vec![k_preheader] {
+            return None;
+        }
+        non_body[0]
+    };
+    // Both headers are BYPASSED by the new loop (unlike the inner tier, which
+    // keeps executing the j header for its remainder), so they must contain
+    // nothing but whitelisted compute/control — no memory op, no call.
+    for h in [k_header, inner.header] {
+        for inst in &func.blocks.get(&h)?.insts {
+            if !is_whitelisted_body_opcode(inst.opcode) {
+                return None;
+            }
+        }
+    }
+
+    // (c) The PRE-INNER chain from the k-header's body successor to the inner
+    // preheader: pure-trap side edges classified w.r.t. the k IV (row
+    // obligations), whitelisted opcodes, and EXACTLY ONE admitted load — the
+    // 64-bit aik element load. No stores, no calls.
+    let mut k_obs: Vec<(VReg, i64, i64)> = Vec::new(); // (leaf, mult, bound)
+    let mut visited: HashSet<Block> = HashSet::new();
+    let mut aik_load: Option<(u32, VReg, i64, VReg)> = None; // (slot, leaf, mult, canon dst)
+    let mut cur = unique_in_body_succ(&func.blocks.get(&k_header)?.successors, body)?;
+    loop {
+        if !body.contains(&cur)
+            || inner_lp.body.contains(&cur)
+            || cur == k_header
+            || !visited.insert(cur)
+        {
+            return None;
+        }
+        let block = func.blocks.get(&cur)?;
+        let mut has_trap_edge = false;
+        for s in &block.successors {
+            if body.contains(s) {
+                continue;
+            }
+            if !is_pure_trap_block(func, *s) {
+                return None;
+            }
+            has_trap_edge = true;
+        }
+        if has_trap_edge {
+            match classify_guard_compare(func, &defs, k_iv, &mut memo, cur, body, k_trip)? {
+                GuardClass::StaticOk => {}
+                GuardClass::Inv(leaf, mult, bound) => {
+                    // Dedup on (leaf, mult): keep the SMALLEST bound.
+                    match k_obs.iter_mut().find(|(l, m, _)| *l == leaf && *m == mult) {
+                        Some(entry) => entry.2 = entry.2.min(bound),
+                        None => k_obs.push((leaf, mult, bound)),
+                    }
+                }
+            }
+        }
+        for inst in &block.insts {
+            let op = inst.opcode;
+            if op == X86Opcode::Call || op == X86Opcode::CallR || op == X86Opcode::CallM {
+                return None;
+            }
+            if is_load_opcode(op) {
+                if op != X86Opcode::MovRM || aik_load.is_some() {
+                    return None;
+                }
+                let dst = match inst.operands.first() {
+                    Some(X86ISelOperand::VReg(d)) if d.class == RegClass::Gpr64 => *d,
+                    _ => return None,
+                };
+                let (slot, leaf, mult) = match inst.operands.get(1) {
+                    Some(X86ISelOperand::MemAddr { base, disp }) if *disp == 0 => {
+                        match base.as_ref() {
+                            X86ISelOperand::VReg(bv) => {
+                                match prov(func, &defs, k_iv, *bv, &mut memo, 0) {
+                                    Prov::ElemAddrInvMul(slot, scale, leaf, mult)
+                                        if scale == ELEM_SIZE_Q as i64 =>
+                                    {
+                                        (slot, leaf, mult)
+                                    }
+                                    _ => return None,
+                                }
+                            }
+                            _ => return None,
+                        }
+                    }
+                    _ => return None,
+                };
+                aik_load = Some((slot, leaf, mult, canon(func, &defs, dst)));
+            } else if is_store_opcode(op) {
+                return None;
+            } else if !is_whitelisted_body_opcode(op) {
+                return None;
+            }
+        }
+        if cur == inner_pre {
+            break;
+        }
+        cur = unique_in_body_succ(&block.successors, body)?;
+    }
+    let (slot_a, leaf_a, mult_a, aik) = aik_load?;
+    // The loaded row scalar must BE the inner plan's invariant multiplier.
+    if aik != inner.k || slot_a == inner.slot_c || leaf_a == k_iv {
+        return None;
+    }
+    // No unguarded-load admission: the aik access needs a matching K-CHAIN
+    // guard obligation (k-quantified — an inner, n_trip-quantified obligation
+    // for the same (leaf, mult) is NOT evidence over k), whose bound must
+    // also fit the slot (every access provably in-slot once the check holds).
+    {
+        let (_, _, bound_a) = k_obs
+            .iter()
+            .find(|(l, m, _)| *l == leaf_a && *m == mult_a)?;
+        let info = func.stack_slots.get(slot_a as usize)?;
+        let need = bound_a.checked_mul(ELEM_SIZE_Q as i64)?;
+        if (info.size as i64) < need {
+            return None;
+        }
+    }
+
+    // POST-INNER chain: the j-header's unique non-inner successor down to the
+    // k latch. Whitelisted compute/control only — no memory op, no call, and
+    // no side exit of any kind.
+    let mut post_cur = {
+        let jsuccs = &func.blocks.get(&inner.header)?.successors;
+        let outs: Vec<Block> = jsuccs
+            .iter()
+            .copied()
+            .filter(|s| !inner_lp.body.contains(s))
+            .collect();
+        if outs.len() != 1 {
+            return None;
+        }
+        outs[0]
+    };
+    loop {
+        if !body.contains(&post_cur)
+            || inner_lp.body.contains(&post_cur)
+            || post_cur == k_header
+            || !visited.insert(post_cur)
+        {
+            return None;
+        }
+        let block = func.blocks.get(&post_cur)?;
+        for s in &block.successors {
+            if !body.contains(s) {
+                return None;
+            }
+        }
+        for inst in &block.insts {
+            if !is_whitelisted_body_opcode(inst.opcode) {
+                return None;
+            }
+        }
+        if post_cur == k_latch {
+            break;
+        }
+        post_cur = unique_in_body_succ(&block.successors, body)?;
+    }
+    // The latch's only in-body successor must be the header (the back-edge).
+    if unique_in_body_succ(&func.blocks.get(&k_latch)?.successors, body)? != k_header {
+        return None;
+    }
+    // Accounting: every k-body block is the header, on one of the two chains,
+    // or inside the inner loop — nothing hidden.
+    for block_id in body {
+        if *block_id != k_header && !visited.contains(block_id) && !inner_lp.body.contains(block_id)
+        {
+            return None;
+        }
+    }
+
+    // (e) CARRIER HYGIENE — the a051240f-class partition (fail-closed).
+    let mut body_def_counts: HashMap<VReg, u32> = HashMap::new();
+    for block_id in body {
+        let block = func.blocks.get(block_id)?;
+        for inst in &block.insts {
+            if x86_produces_value(inst.opcode)
+                && let Some(X86ISelOperand::VReg(d)) = inst.operands.first()
+            {
+                *body_def_counts.entry(*d).or_insert(0) += 1;
+            }
+        }
+    }
+    // Latch identity round-trips: `MovRR v_out, t` in the latch where `t`'s
+    // unique function-wide def is `MovRR t, v_out` inside the body and
+    // executed before the copy-back, one body def per side. The body is a
+    // single guaranteed path per iteration (chain discipline; side edges only
+    // trap), so the copy-in runs every iteration and v_out's live-out value
+    // is provably unchanged — the new loop simply never touches it.
+    let mut identity_outs: HashSet<VReg> = HashSet::new();
+    {
+        let latch_block = func.blocks.get(&k_latch)?;
+        for (cb_idx, inst) in latch_block.insts.iter().enumerate() {
+            if !matches!(inst.opcode, X86Opcode::MovRR | X86Opcode::MovRR32) {
+                continue;
+            }
+            let (v_out, t) = match (inst.operands.first(), inst.operands.get(1)) {
+                (Some(X86ISelOperand::VReg(v)), Some(X86ISelOperand::VReg(t))) => (*v, *t),
+                _ => continue,
+            };
+            if v_out == t
+                || body_def_counts.get(&v_out) != Some(&1)
+                || body_def_counts.get(&t) != Some(&1)
+            {
+                continue;
+            }
+            let Some(&(tb, ti)) = defs.single.get(&t) else {
+                continue; // t multi-def function-wide: not a provable pair
+            };
+            if !body.contains(&tb) || (tb == k_latch && ti >= cb_idx) {
+                continue;
+            }
+            let tdef = func.blocks.get(&tb)?.insts.get(ti)?;
+            if !matches!(tdef.opcode, X86Opcode::MovRR | X86Opcode::MovRR32) {
+                continue;
+            }
+            let src_is_vout =
+                matches!(tdef.operands.get(1), Some(X86ISelOperand::VReg(s)) if *s == v_out);
+            let dst_is_t =
+                matches!(tdef.operands.first(), Some(X86ISelOperand::VReg(d)) if *d == t);
+            if src_is_vout && dst_is_t {
+                identity_outs.insert(v_out);
+            }
+        }
+    }
+    // Every OTHER vreg defined in the k-body must be read nowhere outside it:
+    // bypassing the original loop is then unobservable. This covers the k IV
+    // itself (a live-out k rejects) and every identity temp `t` (never
+    // written on the new path, so an outside read would see garbage).
+    let outside_reads = vregs_used_outside_body(func, body);
+    for v in body_def_counts.keys() {
+        if identity_outs.contains(v) {
+            continue;
+        }
+        if outside_reads.contains(v) {
+            return None;
+        }
+    }
+
+    // k-invariance rule for leaves: no def inside the k-body, or the def is a
+    // proven identity round-trip (value unchanged every iteration).
+    let leaf_k_invariant =
+        |leaf: VReg| !body_def_counts.contains_key(&leaf) || identity_outs.contains(&leaf);
+    for (leaf, _, _) in &k_obs {
+        if *leaf == k_iv || !leaf_k_invariant(*leaf) {
+            return None;
+        }
+    }
+    if !leaf_k_invariant(leaf_a) {
+        return None;
+    }
+    // The hoisted c row must be k-STATIONARY: its leaf may not be the k IV
+    // and must be k-invariant (this is what licenses holding the row in
+    // registers across the whole k-loop).
+    if canon(func, &defs, inner.leaf_c) == k_iv || !leaf_k_invariant(inner.leaf_c) {
+        return None;
+    }
+
+    // (d) Classify every inner obligation w.r.t. the k IV and build the
+    // merged, deduplicated runtime check list (CHECK LIMITS, minimum kept).
+    let mut row_obligations: Vec<(VReg, i64, i64)> = Vec::new();
+    let push_limit = |obs: &mut Vec<(VReg, i64, i64)>, leaf: VReg, mult: i64, limit: i64| match obs
+        .iter_mut()
+        .find(|(l, m, _)| *l == leaf && *m == mult)
+    {
+        Some(entry) => entry.2 = entry.2.min(limit),
+        None => obs.push((leaf, mult, limit)),
+    };
+    for (leaf, mult, bound) in &k_obs {
+        push_limit(&mut row_obligations, *leaf, *mult, *bound - (k_trip - 1));
+    }
+    for (leaf, mult, bound) in &inner.obligations {
+        if canon(func, &defs, *leaf) == k_iv {
+            // COMPILE-TIME discharge: k init 0 is header-verified, so the
+            // flat index `k*mult + j` is maximal at k=k_trip-1, j=n_trip-1;
+            // require it < bound with mult >= 0, all checked (no wrap).
+            if *mult < 0 {
+                return None;
+            }
+            let max_idx = (k_trip - 1)
+                .checked_mul(*mult)?
+                .checked_add(inner.n_trip - 1)?;
+            if max_idx >= *bound {
+                return None;
+            }
+        } else if leaf_k_invariant(*leaf) {
+            push_limit(
+                &mut row_obligations,
+                *leaf,
+                *mult,
+                *bound - (inner.n_trip - 1),
+            );
+        } else {
+            return None; // unclassifiable leaf: inner plan still applies alone
+        }
+    }
+
+    // (f) Aliasing + x-row classification: register-resident c must not be
+    // observable through x reads.
+    if inner.slot_x == inner.slot_c {
+        return None;
+    }
+    let x_discharge = if canon(func, &defs, inner.leaf_x) == k_iv {
+        XDischarge::CompileTime
+    } else if leaf_k_invariant(inner.leaf_x) {
+        XDischarge::Runtime
+    } else {
+        return None;
+    };
+    // Every base-pointer fold the apply performs must have a materialized
+    // invariant to fold (obligation-matched, like the inner tier's inv_for).
+    let has_ob = |leaf: VReg, mult: i64| {
+        row_obligations
+            .iter()
+            .any(|(l, m, _)| *l == leaf && *m == mult)
+    };
+    if !has_ob(inner.leaf_c, inner.mult_c) || !has_ob(leaf_a, mult_a) {
+        return None;
+    }
+    if x_discharge == XDischarge::Runtime && !has_ob(inner.leaf_x, inner.mult_x) {
+        return None;
+    }
+
+    // Resolve the a slot base (unique `Lea r, [StackSlot(slot_a)]`).
+    let base_a = slot_base_vreg(func, &defs, slot_a)?;
+
+    // Every value the NEW blocks read must exist at the k-preheader: some def
+    // whose block dominates it. (No body def — or identity preservation —
+    // then guarantees the value read there is the one iteration k reads.)
+    let mut preheader_visible: Vec<VReg> = row_obligations.iter().map(|(l, _, _)| *l).collect();
+    preheader_visible.push(base_a);
+    preheader_visible.push(inner.base_c);
+    preheader_visible.push(inner.base_x);
+    for v in preheader_visible {
+        let mut dominated = false;
+        for block_id in &func.block_order {
+            let Some(block) = func.blocks.get(block_id) else {
+                continue;
+            };
+            for inst in &block.insts {
+                if x86_produces_value(inst.opcode)
+                    && let Some(X86ISelOperand::VReg(d)) = inst.operands.first()
+                    && *d == v
+                    && dominates(*block_id, k_preheader, idom)
+                {
+                    dominated = true;
+                }
+            }
+        }
+        if !dominated {
+            return None;
+        }
+    }
+
+    Some(SaxpyQRowRegPlan {
+        inner,
+        k_iv,
+        k_trip,
+        k_preheader,
+        k_header,
+        k_exit,
+        slot_a,
+        base_a,
+        leaf_a,
+        mult_a,
+        aik,
+        row_obligations,
+        x_discharge,
+    })
+}
+
 /// Which integer reduction the summed term is.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ReduceKind {
@@ -3901,6 +4605,33 @@ fn recognize_heap_sumq_loop(
                     _ => return None,
                 };
                 raw_stores.push((s, d, val, pos));
+            } else if op == X86Opcode::TrapBoundsCheckExact {
+                // The bounds-check CARRIER form of the trap-edge rule above:
+                // accept it only when it re-checks EXACTLY the header's guard —
+                // index chases to `iv` and the bound is a load of the SAME
+                // invariant `[len_slot + len_disp]` field the header compares
+                // against. The header dominates every body instruction and
+                // proves `iv <u len`, and the packed prefix only replaces
+                // iterations with `iv < vN <= len`, so the carrier could never
+                // have fired on a replaced iteration; the scalar tail re-enters
+                // the ORIGINAL blocks, so remainder iterations keep the carrier
+                // (and its expansion + canary) untouched. The carrier produces
+                // no value (`x86_produces_value` is false), so def-chain
+                // reasoning below is unaffected. Any other operand shape —
+                // different index, different bound, constant bound, mutated
+                // len field — declines the whole loop, as ever.
+                let index_ok = matches!(
+                    inst.operands.get(1),
+                    Some(X86ISelOperand::VReg(idx)) if canon(func, &defs, *idx) == iv
+                );
+                let bound_ok = match inst.operands.get(2) {
+                    Some(X86ISelOperand::VReg(b)) => slot_field_load(func, &defs, *b)
+                        .is_some_and(|(_, s, d)| s == len_slot && d == len_disp),
+                    _ => false,
+                };
+                if !index_ok || !bound_ok {
+                    return None;
+                }
             } else if !is_whitelisted_body_opcode(op) {
                 return None;
             }
@@ -5312,26 +6043,27 @@ fn apply_saxpy_plan(func: &mut X86ISelFunction, plan: &SaxpyPlan) {
 /// //   xs   = PADDQ(xc, prod)                  // (operand order per plan)
 /// //   MOVDQU [pc + d*8] = xs
 ///
-/// VBU:  px = &pbx[iv]; pc = &pbc[iv];          // 2x-UNROLLED, BOTTOM-TEST
-///       group(px,pc,0); group(px,pc,2);        // two independent chains (ILP)
-///       iv += 4;  iv <u vn4 ? VBU : VBT/header  // 1 branch / 4 elements
-/// VBT:  px = &pbx[iv]; pc = &pbc[iv];          // single trailing 2-lane group
-///       group(px,pc,0); iv += 2; -> header      // only when vn is 2 (mod 4)
+/// VBU:  px = &pbx[iv]; pc = &pbc[iv];          // 4x-UNROLLED, BOTTOM-TEST
+///       group(px,pc,0); .. group(px,pc,6);     // four independent chains (ILP)
+///       iv += 8;  iv <u vn4 ? VBU : VBT/header  // 1 branch / 8 elements
+/// VBT:  px = &pbx[iv]; pc = &pbc[iv];          // (vn-vn4)/2 trailing groups
+///       group(px,pc,0..); iv += vn-vn4; -> header
 /// ```
 ///
-/// `vn = (N/2)*2` is the packed element count and `vn4 = (vn/4)*4` the
-/// unrolled portion; VBU is emitted only when `vn4 >= 4` (so its bottom-test
-/// is legal by construction — at least one full iteration), and VBT only when
-/// `vn - vn4 == 2`. When neither holds (`vn == 0`, impossible since
-/// `N >= LANES_Q`) VPB jumps straight to the scalar header. The scalar loop is
-/// untouched; the runtime-check failure path and the `N % 2` scalar remainder
-/// both enter it with the correct `iv`.
+/// `vn = (N/2)*2` is the packed element count and `vn4 = (vn/group)*group` the
+/// unrolled portion (group = 8 by default; `TCG_NO_X86_SAXPYQ_UNROLL4`
+/// restores the original x2 body, group = 4). VBU is emitted only when
+/// `vn4 >= group` (so its bottom-test is legal by construction — at least one
+/// full iteration), and VBT only when `vn > vn4` (1-3 straight-line trailing
+/// groups). When neither holds (`vn == 0`, impossible since `N >= LANES_Q`)
+/// VPB jumps straight to the scalar header. The scalar loop is untouched; the
+/// runtime-check failure path and the `N % 2` scalar remainder both enter it
+/// with the correct `iv`.
 ///
-/// The K broadcast stays a scratch-slot store/`MOVDQU`-reload: a register-form
-/// `MOVQ` + `PUNPCKLQDQ` broadcast would be one fewer round-trip, but
-/// `PUNPCKLQDQ` (a shuffle/pack op) has no single-instruction lowering proof
-/// (deliberately omitted from `packed_to_proof_query`), so it would fail-close
-/// the whole function at proof promotion.
+/// K needs no broadcast at all on the default scalar-IMUL route (88216784);
+/// the packed fallback's [K;2] broadcast is register-form MOVQ + PUNPCKLQDQ,
+/// per-instruction certified since the PackLowQwords reconstruction
+/// (0cb31507).
 ///
 /// ⚑ "The broadcast runs once per invocation" — this block previously said
 /// that, and it is WRONG. VP0 is the preheader of the INNERMOST (j) loop, so it
@@ -5358,8 +6090,13 @@ fn apply_saxpyq_plan(func: &mut X86ISelFunction, plan: &SaxpyQPlan) {
     // entered with at least one full iteration (bottom-test legal by
     // construction — no separate small-`vn` entry guard is needed).
     let vn = (plan.n_trip / LANES_Q) * LANES_Q;
-    let unroll = 2i64;
-    let group = LANES_Q * unroll; // 4 elements per unrolled iteration
+    // Unroll x4 by default (the 88216784 follow-up: LLVM's p4 loop runs more
+    // groups per branch; 4 groups/iteration amortizes the iv/branch chain over
+    // 8 elements). `TCG_NO_X86_SAXPYQ_UNROLL4` restores the original x2 body
+    // AND the original IMUL operand order (see emit_group) for a one-dylib A/B.
+    let unroll4 = std::env::var_os("TCG_NO_X86_SAXPYQ_UNROLL4").is_none();
+    let unroll = if unroll4 { 4i64 } else { 2i64 };
+    let group = LANES_Q * unroll; // elements per unrolled iteration (8 or 4)
     let vn4 = (vn / group) * group;
     let has_unrolled = vn4 >= group;
     let has_tail = vn > vn4; // 0 or 1 trailing 2-lane group
@@ -5423,30 +6160,53 @@ fn apply_saxpyq_plan(func: &mut X86ISelFunction, plan: &SaxpyQPlan) {
         disp: (disp_elems * ELEM_SIZE_Q as i64) as i32,
     };
 
-    // VP0: broadcast [K;2] and [K>>32;2] via a scratch-slot store/reload (only
-    // proof-covered ops: Lea + MovMR + MovdquRM), then materialize the invariant
-    // offsets. NOTE: VP0 is the INNERMOST loop's preheader — it runs once per
-    // (i,k), not once per invocation.
-    let mut vp0_insts = vec![X86ISelInst::new(
-        X86Opcode::Lea,
-        vec![
-            vr(rs),
-            X86ISelOperand::MemAddr {
-                base: Box::new(X86ISelOperand::StackSlot(scratch_slot)),
-                disp: 0,
-            },
-        ],
-    )];
-    for disp in [0, ELEM_SIZE_Q as i32] {
+    // Scalar-IMUL product route (default ON): each group's two lane products
+    // are computed with pipelined scalar IMULs and packed
+    // (IMUL/IMUL/MOVQ/MOVQ/PUNPCKLQDQ — the composite-proven 0bfe4e1e
+    // sequence; every instruction is per-instruction certified: IMUL via its
+    // reconstruction, MOVQ via the named bit-preservation proof, PUNPCKLQDQ
+    // via the PackLowQwords reconstruction). K then never needs broadcasting
+    // at all, so the whole [K;2]/[K>>32;2] preheader disappears. This is
+    // LLVM's own SSE2 strategy for 64-bit lane products: two pipelined
+    // scalar IMULs beat the 3xPMULUDQ + 2-shift + 2-add lo64 compose.
+    // `TCG_NO_X86_SAXPYQ_SCALAR_MUL` restores the PMULUDQ-compose path
+    // (broadcast preheader + packed multiply) for a one-dylib A/B.
+    let scalar_mul = std::env::var_os("TCG_NO_X86_SAXPYQ_SCALAR_MUL").is_none();
+
+    // VP0: broadcast [K;2] in REGISTER form — MOVQ K into a low lane, then
+    // PUNPCKLQDQ the register with itself to duplicate it. Both instructions
+    // carry per-instruction certificates: MovqToXmm via its named
+    // "MOVQ xmm,r64 preserves bits" proof, Punpcklqdq via the
+    // `X86SourceOp::PackLowQwords` RECONSTRUCTION (machine `encode_punpcklqdq`
+    // vs the independent `V2I64PackLanes` spec — the PSADBW credit rule). This
+    // replaces the former scratch-slot round-trip (two 8-byte MovMR + one
+    // 16-byte MovdquRM reload — a guaranteed store-to-load-forwarding stall,
+    // paid once per (i,k) since VP0 is the INNERMOST loop's preheader).
+    //
+    // The scratch slot and its base address stay: the covered horizontal
+    // reduce below still spills `vacc` through them.
+    let xk0 = new_fpr128(func); // MOVQ-loaded [K; --] low lane (packed route only)
+    let mut vp0_insts: Vec<X86ISelInst> = Vec::new();
+    if !scalar_mul {
         vp0_insts.push(X86ISelInst::new(
-            X86Opcode::MovMR,
-            vec![scratch_mem(disp), vr(plan.k)],
+            X86Opcode::Lea,
+            vec![
+                vr(rs),
+                X86ISelOperand::MemAddr {
+                    base: Box::new(X86ISelOperand::StackSlot(scratch_slot)),
+                    disp: 0,
+                },
+            ],
+        ));
+        vp0_insts.push(X86ISelInst::new(
+            X86Opcode::MovqToXmm,
+            vec![vr(xk0), vr(plan.k)],
+        ));
+        vp0_insts.push(X86ISelInst::new(
+            X86Opcode::Punpcklqdq,
+            vec![vr(xk), vr(xk0), vr(xk0)],
         ));
     }
-    vp0_insts.push(X86ISelInst::new(
-        X86Opcode::MovdquRM,
-        vec![vr(xk), scratch_mem(0)],
-    ));
     // xkh = [K>>32; 2], derived IN-REGISTER from the [K;2] broadcast above.
     //
     // `xk` already holds two 64-bit lanes each equal to K, so a single
@@ -5469,7 +6229,7 @@ fn apply_saxpyq_plan(func: &mut X86ISelFunction, plan: &SaxpyQPlan) {
     //
     // Kill switch `TCG_NO_X86_SAXPYQ_PSRLQ` restores the store/reload so the
     // effect can be A/B'd inside ONE dylib.
-    if std::env::var_os("TCG_NO_X86_SAXPYQ_PSRLQ").is_some() {
+    if !scalar_mul && std::env::var_os("TCG_NO_X86_SAXPYQ_PSRLQ").is_some() {
         vp0_insts.push(X86ISelInst::new(
             X86Opcode::ShrRI,
             vec![vr(kh), vr(plan.k), X86ISelOperand::Imm(32)],
@@ -5484,7 +6244,7 @@ fn apply_saxpyq_plan(func: &mut X86ISelFunction, plan: &SaxpyQPlan) {
             X86Opcode::MovdquRM,
             vec![vr(xkh), scratch_mem(0)],
         ));
-    } else {
+    } else if !scalar_mul {
         vp0_insts.push(X86ISelInst::new(
             X86Opcode::Psrlq,
             vec![vr(xkh), vr(xk), X86ISelOperand::Imm(32)],
@@ -5603,13 +6363,6 @@ fn apply_saxpyq_plan(func: &mut X86ISelFunction, plan: &SaxpyQPlan) {
     // order preserves the scalar `mul_is_first` choice.
     let emit_group =
         |func: &mut X86ISelFunction, px: VReg, pc: VReg, disp_elems: i64| -> Vec<X86ISelInst> {
-            let xb = new_fpr128(func);
-            let t1 = new_fpr128(func);
-            let xbh = new_fpr128(func);
-            let t2 = new_fpr128(func);
-            let t3 = new_fpr128(func);
-            let t4 = new_fpr128(func);
-            let t5 = new_fpr128(func);
             let prod = new_fpr128(func);
             let xc = new_fpr128(func);
             let xs = new_fpr128(func);
@@ -5618,28 +6371,94 @@ fn apply_saxpyq_plan(func: &mut X86ISelFunction, plan: &SaxpyQPlan) {
             } else {
                 (xc, prod)
             };
-            vec![
-                // xb = x[.. + disp ..+2]
-                X86ISelInst::new(X86Opcode::MovdquRM, vec![vr(xb), mem_disp(px, disp_elems)]),
-                // prod = lo64(K * xb) per lane (PMULUDQ compose; see fn docs).
-                X86ISelInst::new(X86Opcode::Pmuludq, vec![vr(t1), vr(xk), vr(xb)]),
-                X86ISelInst::new(
-                    X86Opcode::Psrlq,
-                    vec![vr(xbh), vr(xb), X86ISelOperand::Imm(32)],
-                ),
-                X86ISelInst::new(X86Opcode::Pmuludq, vec![vr(t2), vr(xk), vr(xbh)]),
-                X86ISelInst::new(X86Opcode::Pmuludq, vec![vr(t3), vr(xkh), vr(xb)]),
-                X86ISelInst::new(X86Opcode::Paddq, vec![vr(t4), vr(t2), vr(t3)]),
-                X86ISelInst::new(
-                    X86Opcode::Psllq,
-                    vec![vr(t5), vr(t4), X86ISelOperand::Imm(32)],
-                ),
-                X86ISelInst::new(X86Opcode::Paddq, vec![vr(prod), vr(t1), vr(t5)]),
-                // xs = c[.. + disp ..+2] + prod (scalar operand order kept).
-                X86ISelInst::new(X86Opcode::MovdquRM, vec![vr(xc), mem_disp(pc, disp_elems)]),
-                X86ISelInst::new(X86Opcode::Paddq, vec![vr(xs), vr(op1), vr(op2)]),
-                X86ISelInst::new(X86Opcode::MovdquMR, vec![mem_disp(pc, disp_elems), vr(xs)]),
-            ]
+            if scalar_mul {
+                // Two scalar loads + two pipelined scalar IMULs + the
+                // composite-proven pack (0bfe4e1e): prod = [K*x[j], K*x[j+1]]
+                // with lane 0 = the lower element, exactly the packed route's
+                // lane order. `ImulRR` is the same wrapping lo64 multiply the
+                // scalar loop performs; MOVQ/PUNPCKLQDQ are per-instruction
+                // certified (named bit-preservation proof / PackLowQwords
+                // reconstruction).
+                let b0 = new_gpr64(func);
+                let b1 = new_gpr64(func);
+                let m0 = new_gpr64(func);
+                let m1 = new_gpr64(func);
+                let x0 = new_fpr128(func);
+                let x1 = new_fpr128(func);
+                let byte_disp = |base: VReg, bytes: i64| X86ISelOperand::MemAddr {
+                    base: Box::new(X86ISelOperand::VReg(base)),
+                    disp: bytes as i32,
+                };
+                let base_bytes = disp_elems * ELEM_SIZE_Q as i64;
+                vec![
+                    X86ISelInst::new(X86Opcode::MovRM, vec![vr(b0), byte_disp(px, base_bytes)]),
+                    X86ISelInst::new(
+                        X86Opcode::MovRM,
+                        vec![vr(b1), byte_disp(px, base_bytes + ELEM_SIZE_Q as i64)],
+                    ),
+                    // Operand order: (load, K), not (K, load) — two-address
+                    // lowering copies the FIRST source into the dst, and the
+                    // load result DIES here while K is live for the whole
+                    // loop, so this order lets the copy coalesce away
+                    // (LLVM's exact shape: imul into the load register).
+                    // Wrapping lo64 multiply commutes, so the wiring change
+                    // is proof-neutral (reconstruction checks the operands).
+                    // Reverted together with the x2 body by
+                    // `TCG_NO_X86_SAXPYQ_UNROLL4`.
+                    X86ISelInst::new(
+                        X86Opcode::ImulRR,
+                        if unroll4 {
+                            vec![vr(m0), vr(b0), vr(plan.k)]
+                        } else {
+                            vec![vr(m0), vr(plan.k), vr(b0)]
+                        },
+                    ),
+                    X86ISelInst::new(
+                        X86Opcode::ImulRR,
+                        if unroll4 {
+                            vec![vr(m1), vr(b1), vr(plan.k)]
+                        } else {
+                            vec![vr(m1), vr(plan.k), vr(b1)]
+                        },
+                    ),
+                    X86ISelInst::new(X86Opcode::MovqToXmm, vec![vr(x0), vr(m0)]),
+                    X86ISelInst::new(X86Opcode::MovqToXmm, vec![vr(x1), vr(m1)]),
+                    X86ISelInst::new(X86Opcode::Punpcklqdq, vec![vr(prod), vr(x0), vr(x1)]),
+                    X86ISelInst::new(X86Opcode::MovdquRM, vec![vr(xc), mem_disp(pc, disp_elems)]),
+                    X86ISelInst::new(X86Opcode::Paddq, vec![vr(xs), vr(op1), vr(op2)]),
+                    X86ISelInst::new(X86Opcode::MovdquMR, vec![mem_disp(pc, disp_elems), vr(xs)]),
+                ]
+            } else {
+                let xb = new_fpr128(func);
+                let t1 = new_fpr128(func);
+                let xbh = new_fpr128(func);
+                let t2 = new_fpr128(func);
+                let t3 = new_fpr128(func);
+                let t4 = new_fpr128(func);
+                let t5 = new_fpr128(func);
+                vec![
+                    // xb = x[.. + disp ..+2]
+                    X86ISelInst::new(X86Opcode::MovdquRM, vec![vr(xb), mem_disp(px, disp_elems)]),
+                    // prod = lo64(K * xb) per lane (PMULUDQ compose; see fn docs).
+                    X86ISelInst::new(X86Opcode::Pmuludq, vec![vr(t1), vr(xk), vr(xb)]),
+                    X86ISelInst::new(
+                        X86Opcode::Psrlq,
+                        vec![vr(xbh), vr(xb), X86ISelOperand::Imm(32)],
+                    ),
+                    X86ISelInst::new(X86Opcode::Pmuludq, vec![vr(t2), vr(xk), vr(xbh)]),
+                    X86ISelInst::new(X86Opcode::Pmuludq, vec![vr(t3), vr(xkh), vr(xb)]),
+                    X86ISelInst::new(X86Opcode::Paddq, vec![vr(t4), vr(t2), vr(t3)]),
+                    X86ISelInst::new(
+                        X86Opcode::Psllq,
+                        vec![vr(t5), vr(t4), X86ISelOperand::Imm(32)],
+                    ),
+                    X86ISelInst::new(X86Opcode::Paddq, vec![vr(prod), vr(t1), vr(t5)]),
+                    // xs = c[.. + disp ..+2] + prod (scalar operand order kept).
+                    X86ISelInst::new(X86Opcode::MovdquRM, vec![vr(xc), mem_disp(pc, disp_elems)]),
+                    X86ISelInst::new(X86Opcode::Paddq, vec![vr(xs), vr(op1), vr(op2)]),
+                    X86ISelInst::new(X86Opcode::MovdquMR, vec![mem_disp(pc, disp_elems), vr(xs)]),
+                ]
+            }
         };
 
     // Advance `iv` by `step` elements: iv = iv + step (fresh imm + add + copy).
@@ -5668,9 +6487,10 @@ fn apply_saxpyq_plan(func: &mut X86ISelFunction, plan: &SaxpyQPlan) {
             X86ISelInst::new(X86Opcode::LeaSib, vec![vr(px), sib(pbx, iv)]),
             X86ISelInst::new(X86Opcode::LeaSib, vec![vr(pc), sib(pbc, iv)]),
         ];
-        // Group 0 at iv+0, group 1 at iv+2 elements — independent chains (ILP).
-        insts.extend(emit_group(func, px, pc, 0));
-        insts.extend(emit_group(func, px, pc, LANES_Q));
+        // One 2-lane group every LANES_Q elements — independent chains (ILP).
+        for g in 0..unroll {
+            insts.extend(emit_group(func, px, pc, g * LANES_Q));
+        }
         insts.extend(emit_iv_advance(func, group));
         insts.push(X86ISelInst::new(
             X86Opcode::MovRI,
@@ -5697,18 +6517,25 @@ fn apply_saxpyq_plan(func: &mut X86ISelFunction, plan: &SaxpyQPlan) {
         );
     }
 
-    // VBT: the single trailing 2-lane group (packed remainder vn - vn4 == 2).
-    // Straight-line: one group at `iv`, iv += 2, then fall to the scalar header
-    // (which finishes the N % 2 scalar tail from iv == vn).
+    // VBT: the trailing packed groups (remainder vn - vn4, a multiple of
+    // LANES_Q in [LANES_Q, group)). Straight-line: (vn-vn4)/2 groups at
+    // iv+0/+2/+4 elements off one LeaSib pair, one iv advance by the full
+    // remainder, then fall to the scalar header (which finishes the N % 2
+    // scalar tail from iv == vn). Same in-bounds argument as VBU: every
+    // touched index is < vn <= n_trip, covered by the preheader obligations
+    // independent of how iterations are grouped.
     if has_tail {
+        let tail_elems = vn - vn4;
         let px = new_gpr64(func);
         let pc = new_gpr64(func);
         let mut insts = vec![
             X86ISelInst::new(X86Opcode::LeaSib, vec![vr(px), sib(pbx, iv)]),
             X86ISelInst::new(X86Opcode::LeaSib, vec![vr(pc), sib(pbc, iv)]),
         ];
-        insts.extend(emit_group(func, px, pc, 0));
-        insts.extend(emit_iv_advance(func, LANES_Q));
+        for g in 0..(tail_elems / LANES_Q) {
+            insts.extend(emit_group(func, px, pc, g * LANES_Q));
+        }
+        insts.extend(emit_iv_advance(func, tail_elems));
         insts.push(X86ISelInst::new(
             X86Opcode::Jmp,
             vec![X86ISelOperand::Block(plan.header)],
@@ -5752,6 +6579,353 @@ fn apply_saxpyq_plan(func: &mut X86ISelFunction, plan: &SaxpyQPlan) {
         new_order.push(vbt);
     }
     if let Some(pos) = func.block_order.iter().position(|b| *b == plan.preheader) {
+        for (offset, b) in new_order.into_iter().enumerate() {
+            func.block_order.insert(pos + 1 + offset, b);
+        }
+    } else {
+        func.block_order.extend(new_order);
+    }
+}
+
+/// Rewrite the two-level saxpy-Q nest to the row-register form (see
+/// [`recognize_saxpyq_rowreg_loop`] for the legality argument).
+///
+/// CFG before: `k_preheader -[jmp]-> k_header` (the original nest).
+/// CFG after:  `k_preheader -[jmp]-> RVP0`;
+///             `RVP0:  inv_i = leaf_i * mult_i per deduped obligation; -> RVC_0`;
+///             `RVC_i: inv_i <u limit_i ? next : ORIGINAL k_header`;
+///             `RVPB:  pc = &c[inv_c]; pa = &a[inv_a]; pxrow = &x-row;
+///                     acc_g = c-row loads (N/2 MOVDQU); kv = 0; -> RVB`;
+///             `RVB:   aik = [pa]; per group g: b0/b1 = [pxrow+16g(+8)],
+///                     b0 *= aik; b1 *= aik (in-place, the Paddd-vacc
+///                     precedent), pack (MOVQ/MOVQ/PUNPCKLQDQ, in-place),
+///                     acc_g += pack (PADDQ, mul_is_first order kept);
+///                     pa += 8; [pxrow += mult_x*8;] kv += 1;
+///                     kv <u k_trip ? RVB : RVS`  (bottom-test; k_trip >= 1)`;
+///             `RVS:   c-row stores (N/2 MOVDQU); -> ORIGINAL k_exit`.
+///
+/// The new blocks write ONLY fresh vregs (unlike `apply_saxpyq_plan`, which
+/// advances the original IV): the original nest is bypassed whole, its k IV
+/// proven dead outside and its carriers proven identity round-trips, so the
+/// fail path enters `k_header` with every original vreg intact. Block ids are
+/// contiguous by construction (every block is unconditionally emitted).
+///
+/// Emitted opcodes: MovRI, MovRM, MovdquRM/MovdquMR, LeaSib, ImulRR,
+/// MovqToXmm, Punpcklqdq, Paddq, AddRI, MovRR, CmpRR, Jcc, Jmp — all already
+/// emitted by default-on proof-gated tiers (zero new perimeter surface).
+fn apply_saxpyq_rowreg_plan(func: &mut X86ISelFunction, plan: &SaxpyQRowRegPlan) {
+    let inner = &plan.inner;
+    let n_acc = inner.n_trip / LANES_Q; // n_trip % LANES_Q == 0 (admission)
+    let n_checks = plan.row_obligations.len() as u32;
+
+    // Contiguous fresh block ids (x86 regalloc replay requirement): RVP0, one
+    // check block per obligation, RVPB, RVB, RVS — every one unconditionally
+    // emitted, so the ids are dense by construction.
+    let base = next_block_id(func);
+    let rvp0 = Block(base);
+    let check_block = |i: u32| Block(base + 1 + i);
+    let rvpb = Block(base + 1 + n_checks);
+    let rvb = Block(base + 2 + n_checks);
+    let rvs = Block(base + 3 + n_checks);
+
+    let vr = |v: VReg| X86ISelOperand::VReg(v);
+    let sib = |base: VReg, index: VReg| X86ISelOperand::SibMemAddr {
+        base: Box::new(X86ISelOperand::VReg(base)),
+        index: Box::new(X86ISelOperand::VReg(index)),
+        scale: ELEM_SIZE_Q,
+        disp: 0,
+    };
+    // `[base + disp]` with the displacement in ELEMENTS (8-byte i64 lanes) —
+    // the covered MovRM/MovdquRM/MovdquMR `[reg+disp]` operand form.
+    let mem_disp = |base: VReg, disp_elems: i64| X86ISelOperand::MemAddr {
+        base: Box::new(X86ISelOperand::VReg(base)),
+        disp: (disp_elems * ELEM_SIZE_Q as i64) as i32,
+    };
+
+    // RVP0: inv = leaf * mult per deduped obligation — the same wrapping IMUL
+    // the scalar body computes, evaluated once at the k-preheader (every leaf
+    // is k-invariant there, so the value is identical).
+    let mut inv_of: Vec<((VReg, i64), VReg)> = Vec::new();
+    let mut rvp0_insts: Vec<X86ISelInst> = Vec::new();
+    for (leaf, mult, _) in &plan.row_obligations {
+        let m = new_gpr64(func);
+        let inv = new_gpr64(func);
+        rvp0_insts.push(X86ISelInst::new(
+            X86Opcode::MovRI,
+            vec![vr(m), X86ISelOperand::Imm(*mult)],
+        ));
+        rvp0_insts.push(X86ISelInst::new(
+            X86Opcode::ImulRR,
+            vec![vr(inv), vr(*leaf), vr(m)],
+        ));
+        inv_of.push(((*leaf, *mult), inv));
+    }
+    let first_check = if n_checks > 0 { check_block(0) } else { rvpb };
+    rvp0_insts.push(X86ISelInst::new(
+        X86Opcode::Jmp,
+        vec![X86ISelOperand::Block(first_check)],
+    ));
+    func.blocks.insert(
+        rvp0,
+        X86ISelBlock {
+            insts: rvp0_insts,
+            successors: vec![first_check],
+        },
+    );
+
+    // RVC_i: inv_i <u limit_i ? next : ORIGINAL k-header. The limits were
+    // pre-subtracted (and >= 1) at recognition; a failing check enters the
+    // untouched nest with all original vregs intact, since the new blocks
+    // write ONLY fresh vregs and only the preheader terminator was redirected.
+    for (i, ((_, _), inv)) in inv_of.iter().enumerate() {
+        let (_, _, limit) = plan.row_obligations[i];
+        let next = if (i as u32) + 1 < n_checks {
+            check_block(i as u32 + 1)
+        } else {
+            rvpb
+        };
+        let limit_reg = new_gpr64(func);
+        let insts = vec![
+            X86ISelInst::new(
+                X86Opcode::MovRI,
+                vec![vr(limit_reg), X86ISelOperand::Imm(limit)],
+            ),
+            X86ISelInst::new(X86Opcode::CmpRR, vec![vr(*inv), vr(limit_reg)]),
+            X86ISelInst::new(
+                X86Opcode::Jcc,
+                vec![
+                    X86ISelOperand::CondCode(X86CondCode::B),
+                    X86ISelOperand::Block(next),
+                ],
+            ),
+            X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(plan.k_header)]),
+        ];
+        func.blocks.insert(
+            check_block(i as u32),
+            X86ISelBlock {
+                insts,
+                successors: vec![next, plan.k_header],
+            },
+        );
+    }
+
+    // RVPB: fold the invariants into the row base pointers, hoist the c row
+    // into the accumulators, seed the fresh k counter.
+    let inv_for = |leaf: VReg, mult: i64| -> VReg {
+        inv_of
+            .iter()
+            .find(|((l, m), _)| *l == leaf && *m == mult)
+            .map(|(_, inv)| *inv)
+            .expect("row invariant was materialized (obligation-matched)")
+    };
+    let pc = new_gpr64(func); // &c[inv_c] — the hoisted row base
+    let pa = new_gpr64(func); // &a[inv_a] — advanced 8 bytes per k
+    let pxrow = new_gpr64(func); // x-row base (advanced per k iff leaf_x == k)
+    let kv = new_gpr64(func); // fresh k counter (the original k is untouched)
+    let mut rvpb_insts = vec![
+        X86ISelInst::new(
+            X86Opcode::LeaSib,
+            vec![
+                vr(pc),
+                sib(inner.base_c, inv_for(inner.leaf_c, inner.mult_c)),
+            ],
+        ),
+        X86ISelInst::new(
+            X86Opcode::LeaSib,
+            vec![vr(pa), sib(plan.base_a, inv_for(plan.leaf_a, plan.mult_a))],
+        ),
+    ];
+    match plan.x_discharge {
+        // leaf_x IS k: the row starts at base_x (k = 0, header-verified).
+        XDischarge::CompileTime => rvpb_insts.push(X86ISelInst::new(
+            X86Opcode::MovRR,
+            vec![vr(pxrow), vr(inner.base_x)],
+        )),
+        // k-invariant leaf: the row is fixed at &x[inv_x].
+        XDischarge::Runtime => rvpb_insts.push(X86ISelInst::new(
+            X86Opcode::LeaSib,
+            vec![
+                vr(pxrow),
+                sib(inner.base_x, inv_for(inner.leaf_x, inner.mult_x)),
+            ],
+        )),
+    }
+    // The hoisted c row: per element the new computation is the identical
+    // sequence of wrapping ops in identical k-order; only the intermediate
+    // store/reload through private, non-aliased slot_c memory is elided.
+    let mut accs: Vec<VReg> = Vec::new();
+    for g in 0..n_acc {
+        let acc = new_fpr128(func);
+        rvpb_insts.push(X86ISelInst::new(
+            X86Opcode::MovdquRM,
+            vec![vr(acc), mem_disp(pc, g * LANES_Q)],
+        ));
+        accs.push(acc);
+    }
+    rvpb_insts.push(X86ISelInst::new(
+        X86Opcode::MovRI,
+        vec![vr(kv), X86ISelOperand::Imm(0)],
+    ));
+    rvpb_insts.push(X86ISelInst::new(
+        X86Opcode::Jmp,
+        vec![X86ISelOperand::Block(rvb)],
+    ));
+    func.blocks.insert(
+        rvpb,
+        X86ISelBlock {
+            insts: rvpb_insts,
+            successors: vec![rvb],
+        },
+    );
+
+    // RVB: the single bottom-test k body (entered unconditionally — k_trip
+    // >= 1 was verified at recognition, so the first iteration always runs).
+    let aik = new_gpr64(func);
+    let mut rvb_insts = vec![X86ISelInst::new(
+        X86Opcode::MovRM,
+        vec![vr(aik), mem_disp(pa, 0)],
+    )];
+    for (g, acc) in accs.iter().enumerate() {
+        let g = g as i64;
+        let b0 = new_gpr64(func);
+        let b1 = new_gpr64(func);
+        let x0 = new_fpr128(func);
+        let x1 = new_fpr128(func);
+        rvb_insts.push(X86ISelInst::new(
+            X86Opcode::MovRM,
+            vec![vr(b0), mem_disp(pxrow, g * LANES_Q)],
+        ));
+        rvb_insts.push(X86ISelInst::new(
+            X86Opcode::MovRM,
+            vec![vr(b1), mem_disp(pxrow, g * LANES_Q + 1)],
+        ));
+        // In-place dst==src1 IMUL (no tie copy — the Paddd-vacc / AddRI-viv
+        // carrier-RMW precedent; wrapping lo64 multiply commutes, so the
+        // wiring is proof-neutral and matches LLVM's imul-into-load-reg).
+        rvb_insts.push(X86ISelInst::new(
+            X86Opcode::ImulRR,
+            vec![vr(b0), vr(b0), vr(aik)],
+        ));
+        rvb_insts.push(X86ISelInst::new(
+            X86Opcode::ImulRR,
+            vec![vr(b1), vr(b1), vr(aik)],
+        ));
+        // The composite-proven 0bfe4e1e pack: MOVQ per lane, then an in-place
+        // PUNPCKLQDQ (post-two-address-fixup the machine inst is identical to
+        // the tied form minus the MOVDQA; PackLowQwords reconstruction
+        // unchanged). Lane 0 = the lower-address element, LLVM's lane order.
+        rvb_insts.push(X86ISelInst::new(X86Opcode::MovqToXmm, vec![vr(x0), vr(b0)]));
+        rvb_insts.push(X86ISelInst::new(X86Opcode::MovqToXmm, vec![vr(x1), vr(b1)]));
+        rvb_insts.push(X86ISelInst::new(
+            X86Opcode::Punpcklqdq,
+            vec![vr(x0), vr(x0), vr(x1)],
+        ));
+        // PADDQ commutes; the scalar operand order is kept like the inner
+        // tier's emit_group (cosmetics, preserved for exactness).
+        let (op1, op2) = if inner.mul_is_first {
+            (x0, *acc)
+        } else {
+            (*acc, x0)
+        };
+        rvb_insts.push(X86ISelInst::new(
+            X86Opcode::Paddq,
+            vec![vr(*acc), vr(op1), vr(op2)],
+        ));
+    }
+    rvb_insts.push(X86ISelInst::new(
+        X86Opcode::AddRI,
+        vec![vr(pa), vr(pa), X86ISelOperand::Imm(ELEM_SIZE_Q as i64)],
+    ));
+    if plan.x_discharge == XDischarge::CompileTime {
+        rvb_insts.push(X86ISelInst::new(
+            X86Opcode::AddRI,
+            vec![
+                vr(pxrow),
+                vr(pxrow),
+                X86ISelOperand::Imm(inner.mult_x * ELEM_SIZE_Q as i64),
+            ],
+        ));
+    }
+    rvb_insts.push(X86ISelInst::new(
+        X86Opcode::AddRI,
+        vec![vr(kv), vr(kv), X86ISelOperand::Imm(1)],
+    ));
+    let ktrip_reg = new_gpr64(func);
+    rvb_insts.push(X86ISelInst::new(
+        X86Opcode::MovRI,
+        vec![vr(ktrip_reg), X86ISelOperand::Imm(plan.k_trip)],
+    ));
+    rvb_insts.push(X86ISelInst::new(
+        X86Opcode::CmpRR,
+        vec![vr(kv), vr(ktrip_reg)],
+    ));
+    rvb_insts.push(X86ISelInst::new(
+        X86Opcode::Jcc,
+        vec![
+            X86ISelOperand::CondCode(X86CondCode::B),
+            X86ISelOperand::Block(rvb),
+        ],
+    ));
+    rvb_insts.push(X86ISelInst::new(
+        X86Opcode::Jmp,
+        vec![X86ISelOperand::Block(rvs)],
+    ));
+    func.blocks.insert(
+        rvb,
+        X86ISelBlock {
+            insts: rvb_insts,
+            successors: vec![rvb, rvs],
+        },
+    );
+
+    // RVS: the row sink — write the finished row back once, then leave the
+    // nest through the ORIGINAL k exit.
+    let mut rvs_insts: Vec<X86ISelInst> = Vec::new();
+    for (g, acc) in accs.iter().enumerate() {
+        rvs_insts.push(X86ISelInst::new(
+            X86Opcode::MovdquMR,
+            vec![mem_disp(pc, g as i64 * LANES_Q), vr(*acc)],
+        ));
+    }
+    rvs_insts.push(X86ISelInst::new(
+        X86Opcode::Jmp,
+        vec![X86ISelOperand::Block(plan.k_exit)],
+    ));
+    func.blocks.insert(
+        rvs,
+        X86ISelBlock {
+            insts: rvs_insts,
+            successors: vec![plan.k_exit],
+        },
+    );
+
+    // Redirect the k-preheader's terminator from `k_header` to `RVP0` — the
+    // ONLY original-block edit this plan performs.
+    if let Some(pre) = func.blocks.get_mut(&plan.k_preheader) {
+        for inst in pre.insts.iter_mut() {
+            if inst.opcode == X86Opcode::Jmp
+                && let Some(X86ISelOperand::Block(t)) = inst.operands.first_mut()
+                && *t == plan.k_header
+            {
+                *t = rvp0;
+            }
+        }
+        pre.successors = pre
+            .successors
+            .iter()
+            .map(|s| if *s == plan.k_header { rvp0 } else { *s })
+            .collect();
+    }
+
+    // Place the new blocks right after the k-preheader in the layout order.
+    let mut new_order: Vec<Block> = vec![rvp0];
+    for i in 0..n_checks {
+        new_order.push(check_block(i));
+    }
+    new_order.push(rvpb);
+    new_order.push(rvb);
+    new_order.push(rvs);
+    if let Some(pos) = func.block_order.iter().position(|b| *b == plan.k_preheader) {
         for (offset, b) in new_order.into_iter().enumerate() {
             func.block_order.insert(pos + 1 + offset, b);
         }
@@ -7640,6 +8814,30 @@ fn recognize_byte_eq_count_loop(
     }) {
         return None;
     }
+    // Closed-world scan of the latch (fail-closed): the check above only
+    // proves the writeback EXISTS. Without this scan a store, call, load, or
+    // Trap*Exact carrier in the latch would be silently accepted, and the
+    // packed prefix would drop its effect for every replaced iteration. A
+    // bounds carrier is admitted only under the same proven-dead rule as the
+    // chain blocks (`iv`-indexed against this loop's own constant bound).
+    for inst in &lb.insts {
+        let op = inst.opcode;
+        if op == X86Opcode::Call || op == X86Opcode::CallR || op == X86Opcode::CallM {
+            return None;
+        }
+        if is_load_opcode(op) || is_store_opcode(op) {
+            return None;
+        }
+        if op == X86Opcode::TrapBoundsCheckExact {
+            if !is_safe_iv_bounds_carrier(func, &defs, iv, &mut memo, inst, bound) {
+                return None;
+            }
+            continue;
+        }
+        if !is_whitelisted_body_opcode(op) {
+            return None;
+        }
+    }
     let has_outside_def = func.block_order.iter().any(|b| {
         !body.contains(b)
             && func.blocks.get(b).is_some_and(|blk| {
@@ -7770,6 +8968,43 @@ struct BitrevPlan {
 /// Recognizer for the 64-bit bit-reversal idiom (see [`BitrevPlan`]). The exact
 /// `for i in 0..64 { r=(r<<1)|(x&1); x>>=1 }` shape; fails closed otherwise. The
 /// trip bound MUST be 64 (the type's bit width) so the loop reverses every bit.
+/// Closed-world vocabulary for the 2-block pure-ALU idiom tiers (bitrev,
+/// CRC-table). Their applies REPLACE the latch wholesale — deleting anything
+/// the recurrence match merely tolerated — so unlike the tiers that keep a
+/// scalar tail there is no surviving copy to keep a guard alive in: no
+/// loads, no stores, no calls, and no Trap*Exact carriers may be admitted
+/// (acceptance would DELETE a live guard for ALL iterations). Under the old
+/// branch-to-Ud2 guard form such loops were excluded structurally (a guard
+/// edge fails the two-successor check); the inline carrier form is invisible
+/// to CFG checks, so this scan restores the fail-closed posture.
+fn is_pure_alu_idiom_opcode(op: X86Opcode) -> bool {
+    matches!(
+        op,
+        X86Opcode::MovRR
+            | X86Opcode::MovRR32
+            | X86Opcode::MovRI
+            | X86Opcode::Movzx
+            | X86Opcode::ShlRI
+            | X86Opcode::ShrRI
+            | X86Opcode::OrRR
+            | X86Opcode::XorRR
+            | X86Opcode::AndRR
+            | X86Opcode::AndRI
+            | X86Opcode::SubRR
+            | X86Opcode::SubRI
+            | X86Opcode::AddRR
+            | X86Opcode::AddRI
+            | X86Opcode::CmpRR
+            | X86Opcode::CmpRI
+            | X86Opcode::CmpRI8
+            | X86Opcode::TestRR
+            | X86Opcode::TestRI
+            | X86Opcode::Setcc
+            | X86Opcode::Jcc
+            | X86Opcode::Jmp
+    )
+}
+
 fn recognize_bitrev_loop(func: &X86ISelFunction, lp: &LoopInfo) -> Option<BitrevPlan> {
     if !bitrev_idiom_enabled() {
         return None;
@@ -7792,6 +9027,18 @@ fn recognize_bitrev_loop(func: &X86ISelFunction, lp: &LoopInfo) -> Option<Bitrev
         return None;
     }
     let exit = *hblock.successors.iter().find(|&&s| s != latch)?;
+
+    // Closed-world scan (fail-closed): the apply REPLACES the latch wholesale,
+    // so any effect the recurrence match merely tolerated — a store, a call,
+    // a load, a Trap*Exact carrier — would be silently DELETED for every
+    // iteration. See `is_pure_alu_idiom_opcode`.
+    for blk in [hblock, lblock] {
+        for inst in &blk.insts {
+            if !is_pure_alu_idiom_opcode(inst.opcode) {
+                return None;
+            }
+        }
+    }
 
     let defs = DefIndex::build(func);
     let is_const = |v: VReg, k: i64| -> bool {
@@ -8076,6 +9323,18 @@ fn recognize_crc_table_loop(func: &X86ISelFunction, lp: &LoopInfo) -> Option<Crc
     }
     let exit = *hblock.successors.iter().find(|&&s| s != latch)?;
 
+    // Closed-world scan (fail-closed): the apply REPLACES the latch wholesale,
+    // so any effect the recurrence match merely tolerated — a store, a call,
+    // a load, a Trap*Exact carrier — would be silently DELETED for every
+    // iteration. See `is_pure_alu_idiom_opcode`.
+    for blk in [hblock, lblock] {
+        for inst in &blk.insts {
+            if !is_pure_alu_idiom_opcode(inst.opcode) {
+                return None;
+            }
+        }
+    }
+
     let defs = DefIndex::build(func);
     let is_const = |v: VReg, k: i64| -> bool {
         defs.def_inst(func, v).is_some_and(|d| {
@@ -8344,6 +9603,17 @@ fn apply_crc_table(func: &mut X86ISelFunction, plan: &CrcTablePlan) {
 ///             `VB: vacc = PADDQ(vacc, [ptr + iv*8 .. +16)); iv += 2; -> VH`;
 ///             `VR: acc += lane0(vacc) + lane1(vacc); -> header`.
 fn apply_heap_sumq_plan(func: &mut X86ISelFunction, plan: &HeapSumQPlan) {
+    // 4-WIDE, FRESH-IV emission (default; `TCG_NO_X86_SUMQ_X4` restores the
+    // original 2-wide shared-IV shape for a one-dylib A/B). Two changes, one
+    // measured cause (2026-08-28 recon): (a) the hot loop advances a FRESH
+    // vector-local IV instead of the ORIGINAL `plan.iv` — the original vreg is
+    // shared with the scalar tail, and in h2's shape regalloc spills it,
+    // putting a per-iteration store-to-load-forward chain on the loop; the
+    // original iv is now written ONCE (iv = vN) at the reduce block, which
+    // preserves the tail contract exactly. (b) two accumulators x two 2-lane
+    // loads per iteration (vN = len & !3) — the single-accumulator PADDQ
+    // chain was the throughput limiter; the scalar tail now covers len % 4.
+    let x4 = std::env::var_os("TCG_NO_X86_SUMQ_X4").is_none();
     // A fresh, distinct 16-byte scratch slot: first zeroed to seed `[0;2]`,
     // then reused to spill `vacc` for the covered horizontal reduce.
     let scratch_slot = func.stack_slots.len() as u32;
@@ -8366,8 +9636,11 @@ fn apply_heap_sumq_plan(func: &mut X86ISelFunction, plan: &HeapSumQPlan) {
     let rs = new_gpr64(func); // scratch slot base
     let rz = new_gpr64(func); // constant 0
     let vacc = new_fpr128(func); // loop-carried packed lane-partials
+    let vacc1 = new_fpr128(func); // second accumulator (x4 route)
+    let viv = new_gpr64(func); // fresh vector-local IV (x4 route)
     let pe = new_gpr64(func); // &elem[iv]
     let xe = new_fpr128(func); // packed pair of elements
+    let xe1 = new_fpr128(func); // second packed pair (x4 route)
     let two = new_gpr64(func);
     let niv = new_gpr64(func);
     let s0 = new_gpr64(func);
@@ -8400,7 +9673,11 @@ fn apply_heap_sumq_plan(func: &mut X86ISelFunction, plan: &HeapSumQPlan) {
         X86ISelInst::new(X86Opcode::MovRM, vec![vr(lenv), mem_d(rlen, plan.len_disp)]),
         X86ISelInst::new(
             X86Opcode::AndRI,
-            vec![vr(vn), vr(lenv), X86ISelOperand::Imm(-2)],
+            vec![
+                vr(vn),
+                vr(lenv),
+                X86ISelOperand::Imm(if x4 { -4 } else { -2 }),
+            ],
         ),
         X86ISelInst::new(X86Opcode::CmpRI, vec![vr(vn), X86ISelOperand::Imm(0)]),
         X86ISelInst::new(
@@ -8467,6 +9744,21 @@ fn apply_heap_sumq_plan(func: &mut X86ISelFunction, plan: &HeapSumQPlan) {
         X86Opcode::MovdquRM,
         vec![vr(vacc), mem_d(rs, 0)],
     ));
+    if x4 {
+        // Second accumulator seeded from the same still-zero scratch bytes
+        // (the spill reuse happens only in VR, after the loop).
+        vps_insts.push(X86ISelInst::new(
+            X86Opcode::MovdquRM,
+            vec![vr(vacc1), mem_d(rs, 0)],
+        ));
+        // The fresh loop-local IV. The recognizer proved the original iv is a
+        // zero-init counter, so `viv = 0` matches the value the elided
+        // iterations would have seen.
+        vps_insts.push(X86ISelInst::new(
+            X86Opcode::MovRI,
+            vec![vr(viv), X86ISelOperand::Imm(0)],
+        ));
+    }
     vps_insts.push(X86ISelInst::new(
         X86Opcode::Jmp,
         vec![X86ISelOperand::Block(vh)],
@@ -8479,9 +9771,10 @@ fn apply_heap_sumq_plan(func: &mut X86ISelFunction, plan: &HeapSumQPlan) {
         },
     );
 
-    // VH: iv <u vN ? VB : VR.
+    // VH: loop-iv <u vN ? VB : VR.
+    let hiv = if x4 { viv } else { iv };
     let vh_insts = vec![
-        X86ISelInst::new(X86Opcode::CmpRR, vec![vr(iv), vr(vn)]),
+        X86ISelInst::new(X86Opcode::CmpRR, vec![vr(hiv), vr(vn)]),
         X86ISelInst::new(
             X86Opcode::Jcc,
             vec![
@@ -8499,30 +9792,61 @@ fn apply_heap_sumq_plan(func: &mut X86ISelFunction, plan: &HeapSumQPlan) {
         },
     );
 
-    // VB: vacc += [ptr + iv*8 .. +16); iv += 2.
-    let vb_insts = vec![
-        X86ISelInst::new(
-            X86Opcode::LeaSib,
-            vec![
-                vr(pe),
-                X86ISelOperand::SibMemAddr {
-                    base: Box::new(vr(ptrv)),
-                    index: Box::new(vr(iv)),
-                    scale: ELEM_SIZE_Q,
-                    disp: 0,
-                },
-            ],
-        ),
-        X86ISelInst::new(X86Opcode::MovdquRM, vec![vr(xe), mem_d(pe, 0)]),
-        X86ISelInst::new(X86Opcode::Paddq, vec![vr(vacc), vr(vacc), vr(xe)]),
-        X86ISelInst::new(
-            X86Opcode::MovRI,
-            vec![vr(two), X86ISelOperand::Imm(LANES_Q)],
-        ),
-        X86ISelInst::new(X86Opcode::AddRR, vec![vr(niv), vr(iv), vr(two)]),
-        X86ISelInst::new(X86Opcode::MovRR, vec![vr(iv), vr(niv)]),
-        X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(vh)]),
-    ];
+    // VB (x4): vacc += [ptr+viv*8 ..+16); vacc1 += [.. +16..+32); viv += 4 —
+    // two independent PADDQ chains, one in-place AddRI advance (carrier-RMW
+    // form, no fixup copy). VB (legacy): the original 2-wide shared-iv body.
+    let vb_insts = if x4 {
+        vec![
+            X86ISelInst::new(
+                X86Opcode::LeaSib,
+                vec![
+                    vr(pe),
+                    X86ISelOperand::SibMemAddr {
+                        base: Box::new(vr(ptrv)),
+                        index: Box::new(vr(viv)),
+                        scale: ELEM_SIZE_Q,
+                        disp: 0,
+                    },
+                ],
+            ),
+            X86ISelInst::new(X86Opcode::MovdquRM, vec![vr(xe), mem_d(pe, 0)]),
+            X86ISelInst::new(X86Opcode::Paddq, vec![vr(vacc), vr(vacc), vr(xe)]),
+            X86ISelInst::new(
+                X86Opcode::MovdquRM,
+                vec![vr(xe1), mem_d(pe, 2 * ELEM_SIZE_Q as i32)],
+            ),
+            X86ISelInst::new(X86Opcode::Paddq, vec![vr(vacc1), vr(vacc1), vr(xe1)]),
+            X86ISelInst::new(
+                X86Opcode::AddRI,
+                vec![vr(viv), vr(viv), X86ISelOperand::Imm(2 * LANES_Q)],
+            ),
+            X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(vh)]),
+        ]
+    } else {
+        vec![
+            X86ISelInst::new(
+                X86Opcode::LeaSib,
+                vec![
+                    vr(pe),
+                    X86ISelOperand::SibMemAddr {
+                        base: Box::new(vr(ptrv)),
+                        index: Box::new(vr(iv)),
+                        scale: ELEM_SIZE_Q,
+                        disp: 0,
+                    },
+                ],
+            ),
+            X86ISelInst::new(X86Opcode::MovdquRM, vec![vr(xe), mem_d(pe, 0)]),
+            X86ISelInst::new(X86Opcode::Paddq, vec![vr(vacc), vr(vacc), vr(xe)]),
+            X86ISelInst::new(
+                X86Opcode::MovRI,
+                vec![vr(two), X86ISelOperand::Imm(LANES_Q)],
+            ),
+            X86ISelInst::new(X86Opcode::AddRR, vec![vr(niv), vr(iv), vr(two)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vr(iv), vr(niv)]),
+            X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(vh)]),
+        ]
+    };
     func.blocks.insert(
         vb,
         X86ISelBlock {
@@ -8532,8 +9856,19 @@ fn apply_heap_sumq_plan(func: &mut X86ISelFunction, plan: &HeapSumQPlan) {
     );
 
     // VR: horizontal reduce (covered ops only: MOVDQU spill + two MovRM loads
-    // + AddRRs), fold into the carried `acc`, fall into the scalar loop.
-    let vr_insts = vec![
+    // + AddRRs), fold into the carried `acc`, fall into the scalar loop. On
+    // the x4 route: first fold the second accumulator in (PADDQ — the same
+    // lane-wise wrapping add, order-insensitive), and hand the ORIGINAL iv
+    // its tail-contract value `vN` exactly once.
+    let mut vr_insts = Vec::new();
+    if x4 {
+        vr_insts.push(X86ISelInst::new(
+            X86Opcode::Paddq,
+            vec![vr(vacc), vr(vacc), vr(vacc1)],
+        ));
+        vr_insts.push(X86ISelInst::new(X86Opcode::MovRR, vec![vr(iv), vr(vn)]));
+    }
+    let vr_tail = vec![
         X86ISelInst::new(X86Opcode::MovdquMR, vec![mem_d(rs, 0), vr(vacc)]),
         X86ISelInst::new(X86Opcode::MovRM, vec![vr(s0), mem_d(rs, 0)]),
         X86ISelInst::new(
@@ -8545,6 +9880,7 @@ fn apply_heap_sumq_plan(func: &mut X86ISelFunction, plan: &HeapSumQPlan) {
         X86ISelInst::new(X86Opcode::MovRR, vec![vr(acc), vr(accf)]),
         X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(plan.header)]),
     ];
+    vr_insts.extend(vr_tail);
     func.blocks.insert(
         vrb,
         X86ISelBlock {
@@ -9107,6 +10443,33 @@ fn recognize_regarg_sumq_loop(
                 } else {
                     return None; // unclassifiable load — refuse.
                 }
+            } else if op == X86Opcode::TrapBoundsCheckExact {
+                // The CARRIER spelling of the branch-form guard this tier
+                // already accepts: the index must chase to `iv` and the bound
+                // must be the SAME loop-invariant `len_reg` the header
+                // compares — the own-length rule, with cross-length shapes
+                // declining exactly as in the branch form. The header
+                // dominates the chain and admits iteration iv only when
+                // `iv <u len_reg`, and step 3 proves the body has NO stores,
+                // so nothing can change len0: header predicate and carrier
+                // predicate are the same predicate over the same len0. The
+                // packed prefix replaces only iterations with iv < vN <= len0,
+                // so the carrier could never have fired on a replaced
+                // iteration; the scalar tail re-enters the ORIGINAL blocks,
+                // keeping the carrier, its expansion and the guard canary.
+                // The carrier produces no value, so the def-chain reasoning
+                // below is unaffected.
+                let index_ok = matches!(
+                    inst.operands.get(1),
+                    Some(X86ISelOperand::VReg(idx)) if canon(func, &defs, *idx) == iv
+                );
+                let bound_ok = matches!(
+                    inst.operands.get(2),
+                    Some(X86ISelOperand::VReg(b)) if canon(func, &defs, *b) == len_reg
+                );
+                if !index_ok || !bound_ok {
+                    bail!("carrier is not the header's own-length guard");
+                }
             } else if !is_whitelisted_body_opcode(op) {
                 return None;
             }
@@ -9646,6 +11009,10 @@ fn apply_regarg_sumq_plan(func: &mut X86ISelFunction, plan: &RegArgSumQPlan) {
                 prod
             }
             RegArgSumQKind::Dot => {
+                // `dot2 = plan.ptr2.map(..)`, and the recognizer only ever
+                // yields `kind == Dot` inside `if let Some(..) = second`, the
+                // same `second` that decides `ptr2 = match second { .. }` — so
+                // a `Dot` plan always carries `ptr2`.
                 let (_, pe2, ye, ..) = dot2.as_ref().expect("Dot plan carries ptr2");
                 vb_insts.push(X86ISelInst::new(
                     X86Opcode::MovdquRM,
@@ -9730,6 +11097,9 @@ fn apply_regarg_sumq_plan(func: &mut X86ISelFunction, plan: &RegArgSumQPlan) {
             prod
         }
         RegArgSumQKind::Dot => {
+            // Same invariant as the unrolled body above: `kind == Dot` is only
+            // reachable when the recognizer's `second` was `Some`, which is
+            // exactly when `plan.ptr2` — hence `dot2` — is `Some`.
             let (ptrv2, _, _, per2, yer) = dot2.as_ref().expect("Dot plan carries ptr2");
             rb_insts.push(X86ISelInst::new(
                 X86Opcode::LeaSib,
@@ -10354,8 +11724,15 @@ fn recognize_window_scan_loop(
             if op == X86Opcode::TrapBoundsCheckExact {
                 // Accept ONLY the pat-side `k < m` carrier: it cannot fire
                 // (inner header bound) and stays in the scalar tail.
+                //
+                // Operand 1 is the INDEX — the value the expansion actually
+                // compares (`CMP index, bound; Jcc AE -> UD2`); operand 0 is
+                // the base, preserved for proof-operand identity only and
+                // never read by the runtime check. Validating the base
+                // instead would accept a carrier whose real index is
+                // unconstrained.
                 let ok_carrier = matches!(
-                    (inst.operands.first(), inst.operands.get(2)),
+                    (inst.operands.get(1), inst.operands.get(2)),
                     (Some(X86ISelOperand::VReg(v)), Some(X86ISelOperand::Imm(c)))
                         if canon_through_carrier(func, &defs, *v) == k && *c == m
                 );
@@ -11245,7 +12622,10 @@ mod tests {
     fn vectorizes_distinct_array_add() {
         let LoopShape { mut func, iv } = build_loop(64, X86Opcode::AddRR, 0, 1, 2, 1, false);
         let blocks_before = func.block_order.len();
-        assert!(X86Vectorize.run_on_function(&mut func), "should vectorize");
+        assert!(
+            X86Vectorize::default().run_on_function(&mut func),
+            "should vectorize"
+        );
         // Two new blocks (vector header + body).
         assert_eq!(func.block_order.len(), blocks_before + 2);
         // Packed add + two packed loads + one packed store emitted.
@@ -11294,7 +12674,10 @@ mod tests {
             (X86Opcode::XorRR, X86Opcode::Pxor),
         ] {
             let LoopShape { mut func, .. } = build_loop(64, scalar, 0, 1, 2, 1, false);
-            assert!(X86Vectorize.run_on_function(&mut func), "{scalar:?}");
+            assert!(
+                X86Vectorize::default().run_on_function(&mut func),
+                "{scalar:?}"
+            );
             assert_eq!(count_op(&func, packed), 1, "{scalar:?} -> {packed:?}");
         }
     }
@@ -11304,7 +12687,7 @@ mod tests {
         // c aliases a source slot (write slot 0, read slots 0 and 1): a
         // loop-carried dependence — must not vectorize.
         let LoopShape { mut func, .. } = build_loop(64, X86Opcode::AddRR, 0, 1, 0, 1, false);
-        assert!(!X86Vectorize.run_on_function(&mut func));
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
         assert_eq!(count_op(&func, X86Opcode::Paddd), 0);
     }
 
@@ -11313,7 +12696,7 @@ mod tests {
         // The destination base is not a distinct local StackSlot (a raw
         // pointer): aliasing is possible — must not vectorize.
         let LoopShape { mut func, .. } = build_loop(64, X86Opcode::AddRR, 0, 1, 2, 1, true);
-        assert!(!X86Vectorize.run_on_function(&mut func));
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
         assert_eq!(count_op(&func, X86Opcode::Paddd), 0);
     }
 
@@ -11322,7 +12705,7 @@ mod tests {
         // iv += 2 (non-unit stride): the accesses are not contiguous — must not
         // vectorize.
         let LoopShape { mut func, .. } = build_loop(64, X86Opcode::AddRR, 0, 1, 2, 2, false);
-        assert!(!X86Vectorize.run_on_function(&mut func));
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
         assert_eq!(count_op(&func, X86Opcode::Paddd), 0);
     }
 
@@ -11330,7 +12713,7 @@ mod tests {
     fn rejects_small_trip_count() {
         // N < lanes: no full vector iteration.
         let LoopShape { mut func, .. } = build_loop(3, X86Opcode::AddRR, 0, 1, 2, 1, false);
-        assert!(!X86Vectorize.run_on_function(&mut func));
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
     }
 
     #[test]
@@ -11341,7 +12724,7 @@ mod tests {
         // Corrupt the trap block so it is no longer a pure single-Ud2 block.
         let trap = Block(7);
         func.blocks.get_mut(&trap).unwrap().insts = vec![inst(X86Opcode::Ret, vec![])];
-        assert!(!X86Vectorize.run_on_function(&mut func));
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
         assert_eq!(count_op(&func, X86Opcode::Paddd), 0);
     }
 
@@ -11555,7 +12938,10 @@ mod tests {
             build_fill_loop(64, 4, false, false, FillTestValue::Const(0x1234));
         let blocks_before = func.block_order.len();
         let slots_before = func.stack_slots.len();
-        assert!(X86Vectorize.run_on_function(&mut func), "should vectorize");
+        assert!(
+            X86Vectorize::default().run_on_function(&mut func),
+            "should vectorize"
+        );
         // Three new blocks (vector preheader + header + body).
         assert_eq!(func.block_order.len(), blocks_before + 3);
         // One fresh 16-byte scratch slot for the packed constant.
@@ -11599,7 +12985,7 @@ mod tests {
         // `a[i] = i` — the stored value is the IV, not a constant. There is no
         // covered broadcast for a per-iteration value; must stay scalar.
         let LoopShape { mut func, .. } = build_fill_loop(64, 4, false, false, FillTestValue::Iv);
-        assert!(!X86Vectorize.run_on_function(&mut func));
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
         assert_eq!(count_op(&func, X86Opcode::MovdquMR), 0);
     }
 
@@ -11609,7 +12995,7 @@ mod tests {
         // cannot be proven loop-invariant; must stay scalar.
         let LoopShape { mut func, .. } =
             build_fill_loop(64, 4, false, false, FillTestValue::RuntimeUndef);
-        assert!(!X86Vectorize.run_on_function(&mut func));
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
         assert_eq!(count_op(&func, X86Opcode::MovdquMR), 0);
     }
 
@@ -11619,7 +13005,7 @@ mod tests {
         // pointer): aliasing is possible — must not vectorize.
         let LoopShape { mut func, .. } =
             build_fill_loop(64, 4, true, false, FillTestValue::Const(7));
-        assert!(!X86Vectorize.run_on_function(&mut func));
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
         assert_eq!(count_op(&func, X86Opcode::MovdquMR), 0);
     }
 
@@ -11628,7 +13014,7 @@ mod tests {
         // N < lanes: no full vector iteration.
         let LoopShape { mut func, .. } =
             build_fill_loop(3, 4, false, false, FillTestValue::Const(7));
-        assert!(!X86Vectorize.run_on_function(&mut func));
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
         assert_eq!(count_op(&func, X86Opcode::MovdquMR), 0);
     }
 
@@ -11675,7 +13061,10 @@ mod tests {
         let LoopShape { mut func, .. } =
             build_fill_loop(256, 1, false, true, FillTestValue::InvariantOutside);
         let slots_before = func.stack_slots.len();
-        assert!(X86Vectorize.run_on_function(&mut func), "u8 invariant fill");
+        assert!(
+            X86Vectorize::default().run_on_function(&mut func),
+            "u8 invariant fill"
+        );
         assert_eq!(func.stack_slots.len(), slots_before + 1);
         assert_eq!(func.stack_slots.last().unwrap().size, 16);
         assert_invariant_fill_vectorized(&func, 1); // 16 lanes
@@ -11686,7 +13075,7 @@ mod tests {
         let LoopShape { mut func, .. } =
             build_fill_loop(128, 2, false, true, FillTestValue::InvariantOutside);
         assert!(
-            X86Vectorize.run_on_function(&mut func),
+            X86Vectorize::default().run_on_function(&mut func),
             "u16 invariant fill"
         );
         assert_invariant_fill_vectorized(&func, 2); // 8 lanes
@@ -11697,7 +13086,7 @@ mod tests {
         let LoopShape { mut func, .. } =
             build_fill_loop(64, 4, false, true, FillTestValue::InvariantOutside);
         assert!(
-            X86Vectorize.run_on_function(&mut func),
+            X86Vectorize::default().run_on_function(&mut func),
             "u32 invariant fill"
         );
         assert_invariant_fill_vectorized(&func, 4); // 4 lanes
@@ -11710,7 +13099,7 @@ mod tests {
         let LoopShape { mut func, .. } =
             build_fill_loop(256, 1, false, false, FillTestValue::InvariantOutside);
         assert!(
-            X86Vectorize.run_on_function(&mut func),
+            X86Vectorize::default().run_on_function(&mut func),
             "u8 invariant fill (imul form)"
         );
         assert_invariant_fill_vectorized(&func, 1);
@@ -11811,7 +13200,7 @@ mod tests {
             let LoopShape { mut func, .. } =
                 build_fill_loop(256, elem_size, false, true, FillTestValue::RedefinedInside);
             assert!(
-                !X86Vectorize.run_on_function(&mut func),
+                !X86Vectorize::default().run_on_function(&mut func),
                 "in-body value (elem={elem_size}) must not vectorize"
             );
             assert_eq!(count_op(&func, X86Opcode::MovdquMR), 0);
@@ -11825,7 +13214,7 @@ mod tests {
         // `a[i] = i as u8` — the value is the IV itself (per-iteration varying,
         // and multi-def). Must stay scalar.
         let LoopShape { mut func, .. } = build_fill_loop(256, 1, false, true, FillTestValue::Iv);
-        assert!(!X86Vectorize.run_on_function(&mut func));
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
         assert_eq!(count_op(&func, X86Opcode::MovdquMR), 0);
     }
 
@@ -11835,7 +13224,7 @@ mod tests {
         // must stay scalar (aliasing is possible).
         let LoopShape { mut func, .. } =
             build_fill_loop(256, 1, true, true, FillTestValue::InvariantOutside);
-        assert!(!X86Vectorize.run_on_function(&mut func));
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
         assert_eq!(count_op(&func, X86Opcode::MovdquMR), 0);
     }
 
@@ -12113,7 +13502,7 @@ mod tests {
         let blocks_before = func.block_order.len();
         let slots_before = func.stack_slots.len();
         assert!(
-            X86Vectorize.run_on_function(&mut func),
+            X86Vectorize::default().run_on_function(&mut func),
             "should vectorize the runtime byte fill"
         );
         // Four new blocks (guard + vector preheader + header + body).
@@ -12175,7 +13564,7 @@ mod tests {
     fn rejects_runtime_fill_reversed_compare() {
         // `n <s iv` is NOT the fill trip semantics; must stay scalar.
         let LoopShape { mut func, .. } = build_runtime_byte_fill_loop(RtFill::ReversedCmp);
-        assert!(!X86Vectorize.run_on_function(&mut func));
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
         assert_eq!(count_op(&func, X86Opcode::MovdquMR), 0);
     }
 
@@ -12183,28 +13572,28 @@ mod tests {
     fn rejects_runtime_fill_ne_loop() {
         // A `!=`-terminated loop (divergent for `n < iv0`): must stay scalar.
         let LoopShape { mut func, .. } = build_runtime_byte_fill_loop(RtFill::NeLoop);
-        assert!(!X86Vectorize.run_on_function(&mut func));
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
         assert_eq!(count_op(&func, X86Opcode::MovdquMR), 0);
     }
 
     #[test]
     fn rejects_runtime_fill_base_defined_inside() {
         let LoopShape { mut func, .. } = build_runtime_byte_fill_loop(RtFill::BaseInLoop);
-        assert!(!X86Vectorize.run_on_function(&mut func));
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
         assert_eq!(count_op(&func, X86Opcode::MovdquMR), 0);
     }
 
     #[test]
     fn rejects_runtime_fill_value_defined_inside() {
         let LoopShape { mut func, .. } = build_runtime_byte_fill_loop(RtFill::ValueInLoop);
-        assert!(!X86Vectorize.run_on_function(&mut func));
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
         assert_eq!(count_op(&func, X86Opcode::MovdquMR), 0);
     }
 
     #[test]
     fn rejects_runtime_fill_second_store() {
         let LoopShape { mut func, .. } = build_runtime_byte_fill_loop(RtFill::SecondStore);
-        assert!(!X86Vectorize.run_on_function(&mut func));
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
         assert_eq!(count_op(&func, X86Opcode::MovdquMR), 0);
     }
 
@@ -12213,7 +13602,7 @@ mod tests {
         // A load makes it not a pure fill (and could observe the reordered
         // packed stores): must stay scalar.
         let LoopShape { mut func, .. } = build_runtime_byte_fill_loop(RtFill::LoadInBody);
-        assert!(!X86Vectorize.run_on_function(&mut func));
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
         assert_eq!(count_op(&func, X86Opcode::MovdquMR), 0);
     }
 
@@ -12222,7 +13611,7 @@ mod tests {
         // Only the byte-fill slice is implemented; a 4-byte store with a
         // RUNTIME trip count must stay scalar.
         let LoopShape { mut func, .. } = build_runtime_byte_fill_loop(RtFill::WideStore);
-        assert!(!X86Vectorize.run_on_function(&mut func));
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
         assert_eq!(count_op(&func, X86Opcode::MovdquMR), 0);
     }
 
@@ -12231,7 +13620,7 @@ mod tests {
         // Any off-chain edge (even a pure trap) is outside this slice's strict
         // shape: must stay scalar.
         let LoopShape { mut func, .. } = build_runtime_byte_fill_loop(RtFill::OffChainEdge);
-        assert!(!X86Vectorize.run_on_function(&mut func));
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
         assert_eq!(count_op(&func, X86Opcode::MovdquMR), 0);
     }
 
@@ -12248,7 +13637,7 @@ mod tests {
     fn vectorizes_runtime_fill_multidef_n_all_defs_outside_loop() {
         let LoopShape { mut func, .. } = build_runtime_byte_fill_loop(RtFill::MultiDefN);
         assert!(
-            X86Vectorize.run_on_function(&mut func),
+            X86Vectorize::default().run_on_function(&mut func),
             "multiple defs of `n`, ALL outside the loop, are still invariant"
         );
         assert!(count_op(&func, X86Opcode::MovdquMR) > 0);
@@ -12261,7 +13650,7 @@ mod tests {
     fn rejects_runtime_fill_n_redefined_inside_loop() {
         let LoopShape { mut func, .. } = build_runtime_byte_fill_loop(RtFill::RedefinedNInLoop);
         assert!(
-            !X86Vectorize.run_on_function(&mut func),
+            !X86Vectorize::default().run_on_function(&mut func),
             "a trip count redefined inside the loop must not vectorize"
         );
         assert_eq!(count_op(&func, X86Opcode::MovdquMR), 0);
@@ -12556,7 +13945,10 @@ mod tests {
         );
         let blocks_before = func.block_order.len();
         let slots_before = func.stack_slots.len();
-        assert!(X86Vectorize.run_on_function(&mut func), "should vectorize");
+        assert!(
+            X86Vectorize::default().run_on_function(&mut func),
+            "should vectorize"
+        );
         assert_eq!(
             func.block_order.len(),
             blocks_before + 5,
@@ -12586,7 +13978,10 @@ mod tests {
             SaxpyDest::SameAsY,
             SaxpyK::InvariantOutside,
         );
-        assert!(X86Vectorize.run_on_function(&mut func), "should vectorize");
+        assert!(
+            X86Vectorize::default().run_on_function(&mut func),
+            "should vectorize"
+        );
         assert_saxpy_vectorized(&func, X86Opcode::Paddd);
     }
 
@@ -12599,7 +13994,10 @@ mod tests {
             SaxpyDest::Distinct,
             SaxpyK::InvariantOutside,
         );
-        assert!(X86Vectorize.run_on_function(&mut func), "should vectorize");
+        assert!(
+            X86Vectorize::default().run_on_function(&mut func),
+            "should vectorize"
+        );
         assert_saxpy_vectorized(&func, X86Opcode::Paddd);
     }
 
@@ -12608,7 +14006,10 @@ mod tests {
         // dest = (k*x) - y with a compile-time constant k -> PMULLD + PSUBD.
         let LoopShape { mut func, .. } =
             build_saxpy_loop(64, X86Opcode::SubRR, SaxpyDest::SameAsX, SaxpyK::Const(5));
-        assert!(X86Vectorize.run_on_function(&mut func), "should vectorize");
+        assert!(
+            X86Vectorize::default().run_on_function(&mut func),
+            "should vectorize"
+        );
         assert_saxpy_vectorized(&func, X86Opcode::Psubd);
     }
 
@@ -12623,7 +14024,7 @@ mod tests {
             SaxpyK::RedefinedInside,
         );
         assert!(
-            !X86Vectorize.run_on_function(&mut func),
+            !X86Vectorize::default().run_on_function(&mut func),
             "in-body k must not vectorize"
         );
         assert_eq!(count_op(&func, X86Opcode::Pmulld), 0);
@@ -12635,7 +14036,7 @@ mod tests {
         // k IS the IV (per-iteration varying, multi-def) -> must stay scalar.
         let LoopShape { mut func, .. } =
             build_saxpy_loop(64, X86Opcode::AddRR, SaxpyDest::SameAsX, SaxpyK::Iv);
-        assert!(!X86Vectorize.run_on_function(&mut func));
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
         assert_eq!(count_op(&func, X86Opcode::Pmulld), 0);
     }
 
@@ -12648,7 +14049,7 @@ mod tests {
             SaxpyDest::SameAsX,
             SaxpyK::InvariantOutside,
         );
-        assert!(!X86Vectorize.run_on_function(&mut func));
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
         assert_eq!(count_op(&func, X86Opcode::Pmulld), 0);
     }
 
@@ -13106,7 +14507,7 @@ mod tests {
         let did_off = {
             let _kill_switch =
                 crate::env_lock::ScopedEnvVar::set(&env_scope, "TCG_NO_X86_POPCOUNT_IDIOM", "1");
-            X86Vectorize.run_on_function(&mut off)
+            X86Vectorize::default().run_on_function(&mut off)
         };
         assert!(!did_off, "kill switch: must not rewrite");
         assert_eq!(count_op(&off, X86Opcode::ImulRR), 0, "kill switch: no SWAR");
@@ -13116,7 +14517,7 @@ mod tests {
         // latch, replaced by the mask-ANDs; the latch loses its back-edge).
         let mut func = build_kernighan_popcount_loop();
         assert!(
-            X86Vectorize.run_on_function(&mut func),
+            X86Vectorize::default().run_on_function(&mut func),
             "default-on: Kernighan popcount must rewrite"
         );
         assert_eq!(count_op(&func, X86Opcode::ImulRR), 1, "one SWAR multiply");
@@ -13203,6 +14604,48 @@ mod tests {
     }
 
     #[test]
+    fn rejects_bitrev_with_carrier_in_latch() {
+        // The apply REPLACES the latch wholesale — an admitted Trap*Exact
+        // carrier would be silently DELETED for ALL iterations (no scalar
+        // tail exists in this tier). The closed-world scan must keep the
+        // loop scalar and the carrier alive.
+        let mut func = build_bitrev_loop();
+        let cv = VReg::new(func.next_vreg, RegClass::Gpr64);
+        func.next_vreg += 1;
+        let latch = func.blocks.get_mut(&Block(2)).unwrap();
+        let pos = latch.insts.len() - 1; // before the back-edge Jmp
+        latch.insts.insert(
+            pos,
+            inst(
+                X86Opcode::TrapBoundsCheckExact,
+                vec![vr(cv), vr(cv), imm(64)],
+            ),
+        );
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
+        assert_eq!(
+            count_op(&func, X86Opcode::TrapBoundsCheckExact),
+            1,
+            "the carrier must survive in the (still scalar) loop"
+        );
+    }
+
+    #[test]
+    fn rejects_bitrev_with_store_in_latch() {
+        // Same admit-and-delete hazard with a plain store: the recurrence
+        // match tolerates extra instructions, so only the closed-world scan
+        // keeps the store from being deleted by the wholesale latch rewrite.
+        let mut func = build_bitrev_loop();
+        let sv = VReg::new(func.next_vreg, RegClass::Gpr64);
+        func.next_vreg += 1;
+        let latch = func.blocks.get_mut(&Block(2)).unwrap();
+        let pos = latch.insts.len() - 1;
+        latch
+            .insts
+            .insert(pos, inst(X86Opcode::MovMR, vec![memaddr(sv), vr(sv)]));
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
+    }
+
+    #[test]
     fn bitrev_idiom_recognized_and_rewritten() {
         let env_scope = crate::env_lock::override_scope();
         let _default_on =
@@ -13211,13 +14654,13 @@ mod tests {
         let did_off = {
             let _kill_switch =
                 crate::env_lock::ScopedEnvVar::set(&env_scope, "TCG_NO_X86_BITREV_IDIOM", "1");
-            X86Vectorize.run_on_function(&mut off)
+            X86Vectorize::default().run_on_function(&mut off)
         };
         assert!(!did_off, "kill switch: must not rewrite");
 
         let mut func = build_bitrev_loop();
         assert!(
-            X86Vectorize.run_on_function(&mut func),
+            X86Vectorize::default().run_on_function(&mut func),
             "default-on: bit-reversal must rewrite"
         );
         // SWAR bit-reverse = 5 mask steps (each a ShrRI+MovRI+2×AndRR+ShlRI+OrRR)
@@ -13239,7 +14682,7 @@ mod tests {
         let off = {
             let _kill_switch =
                 crate::env_lock::ScopedEnvVar::set(&env_scope, "TCG_NO_X86_BYTE_SUM", "1");
-            X86Vectorize.run_on_function(&mut func)
+            X86Vectorize::default().run_on_function(&mut func)
         };
         assert!(!off, "kill switch: must NOT vectorize");
         assert_eq!(
@@ -13259,7 +14702,7 @@ mod tests {
         let LoopShape { mut func, .. } = build_byte_sum_loop(64);
         let blocks_before = func.block_order.len();
         let slots_before = func.stack_slots.len();
-        let vectorized = X86Vectorize.run_on_function(&mut func);
+        let vectorized = X86Vectorize::default().run_on_function(&mut func);
         assert!(vectorized, "default-on: byte sum should vectorize");
         assert_eq!(
             count_op(&func, X86Opcode::Psadbw),
@@ -13366,7 +14809,7 @@ mod tests {
         let off = {
             let _kill_switch =
                 crate::env_lock::ScopedEnvVar::set(&env_scope, "TCG_NO_X86_BYTE_SUM", "1");
-            X86Vectorize.run_on_function(&mut func)
+            X86Vectorize::default().run_on_function(&mut func)
         };
         assert!(!off, "kill switch: must NOT vectorize");
         assert_eq!(
@@ -13380,7 +14823,7 @@ mod tests {
         let LoopShape { mut func, .. } = build_byte_sum_popcount_loop(64);
         let blocks_before = func.block_order.len();
         assert!(
-            X86Vectorize.run_on_function(&mut func),
+            X86Vectorize::default().run_on_function(&mut func),
             "popcount byte sum should vectorize"
         );
         assert_eq!(
@@ -13432,7 +14875,7 @@ mod tests {
         for mask in [0xffff_ff00_i64, 0xf0, 0x0f, 0x7f] {
             let LoopShape { mut func, .. } = build_byte_sum_popcount_loop_masked(64, mask);
             assert!(
-                !X86Vectorize.run_on_function(&mut func),
+                !X86Vectorize::default().run_on_function(&mut func),
                 "mask {mask:#x} does not preserve the low byte and must decline"
             );
             assert_eq!(count_op(&func, X86Opcode::Psadbw), 0, "no PSADBW");
@@ -13461,7 +14904,7 @@ mod tests {
         blk.insts
             .insert(at + 1, inst(X86Opcode::Popcnt, vec![vr(extra), vr(src)]));
         assert!(
-            !X86Vectorize.run_on_function(&mut func),
+            !X86Vectorize::default().run_on_function(&mut func),
             "a second POPCNT must decline"
         );
         assert_eq!(count_op(&func, X86Opcode::Psadbw), 0, "no PSADBW");
@@ -13489,7 +14932,7 @@ mod tests {
         blk.insts
             .insert(li + 1, inst(X86Opcode::Movzx, vec![vr(w), vr(load_dst)]));
         assert!(
-            !X86Vectorize.run_on_function(&mut func),
+            !X86Vectorize::default().run_on_function(&mut func),
             "mixed widening/popcount shape must decline"
         );
         assert_eq!(count_op(&func, X86Opcode::Psadbw), 0, "no PSADBW");
@@ -13657,7 +15100,7 @@ mod tests {
         let off = {
             let _kill =
                 crate::env_lock::ScopedEnvVar::set(&env_scope, "TCG_NO_X86_BYTE_EQ_COUNT", "1");
-            X86Vectorize.run_on_function(&mut func)
+            X86Vectorize::default().run_on_function(&mut func)
         };
         assert!(!off, "kill switch: must NOT vectorize");
         assert_eq!(
@@ -13668,7 +15111,10 @@ mod tests {
 
         let LoopShape { mut func, .. } = build_byte_eq_count_loop(1024, 0, 0, 1, X86CondCode::E);
         let blocks_before = func.block_order.len();
-        assert!(X86Vectorize.run_on_function(&mut func), "should vectorize");
+        assert!(
+            X86Vectorize::default().run_on_function(&mut func),
+            "should vectorize"
+        );
         assert_eq!(count_op(&func, X86Opcode::Pcmpeqb), 1, "one PCMPEQB");
         assert_eq!(
             count_op(&func, X86Opcode::Psubb),
@@ -13692,6 +15138,93 @@ mod tests {
     /// The whole point of this tier's separate header analysis: every other
     /// tier requires the IV to start at literal 0.
     #[test]
+    fn byte_eq_count_latch_accepts_only_the_proven_dead_carrier() {
+        // Positive control: a well-formed carrier in the latch — index chases
+        // to the iv, bound is a register-materialized constant == the trip
+        // count (the const_of arm of `is_safe_iv_bounds_carrier`) — must NOT
+        // block the tier, and must survive in the scalar tail.
+        let LoopShape { mut func, iv } = build_byte_eq_count_loop(1024, 0, 0, 1, X86CondCode::E);
+        let c = VReg::new(func.next_vreg, RegClass::Gpr64);
+        let bnd = VReg::new(func.next_vreg + 1, RegClass::Gpr64);
+        func.next_vreg += 2;
+        let latch = func.blocks.get_mut(&Block(6)).unwrap();
+        let pos = latch.insts.len() - 1; // before the back-edge Jmp
+        latch.insts.splice(
+            pos..pos,
+            [
+                inst(X86Opcode::MovRR, vec![vr(c), vr(iv)]),
+                inst(X86Opcode::MovRI, vec![vr(bnd), imm(1024)]),
+                inst(X86Opcode::TrapBoundsCheckExact, vec![vr(c), vr(c), vr(bnd)]),
+            ],
+        );
+        assert!(
+            X86Vectorize::default().run_on_function(&mut func),
+            "a proven-dead latch carrier must not block the tier"
+        );
+        assert_eq!(count_op(&func, X86Opcode::TrapBoundsCheckExact), 1);
+    }
+
+    #[test]
+    fn byte_eq_count_rejects_short_bound_carrier_in_latch() {
+        // The carrier's constant bound is BELOW the trip count: it can fire
+        // on a replaced iteration — MUST stay scalar.
+        let LoopShape { mut func, iv } = build_byte_eq_count_loop(1024, 0, 0, 1, X86CondCode::E);
+        let c = VReg::new(func.next_vreg, RegClass::Gpr64);
+        func.next_vreg += 1;
+        let latch = func.blocks.get_mut(&Block(6)).unwrap();
+        let pos = latch.insts.len() - 1;
+        latch.insts.splice(
+            pos..pos,
+            [
+                inst(X86Opcode::MovRR, vec![vr(c), vr(iv)]),
+                inst(
+                    X86Opcode::TrapBoundsCheckExact,
+                    vec![vr(c), vr(c), imm(1023)],
+                ),
+            ],
+        );
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
+    }
+
+    #[test]
+    fn byte_eq_count_rejects_multi_def_bound_carrier_in_latch() {
+        // The carrier's bound register has TWO defs: not a provable constant
+        // (DefIndex drops multi-def vregs, const_of fails) — MUST stay scalar.
+        let LoopShape { mut func, iv } = build_byte_eq_count_loop(1024, 0, 0, 1, X86CondCode::E);
+        let c = VReg::new(func.next_vreg, RegClass::Gpr64);
+        let bnd = VReg::new(func.next_vreg + 1, RegClass::Gpr64);
+        func.next_vreg += 2;
+        let latch = func.blocks.get_mut(&Block(6)).unwrap();
+        let pos = latch.insts.len() - 1;
+        latch.insts.splice(
+            pos..pos,
+            [
+                inst(X86Opcode::MovRR, vec![vr(c), vr(iv)]),
+                inst(X86Opcode::MovRI, vec![vr(bnd), imm(1024)]),
+                inst(X86Opcode::MovRI, vec![vr(bnd), imm(4)]),
+                inst(X86Opcode::TrapBoundsCheckExact, vec![vr(c), vr(c), vr(bnd)]),
+            ],
+        );
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
+    }
+
+    #[test]
+    fn byte_eq_count_rejects_store_in_latch() {
+        // A store in the latch would be dropped for every replaced iteration
+        // by the packed prefix — the latch closed-world scan MUST keep the
+        // loop scalar.
+        let LoopShape { mut func, .. } = build_byte_eq_count_loop(1024, 0, 0, 1, X86CondCode::E);
+        let sv = VReg::new(func.next_vreg, RegClass::Gpr64);
+        func.next_vreg += 1;
+        let latch = func.blocks.get_mut(&Block(6)).unwrap();
+        let pos = latch.insts.len() - 1;
+        latch
+            .insts
+            .insert(pos, inst(X86Opcode::MovMR, vec![memaddr(sv), vr(sv)]));
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
+    }
+
+    #[test]
     fn byte_eq_count_admits_a_nonzero_iv_start() {
         let env_scope = crate::env_lock::override_scope();
         let _on = crate::env_lock::ScopedEnvVar::unset(&env_scope, "TCG_NO_X86_BYTE_EQ_COUNT");
@@ -13699,7 +15232,7 @@ mod tests {
             let LoopShape { mut func, .. } =
                 build_byte_eq_count_loop(1024, 0, start, 1, X86CondCode::E);
             assert!(
-                X86Vectorize.run_on_function(&mut func),
+                X86Vectorize::default().run_on_function(&mut func),
                 "IV starting at {start} must still vectorize"
             );
             assert_eq!(count_op(&func, X86Opcode::Pcmpeqb), 1);
@@ -13713,7 +15246,7 @@ mod tests {
         let env_scope = crate::env_lock::override_scope();
         let _on = crate::env_lock::ScopedEnvVar::unset(&env_scope, "TCG_NO_X86_BYTE_EQ_COUNT");
         let LoopShape { mut func, .. } = build_byte_eq_count_loop(1024, 0, 3, 1, X86CondCode::E);
-        assert!(X86Vectorize.run_on_function(&mut func));
+        assert!(X86Vectorize::default().run_on_function(&mut func));
         // Locate the VECTOR header: the block whose `Jcc` targets the block
         // holding the PCMPEQB. The ORIGINAL scalar header legitimately still
         // compares against 1024, so a function-wide scan proves nothing.
@@ -13760,7 +15293,7 @@ mod tests {
         // MISmatches — a different reduction, not claimed here.
         let LoopShape { mut func, .. } = build_byte_eq_count_loop(1024, 0, 0, 1, X86CondCode::NE);
         assert!(
-            !X86Vectorize.run_on_function(&mut func),
+            !X86Vectorize::default().run_on_function(&mut func),
             "inverted polarity must decline"
         );
         assert_eq!(count_op(&func, X86Opcode::Pcmpeqb), 0);
@@ -13768,7 +15301,7 @@ mod tests {
         // `count += 2` is not a count.
         let LoopShape { mut func, .. } = build_byte_eq_count_loop(1024, 0, 0, 2, X86CondCode::E);
         assert!(
-            !X86Vectorize.run_on_function(&mut func),
+            !X86Vectorize::default().run_on_function(&mut func),
             "non-unit increment must decline"
         );
         assert_eq!(count_op(&func, X86Opcode::Pcmpeqb), 0);
@@ -13776,7 +15309,7 @@ mod tests {
         // A bound below one full vector has no packed iteration.
         let LoopShape { mut func, .. } = build_byte_eq_count_loop(8, 0, 0, 1, X86CondCode::E);
         assert!(
-            !X86Vectorize.run_on_function(&mut func),
+            !X86Vectorize::default().run_on_function(&mut func),
             "bound < 16 must decline"
         );
         assert_eq!(count_op(&func, X86Opcode::Pcmpeqb), 0);
@@ -13824,7 +15357,7 @@ mod tests {
         crate::env_lock::with_env_overrides_removed(&["TCG_NO_X86_BYTE_SUM"], || {
             let LoopShape { mut func, .. } = build_byte_sum_loop_carrier(64, true, 64);
             let blocks_before = func.block_order.len();
-            let vectorized = X86Vectorize.run_on_function(&mut func);
+            let vectorized = X86Vectorize::default().run_on_function(&mut func);
             assert!(vectorized, "carrier byte sum should vectorize");
             assert_eq!(
                 count_op(&func, X86Opcode::Psadbw),
@@ -13858,7 +15391,7 @@ mod tests {
     fn byte_sum_carrier_bound_below_trip_declines() {
         crate::env_lock::with_env_overrides_removed(&["TCG_NO_X86_BYTE_SUM"], || {
             let LoopShape { mut func, .. } = build_byte_sum_loop_carrier(64, true, 63);
-            let vectorized = X86Vectorize.run_on_function(&mut func);
+            let vectorized = X86Vectorize::default().run_on_function(&mut func);
             assert!(!vectorized, "bound < n_trip must NOT vectorize");
             assert_eq!(count_op(&func, X86Opcode::Psadbw), 0, "no PSADBW");
         });
@@ -13871,7 +15404,7 @@ mod tests {
     fn byte_sum_carrier_non_iv_index_declines() {
         crate::env_lock::with_env_overrides_removed(&["TCG_NO_X86_BYTE_SUM"], || {
             let LoopShape { mut func, .. } = build_byte_sum_loop_carrier(64, false, 64);
-            let vectorized = X86Vectorize.run_on_function(&mut func);
+            let vectorized = X86Vectorize::default().run_on_function(&mut func);
             assert!(!vectorized, "non-IV carrier index must NOT vectorize");
             assert_eq!(count_op(&func, X86Opcode::Psadbw), 0, "no PSADBW");
         });
@@ -13905,7 +15438,7 @@ mod tests {
         let blocks_before = func.block_order.len();
         let slots_before = func.stack_slots.len();
         assert!(
-            X86Vectorize.run_on_function(&mut func),
+            X86Vectorize::default().run_on_function(&mut func),
             "sum should vectorize"
         );
         assert_eq!(
@@ -13945,7 +15478,7 @@ mod tests {
     fn vectorizes_integer_dot_product() {
         let LoopShape { mut func, .. } = build_reduction_loop(64, RedKind::Dot);
         assert!(
-            X86Vectorize.run_on_function(&mut func),
+            X86Vectorize::default().run_on_function(&mut func),
             "dot should vectorize"
         );
         assert_eq!(count_op(&func, X86Opcode::Pmulld), 1, "one packed multiply");
@@ -13970,7 +15503,7 @@ mod tests {
         // and the add is ADDSS, not ADDRR — a triple fail-safe.)
         let LoopShape { mut func, .. } = build_reduction_loop(100, RedKind::FloatSum);
         assert!(
-            !X86Vectorize.run_on_function(&mut func),
+            !X86Vectorize::default().run_on_function(&mut func),
             "float sum must stay scalar"
         );
         assert_eq!(count_op(&func, X86Opcode::Paddd), 0);
@@ -13983,7 +15516,7 @@ mod tests {
         // we only prove integer ADD associative/commutative. MUST stay scalar.
         let LoopShape { mut func, .. } = build_reduction_loop(64, RedKind::SubReduce);
         assert!(
-            !X86Vectorize.run_on_function(&mut func),
+            !X86Vectorize::default().run_on_function(&mut func),
             "sub-reduce must stay scalar"
         );
         assert_eq!(count_op(&func, X86Opcode::Paddd), 0);
@@ -13995,7 +15528,7 @@ mod tests {
         // observe the reordered partial sums. MUST stay scalar.
         let LoopShape { mut func, .. } = build_reduction_loop(64, RedKind::AccEscapes);
         assert!(
-            !X86Vectorize.run_on_function(&mut func),
+            !X86Vectorize::default().run_on_function(&mut func),
             "escaping acc must stay scalar"
         );
         assert_eq!(count_op(&func, X86Opcode::Paddd), 0);
@@ -14008,7 +15541,7 @@ mod tests {
         // memory in-loop; any store disqualifies it. MUST stay scalar.
         let LoopShape { mut func, .. } = build_reduction_loop(64, RedKind::AccStored);
         assert!(
-            !X86Vectorize.run_on_function(&mut func),
+            !X86Vectorize::default().run_on_function(&mut func),
             "stored acc must stay scalar"
         );
         assert_eq!(count_op(&func, X86Opcode::Paddd), 0);
@@ -14018,7 +15551,7 @@ mod tests {
     fn rejects_small_trip_reduction() {
         // N < lanes: no full vector iteration.
         let LoopShape { mut func, .. } = build_reduction_loop(3, RedKind::Sum);
-        assert!(!X86Vectorize.run_on_function(&mut func));
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
         assert_eq!(count_op(&func, X86Opcode::Paddd), 0);
     }
 
@@ -14352,46 +15885,44 @@ mod tests {
     fn vectorizes_saxpyq_matmul_inner_loop_shape() {
         let LoopShape { mut func, .. } = build_saxpyq_loop(QKnobs::default());
         assert!(
-            X86Vectorize.run_on_function(&mut func),
+            X86Vectorize::default().run_on_function(&mut func),
             "the matmul inner-loop shape must vectorize"
         );
-        // N=6: vn=6 packed elements = 3 two-lane groups. The body is unrolled
-        // by 2 (one VBU iteration covering [0,4) = 2 groups) plus a single VBT
-        // tail group covering [4,6). So the per-group PMULUDQ-compose op counts
-        // are 3x the single-group shape.
+        // N=6: vn=6 packed elements = 3 two-lane groups. Under the default
+        // x4 unroll (group width 8), vn=6 < 8 means NO VBU loop — the whole
+        // packed region is 3 straight-line VBT groups.
+        // Scalar-IMUL route (default): per group,
+        // two scalar loads + two scalar IMULs + MOVQ/MOVQ/PUNPCKLQDQ pack +
+        // one c-load PADDQ accumulate + one packed store — the
+        // composite-proven 0bfe4e1e sequence. The PMULUDQ compose and the
+        // whole [K;2]/[K>>32;2] broadcast preheader are gone (K stays in its
+        // GPR); `TCG_NO_X86_SAXPYQ_SCALAR_MUL` restores them.
         let groups = 3;
-        // The exact packed 64-bit multiply compose, per group.
         assert_eq!(
             count_op(&func, X86Opcode::Pmuludq),
-            3 * groups,
-            "3 PMULUDQ partial products/group"
+            0,
+            "no PMULUDQ compose on the scalar-IMUL route"
         );
         assert_eq!(
             count_op(&func, X86Opcode::Psrlq),
-            groups + 1,
-            "b_hi extract/group, PLUS one preheader PSRLQ deriving [K>>32;2] \
-             from the [K;2] broadcast in-register"
+            0,
+            "no b_hi extracts and no preheader [K>>32;2] derivation"
         );
-        assert_eq!(
-            count_op(&func, X86Opcode::Psllq),
-            groups,
-            "cross-term << 32/group"
-        );
+        assert_eq!(count_op(&func, X86Opcode::Psllq), 0, "no cross-term shift");
         assert_eq!(
             count_op(&func, X86Opcode::Paddq),
-            3 * groups,
-            "t2+t3, t1+t5, c+prod per group"
+            groups,
+            "c + prod per group"
         );
-        // x load + c load per group; one packed store per group. Plus ONE
-        // broadcast MOVDQU reload ([K;2]) from the scratch slot — the second
-        // reload ([K>>32;2]) is gone: it is now derived in-register by PSRLQ,
-        // which removes a store-to-load forwarding stall (8+8-byte stores
-        // reloaded as a single 16-byte load).
-        assert_eq!(count_op(&func, X86Opcode::MovdquRM), 2 * groups + 1);
+        // One c load per group (the x lanes are two scalar MovRM loads now);
+        // one packed store per group; no broadcast reload.
+        assert_eq!(count_op(&func, X86Opcode::MovdquRM), groups);
         assert_eq!(count_op(&func, X86Opcode::MovdquMR), groups);
-        // Proof-covered scratch-slot broadcast: no shuffle/pack broadcast ops.
-        assert_eq!(count_op(&func, X86Opcode::MovqToXmm), 0);
-        assert_eq!(count_op(&func, X86Opcode::Punpcklqdq), 0);
+        // The pack pair, per group — every instruction per-instruction
+        // certified (MovqToXmm via its named bit-preservation proof,
+        // Punpcklqdq via the PackLowQwords RECONSTRUCTION).
+        assert_eq!(count_op(&func, X86Opcode::MovqToXmm), 2 * groups);
+        assert_eq!(count_op(&func, X86Opcode::Punpcklqdq), groups);
         // No uncovered helper ops.
         assert_eq!(count_op(&func, X86Opcode::Pshufd), 0);
         assert_eq!(count_op(&func, X86Opcode::Pinsrq), 0);
@@ -14410,6 +15941,18 @@ mod tests {
             check_consts, 2,
             "two runtime bound checks fail-safe to scalar"
         );
+        assert!(
+            !has_vbu_self_loop(&func),
+            "vn=6 < the x4 group width: tail-only, no VBU loop block"
+        );
+    }
+
+    /// VBU is the only self-successor block the emitter creates (its
+    /// bottom-test jumps to itself); the scalar loop's back edge crosses
+    /// blocks. Presence of a self-loop therefore pins "the unrolled loop
+    /// was emitted".
+    fn has_vbu_self_loop(func: &X86ISelFunction) -> bool {
+        func.blocks.iter().any(|(id, b)| b.successors.contains(id))
     }
 
     #[test]
@@ -14420,9 +15963,10 @@ mod tests {
             x_is_dest_same_offset: true,
             ..QKnobs::default()
         });
-        assert!(X86Vectorize.run_on_function(&mut func));
-        // N=6 -> 3 two-lane groups (2 unrolled + 1 tail); 3 PMULUDQ per group.
-        assert_eq!(count_op(&func, X86Opcode::Pmuludq), 9);
+        assert!(X86Vectorize::default().run_on_function(&mut func));
+        // N=6 -> 3 two-lane groups (2 unrolled + 1 tail); 1 PUNPCKLQDQ pack
+        // per group on the scalar-IMUL route.
+        assert_eq!(count_op(&func, X86Opcode::Punpcklqdq), 3);
     }
 
     /// The x86 regalloc replay requires CONTIGUOUS block ids. The emitter
@@ -14455,51 +15999,93 @@ mod tests {
             ..QKnobs::default()
         });
         assert!(
-            X86Vectorize.run_on_function(&mut func),
+            X86Vectorize::default().run_on_function(&mut func),
             "N=3 must vectorize"
         );
         // Exactly one 2-lane group (the tail): 3 PMULUDQ, one packed store.
-        assert_eq!(count_op(&func, X86Opcode::Pmuludq), 3);
+        assert_eq!(count_op(&func, X86Opcode::Pmuludq), 0);
+        assert_eq!(count_op(&func, X86Opcode::Punpcklqdq), 1);
         assert_eq!(count_op(&func, X86Opcode::MovdquMR), 1);
         assert_block_ids_contiguous(&func);
     }
 
     #[test]
-    fn vectorizes_saxpyq_unroll_no_tail_even_multiple() {
-        // N=4: vn=4, vn4=4 so has_unrolled=true, has_tail=false — VBU only, no
-        // VBT. Two groups in the unrolled body; block ids contiguous.
+    fn vectorizes_saxpyq_tail_only_below_unroll_width() {
+        // N=4: vn=4 < 8 (the x4 group width) so has_unrolled=false — two
+        // straight-line VBT groups, no VBU; block ids contiguous.
         let LoopShape { mut func, .. } = build_saxpyq_loop(QKnobs {
             n: 4,
             ..QKnobs::default()
         });
         assert!(
-            X86Vectorize.run_on_function(&mut func),
+            X86Vectorize::default().run_on_function(&mut func),
             "N=4 must vectorize"
         );
-        assert_eq!(count_op(&func, X86Opcode::Pmuludq), 6, "2 unrolled groups");
+        assert_eq!(count_op(&func, X86Opcode::Punpcklqdq), 2, "2 tail groups");
         assert_eq!(count_op(&func, X86Opcode::MovdquMR), 2);
+        assert!(!has_vbu_self_loop(&func), "no VBU below the group width");
         assert_block_ids_contiguous(&func);
     }
 
     #[test]
-    fn vectorizes_saxpyq_unroll_and_tail_odd_multiple() {
-        // N=7: vn=6, vn4=4 so has_unrolled=true AND has_tail=true — VBU (2
-        // groups) + VBT (1 group) + a 1-element scalar remainder. Full coverage;
-        // block ids contiguous.
+    fn vectorizes_saxpyq_tail_groups_and_scalar_remainder() {
+        // N=7: vn=6 < 8 so tail-only — 3 straight-line VBT groups + a
+        // 1-element scalar remainder; block ids contiguous.
         let LoopShape { mut func, .. } = build_saxpyq_loop(QKnobs {
             n: 7,
             ..QKnobs::default()
         });
         assert!(
-            X86Vectorize.run_on_function(&mut func),
+            X86Vectorize::default().run_on_function(&mut func),
             "N=7 must vectorize"
         );
-        assert_eq!(
-            count_op(&func, X86Opcode::Pmuludq),
-            9,
-            "3 groups (2 unrolled + 1 tail)"
-        );
+        assert_eq!(count_op(&func, X86Opcode::Punpcklqdq), 3, "3 tail groups");
         assert_eq!(count_op(&func, X86Opcode::MovdquMR), 3);
+        assert!(!has_vbu_self_loop(&func), "no VBU below the group width");
+        assert_block_ids_contiguous(&func);
+    }
+
+    #[test]
+    fn vectorizes_saxpyq_unroll_no_tail_even_multiple() {
+        // N=8: vn=8, vn4=8 — has_unrolled=true, has_tail=false: one VBU
+        // bottom-test loop of 4 groups per iteration, no VBT; contiguous ids.
+        let LoopShape { mut func, .. } = build_saxpyq_loop(QKnobs {
+            n: 8,
+            ..QKnobs::default()
+        });
+        assert!(
+            X86Vectorize::default().run_on_function(&mut func),
+            "N=8 must vectorize"
+        );
+        assert_eq!(
+            count_op(&func, X86Opcode::Punpcklqdq),
+            4,
+            "4 unrolled groups"
+        );
+        assert_eq!(count_op(&func, X86Opcode::MovdquMR), 4);
+        assert!(has_vbu_self_loop(&func), "VBU loop present at vn=8");
+        assert_block_ids_contiguous(&func);
+    }
+
+    #[test]
+    fn vectorizes_saxpyq_unroll_and_tail_odd_multiple() {
+        // N=11: vn=10, vn4=8 — VBU (4 groups) + VBT (1 trailing group) + a
+        // 1-element scalar remainder = 5 groups total; contiguous ids.
+        let LoopShape { mut func, .. } = build_saxpyq_loop(QKnobs {
+            n: 11,
+            ..QKnobs::default()
+        });
+        assert!(
+            X86Vectorize::default().run_on_function(&mut func),
+            "N=11 must vectorize"
+        );
+        assert_eq!(
+            count_op(&func, X86Opcode::Punpcklqdq),
+            5,
+            "5 groups (4 unrolled + 1 tail)"
+        );
+        assert_eq!(count_op(&func, X86Opcode::MovdquMR), 5);
+        assert!(has_vbu_self_loop(&func), "VBU loop present at vn=10");
         assert_block_ids_contiguous(&func);
     }
 
@@ -14511,7 +16097,7 @@ mod tests {
             scale: 4,
             ..QKnobs::default()
         });
-        assert!(!X86Vectorize.run_on_function(&mut func));
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
         assert_saxpyq_not_vectorized(&func);
     }
 
@@ -14524,7 +16110,7 @@ mod tests {
             store_leaf_differs: true,
             ..QKnobs::default()
         });
-        assert!(!X86Vectorize.run_on_function(&mut func));
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
         assert_saxpyq_not_vectorized(&func);
     }
 
@@ -14536,7 +16122,7 @@ mod tests {
             x_reads_dest_at_other_offset: true,
             ..QKnobs::default()
         });
-        assert!(!X86Vectorize.run_on_function(&mut func));
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
         assert_saxpyq_not_vectorized(&func);
     }
 
@@ -14549,7 +16135,7 @@ mod tests {
             leaf_redefined_inside: true,
             ..QKnobs::default()
         });
-        assert!(!X86Vectorize.run_on_function(&mut func));
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
         assert_saxpyq_not_vectorized(&func);
     }
 
@@ -14561,7 +16147,7 @@ mod tests {
             k_redefined_inside: true,
             ..QKnobs::default()
         });
-        assert!(!X86Vectorize.run_on_function(&mut func));
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
         assert_saxpyq_not_vectorized(&func);
     }
 
@@ -14574,7 +16160,7 @@ mod tests {
             bound: 4, // < n == 6
             ..QKnobs::default()
         });
-        assert!(!X86Vectorize.run_on_function(&mut func));
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
         assert_saxpyq_not_vectorized(&func);
     }
 
@@ -14587,7 +16173,7 @@ mod tests {
             slot_bytes: 16 * 8, // < bound(32)*8
             ..QKnobs::default()
         });
-        assert!(!X86Vectorize.run_on_function(&mut func));
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
         assert_saxpyq_not_vectorized(&func);
     }
 
@@ -14599,7 +16185,7 @@ mod tests {
             unclassifiable_guard: true,
             ..QKnobs::default()
         });
-        assert!(!X86Vectorize.run_on_function(&mut func));
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
         assert_saxpyq_not_vectorized(&func);
     }
 
@@ -14611,7 +16197,7 @@ mod tests {
             non_trap_side_exit: true,
             ..QKnobs::default()
         });
-        assert!(!X86Vectorize.run_on_function(&mut func));
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
         assert_saxpyq_not_vectorized(&func);
     }
 
@@ -14622,7 +16208,7 @@ mod tests {
             n: 1,
             ..QKnobs::default()
         });
-        assert!(!X86Vectorize.run_on_function(&mut func));
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
         assert_saxpyq_not_vectorized(&func);
     }
 
@@ -14663,6 +16249,17 @@ mod tests {
         /// The off-chain side exit is not a pure single-`Ud2` trap block —
         /// MUST stay scalar.
         non_trap_side_exit: bool,
+        /// Insert an inline `TrapBoundsCheckExact` carrier in the guard block
+        /// re-checking the header's exact guard (`iv <u [vp+16]`) — the
+        /// carriers-are-reads form the bridge emits since the b14/b18
+        /// redesign. MUST still vectorize.
+        carrier_guard: bool,
+        /// The carrier's bound loads `[vp + 0]` (the ptr field), not the
+        /// header's `[vp + 16]`: bound values may differ — MUST stay scalar.
+        carrier_bound_other_field: bool,
+        /// The carrier's index is `acc`, not `iv` — the carrier is not the
+        /// header's guard — MUST stay scalar.
+        carrier_index_not_iv: bool,
     }
 
     /// Build the raw post-ISel heap-sum shape (mirroring the bridge's real
@@ -14833,6 +16430,25 @@ mod tests {
             if k.call_in_body {
                 insts.push(inst(X86Opcode::Call, vec![]));
             }
+            if k.carrier_guard || k.carrier_bound_other_field || k.carrier_index_not_iv {
+                // The inline carrier form: `TrapBoundsCheckExact [base, index,
+                // bound]`, base == index (an iv copy) exactly as the bridge
+                // emits for `v[k]` (base is proof-identity only).
+                let cidx = if k.carrier_index_not_iv {
+                    acc
+                } else {
+                    let c = b.g();
+                    insts.push(inst(X86Opcode::MovRR, vec![vr(c), vr(iv)]));
+                    c
+                };
+                let cbound_field = if k.carrier_bound_other_field { 0 } else { 16 };
+                let (cbound, cb_insts) = field_load(&mut b, vp, cbound_field);
+                insts.extend(cb_insts);
+                insts.push(inst(
+                    X86Opcode::TrapBoundsCheckExact,
+                    vec![vr(cidx), vr(cidx), vr(cbound)],
+                ));
+            }
             insts.extend(below_branch_tail(&mut b, ivc2, len2, latch, trap));
             // The latch reads the data pointer back through the temp (the
             // rustc shape), or uses the adversarial early reload.
@@ -14926,19 +16542,63 @@ mod tests {
     #[test]
     fn vectorizes_heap_sumq_positive() {
         let LoopShape { mut func, .. } = build_heap_sumq_loop(HKnobs::default());
-        assert!(X86Vectorize.run_on_function(&mut func));
-        // A packed accumulate + a MOVDQU element load + the spill/reduce.
-        assert_eq!(count_op(&func, X86Opcode::Paddq), 1);
-        assert_eq!(count_op(&func, X86Opcode::MovdquRM), 2); // seed + element
+        assert!(X86Vectorize::default().run_on_function(&mut func));
+        // The x4 emission: two packed accumulates in the body + the VR fold
+        // of the second accumulator; two seed loads + two element loads; one
+        // reduce spill.
+        assert_eq!(count_op(&func, X86Opcode::Paddq), 3);
+        assert_eq!(count_op(&func, X86Opcode::MovdquRM), 4); // 2 seeds + 2 elements
         assert_eq!(count_op(&func, X86Opcode::MovdquMR), 1); // reduce spill
-        // The runtime gate: len & !1 materialized via AndRI(-2).
+        // The runtime gate: len & !3 materialized via AndRI(-4).
         assert!(func.blocks.values().any(|blk| blk.insts.iter().any(|i| {
             i.opcode == X86Opcode::AndRI
-                && matches!(i.operands.get(2), Some(X86ISelOperand::Imm(-2)))
+                && matches!(i.operands.get(2), Some(X86ISelOperand::Imm(-4)))
         })));
         // The scalar loop remains intact as the epilogue (its element load
         // pattern — ImulRR by 8 — is still present).
         assert!(count_op(&func, X86Opcode::ImulRR) >= 1);
+    }
+
+    #[test]
+    fn vectorizes_heap_sumq_with_bounds_carrier() {
+        // The inline `TrapBoundsCheckExact` carrier re-checking the header's
+        // exact guard (the shape the bridge emits for `v[k]` since the
+        // carriers-are-reads redesign) must not block the tier: the header
+        // dominates the carrier and proves `iv <u len`, and the scalar tail
+        // (the original blocks) keeps the carrier for remainder iterations.
+        let LoopShape { mut func, .. } = build_heap_sumq_loop(HKnobs {
+            carrier_guard: true,
+            ..HKnobs::default()
+        });
+        assert!(X86Vectorize::default().run_on_function(&mut func));
+        assert_eq!(count_op(&func, X86Opcode::Paddq), 3);
+        // The carrier itself must survive untouched in the scalar tail.
+        assert_eq!(count_op(&func, X86Opcode::TrapBoundsCheckExact), 1);
+    }
+
+    #[test]
+    fn rejects_heap_sumq_carrier_bound_other_field() {
+        // The carrier's bound is a DIFFERENT field than the header's: the
+        // carrier is not provably dead under the header guard — MUST stay
+        // scalar.
+        let LoopShape { mut func, .. } = build_heap_sumq_loop(HKnobs {
+            carrier_bound_other_field: true,
+            ..HKnobs::default()
+        });
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
+        assert_heap_sumq_not_vectorized(&func);
+    }
+
+    #[test]
+    fn rejects_heap_sumq_carrier_index_not_iv() {
+        // The carrier checks a non-`iv` value against the bound: not the
+        // header's guard — MUST stay scalar.
+        let LoopShape { mut func, .. } = build_heap_sumq_loop(HKnobs {
+            carrier_index_not_iv: true,
+            ..HKnobs::default()
+        });
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
+        assert_heap_sumq_not_vectorized(&func);
     }
 
     #[test]
@@ -14949,7 +16609,7 @@ mod tests {
             guard_bound_other_field: true,
             ..HKnobs::default()
         });
-        assert!(!X86Vectorize.run_on_function(&mut func));
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
         assert_heap_sumq_not_vectorized(&func);
     }
 
@@ -14961,7 +16621,7 @@ mod tests {
             store_acc: true,
             ..HKnobs::default()
         });
-        assert!(!X86Vectorize.run_on_function(&mut func));
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
         assert_heap_sumq_not_vectorized(&func);
     }
 
@@ -14974,7 +16634,7 @@ mod tests {
             stores_hit_vec_slot: true,
             ..HKnobs::default()
         });
-        assert!(!X86Vectorize.run_on_function(&mut func));
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
         assert_heap_sumq_not_vectorized(&func);
     }
 
@@ -14986,7 +16646,7 @@ mod tests {
             elem_load_32: true,
             ..HKnobs::default()
         });
-        assert!(!X86Vectorize.run_on_function(&mut func));
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
         assert_heap_sumq_not_vectorized(&func);
     }
 
@@ -14998,7 +16658,7 @@ mod tests {
             stride_4: true,
             ..HKnobs::default()
         });
-        assert!(!X86Vectorize.run_on_function(&mut func));
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
         assert_heap_sumq_not_vectorized(&func);
     }
 
@@ -15011,7 +16671,7 @@ mod tests {
             reload_before_store: true,
             ..HKnobs::default()
         });
-        assert!(!X86Vectorize.run_on_function(&mut func));
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
         assert_heap_sumq_not_vectorized(&func);
     }
 
@@ -15023,7 +16683,7 @@ mod tests {
             acc_second_reader: true,
             ..HKnobs::default()
         });
-        assert!(!X86Vectorize.run_on_function(&mut func));
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
         assert_heap_sumq_not_vectorized(&func);
     }
 
@@ -15034,7 +16694,7 @@ mod tests {
             call_in_body: true,
             ..HKnobs::default()
         });
-        assert!(!X86Vectorize.run_on_function(&mut func));
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
         assert_heap_sumq_not_vectorized(&func);
     }
 
@@ -15045,7 +16705,7 @@ mod tests {
             non_trap_side_exit: true,
             ..HKnobs::default()
         });
-        assert!(!X86Vectorize.run_on_function(&mut func));
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
         assert_heap_sumq_not_vectorized(&func);
     }
 
@@ -15083,6 +16743,17 @@ mod tests {
         /// second invariant pointer at the SAME index (the two-slice Dot shape).
         /// MUST vectorize (RegArgSumQKind::Dot).
         dot: bool,
+        /// An inline `TrapBoundsCheckExact` carrier in the latch re-checking
+        /// the header's own-length guard (`iv <u len`) — the carriers-are-reads
+        /// form. MUST still vectorize, and the carrier MUST survive in the
+        /// scalar tail.
+        carrier_own_len: bool,
+        /// The carrier's bound is the OTHER invariant length register
+        /// (cross-length) — not the header's guard — MUST stay scalar.
+        carrier_cross_len: bool,
+        /// The carrier's index is the loaded element, not `iv` — MUST stay
+        /// scalar.
+        carrier_non_iv: bool,
     }
     impl RKnobs {
         fn default() -> Self {
@@ -15093,6 +16764,9 @@ mod tests {
                 square: false,
                 cross_product: false,
                 dot: false,
+                carrier_own_len: false,
+                carrier_cross_len: false,
+                carrier_non_iv: false,
             }
         }
     }
@@ -15273,6 +16947,22 @@ mod tests {
                 X86Opcode::AddRR,
                 vec![vr(accn), vr(accc2), vr(term_reg)],
             ));
+            if k.carrier_own_len || k.carrier_cross_len || k.carrier_non_iv {
+                // Carrier shape [base, index, bound] with base == index, as
+                // the bridge emits (base is proof-identity only).
+                let cidx = if k.carrier_non_iv {
+                    elemc
+                } else {
+                    let c = b.g();
+                    ls.push(inst(X86Opcode::MovRR, vec![vr(c), vr(iv)]));
+                    c
+                };
+                let cbound = if k.carrier_cross_len { len2 } else { len };
+                ls.push(inst(
+                    X86Opcode::TrapBoundsCheckExact,
+                    vec![vr(cidx), vr(cidx), vr(cbound)],
+                ));
+            }
             if k.has_store {
                 // A store into the (distinct) local slot — forfeits pure-reduce.
                 ls.push(inst(X86Opcode::MovMR, vec![memaddr(sbase), vr(elem)]));
@@ -15318,7 +17008,7 @@ mod tests {
         let blocks_before = func.block_order.len();
         let slots_before = func.stack_slots.len();
         assert!(
-            X86Vectorize.run_on_function(&mut func),
+            X86Vectorize::default().run_on_function(&mut func),
             "reg-arg i64 sum should vectorize"
         );
         // VP0 + VPS + VH + VB + RH + RB + CB.
@@ -15386,6 +17076,47 @@ mod tests {
     }
 
     #[test]
+    fn vectorizes_regarg_with_own_length_carrier() {
+        // The carrier spelling of the own-length guard must not block the
+        // tier, and the carrier must survive untouched in the scalar tail.
+        let LoopShape { mut func, .. } = build_regarg_sumq_loop(RKnobs {
+            carrier_own_len: true,
+            ..RKnobs::default()
+        });
+        assert!(
+            X86Vectorize::default().run_on_function(&mut func),
+            "own-length carrier must not block the reg-arg tier"
+        );
+        assert_eq!(
+            count_op(&func, X86Opcode::TrapBoundsCheckExact),
+            1,
+            "the carrier must survive in the scalar tail"
+        );
+    }
+
+    #[test]
+    fn rejects_regarg_cross_length_carrier() {
+        // The carrier checks the OTHER slice's length: not the header's
+        // guard, so the loop is not provably safe to pack — MUST stay scalar.
+        let LoopShape { mut func, .. } = build_regarg_sumq_loop(RKnobs {
+            carrier_cross_len: true,
+            ..RKnobs::default()
+        });
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
+    }
+
+    #[test]
+    fn rejects_regarg_non_iv_index_carrier() {
+        // The carrier's index is a loaded element, not the iv — the header
+        // guard proves nothing about it — MUST stay scalar.
+        let LoopShape { mut func, .. } = build_regarg_sumq_loop(RKnobs {
+            carrier_non_iv: true,
+            ..RKnobs::default()
+        });
+        assert!(!X86Vectorize::default().run_on_function(&mut func));
+    }
+
+    #[test]
     fn rejects_regarg_cross_length() {
         // CRITICAL: the per-element bound is a DIFFERENT register than the
         // trip-count bound. The own-length identity fails ⇒ MUST stay scalar
@@ -15395,7 +17126,7 @@ mod tests {
             ..RKnobs::default()
         });
         assert!(
-            !X86Vectorize.run_on_function(&mut func),
+            !X86Vectorize::default().run_on_function(&mut func),
             "cross-length must stay scalar"
         );
         assert_eq!(count_op(&func, X86Opcode::Paddq), 0);
@@ -15410,7 +17141,7 @@ mod tests {
             ..RKnobs::default()
         });
         assert!(
-            !X86Vectorize.run_on_function(&mut func),
+            !X86Vectorize::default().run_on_function(&mut func),
             "store-bearing loop must stay scalar"
         );
         assert_eq!(count_op(&func, X86Opcode::Paddq), 0);
@@ -15425,7 +17156,7 @@ mod tests {
             ..RKnobs::default()
         });
         assert!(
-            !X86Vectorize.run_on_function(&mut func),
+            !X86Vectorize::default().run_on_function(&mut func),
             "non-invariant len must stay scalar"
         );
         assert_eq!(count_op(&func, X86Opcode::Paddq), 0);
@@ -15442,7 +17173,7 @@ mod tests {
             ..RKnobs::default()
         });
         assert!(
-            X86Vectorize.run_on_function(&mut func),
+            X86Vectorize::default().run_on_function(&mut func),
             "reg-arg i64 square should vectorize"
         );
         // PADDQ = 2*K reduction (K unrolled + 1 remainder + K-1 combine) PLUS
@@ -15484,7 +17215,7 @@ mod tests {
             ..RKnobs::default()
         });
         assert!(
-            X86Vectorize.run_on_function(&mut func),
+            X86Vectorize::default().run_on_function(&mut func),
             "reg-arg i64 two-slice dot should vectorize"
         );
         // PADDQ = 2*K reduction (K unrolled + 1 remainder + K-1 combine) PLUS
@@ -15517,10 +17248,737 @@ mod tests {
             ..RKnobs::default()
         });
         assert!(
-            !X86Vectorize.run_on_function(&mut func),
+            !X86Vectorize::default().run_on_function(&mut func),
             "non-square product must stay scalar"
         );
         assert_eq!(count_op(&func, X86Opcode::Pmuludq), 0);
         assert_eq!(count_op(&func, X86Opcode::Paddq), 0);
+    }
+
+    // ------------------------------------------------------------------
+    // Two-level saxpy-Q ROW-REGISTER nest (stage 1, opt-in behind
+    // TCG_X86_SAXPYQ_ROWREG). The builder wraps the proven saxpy-Q j-loop
+    // shape in a k-loop that mirrors the p4 matmul middle loop: one guarded
+    // aik load (`a[i*N + k]`), the j-loop with `c[i*N + j] += aik*x[k*N + j]`,
+    // identity carrier round-trips (`t = v; ...; v = t`) through the k-latch,
+    // and unit k-IV bookkeeping. The identity carrier `s_out` is READ AFTER
+    // the loop, so accepts exercise the identity-exemption proof and the
+    // adversarial knobs exercise every reject condition of the design.
+    // ------------------------------------------------------------------
+
+    /// Adversarial knobs for `build_saxpyq_rowreg_nest`. `default()` is the
+    /// exact accepted p4-like shape (N=24, K=24, mult=24, bound=576).
+    struct RowKnobs {
+        /// Inner j trip count N.
+        n: i64,
+        /// k trip count K.
+        k_trip: i64,
+        /// Flat multiplier shared by the a/c/x accesses (p4: 24).
+        mult: i64,
+        /// Guard bound shared by every access (p4: 576).
+        bound: i64,
+        /// Slot size for all three arrays (must be >= bound*8 to admit).
+        slot_bytes: u32,
+        /// x row at a k-INVARIANT leaf (fixed row) instead of `x[k*N + j]`.
+        x_leaf_invariant: bool,
+        /// The x access reads the DESTINATION slot at the same flat index
+        /// (inner-legal; the rowreg tier must reject slot_x == slot_c).
+        x_slot_is_c: bool,
+        /// Drop the a-row guard: the aik load has no k-quantified obligation.
+        no_a_guard: bool,
+        /// A `Call` in the k-body outside the j-loop.
+        call_in_kbody: bool,
+        /// A second store in the k-body outside the j-loop.
+        second_store_in_kbody: bool,
+        /// The latch write-back of `s_out` copies a NON-pair vreg (a real
+        /// value change) while `s_out` is read after the loop.
+        nonidentity_latch_carrier: bool,
+        /// The k IV is read after the loop (live-out escape).
+        kbody_def_escapes: bool,
+        /// The inner c-offset leaf is recomputed k-VARYINGLY in the k-body
+        /// (neither k-invariant nor the k IV — unclassifiable).
+        kvarying_inner_leaf: bool,
+        /// A second (self-loop) nested loop inside the k-body.
+        second_inner_loop: bool,
+    }
+
+    impl RowKnobs {
+        fn default() -> Self {
+            RowKnobs {
+                n: 24,
+                k_trip: 24,
+                mult: 24,
+                bound: 576,
+                slot_bytes: 4608,
+                x_leaf_invariant: false,
+                x_slot_is_c: false,
+                no_a_guard: false,
+                call_in_kbody: false,
+                second_store_in_kbody: false,
+                nonidentity_latch_carrier: false,
+                kbody_def_escapes: false,
+                kvarying_inner_leaf: false,
+                second_inner_loop: false,
+            }
+        }
+    }
+
+    /// Build the two-level nest (see the section comment). Slot 0 = `c`,
+    /// slot 1 = `x`, slot 2 = `a`.
+    fn build_saxpyq_rowreg_nest(k: RowKnobs) -> LoopShape {
+        let sig = Signature {
+            params: vec![],
+            returns: vec![Type::I64],
+        };
+        let mut func = X86ISelFunction::new("saxpyq_rowreg_test".to_string(), sig);
+        func.stack_slots = vec![
+            StackSlotInfo::new(k.slot_bytes, 8), // slot 0: c
+            StackSlotInfo::new(k.slot_bytes, 8), // slot 1: x
+            StackSlotInfo::new(k.slot_bytes, 8), // slot 2: a
+        ];
+        let mut b = B { next: 0 };
+
+        let base_c = b.g();
+        let base_x = b.g();
+        let base_a = b.g();
+        let kv = b.g(); // the k IV
+        let jv = b.g(); // the inner j IV
+        let leaf_i = b.g(); // outer-i stand-in (identity round-trip carrier)
+        let leaf_xk = b.g(); // k-invariant x leaf (x_leaf_invariant variant)
+        let s_out = b.g(); // benign second identity carrier, READ after the loop
+        let t_i = b.g(); // in-body copy of leaf_i
+        let t_s = b.g(); // in-body copy of s_out
+        let tv = b.g(); // k-varying leaf (kvarying_inner_leaf variant)
+        let aik = b.g(); // the row scalar
+
+        let entry = Block(0);
+        let kpre = Block(1);
+        let khead = Block(2);
+        let kg1 = Block(3);
+        let kload = Block(4); // aik load + copy-ins + j init == the j preheader
+        let jhead = Block(5);
+        let jg1 = Block(6);
+        let jg2 = Block(7);
+        let jg3 = Block(8);
+        let jlatch = Block(9);
+        let klatch = Block(10);
+        let trap = Block(11);
+        let exit = Block(12);
+        let winner = Block(13); // knob-only second inner loop
+        let mut all = vec![
+            entry, kpre, khead, kg1, kload, jhead, jg1, jg2, jg3, jlatch, klatch, trap, exit,
+        ];
+        if k.second_inner_loop {
+            all.push(winner);
+        }
+        for blk in &all {
+            func.ensure_block(*blk);
+        }
+
+        // Entry: the three slot bases + runtime leaves + the carrier inits.
+        {
+            let one = b.g();
+            let two = b.g();
+            let e = func.blocks.get_mut(&entry).unwrap();
+            for (slot, base) in [(0u32, base_c), (1u32, base_x), (2u32, base_a)] {
+                e.insts.push(inst(
+                    X86Opcode::Lea,
+                    vec![
+                        vr(base),
+                        X86ISelOperand::MemAddr {
+                            base: Box::new(X86ISelOperand::StackSlot(slot)),
+                            disp: 0,
+                        },
+                    ],
+                ));
+            }
+            e.insts.push(inst(X86Opcode::MovRI, vec![vr(one), imm(1)]));
+            e.insts.push(inst(X86Opcode::MovRI, vec![vr(two), imm(2)]));
+            e.insts
+                .push(inst(X86Opcode::OrRR, vec![vr(leaf_i), vr(one), vr(two)]));
+            e.insts
+                .push(inst(X86Opcode::OrRR, vec![vr(leaf_xk), vr(two), vr(one)]));
+            e.insts
+                .push(inst(X86Opcode::OrRR, vec![vr(s_out), vr(one), vr(one)]));
+            e.insts
+                .push(inst(X86Opcode::Jmp, vec![X86ISelOperand::Block(kpre)]));
+            e.successors = vec![kpre];
+        }
+        // k preheader: kv = 0.
+        {
+            let zero = b.g();
+            let p = func.blocks.get_mut(&kpre).unwrap();
+            p.insts.push(inst(X86Opcode::MovRI, vec![vr(zero), imm(0)]));
+            p.insts.push(inst(X86Opcode::MovRR, vec![vr(kv), vr(zero)]));
+            p.insts
+                .push(inst(X86Opcode::Jmp, vec![X86ISelOperand::Block(khead)]));
+            p.successors = vec![khead];
+        }
+        // k header: kv <u K ? kg1 : exit.
+        {
+            let t = b.g();
+            let nn = b.g();
+            let h = func.blocks.get_mut(&khead).unwrap();
+            h.insts.push(inst(X86Opcode::MovRR, vec![vr(t), vr(kv)]));
+            h.insts
+                .push(inst(X86Opcode::MovRI, vec![vr(nn), imm(k.k_trip)]));
+            h.insts.push(inst(X86Opcode::CmpRR, vec![vr(t), vr(nn)]));
+            h.insts.push(inst(
+                X86Opcode::Jcc,
+                vec![
+                    X86ISelOperand::CondCode(X86CondCode::B),
+                    X86ISelOperand::Block(kg1),
+                ],
+            ));
+            h.insts
+                .push(inst(X86Opcode::Jmp, vec![X86ISelOperand::Block(exit)]));
+            h.successors = vec![kg1, exit];
+        }
+        // kg1: the a-row guard `leaf_i*mult + kv <u bound` (or a pass-through
+        // when no_a_guard). The knobbed second inner loop hangs off its
+        // continue edge.
+        let kg1_cont = if k.second_inner_loop { winner } else { kload };
+        {
+            let blk = func.blocks.get_mut(&kg1).unwrap();
+            if k.no_a_guard {
+                blk.insts
+                    .push(inst(X86Opcode::Jmp, vec![X86ISelOperand::Block(kg1_cont)]));
+                blk.successors = vec![kg1_cont];
+            } else {
+                let (flat_a, mut s) = flat_of(&mut b, leaf_i, k.mult, kv);
+                s.extend(guard_flat(&mut b, flat_a, k.bound, kg1_cont, trap));
+                blk.insts.extend(s);
+                blk.successors = vec![kg1_cont, trap];
+            }
+        }
+        // The knob-only second inner loop: a whitelisted-only self-loop.
+        if k.second_inner_loop {
+            let wt = b.g();
+            let w = func.blocks.get_mut(&winner).unwrap();
+            w.insts.push(inst(X86Opcode::MovRR, vec![vr(wt), vr(kv)]));
+            w.insts.push(inst(X86Opcode::CmpRI, vec![vr(wt), imm(0)]));
+            w.insts.push(inst(
+                X86Opcode::Jcc,
+                vec![
+                    X86ISelOperand::CondCode(X86CondCode::B),
+                    X86ISelOperand::Block(winner),
+                ],
+            ));
+            w.insts
+                .push(inst(X86Opcode::Jmp, vec![X86ISelOperand::Block(kload)]));
+            w.successors = vec![winner, kload];
+        }
+        // kload (the j preheader): aik = a[leaf_i*mult + kv]; identity
+        // copy-ins; jv = 0. Adversarial knobs inject their poison here.
+        {
+            let (flat_a2, mut s) = flat_of(&mut b, leaf_i, k.mult, kv);
+            let (addr_a, sa) = addr_of_scale(&mut b, base_a, flat_a2, 8);
+            s.extend(sa);
+            s.push(inst(X86Opcode::MovRM, vec![vr(aik), memaddr(addr_a)]));
+            if k.second_store_in_kbody {
+                s.push(inst(X86Opcode::MovMR, vec![memaddr(addr_a), vr(aik)]));
+            }
+            if k.call_in_kbody {
+                s.push(inst(
+                    X86Opcode::Call,
+                    vec![X86ISelOperand::Symbol("helper".to_string())],
+                ));
+            }
+            s.push(inst(X86Opcode::MovRR, vec![vr(t_i), vr(leaf_i)]));
+            s.push(inst(X86Opcode::MovRR, vec![vr(t_s), vr(s_out)]));
+            if k.kvarying_inner_leaf {
+                s.push(inst(X86Opcode::OrRR, vec![vr(tv), vr(leaf_i), vr(kv)]));
+            }
+            let jz = b.g();
+            s.push(inst(X86Opcode::MovRI, vec![vr(jz), imm(0)]));
+            s.push(inst(X86Opcode::MovRR, vec![vr(jv), vr(jz)]));
+            s.push(inst(X86Opcode::Jmp, vec![X86ISelOperand::Block(jhead)]));
+            let blk = func.blocks.get_mut(&kload).unwrap();
+            blk.insts.extend(s);
+            blk.successors = vec![jhead];
+        }
+        // j header: jv <u N ? jg1 : klatch.
+        {
+            let t = b.g();
+            let nn = b.g();
+            let h = func.blocks.get_mut(&jhead).unwrap();
+            h.insts.push(inst(X86Opcode::MovRR, vec![vr(t), vr(jv)]));
+            h.insts.push(inst(X86Opcode::MovRI, vec![vr(nn), imm(k.n)]));
+            h.insts.push(inst(X86Opcode::CmpRR, vec![vr(t), vr(nn)]));
+            h.insts.push(inst(
+                X86Opcode::Jcc,
+                vec![
+                    X86ISelOperand::CondCode(X86CondCode::B),
+                    X86ISelOperand::Block(jg1),
+                ],
+            ));
+            h.insts
+                .push(inst(X86Opcode::Jmp, vec![X86ISelOperand::Block(klatch)]));
+            h.successors = vec![jg1, klatch];
+        }
+        // The inner c/x leaves.
+        let c_leaf = if k.kvarying_inner_leaf { tv } else { t_i };
+        let (x_base_reg, x_leaf) = if k.x_slot_is_c {
+            (base_c, c_leaf) // same slot, SAME flat index (inner-legal)
+        } else if k.x_leaf_invariant {
+            (base_x, leaf_xk)
+        } else {
+            (base_x, kv) // matmul's x[k*N + j]
+        };
+        // jg1: flat_c = c_leaf*mult + jv; guard.
+        let (flat_c, _) = {
+            let (flat_c, mut s) = flat_of(&mut b, c_leaf, k.mult, jv);
+            s.extend(guard_flat(&mut b, flat_c, k.bound, jg2, trap));
+            let blk = func.blocks.get_mut(&jg1).unwrap();
+            blk.insts.extend(s);
+            blk.successors = vec![jg2, trap];
+            (flat_c, ())
+        };
+        // jg2: load c[flat_c]; flat_x = x_leaf*mult + jv; guard.
+        let cval = b.g();
+        let flat_x;
+        {
+            let (addr_c, mut s) = addr_of_scale(&mut b, base_c, flat_c, 8);
+            s.push(inst(X86Opcode::MovRM, vec![vr(cval), memaddr(addr_c)]));
+            let (fx, sx) = flat_of(&mut b, x_leaf, k.mult, jv);
+            s.extend(sx);
+            flat_x = fx;
+            s.extend(guard_flat(&mut b, flat_x, k.bound, jg3, trap));
+            let blk = func.blocks.get_mut(&jg2).unwrap();
+            blk.insts.extend(s);
+            blk.successors = vec![jg3, trap];
+        }
+        // jg3: load x[flat_x]; prod = aik*x; sum = c + prod; flat_c2; guard.
+        let sum = b.g();
+        let flat_c2;
+        {
+            let xval = b.g();
+            let (addr_x, mut s) = addr_of_scale(&mut b, x_base_reg, flat_x, 8);
+            s.push(inst(X86Opcode::MovRM, vec![vr(xval), memaddr(addr_x)]));
+            let prod = b.g();
+            s.push(inst(X86Opcode::ImulRR, vec![vr(prod), vr(aik), vr(xval)]));
+            s.push(inst(X86Opcode::AddRR, vec![vr(sum), vr(cval), vr(prod)]));
+            let (fc2, sc2) = flat_of(&mut b, c_leaf, k.mult, jv);
+            s.extend(sc2);
+            flat_c2 = fc2;
+            s.extend(guard_flat(&mut b, flat_c2, k.bound, jlatch, trap));
+            let blk = func.blocks.get_mut(&jg3).unwrap();
+            blk.insts.extend(s);
+            blk.successors = vec![jlatch, trap];
+        }
+        // j latch: store c[flat_c2] = sum; jv += 1; back-edge.
+        {
+            let (addr_s, mut s) = addr_of_scale(&mut b, base_c, flat_c2, 8);
+            let sm = b.g();
+            s.push(inst(X86Opcode::MovRR, vec![vr(sm), vr(sum)]));
+            s.push(inst(X86Opcode::MovMR, vec![memaddr(addr_s), vr(sm)]));
+            let one = b.g();
+            let njv = b.g();
+            s.push(inst(X86Opcode::MovRI, vec![vr(one), imm(1)]));
+            s.push(inst(X86Opcode::AddRR, vec![vr(njv), vr(jv), vr(one)]));
+            s.push(inst(X86Opcode::MovRR, vec![vr(jv), vr(njv)]));
+            s.push(inst(X86Opcode::Jmp, vec![X86ISelOperand::Block(jhead)]));
+            let blk = func.blocks.get_mut(&jlatch).unwrap();
+            blk.insts.extend(s);
+            blk.successors = vec![jhead];
+        }
+        // k latch: identity copy-backs; kv += 1; back-edge.
+        {
+            let l = func.blocks.get_mut(&klatch).unwrap();
+            l.insts
+                .push(inst(X86Opcode::MovRR, vec![vr(leaf_i), vr(t_i)]));
+            let s_src = if k.nonidentity_latch_carrier {
+                t_i
+            } else {
+                t_s
+            };
+            l.insts
+                .push(inst(X86Opcode::MovRR, vec![vr(s_out), vr(s_src)]));
+            let one = b.g();
+            let nkv = b.g();
+            l.insts.push(inst(X86Opcode::MovRI, vec![vr(one), imm(1)]));
+            l.insts
+                .push(inst(X86Opcode::AddRR, vec![vr(nkv), vr(kv), vr(one)]));
+            l.insts.push(inst(X86Opcode::MovRR, vec![vr(kv), vr(nkv)]));
+            l.insts
+                .push(inst(X86Opcode::Jmp, vec![X86ISelOperand::Block(khead)]));
+            l.successors = vec![khead];
+        }
+        // trap: single Ud2. exit: a real outside READ of the identity carrier
+        // (accepted only via the round-trip proof), the knobbed k escape, Ret.
+        {
+            func.blocks
+                .get_mut(&trap)
+                .unwrap()
+                .insts
+                .push(inst(X86Opcode::Ud2, vec![]));
+            let esc = b.g();
+            let x = func.blocks.get_mut(&exit).unwrap();
+            x.insts
+                .push(inst(X86Opcode::MovRR, vec![vr(esc), vr(s_out)]));
+            if k.kbody_def_escapes {
+                let esc2 = b.g();
+                x.insts.push(inst(X86Opcode::MovRR, vec![vr(esc2), vr(kv)]));
+            }
+            x.insts.push(inst(X86Opcode::Ret, vec![]));
+        }
+
+        func.next_vreg = b.next;
+        LoopShape { func, iv: kv }
+    }
+
+    /// Locate the row-register tier's emitted blocks by SHAPE. RVB is the
+    /// only self-loop block with a PUNPCKLQDQ pack and ZERO 16-byte memory
+    /// ops (the inner tier's VBU self-loop always carries per-group
+    /// MovdquRM/MR); RVPB the only MovdquRM-without-MovdquMR block (the
+    /// hoisted row loads); RVS the only MovdquMR-without-MovdquRM block (the
+    /// row sink). Returns `None` unless all three exist uniquely.
+    fn find_rowreg_blocks(func: &X86ISelFunction) -> Option<(Block, Block, Block)> {
+        let count_in =
+            |blk: &X86ISelBlock, op: X86Opcode| blk.insts.iter().filter(|i| i.opcode == op).count();
+        let (mut rvpb, mut rvb, mut rvs) = (None, None, None);
+        for (id, blk) in &func.blocks {
+            let rm = count_in(blk, X86Opcode::MovdquRM);
+            let mr = count_in(blk, X86Opcode::MovdquMR);
+            let pk = count_in(blk, X86Opcode::Punpcklqdq);
+            if blk.successors.contains(id) && pk > 0 && rm == 0 && mr == 0 {
+                if rvb.is_some() {
+                    return None;
+                }
+                rvb = Some(*id);
+            } else if rm > 0 && mr == 0 {
+                if rvpb.is_some() {
+                    return None;
+                }
+                rvpb = Some(*id);
+            } else if mr > 0 && rm == 0 {
+                if rvs.is_some() {
+                    return None;
+                }
+                rvs = Some(*id);
+            }
+        }
+        Some((rvpb?, rvb?, rvs?))
+    }
+
+    /// The row-register RVB shape (a self-loop pack body with no 16-byte
+    /// memory op) — the discriminator between "the rowreg tier fired" and
+    /// "only the inner saxpy-Q fired" (whose VBU self-loop carries MOVDQUs).
+    fn has_rowreg_shape(func: &X86ISelFunction) -> bool {
+        func.blocks.iter().any(|(id, blk)| {
+            blk.successors.contains(id)
+                && blk.insts.iter().any(|i| i.opcode == X86Opcode::Punpcklqdq)
+                && !blk
+                    .insts
+                    .iter()
+                    .any(|i| matches!(i.opcode, X86Opcode::MovdquRM | X86Opcode::MovdquMR))
+        })
+    }
+
+    /// Count the rowreg tier's runtime row-check blocks: two-successor blocks
+    /// with a CmpRR whose fail edge targets the ORIGINAL k header. (The inner
+    /// tier's check blocks target the j header instead.)
+    fn count_rowreg_check_blocks(func: &X86ISelFunction, k_header: Block) -> usize {
+        func.blocks
+            .iter()
+            .filter(|(id, blk)| {
+                **id != k_header
+                    && blk.successors.len() == 2
+                    && blk.successors.contains(&k_header)
+                    && blk.insts.iter().any(|i| i.opcode == X86Opcode::CmpRR)
+            })
+            .count()
+    }
+
+    fn rowreg_count_in(func: &X86ISelFunction, id: Block, op: X86Opcode) -> usize {
+        func.blocks[&id]
+            .insts
+            .iter()
+            .filter(|i| i.opcode == op)
+            .count()
+    }
+
+    #[test]
+    fn rowreg_gate_off_by_default() {
+        // Kill switch: with TCG_NO_X86_SAXPYQ_ROWREG set, the nest must get
+        // ONLY the inner saxpy-Q vectorization (behavior identical to a
+        // build without the tier).
+        let env_scope = crate::env_lock::override_scope();
+        let _off = crate::env_lock::ScopedEnvVar::set(&env_scope, "TCG_NO_X86_SAXPYQ_ROWREG", "1");
+        let LoopShape { mut func, .. } = build_saxpyq_rowreg_nest(RowKnobs::default());
+        assert!(
+            X86Vectorize::default().run_on_function(&mut func),
+            "the inner saxpy-Q must still fire"
+        );
+        assert!(
+            !has_rowreg_shape(&func),
+            "no row-register blocks without the opt-in env"
+        );
+        assert!(find_rowreg_blocks(&func).is_none());
+    }
+
+    #[test]
+    fn rowreg_vectorizes_p4_nest_n24() {
+        let env_scope = crate::env_lock::override_scope();
+        let _on = crate::env_lock::ScopedEnvVar::set(&env_scope, "TCG_X86_SAXPYQ_ROWREG", "1");
+        let LoopShape { mut func, .. } = build_saxpyq_rowreg_nest(RowKnobs::default());
+        assert!(
+            X86Vectorize::default().run_on_function(&mut func),
+            "the p4-shaped nest must row-vectorize"
+        );
+        let (rvpb, rvb, rvs) = find_rowreg_blocks(&func).expect("row-register blocks present");
+        // RVPB: the hoisted c row — 12 accumulator loads.
+        assert_eq!(rowreg_count_in(&func, rvpb, X86Opcode::MovdquRM), 12);
+        // RVS: the row sink — 12 stores, leaving through the ORIGINAL k exit.
+        assert_eq!(rowreg_count_in(&func, rvs, X86Opcode::MovdquMR), 12);
+        assert_eq!(func.blocks[&rvs].successors, vec![Block(12)]);
+        // RVB: the self-loop k body — 12 groups of the 0bfe4e1e pack shape.
+        assert!(func.blocks[&rvb].successors.contains(&rvb), "RVB self-loop");
+        assert_eq!(rowreg_count_in(&func, rvb, X86Opcode::Punpcklqdq), 12);
+        assert_eq!(rowreg_count_in(&func, rvb, X86Opcode::Paddq), 12);
+        assert_eq!(
+            rowreg_count_in(&func, rvb, X86Opcode::ImulRR),
+            24,
+            "two scalar IMULs per group"
+        );
+        assert_eq!(
+            rowreg_count_in(&func, rvb, X86Opcode::MovRM),
+            25,
+            "aik + 24 b-lane loads"
+        );
+        assert_eq!(rowreg_count_in(&func, rvb, X86Opcode::MovqToXmm), 24);
+        // pa advance + pxrow advance (leaf_x == k) + the fresh k counter.
+        assert_eq!(rowreg_count_in(&func, rvb, X86Opcode::AddRI), 3);
+        // Obligation dedup: the k-chain a-guard (leaf_i, 24, 576-23=553) and
+        // the inner c obligation (leaf_i, 24, 576-23=553) merge into ONE row
+        // check with the minimum limit.
+        assert_eq!(
+            count_rowreg_check_blocks(&func, Block(2)),
+            1,
+            "deduped to one row check"
+        );
+        let check_id = func
+            .blocks
+            .iter()
+            .find(|(id, blk)| {
+                **id != Block(2)
+                    && blk.successors.len() == 2
+                    && blk.successors.contains(&Block(2))
+                    && blk.insts.iter().any(|i| i.opcode == X86Opcode::CmpRR)
+            })
+            .map(|(id, _)| *id)
+            .unwrap();
+        assert!(
+            func.blocks[&check_id].insts.iter().any(|i| {
+                i.opcode == X86Opcode::MovRI
+                    && matches!(i.operands.get(1), Some(X86ISelOperand::Imm(553)))
+            }),
+            "check limit = 576 - (24-1) = 553"
+        );
+        // COEXISTENCE: the inner saxpy-Q plan applied to the original j-loop
+        // too — its VBU self-loop (with per-group MOVDQUs) is the fail path.
+        assert!(
+            func.blocks.iter().any(|(id, blk)| {
+                blk.successors.contains(id)
+                    && blk.insts.iter().any(|i| i.opcode == X86Opcode::MovdquRM)
+            }),
+            "inner saxpy-Q VBU must still be applied on the fail path"
+        );
+        // Both applies keep the regalloc-replay id discipline.
+        assert_block_ids_contiguous(&func);
+    }
+
+    #[test]
+    fn rowreg_vectorizes_nest_n8() {
+        let env_scope = crate::env_lock::override_scope();
+        let _on = crate::env_lock::ScopedEnvVar::set(&env_scope, "TCG_X86_SAXPYQ_ROWREG", "1");
+        let LoopShape { mut func, .. } = build_saxpyq_rowreg_nest(RowKnobs {
+            n: 8,
+            ..RowKnobs::default()
+        });
+        assert!(
+            X86Vectorize::default().run_on_function(&mut func),
+            "N=8 must row-vectorize (n_acc=4)"
+        );
+        let (rvpb, rvb, rvs) = find_rowreg_blocks(&func).expect("row-register blocks present");
+        assert_eq!(rowreg_count_in(&func, rvpb, X86Opcode::MovdquRM), 4);
+        assert_eq!(rowreg_count_in(&func, rvs, X86Opcode::MovdquMR), 4);
+        assert_eq!(rowreg_count_in(&func, rvb, X86Opcode::Punpcklqdq), 4);
+        assert_eq!(rowreg_count_in(&func, rvb, X86Opcode::ImulRR), 8);
+        assert_eq!(rowreg_count_in(&func, rvb, X86Opcode::MovRM), 9);
+        assert_block_ids_contiguous(&func);
+    }
+
+    #[test]
+    fn rowreg_vectorizes_k_invariant_x_row() {
+        // The x row at a k-INVARIANT leaf: the row is fixed (no pxrow
+        // advance) and the x obligation becomes a THIRD-source runtime check
+        // instead of the compile-time discharge.
+        let env_scope = crate::env_lock::override_scope();
+        let _on = crate::env_lock::ScopedEnvVar::set(&env_scope, "TCG_X86_SAXPYQ_ROWREG", "1");
+        let LoopShape { mut func, .. } = build_saxpyq_rowreg_nest(RowKnobs {
+            x_leaf_invariant: true,
+            ..RowKnobs::default()
+        });
+        assert!(
+            X86Vectorize::default().run_on_function(&mut func),
+            "the k-invariant-x nest must row-vectorize"
+        );
+        let (_, rvb, _) = find_rowreg_blocks(&func).expect("row-register blocks present");
+        // Fixed x row: only the pa advance and the fresh k counter.
+        assert_eq!(rowreg_count_in(&func, rvb, X86Opcode::AddRI), 2);
+        // (leaf_i, 24) [a-guard merged with the c obligation] + (leaf_xk, 24).
+        assert_eq!(count_rowreg_check_blocks(&func, Block(2)), 2);
+        assert_block_ids_contiguous(&func);
+    }
+
+    /// Every reject asserts the ROWREG shape is absent while the INNER
+    /// saxpy-Q may (and does) still fire — the discriminator is the RVB
+    /// self-loop pack body with no 16-byte memory op.
+    fn assert_rowreg_rejected(mut func: X86ISelFunction) {
+        assert!(
+            X86Vectorize::default().run_on_function(&mut func),
+            "the inner saxpy-Q must still fire on the reject path"
+        );
+        assert!(!has_rowreg_shape(&func), "the rowreg tier must NOT fire");
+        assert!(find_rowreg_blocks(&func).is_none());
+    }
+
+    #[test]
+    fn rowreg_rejects_odd_inner_trip() {
+        // N odd: a scalar j-remainder element would need a 13th carrier.
+        let env_scope = crate::env_lock::override_scope();
+        let _on = crate::env_lock::ScopedEnvVar::set(&env_scope, "TCG_X86_SAXPYQ_ROWREG", "1");
+        let LoopShape { func, .. } = build_saxpyq_rowreg_nest(RowKnobs {
+            n: 7,
+            ..RowKnobs::default()
+        });
+        assert_rowreg_rejected(func);
+    }
+
+    #[test]
+    fn rowreg_rejects_n_acc_above_12() {
+        // N=26 -> n_acc=13: 13 accumulators + temps exceed the 16-XMM budget.
+        // (mult/bound/slot scaled so EVERY other admission check passes: the
+        // compile-time discharge 23*26+25=623 < 624 holds.)
+        let env_scope = crate::env_lock::override_scope();
+        let _on = crate::env_lock::ScopedEnvVar::set(&env_scope, "TCG_X86_SAXPYQ_ROWREG", "1");
+        let LoopShape { func, .. } = build_saxpyq_rowreg_nest(RowKnobs {
+            n: 26,
+            mult: 26,
+            bound: 624,
+            slot_bytes: 4992,
+            ..RowKnobs::default()
+        });
+        assert_rowreg_rejected(func);
+    }
+
+    #[test]
+    fn rowreg_rejects_call_in_kbody() {
+        // SysV makes all 16 XMM caller-saved: a call would spill every
+        // accumulator (and is an unmodeled side effect). MUST reject.
+        let env_scope = crate::env_lock::override_scope();
+        let _on = crate::env_lock::ScopedEnvVar::set(&env_scope, "TCG_X86_SAXPYQ_ROWREG", "1");
+        let LoopShape { func, .. } = build_saxpyq_rowreg_nest(RowKnobs {
+            call_in_kbody: true,
+            ..RowKnobs::default()
+        });
+        assert_rowreg_rejected(func);
+    }
+
+    #[test]
+    fn rowreg_rejects_second_store_in_kbody() {
+        // A store in the k-body outside the j-loop: the closed-world memory
+        // accounting (only the j-loop touches memory besides the one aik
+        // load) dies. MUST reject.
+        let env_scope = crate::env_lock::override_scope();
+        let _on = crate::env_lock::ScopedEnvVar::set(&env_scope, "TCG_X86_SAXPYQ_ROWREG", "1");
+        let LoopShape { func, .. } = build_saxpyq_rowreg_nest(RowKnobs {
+            second_store_in_kbody: true,
+            ..RowKnobs::default()
+        });
+        assert_rowreg_rejected(func);
+    }
+
+    #[test]
+    fn rowreg_rejects_nonidentity_latch_carrier() {
+        // The latch writes `s_out` from a NON-pair vreg (a real value change)
+        // and `s_out` is read after the loop: bypassing the nest would leave
+        // the stale value observable. The a051240f-class check MUST reject.
+        let env_scope = crate::env_lock::override_scope();
+        let _on = crate::env_lock::ScopedEnvVar::set(&env_scope, "TCG_X86_SAXPYQ_ROWREG", "1");
+        let LoopShape { func, .. } = build_saxpyq_rowreg_nest(RowKnobs {
+            nonidentity_latch_carrier: true,
+            ..RowKnobs::default()
+        });
+        assert_rowreg_rejected(func);
+    }
+
+    #[test]
+    fn rowreg_rejects_kbody_def_live_out() {
+        // The k IV is read AFTER the loop: on the new path it would still
+        // hold its preheader value (0), not k_trip. MUST reject.
+        let env_scope = crate::env_lock::override_scope();
+        let _on = crate::env_lock::ScopedEnvVar::set(&env_scope, "TCG_X86_SAXPYQ_ROWREG", "1");
+        let LoopShape { func, .. } = build_saxpyq_rowreg_nest(RowKnobs {
+            kbody_def_escapes: true,
+            ..RowKnobs::default()
+        });
+        assert_rowreg_rejected(func);
+    }
+
+    #[test]
+    fn rowreg_rejects_x_slot_equal_c_slot() {
+        // `c[f] += aik * c[f]` is INNER-legal (read-before-write per
+        // iteration) but the register-resident row would make the x read see
+        // stale memory. slot_x == slot_c MUST reject at the rowreg tier.
+        let env_scope = crate::env_lock::override_scope();
+        let _on = crate::env_lock::ScopedEnvVar::set(&env_scope, "TCG_X86_SAXPYQ_ROWREG", "1");
+        let LoopShape { func, .. } = build_saxpyq_rowreg_nest(RowKnobs {
+            x_slot_is_c: true,
+            ..RowKnobs::default()
+        });
+        assert_rowreg_rejected(func);
+    }
+
+    #[test]
+    fn rowreg_rejects_kvarying_inner_leaf() {
+        // The inner c-offset leaf is recomputed k-VARYINGLY in the k-body:
+        // neither k-invariant nor the k IV — the row is not stationary and
+        // the obligation is unclassifiable. MUST reject (inner still fires).
+        let env_scope = crate::env_lock::override_scope();
+        let _on = crate::env_lock::ScopedEnvVar::set(&env_scope, "TCG_X86_SAXPYQ_ROWREG", "1");
+        let LoopShape { func, .. } = build_saxpyq_rowreg_nest(RowKnobs {
+            kvarying_inner_leaf: true,
+            ..RowKnobs::default()
+        });
+        assert_rowreg_rejected(func);
+    }
+
+    #[test]
+    fn rowreg_rejects_unguarded_aik_load() {
+        // No k-chain guard for the aik access: no k-quantified in-bounds
+        // evidence (the inner j-quantified obligation is NOT evidence over
+        // k). MUST reject.
+        let env_scope = crate::env_lock::override_scope();
+        let _on = crate::env_lock::ScopedEnvVar::set(&env_scope, "TCG_X86_SAXPYQ_ROWREG", "1");
+        let LoopShape { func, .. } = build_saxpyq_rowreg_nest(RowKnobs {
+            no_a_guard: true,
+            ..RowKnobs::default()
+        });
+        assert_rowreg_rejected(func);
+    }
+
+    #[test]
+    fn rowreg_rejects_two_inner_loops() {
+        // A second nested loop inside the k-body: the exactly-one-inner-loop
+        // discipline (window-scan step-0 pattern) MUST reject.
+        let env_scope = crate::env_lock::override_scope();
+        let _on = crate::env_lock::ScopedEnvVar::set(&env_scope, "TCG_X86_SAXPYQ_ROWREG", "1");
+        let LoopShape { func, .. } = build_saxpyq_rowreg_nest(RowKnobs {
+            second_inner_loop: true,
+            ..RowKnobs::default()
+        });
+        assert_rowreg_rejected(func);
     }
 }

@@ -7,10 +7,10 @@
 //! The CANONICAL pure-string classifiers for AY certification-gap reasons —
 //! promoted out of the `#[cfg(test)]`-only [`crate::formal_gap`] module so
 //! every out-of-crate exemption predicate (`rustc-codegen-trust-cg`'s
-//! `mem_refine.rs::alethe_crosscheck_gap` and its `lib.rs` `AYResult` sibling,
-//! `tests/support/cegis_alethe_gap.rs`) can DELEGATE here instead of
-//! hand-copying the strings. The hand copies drifted exactly because these
-//! predicates were trapped in a private test-only module; keeping them here,
+//! `mem_refine.rs::alethe_crosscheck_gap` and its `lib.rs` `AYResult` sibling)
+//! can DELEGATE here instead of hand-copying the strings. The hand copies
+//! drifted exactly because these predicates were trapped in a private
+//! test-only module; keeping them here,
 //! normally compiled and public, is the structural fix.
 //!
 //! Only the two pure classifiers live here. The fresh-transcript re-probe

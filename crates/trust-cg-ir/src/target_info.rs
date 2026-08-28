@@ -461,8 +461,9 @@ impl TargetInfo for AArch64Target {
         // - CSEL-family: test NZCV against a condition code immediate.
         // - FCSEL: the scalar FP conditional select reads NZCV exactly like
         //   the integer CSEL family (this entry had drifted out of sync with
-        //   `effects::reads_flags`; every scheduling/liveness consumer relies
-        //   on this target model being complete).
+        //   `effects::reads_flags`; the verifier's TST consumer scan and
+        //   every scheduling/liveness consumer rely on this target model
+        //   being complete).
         // - ADC/SBC: consume the carry flag for i128 multi-precision
         //   arithmetic. Classifying them here keeps any TargetInfo-based
         //   consumer from reordering/CSE'ing ADC/SBC across a flag writer.

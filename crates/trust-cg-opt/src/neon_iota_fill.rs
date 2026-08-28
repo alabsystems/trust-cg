@@ -967,6 +967,9 @@ fn apply(func: &mut MachFunction, rec: &Recognized) -> bool {
     let main_bound = alloc(func, RegClass::Gpr64);
     match rec.bound {
         Bound::Runtime(n) => {
+            // `pv` was created at the top of `apply` under exactly this
+            // discriminant (`matches!(rec.bound, Bound::Runtime(_)).then(..)`)
+            // and `rec` is a shared ref, so `rec.bound` cannot have changed.
             let pv = pv.expect("runtime bound -> precheck block");
             emit(
                 func,

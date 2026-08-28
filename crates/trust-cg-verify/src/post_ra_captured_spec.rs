@@ -664,6 +664,12 @@ fn op_requires_impurity_nonce(inst: &X86ISelInst, acc: &InstAccess) -> bool {
         // Explicit memory-form loads + Pop's implicit stack read.
         MovRM8 | MovRM16 | MovRM32 | MovRM | MovRMSib | MovRM32Sib | MovsdRM | MovssRM
         | MovdquRM | MovdqaRM | MovRipRel | MovssRipRel | MovsdRipRel | Pop => true,
+        // Memory-destination RMW ALU: reads the slot's VALUE (load-op-store),
+        // so it MUST carry the impurity nonce. These arms are deliberately
+        // explicit `true` (the `_ => has_memory_operand` default would already
+        // yield true) so nobody "tidies" them into the store `false` arm below
+        // — an RMW is NOT a store-only shape.
+        XorMR | AddMR | XorMRSib | AddMRSib => true,
         // Memory-shaped operand but never a memory VALUE read.
         MovMR8 | MovMR16 | MovMR32 | MovMR | MovMRSib | MovMR32Sib | MovsdMR | MovssMR
         | MovdquMR | MovdqaMR | Lea | LeaSib | LeaRip => false,

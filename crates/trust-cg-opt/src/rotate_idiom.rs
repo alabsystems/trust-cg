@@ -114,6 +114,17 @@ fn run_rotate_idiom(
     dom: Option<&DomTree>,
     mut provenance: Option<&mut ProvenanceMap>,
 ) -> bool {
+    // PREFILTER (exact): the only rewrite site is an `OrrRR`. Without one in the live block lists the pass cannot
+    // change anything, so skip the per-block scan and the dominating-constant census. Over-approximating
+    // presence is safe; the check is a single opcode sweep.
+    if !func
+        .block_order
+        .iter()
+        .flat_map(|b| func.block(*b).insts.iter())
+        .any(|&i| func.inst(i).opcode == AArch64Opcode::OrrRR)
+    {
+        return false;
+    }
     let mut changed = false;
     let dominating_constants = dom.map(|_| collect_unique_materialized_constants(func));
 

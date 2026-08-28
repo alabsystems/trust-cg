@@ -1039,6 +1039,10 @@ fn hoist_pure_call_clusters(
         idxs.sort_unstable_by(|a, b| b.cmp(a)); // descending
     }
     for (block_id, idxs) in &by_block {
+        // `by_block`'s keys all came from `to_hoist`, and a block only entered
+        // `to_hoist` after the discovery loop's
+        // `let Some(block) = func.blocks.get(&block_id) else { continue }`.
+        // Nothing between there and here inserts or removes a block.
         let block = func
             .blocks
             .get_mut(block_id)
@@ -1047,6 +1051,9 @@ fn hoist_pure_call_clusters(
             block.insts.remove(idx);
         }
     }
+    // The fail-closed `ph_insert_pos` gate at the top of this function is
+    // `func.blocks.get(&preheader).and_then(..)`, so `preheader` was proven
+    // present there; the loop above only removes INSTRUCTIONS, never a block.
     let ph = func
         .blocks
         .get_mut(&preheader)
@@ -2334,6 +2341,9 @@ fn verify_preheader_defs_precede_uses(
     preheader: Block,
     def_counts: &HashMap<VReg, usize>,
 ) {
+    // Both production callers (`hoist_loop_invariants`, `hoist_pure_call_clusters`)
+    // reach this only after splicing through a `blocks.get_mut(&preheader)`
+    // that succeeded a few lines earlier, and neither removes a block.
     let insts = &func
         .blocks
         .get(&preheader)
@@ -2461,6 +2471,10 @@ fn region_licm_hoist(
         if exits.len() != 1 {
             continue;
         }
+        // `exits.len() != 1` declined on the line above, so the set holds
+        // exactly one element. (Deliberately NOT softened into another
+        // `continue`: a set that is neither empty nor a singleton here would be
+        // a legality bug in the L4 scan, not a shape this pass may skip.)
         let exit_blk = *exits.iter().next().unwrap();
         if !outer.body.contains(&exit_blk) {
             continue;
@@ -2712,6 +2726,10 @@ fn region_licm_hoist(
         // Extract the INIT instructions out of `ip` (high-index-first).
         let mut init_insts: Vec<X86ISelInst> = Vec::with_capacity(init_idx.len());
         {
+            // The INIT-cluster scan earlier in this iteration opened with
+            // `let Some(ip_blk) = func.blocks.get(&ip) else { continue }`, and
+            // this is the first mutation of `func` since — the surgery below
+            // is what starts changing blocks.
             let ipb = func.blocks.get_mut(&ip).expect("ip exists");
             let mut idxs = init_idx.clone();
             idxs.sort_unstable_by(|a, b| b.cmp(a));

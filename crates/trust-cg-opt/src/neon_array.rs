@@ -2971,6 +2971,11 @@ fn bound_reg(func: &mut MachFunction, rec: &Recognized, pre: InstId) -> VReg {
 }
 
 fn apply(func: &mut MachFunction, rec: &Recognized) -> bool {
+    // IDEMPOTENCE: never vectorize the remainder loop of a loop this pass
+    // already vectorized (see `crate::vector_remainder`).
+    if crate::vector_remainder::preheader_folds_neon_lane_into(func, rec.preheader, rec.acc) {
+        return false;
+    }
     let width = UNROLL as i64 * VF; // lanes per vector iteration (16)
     let vh = func.create_block();
     let vb = func.create_block();
@@ -3709,6 +3714,11 @@ fn apply_i64(func: &mut MachFunction, rec: &Recognized) -> bool {
 /// + horizontal fold + scalar tail reproduce the scalar left-fold (comm + assoc
 ///   mod 2^64) — verified overflow-inclusive.
 fn apply_dot_widen(func: &mut MachFunction, rec: &Recognized) -> bool {
+    // IDEMPOTENCE: never vectorize the remainder loop of a loop this pass
+    // already vectorized (see `crate::vector_remainder`).
+    if crate::vector_remainder::preheader_folds_neon_lane_into(func, rec.preheader, rec.acc) {
+        return false;
+    }
     let Some(plan) = rec.dot else {
         return false; // unreachable: dispatched on rec.dot.is_some()
     };
@@ -4017,6 +4027,11 @@ fn apply_dot_widen(func: &mut MachFunction, rec: &Recognized) -> bool {
 ///   vector load reads indices the scalar loop also reads; the transform is
 ///   purely ADDITIVE (the scalar chain is never edited). QED.
 fn apply_abs_widen(func: &mut MachFunction, rec: &Recognized) -> bool {
+    // IDEMPOTENCE: never vectorize the remainder loop of a loop this pass
+    // already vectorized (see `crate::vector_remainder`).
+    if crate::vector_remainder::preheader_folds_neon_lane_into(func, rec.preheader, rec.acc) {
+        return false;
+    }
     let Some(plan) = rec.abs else {
         return false; // unreachable: dispatched on rec.abs.is_some()
     };
@@ -4276,6 +4291,11 @@ fn apply_abs_widen(func: &mut MachFunction, rec: &Recognized) -> bool {
 ///   accumulate (2 ops, clang's shape); when `CTPOP_UDOT_ENABLED` is off,
 ///   fail-closed to the proven `CNT` + `UADDLP`x2 + `ADD.4S` chain.
 fn apply_widen(func: &mut MachFunction, rec: &Recognized) -> bool {
+    // IDEMPOTENCE: never vectorize the remainder loop of a loop this pass
+    // already vectorized (see `crate::vector_remainder`).
+    if crate::vector_remainder::preheader_folds_neon_lane_into(func, rec.preheader, rec.acc) {
+        return false;
+    }
     let Some(plan) = rec.widen else {
         return false; // unreachable: dispatched on rec.widen.is_some()
     };
@@ -7323,5 +7343,77 @@ mod tests {
         func.next_vreg = 512;
         let mut pass = NeonArrayPass::new();
         assert!(!pass.run(&mut func), "LdrRO in the body must fail closed");
+    }
+
+    /// IDEMPOTENCE (the neon-bytesum / neon-fill bug class of 2026-08-27: a
+    /// vectorizer that keeps the scalar loop as the remainder and then
+    /// recognizes that remainder again on the next fixpoint iteration). After
+    /// the first firing, further runs must change nothing.
+    #[test]
+    fn second_run_is_a_no_op() {
+        let mut func = build_array_loop(false, ELEM_BYTES);
+        assert!(NeonArrayPass::new().run(&mut func), "first run must fire");
+        let (insts, blocks) = (func.insts.len(), func.blocks.len());
+        for again in 2..=4 {
+            assert!(
+                !NeonArrayPass::new().run(&mut func),
+                "run {again}: re-fired on its own output"
+            );
+            assert_eq!(func.insts.len(), insts, "run {again} added instructions");
+            assert_eq!(func.blocks.len(), blocks, "run {again} added blocks");
+        }
+    }
+
+    /// IDEMPOTENCE over every firing shape the builders offer (the primary
+    /// `second_run_is_a_no_op` covers one; today's bug class hid in shapes
+    /// the primary test did not exercise).
+    #[test]
+    fn second_run_is_a_no_op_for_every_firing_variant() {
+        let cases: Vec<(&str, Box<dyn Fn() -> MachFunction>)> = vec![
+            ("sum", Box::new(|| build_array_loop(false, ELEM_BYTES))),
+            ("dot", Box::new(|| build_array_loop(true, ELEM_BYTES))),
+            ("iv-term", Box::new(|| build_iv_term_loop(false))),
+            ("chain-abs-widen", Box::new(|| build_chain_abs_loop(0))),
+            ("chain-abs-plain", Box::new(|| build_chain_abs_loop(1))),
+            ("chain-dot", Box::new(|| build_chain_dot_loop(0))),
+            ("chain-dot-diamond", Box::new(|| build_chain_dot_loop(1))),
+            ("popcount", Box::new(|| build_popcount_loop(false))),
+            (
+                "widening-dot-signed",
+                Box::new(|| build_widening_dot_loop(AArch64Opcode::Sxtw, AArch64Opcode::Sxtw)),
+            ),
+            (
+                "widening-dot-unsigned",
+                Box::new(|| build_widening_dot_loop(AArch64Opcode::Uxtw, AArch64Opcode::Uxtw)),
+            ),
+            (
+                "inlined-puzzle",
+                Box::new(|| build_inlined_puzzle_loop(41249, 7, false)),
+            ),
+        ];
+        for (label, build) in cases {
+            let mut func = build();
+            assert!(
+                NeonArrayPass::new().run(&mut func),
+                "{label}: first run must fire"
+            );
+            let (insts, blocks) = (func.insts.len(), func.blocks.len());
+            for again in 2..=4 {
+                assert!(
+                    !NeonArrayPass::new().run(&mut func),
+                    "{label}: run {again} re-fired on its own output"
+                );
+                assert_eq!(
+                    func.insts.len(),
+                    insts,
+                    "{label}: run {again} added instructions"
+                );
+                assert_eq!(
+                    func.blocks.len(),
+                    blocks,
+                    "{label}: run {again} added blocks"
+                );
+            }
+        }
     }
 }

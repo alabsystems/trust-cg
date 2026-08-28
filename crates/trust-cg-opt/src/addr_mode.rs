@@ -61,7 +61,7 @@
 //! | 4 bytes     | 4     | 16380      | 0..=16380 (4-aligned) |
 //! | 8 bytes     | 8     | 32760      | 0..=32760 (8-aligned) |
 
-use std::collections::{HashMap, HashSet};
+use crate::fast_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use trust_cg_ir::{
     AArch64Opcode, BlockId, InstId, MachFunction, MachOperand, PassId, ProvenanceMap, RegClass,
@@ -69,7 +69,9 @@ use trust_cg_ir::{
 };
 
 use crate::dom::DomTree;
-use crate::effects::{aarch64_def_operand_positions, aarch64_use_operand_positions};
+use crate::effects::{
+    aarch64_for_each_def_position, aarch64_for_each_use_position, aarch64_use_operand_positions,
+};
 use crate::pass_manager::{AnalysisCache, MachinePass};
 
 /// Bounded depth for the early proof-use address walk.
@@ -268,7 +270,7 @@ fn run_addr_mode_early(func: &mut MachFunction, provenance: Option<&mut Provenan
     };
 
     let mut rewrites: Vec<EarlyPairRewrite> = Vec::new();
-    let mut to_delete: HashSet<InstId> = HashSet::new();
+    let mut to_delete: HashSet<InstId> = HashSet::default();
 
     for block_id in func.block_order.clone() {
         let block_insts = func.block(block_id).insts.clone();
@@ -459,7 +461,7 @@ fn try_early_pair_rewrites(
         return None;
     }
 
-    let mut pair_deletes = HashSet::new();
+    let mut pair_deletes = HashSet::default();
     for id in first.chain.iter().chain(second.chain.iter()).copied() {
         if already_deleted.contains(&id) || !pair_deletes.insert(id) {
             return None;
@@ -517,7 +519,7 @@ fn run_addr_mode(func: &mut MachFunction, mut provenance: Option<&mut Provenance
     let def_positions = collect_def_positions(func);
 
     // Step 3: Scan for LDR/STR instructions and try to fold.
-    let mut to_delete: HashSet<InstId> = HashSet::new();
+    let mut to_delete: HashSet<InstId> = HashSet::default();
     let mut folded_pairs: Vec<(InstId, InstId)> = Vec::new();
 
     for block_id in func.block_order.clone() {
@@ -697,7 +699,14 @@ fn run_addr_mode(func: &mut MachFunction, mut provenance: Option<&mut Provenance
     // ONLY as the base of RI load/store ops, with any number of uses in any
     // block, provided `base` is available (dominates, never redefined) at each
     // use and every combined offset encodes. Runs on the post-Step-4 stream.
-    changed |= fold_multiuse_base_plus_imm(func, provenance);
+    // Steps 3-4 mutate only when `to_delete` is non-empty (every fold inserts
+    // into it; Step 4 runs only then), so with it empty the stream Step 5 sees
+    // is the one Steps 1-2 analysed and their maps are handed down instead of
+    // being recomputed.
+    let snapshot = to_delete
+        .is_empty()
+        .then_some((&def_counts, &add_ri_defs, &def_positions));
+    changed |= fold_multiuse_base_plus_imm(func, provenance, snapshot);
 
     changed
 }
@@ -1092,17 +1101,17 @@ fn form_post_index(
 /// Uses target-specific operand roles so DefUse writeback bases count as
 /// uses without treating ordinary defs as sources.
 fn count_vreg_uses(func: &MachFunction) -> HashMap<VReg, u32> {
-    let mut counts: HashMap<VReg, u32> = HashMap::new();
+    let mut counts: HashMap<VReg, u32> = HashMap::default();
 
     for block_id in &func.block_order {
         let block = func.block(*block_id);
         for &inst_id in &block.insts {
             let inst = func.inst(inst_id);
-            for idx in aarch64_use_operand_positions(inst.opcode, inst.operands.len()) {
+            aarch64_for_each_use_position(inst.opcode, inst.operands.len(), |idx| {
                 if let Some(MachOperand::VReg(vreg)) = inst.operands.get(idx) {
                     *counts.entry(*vreg).or_insert(0) += 1;
                 }
-            }
+            });
         }
     }
 
@@ -1116,17 +1125,17 @@ fn count_vreg_uses(func: &MachFunction) -> HashMap<VReg, u32> {
 /// VReg as a value identity, because a later duplicate def can otherwise
 /// overwrite the candidate map for an earlier memory access.
 fn count_vreg_defs(func: &MachFunction) -> HashMap<VReg, u32> {
-    let mut counts: HashMap<VReg, u32> = HashMap::new();
+    let mut counts: HashMap<VReg, u32> = HashMap::default();
 
     for block_id in &func.block_order {
         let block = func.block(*block_id);
         for &inst_id in &block.insts {
             let inst = func.inst(inst_id);
-            for idx in aarch64_def_operand_positions(inst.opcode, inst.operands.len()) {
+            aarch64_for_each_def_position(inst.opcode, inst.operands.len(), |idx| {
                 if let Some(vreg) = inst.operands.get(idx).and_then(|op| op.as_vreg()) {
                     *counts.entry(vreg).or_insert(0) += 1;
                 }
-            }
+            });
         }
     }
 
@@ -1141,7 +1150,7 @@ fn collect_add_ri_defs(
     func: &MachFunction,
     def_counts: &HashMap<VReg, u32>,
 ) -> HashMap<VReg, AddDef> {
-    let mut defs: HashMap<VReg, AddDef> = HashMap::new();
+    let mut defs: HashMap<VReg, AddDef> = HashMap::default();
 
     for block_id in &func.block_order {
         let block = func.block(*block_id);
@@ -1184,7 +1193,7 @@ fn collect_sub_ri_defs(
     def_counts: &HashMap<VReg, u32>,
     enabled: bool,
 ) -> HashMap<VReg, AddDef> {
-    let mut defs: HashMap<VReg, AddDef> = HashMap::new();
+    let mut defs: HashMap<VReg, AddDef> = HashMap::default();
     if !enabled {
         return defs;
     }
@@ -1218,7 +1227,7 @@ fn collect_add_rr_defs(
     func: &MachFunction,
     def_counts: &HashMap<VReg, u32>,
 ) -> HashMap<VReg, AddDef> {
-    let mut defs: HashMap<VReg, AddDef> = HashMap::new();
+    let mut defs: HashMap<VReg, AddDef> = HashMap::default();
 
     for block_id in &func.block_order {
         let block = func.block(*block_id);
@@ -1245,17 +1254,17 @@ fn collect_add_rr_defs(
 
 /// Every def position of every vreg, in block order.
 fn collect_def_positions(func: &MachFunction) -> HashMap<VReg, Vec<(BlockId, usize)>> {
-    let mut defs: HashMap<VReg, Vec<(BlockId, usize)>> = HashMap::new();
+    let mut defs: HashMap<VReg, Vec<(BlockId, usize)>> = HashMap::default();
 
     for block_id in &func.block_order {
         let block = func.block(*block_id);
         for (position, &inst_id) in block.insts.iter().enumerate() {
             let inst = func.inst(inst_id);
-            for idx in aarch64_def_operand_positions(inst.opcode, inst.operands.len()) {
+            aarch64_for_each_def_position(inst.opcode, inst.operands.len(), |idx| {
                 if let Some(vreg) = inst.operands.get(idx).and_then(|op| op.as_vreg()) {
                     defs.entry(vreg).or_default().push((*block_id, position));
                 }
-            }
+            });
         }
     }
 
@@ -1280,15 +1289,22 @@ fn add_srcs_unchanged_between(
     mem_pos: usize,
 ) -> bool {
     let add_inst = func.inst(add_inst_id);
-    for idx in aarch64_use_operand_positions(add_inst.opcode, add_inst.operands.len()) {
+    let mut clobbered = false;
+    aarch64_for_each_use_position(add_inst.opcode, add_inst.operands.len(), |idx| {
+        if clobbered {
+            return;
+        }
         if let Some(src) = add_inst.operands.get(idx).and_then(|op| op.as_vreg())
             && let Some(defs) = def_positions.get(&src)
             && defs
                 .iter()
                 .any(|&(b, p)| b == block_id && p > add_pos && p < mem_pos)
         {
-            return false;
+            clobbered = true;
         }
+    });
+    if clobbered {
+        return false;
     }
     true
 }
@@ -1298,7 +1314,7 @@ fn collect_private_movz_const_defs(
     def_counts: &HashMap<VReg, u32>,
     use_counts: &HashMap<VReg, u32>,
 ) -> HashMap<VReg, ConstDef> {
-    let mut defs: HashMap<VReg, ConstDef> = HashMap::new();
+    let mut defs: HashMap<VReg, ConstDef> = HashMap::default();
 
     for block_id in &func.block_order {
         let block = func.block(*block_id);
@@ -1332,7 +1348,7 @@ fn collect_madd_const_offset_defs(
     use_counts: &HashMap<VReg, u32>,
     const_defs: &HashMap<VReg, ConstDef>,
 ) -> HashMap<VReg, ConstOffsetAddrDef> {
-    let mut defs: HashMap<VReg, ConstOffsetAddrDef> = HashMap::new();
+    let mut defs: HashMap<VReg, ConstOffsetAddrDef> = HashMap::default();
 
     for block_id in &func.block_order {
         let block = func.block(*block_id);
@@ -1514,7 +1530,7 @@ impl BaseCleanliness {
         add_block: BlockId,
         add_pos: usize,
     ) -> Self {
-        let mut defs_in_block: HashMap<BlockId, Vec<usize>> = HashMap::new();
+        let mut defs_in_block: HashMap<BlockId, Vec<usize>> = HashMap::default();
         for &(block_id, position) in base_defs {
             defs_in_block.entry(block_id).or_default().push(position);
         }
@@ -1526,8 +1542,8 @@ impl BaseCleanliness {
             .get(&add_block)
             .is_some_and(|defs| defs.iter().any(|&p| p > add_pos));
 
-        let mut dirty_entry: HashSet<BlockId> = HashSet::new();
-        let mut visited: HashSet<(BlockId, bool)> = HashSet::new();
+        let mut dirty_entry: HashSet<BlockId> = HashSet::default();
+        let mut visited: HashSet<(BlockId, bool)> = HashSet::default();
         let mut work: Vec<(BlockId, bool)> = func
             .block(add_block)
             .succs
@@ -1588,6 +1604,11 @@ impl BaseCleanliness {
 fn fold_multiuse_base_plus_imm(
     func: &mut MachFunction,
     provenance: Option<&mut ProvenanceMap>,
+    snapshot: Option<(
+        &HashMap<VReg, u32>,
+        &HashMap<VReg, AddDef>,
+        &HashMap<VReg, Vec<(BlockId, usize)>>,
+    )>,
 ) -> bool {
     if std::env::var_os("TCG_NO_ADDR_MODE_MULTIUSE_FOLD").is_some() {
         return false;
@@ -1595,17 +1616,32 @@ fn fold_multiuse_base_plus_imm(
     let multidef_base_enabled = std::env::var_os("TCG_NO_ADDR_MODE_MULTIDEF_BASE").is_none();
     let intrablock_enabled = std::env::var_os("TCG_NO_ADDR_MODE_INTRABLOCK_MULTIUSE").is_none();
 
-    // Fresh analysis on the post-Step-4 instruction stream.
-    let def_counts = count_vreg_defs(func);
-    let add_ri_defs = collect_add_ri_defs(func, &def_counts);
+    // The caller's Step 1-2 maps when Steps 3-4 changed nothing (the stream is
+    // the one they analysed); otherwise a fresh analysis of the post-Step-4
+    // instruction stream, exactly as before.
+    let (fresh_counts, fresh_add_ri, fresh_positions);
+    let (def_counts, add_ri_defs, def_positions): (
+        &HashMap<VReg, u32>,
+        &HashMap<VReg, AddDef>,
+        &HashMap<VReg, Vec<(BlockId, usize)>>,
+    ) = match snapshot {
+        Some(maps) => maps,
+        None => {
+            fresh_counts = count_vreg_defs(func);
+            fresh_add_ri = collect_add_ri_defs(func, &fresh_counts);
+            if fresh_add_ri.is_empty() {
+                return false;
+            }
+            // Every def position of every vreg (first entry = the unique def
+            // site of a single-def vreg).
+            fresh_positions = collect_def_positions(func);
+            (&fresh_counts, &fresh_add_ri, &fresh_positions)
+        }
+    };
     if add_ri_defs.is_empty() {
         return false;
     }
-
-    // Every def position of every vreg (first entry = the unique def site of
-    // a single-def vreg), plus every operand occurrence of every vreg.
-    let def_positions = collect_def_positions(func);
-    let mut occ: HashMap<VReg, Vec<OperandOcc>> = HashMap::new();
+    let mut occ: HashMap<VReg, Vec<OperandOcc>> = HashMap::default();
     for block_id in &func.block_order {
         let block = func.block(*block_id);
         for (position, &inst_id) in block.insts.iter().enumerate() {
@@ -1627,7 +1663,7 @@ fn fold_multiuse_base_plus_imm(
 
     // Transforms validated against the snapshot above, applied only at the end.
     let mut rewrites: Vec<(InstId, MachOperand, i64)> = Vec::new();
-    let mut to_delete: HashSet<InstId> = HashSet::new();
+    let mut to_delete: HashSet<InstId> = HashSet::default();
     let mut folded_pairs: Vec<(InstId, InstId)> = Vec::new();
 
     // Deterministic iteration order (defining-AddRI instruction id).

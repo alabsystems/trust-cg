@@ -2470,6 +2470,23 @@ fn apply_full_unroll(func: &mut MachFunction, plan: &Plan, fu: &FullUnroll) {
             }
             if let Some(lf) = fu.folds.iter().find(|f| f.load == bid) {
                 let base = base_of[&bid];
+                // `bid == lf.load`, and the only two sites that push a
+                // `LoadFold` (`try_full_unroll`, :1876 and :1907) match on
+                // `Ldr{,b,h}RO` / `Ldr{,b,h}RI` — exactly the six opcodes
+                // `percopy_ri_opcode` is total on.
+                //
+                // The opcode is still one of those six for two reasons, and
+                // NOT because the pass leaves opcodes alone: it does rewrite
+                // one. `normalize_const_trip_guards` (:810) assigns
+                // `inst.opcode = CmpRR`. It cannot disturb this claim because
+                // (a) ORDER — `run_core` calls it at :298, before the
+                // `Plan::recognize` loop that populates `folds`, so every
+                // `LoadFold` is matched against already-normalized code; and
+                // (b) SCOPE — it only ever retargets a `CmpRI` header guard,
+                // never a load, so it cannot move an opcode into or out of the
+                // six-opcode set. Both facts are load-bearing; the earlier
+                // wording claimed the pass rewrites no opcode at all, which is
+                // false and pointed a future reader at the wrong invariant.
                 let ri = percopy_ri_opcode(func.inst(bid).opcode).expect("validated load");
                 let d = alloc(func, lf.dst.class);
                 let off = lf.imm0 + lf.coeff * iv_val;

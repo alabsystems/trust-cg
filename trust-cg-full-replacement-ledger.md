@@ -1,12 +1,13 @@
 # trust-cg replacement-readiness ledger
 
-Version: v0.1.0 publication audit, 2026-07-22.
+Scope: the 0.x research-preview series. Publication audit of 2026-07-22.
 
 ## Decision
 
 trust-cg is **not** ready to replace LLVM, rustc's production codegen backends,
-or another general-purpose compiler backend. v0.1.0 is a source-only research
-preview with useful fail-closed slices and verification infrastructure.
+or another general-purpose compiler backend. The 0.x series is a source-only
+research preview with useful fail-closed slices and verification
+infrastructure.
 
 “Implemented” in this ledger means that a bounded path exists and has targeted
 tests. It does not mean complete language, target, ABI, object, or proof
@@ -14,7 +15,7 @@ coverage.
 
 ## Replacement gates
 
-| Area | v0.1.0 state | What blocks replacement |
+| Area | State | What blocks replacement |
 | --- | --- | --- |
 | trust-ir input | Partial | Complete type, constant, instruction, dialect, global, metadata, lifetime, parser/binary, and semantic coverage. |
 | Rust frontend bridge | Experimental and partial | Full stable rustc MIR, layout, mono-item, ABI, runtime, panic/unwind, drop, trait-object, TLS, static/vtable, and ecosystem coverage. |
@@ -72,8 +73,8 @@ Any replacement claim would require, for each target and object format:
 
 ## Evidence boundary
 
-v0.1.0 distinguishes exhaustive, statistical, external-SMT, and independently
-replayed evidence. These labels are not interchangeable.
+trust-cg distinguishes exhaustive, statistical, external-SMT, and
+independently replayed evidence. These labels are not interchangeable.
 
 - Statistical 32/64-bit evaluator runs are regression tests, not proofs.
 - An SMT `Verified` verdict is only about the represented obligation and trusts
@@ -89,7 +90,7 @@ Replacement requires a compositional argument covering validation, lowering,
 optimization, register allocation, encoding, object/link behavior, and runtime
 execution for every admitted program. That argument does not exist today.
 
-## v0.1.0 release gates
+## Release gates
 
 The publication candidate is expected to satisfy the committed, documented
 local gates, including:

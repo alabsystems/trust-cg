@@ -146,6 +146,8 @@ fn all_reconstructable() -> Vec<X86Opcode> {
         X86Opcode::Pmulld,
         // horizontal byte sum-of-absolute-differences (the byte-sum vectorizer):
         X86Opcode::Psadbw,
+        // low-qword pack (the saxpy-Q register-form [K;2] broadcast):
+        X86Opcode::Punpcklqdq,
         // packed integer compare-mask (incl. q-lane SSE4.1/4.2):
         X86Opcode::Pcmpeqb,
         X86Opcode::Pcmpeqw,
@@ -192,6 +194,14 @@ fn all_reconstructable() -> Vec<X86Opcode> {
         X86Opcode::CmpRM,
         // register-memory signed multiply (reg * load(ea)):
         X86Opcode::ImulRM,
+        // memory-destination RMW ALU (store(ea, load(ea) OP reg); base+disp
+        // and SIB forms — Stage 1 of the RMW arc: proofs land BEFORE any
+        // emission, and the Stage-2 fusion peephole is admission-gated on
+        // exactly this reconstruction discharging Valid):
+        X86Opcode::XorMR,
+        X86Opcode::AddMR,
+        X86Opcode::XorMRSib,
+        X86Opcode::AddMRSib,
         // in-place increment / decrement:
         X86Opcode::Inc,
         X86Opcode::Dec,
@@ -347,6 +357,67 @@ fn injected_sub_for_intended_iadd_refutes() {
             VerificationResult::Invalid { .. }
         ),
         "SUB-for-Iadd must REFUTE (bvadd != bvsub)"
+    );
+    assert!(buggy.is_genuinely_proven());
+}
+
+#[test]
+fn swapped_punpcklqdq_wiring_refutes() {
+    // LOW-QWORD PACK: PUNPCKLQDQ is NON-commutative (a.lane0 lands low,
+    // b.lane0 lands high). Swapped operand wiring must REFUTE — this is the
+    // teeth of the PackLowQwords reconstruction (the exact "which register
+    // lands in which slot" failure 6fc104c8 assumed only the encoder could
+    // catch).
+    let a = SmtExpr::var("recon_src1", 128);
+    let b = SmtExpr::var("recon_src2", 128);
+    let lane0 = |v: &SmtExpr| v.clone().extract(63, 0);
+    let spec =
+        trust_cg_verify::trust_ir_semantics::encode_trust_ir_pack_low_qwords(lane0(&a), lane0(&b));
+    let mut buggy = buggy_binary(
+        "RECONSTRUCTED x86_64 low-qword pack -> Punpcklqdq (INJECTED swapped wiring)",
+        "Punpcklqdq",
+        spec,
+        trust_cg_verify::x86_64_semantics::encode_punpcklqdq(b.clone(), a.clone()), // SWAPPED
+    );
+    buggy.inputs = vec![
+        ("recon_src1".to_string(), 128),
+        ("recon_src2".to_string(), 128),
+    ];
+    assert!(
+        matches!(
+            verify_by_evaluation(&buggy),
+            VerificationResult::Invalid { .. }
+        ),
+        "swapped PUNPCKLQDQ wiring must REFUTE (a.lane0 must land low)"
+    );
+    assert!(buggy.is_genuinely_proven());
+}
+
+#[test]
+fn injected_paddq_for_intended_pack_refutes() {
+    // isel emitted the lane-wise PADDQ where the low-qword pack was intended:
+    // add != pack, must REFUTE.
+    let a = SmtExpr::var("recon_src1", 128);
+    let b = SmtExpr::var("recon_src2", 128);
+    let lane0 = |v: &SmtExpr| v.clone().extract(63, 0);
+    let spec =
+        trust_cg_verify::trust_ir_semantics::encode_trust_ir_pack_low_qwords(lane0(&a), lane0(&b));
+    let mut buggy = buggy_binary(
+        "RECONSTRUCTED x86_64 low-qword pack -> Paddq (INJECTED isel bug)",
+        "Paddq",
+        spec,
+        trust_cg_verify::x86_64_semantics::encode_paddq(a.clone(), b.clone()), // WRONG opcode
+    );
+    buggy.inputs = vec![
+        ("recon_src1".to_string(), 128),
+        ("recon_src2".to_string(), 128),
+    ];
+    assert!(
+        matches!(
+            verify_by_evaluation(&buggy),
+            VerificationResult::Invalid { .. }
+        ),
+        "PADDQ-for-pack must REFUTE (add != pack)"
     );
     assert!(buggy.is_genuinely_proven());
 }
@@ -965,6 +1036,239 @@ mod memory {
         );
         // And it really is a bitvector of the result width.
         assert!(matches!(same1.eval(&env), EvalResult::Bv(_)));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MEMORY-DESTINATION RMW ALU (XorMR/AddMR + SIB forms) — SOUNDNESS PERIMETER
+// ---------------------------------------------------------------------------
+//
+// Stage 1 of the RMW arc (0cb31507 template: NO allowlist, reconstruction
+// credit only). The obligation is the literal COMPOSITION of the MemStore and
+// MemAlu shapes: SOURCE = concat(ir_ea, trust_ir(OP, load(ir_ea), src)),
+// MACHINE = concat(machine_ea, x86_alu(load(machine_ea), src)). These tests
+// lock in BOTH directions:
+//   (a) every faithful form (base+disp and SIB, XOR and ADD) reconstructs
+//       Valid with Reconstructed provenance and binds the source register as
+//       a declared input; AND
+//   (b) every injected corruption REFUTES — wrong EA (both halves diverge:
+//       load(ea) is a deterministic bijection of ea), Add-for-Xor (value
+//       half), dropped source / wrong source register (value half), and a
+//       plain store of src where the RMW was intended (value half).
+// A false COVERED credit here is as bad as a shipped miscompile: the Stage-2
+// fusion peephole's admission gate is this very reconstruction, so if any
+// refutation fails to fire the whole fail-closed argument is void.
+mod mem_rmw {
+    use super::*;
+    use trust_cg_verify::x86_64_semantics::encode_xor_rr;
+
+    fn mem(base: u32, disp: i32) -> X86ISelOperand {
+        X86ISelOperand::MemAddr {
+            base: Box::new(r64(base)),
+            disp,
+        }
+    }
+    fn sib(base: u32, index: u32, scale: u8, disp: i32) -> X86ISelOperand {
+        X86ISelOperand::SibMemAddr {
+            base: Box::new(r64(base)),
+            index: Box::new(r64(index)),
+            scale,
+            disp,
+        }
+    }
+
+    /// The faithful SOURCE side: concat(ir_ea, trust_ir(OP, load(ir_ea), src)).
+    fn source_side(op: &Opcode, ir_ea: SmtExpr) -> SmtExpr {
+        let src = SmtExpr::var("recon_src", 64);
+        let m = SmtExpr::mem_load(ir_ea.clone(), 64, false, 64);
+        let value = match op {
+            Opcode::Bxor => encode_trust_ir_bitwise_binop(op, Type::I64, m, src),
+            _ => encode_trust_ir_binop(op, Type::I64, m, src),
+        };
+        ir_ea.concat(value)
+    }
+
+    fn rmw_ob(name: &str, trust_ir_expr: SmtExpr, machine_expr: SmtExpr) -> ProofObligation {
+        ProofObligation {
+            name: name.to_string(),
+            trust_ir_expr,
+            aarch64_expr: machine_expr,
+            inputs: vec![
+                ("recon_base".to_string(), 64),
+                ("recon_src".to_string(), 64),
+            ],
+            preconditions: vec![],
+            fp_inputs: vec![],
+            category: None,
+            machine_side_provenance: MachineSideProvenance::Reconstructed {
+                from_opcode: "XorMR".to_string(),
+                arity: 2,
+            },
+        }
+    }
+
+    // -- (a) POSITIVE: all four faithful forms reconstruct Valid ---------------
+
+    #[test]
+    fn faithful_rmw_base_and_sib_forms_reconstruct_valid() {
+        for (opcode, operands) in [
+            (X86Opcode::XorMR, vec![mem(0, 16), r64(1)]),
+            (X86Opcode::AddMR, vec![mem(0, 16), r64(1)]),
+            (X86Opcode::XorMRSib, vec![sib(0, 1, 8, -160), r64(2)]),
+            (X86Opcode::AddMRSib, vec![sib(0, 1, 8, -160), r64(2)]),
+        ] {
+            let inst = X86ISelInst::new(opcode, operands);
+            let ob = reconstruct_x86_alu_obligation(&inst)
+                .unwrap_or_else(|| panic!("{opcode:?} must reconstruct"));
+            assert!(ob.is_reconstructed(), "{opcode:?} must be Reconstructed");
+            assert!(
+                ob.inputs.iter().any(|(n, _)| n == "recon_src"),
+                "{opcode:?} must bind the source register as an SMT input"
+            );
+            assert!(
+                matches!(verify_by_evaluation(&ob), VerificationResult::Valid),
+                "{opcode:?} faithful RMW must be Valid"
+            );
+        }
+    }
+
+    // -- (b) REFUTATION controls (0cb31507 template) ---------------------------
+
+    #[test]
+    fn rmw_wrong_ea_refutes() {
+        // The machine side reads AND writes a DIFFERENT effective address
+        // (disp +24 where +8 was intended): both the address half and the
+        // loaded pre-value diverge ⇒ REFUTE.
+        let base = SmtExpr::var("recon_base", 64);
+        let src = SmtExpr::var("recon_src", 64);
+        let ir_ea = encode_lea_base_disp(base.clone(), 8, 64);
+        let machine_ea = encode_lea_base_disp(base, 24, 64); // WRONG disp
+        let machine_m = SmtExpr::mem_load(machine_ea.clone(), 64, false, 64);
+        let buggy = rmw_ob(
+            "XorMR INJECTED wrong EA",
+            source_side(&Opcode::Bxor, ir_ea),
+            machine_ea.concat(encode_xor_rr(S, machine_m, src)),
+        );
+        assert!(
+            matches!(
+                verify_by_evaluation(&buggy),
+                VerificationResult::Invalid { .. }
+            ),
+            "an RMW against a wrong EA must REFUTE (address AND value halves differ)"
+        );
+    }
+
+    #[test]
+    fn rmw_wrong_sib_scale_refutes() {
+        // SIB form with scale=4 where scale=8 was intended: the EA composition
+        // itself diverges ⇒ REFUTE (the exact wrong-address-mode-lowering bug
+        // class the EA reconstruction exists to catch).
+        let base = SmtExpr::var("recon_base", 64);
+        let index = SmtExpr::var("recon_index", 64);
+        let src = SmtExpr::var("recon_src", 64);
+        let ir_ea = encode_lea_base_index_scale_disp(base.clone(), index.clone(), 8, -160);
+        let machine_ea = encode_lea_base_index_scale_disp(base, index, 4, -160); // WRONG scale
+        let machine_m = SmtExpr::mem_load(machine_ea.clone(), 64, false, 64);
+        let mut buggy = rmw_ob(
+            "XorMRSib INJECTED wrong scale x4-for-x8",
+            source_side(&Opcode::Bxor, ir_ea),
+            machine_ea.concat(encode_xor_rr(S, machine_m, src)),
+        );
+        buggy.inputs.insert(1, ("recon_index".to_string(), 64));
+        assert!(
+            matches!(
+                verify_by_evaluation(&buggy),
+                VerificationResult::Invalid { .. }
+            ),
+            "a SIB RMW with a wrong scale must REFUTE"
+        );
+    }
+
+    #[test]
+    fn add_for_xor_rmw_refutes() {
+        // The intended source op is Bxor but the machine executes ADD over the
+        // same (load(ea), src): xor(m, s) != m + s in general ⇒ REFUTE. This is
+        // the table-vs-emission mismatch the opcode-keyed machine half exists
+        // to catch.
+        let base = SmtExpr::var("recon_base", 64);
+        let src = SmtExpr::var("recon_src", 64);
+        let m = SmtExpr::mem_load(base.clone(), 64, false, 64);
+        let buggy = rmw_ob(
+            "XorMR INJECTED as AddMR",
+            source_side(&Opcode::Bxor, base.clone()),
+            base.concat(encode_add_rr(S, m, src)), // WRONG: add
+        );
+        assert!(
+            matches!(
+                verify_by_evaluation(&buggy),
+                VerificationResult::Invalid { .. }
+            ),
+            "Add-for-Xor RMW must REFUTE (xor(m,s) != m+s)"
+        );
+    }
+
+    #[test]
+    fn dropped_src_rmw_refutes() {
+        // The machine value half degenerates to the bare reload (the source
+        // register dropped entirely): xor(m, s) != m whenever s != 0 ⇒ REFUTE.
+        let base = SmtExpr::var("recon_base", 64);
+        let m = SmtExpr::mem_load(base.clone(), 64, false, 64);
+        let buggy = rmw_ob(
+            "XorMR INJECTED dropped source",
+            source_side(&Opcode::Bxor, base.clone()),
+            base.concat(m), // WRONG: no ALU, src dropped
+        );
+        assert!(
+            matches!(
+                verify_by_evaluation(&buggy),
+                VerificationResult::Invalid { .. }
+            ),
+            "an RMW that drops its source register must REFUTE"
+        );
+    }
+
+    #[test]
+    fn wrong_src_rmw_refutes() {
+        // The machine side XORs a DIFFERENT register than the intended source:
+        // xor(m, src) != xor(m, other) whenever src != other ⇒ REFUTE.
+        let base = SmtExpr::var("recon_base", 64);
+        let other = SmtExpr::var("recon_other", 64);
+        let m = SmtExpr::mem_load(base.clone(), 64, false, 64);
+        let mut buggy = rmw_ob(
+            "XorMR INJECTED wrong source register",
+            source_side(&Opcode::Bxor, base.clone()),
+            base.concat(encode_xor_rr(S, m, other)), // WRONG register
+        );
+        buggy.inputs.push(("recon_other".to_string(), 64));
+        assert!(
+            matches!(
+                verify_by_evaluation(&buggy),
+                VerificationResult::Invalid { .. }
+            ),
+            "an RMW wired to the wrong source register must REFUTE"
+        );
+    }
+
+    #[test]
+    fn plain_store_for_rmw_refutes() {
+        // The machine side is a PLAIN STORE of src (no load term at all — the
+        // MovMR shape) where the RMW was intended: xor(m, s) != s in general ⇒
+        // REFUTE. This pins that the RMW obligation cannot be satisfied by the
+        // already-proven MemStore machine half.
+        let base = SmtExpr::var("recon_base", 64);
+        let src = SmtExpr::var("recon_src", 64);
+        let buggy = rmw_ob(
+            "XorMR INJECTED as plain MovMR store",
+            source_side(&Opcode::Bxor, base.clone()),
+            base.concat(src), // WRONG: plain store, no load-op
+        );
+        assert!(
+            matches!(
+                verify_by_evaluation(&buggy),
+                VerificationResult::Invalid { .. }
+            ),
+            "a plain store where an RMW was intended must REFUTE"
+        );
     }
 }
 

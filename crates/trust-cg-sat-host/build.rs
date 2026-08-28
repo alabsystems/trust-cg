@@ -19,9 +19,14 @@
 //   `int main (int argc, char** argv)`
 //       -> `int microsat_unused_main (int argc, char** argv)`
 //
-// Plus a single in-body rewrite to fix the B1-follow-up analyze-driver
-// hand-off bug WITHOUT touching the upstream source on disk: line 133
-// of microsat.c initialises the top-of-`propagate` `forced` flag as
+// Plus narrow in-body rewrites that harden the embedded/library lifecycle
+// without touching the upstream source on disk:
+//
+// * close the input file before parse-time UNSAT returns;
+// * diagnose failed `fopen`/4 GiB `malloc` calls instead of dereferencing
+//   null pointers; and
+// * fix the B1-follow-up analyze-driver hand-off bug. Line 133 of microsat.c
+//   initialises the top-of-`propagate` `forced` flag as
 //
 //   int forced = S->reason[abs (*S->processed)];      // Initialize forced flag
 //
@@ -55,36 +60,63 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-fn main() {
+// Every failure below returns `Err` instead of panicking. A build script that
+// returns `Err` still fails the build loudly — cargo prints the message and
+// stops — so nothing is downgraded to a silent fallback; the `Err` form only
+// buys room to name the path that was resolved and the remediation, and keeps
+// this file free of panic-family sites (`ratchet/panic_audit.md`).
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let manifest_dir =
-        PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+        PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").ok_or(
+            "CARGO_MANIFEST_DIR is unset: run this build script through cargo, not directly",
+        )?);
     let workspace_root = manifest_dir
         .parent()
         .and_then(|p| p.parent())
-        .expect("workspace root has two ancestors above CARGO_MANIFEST_DIR")
+        .ok_or_else(|| {
+            format!(
+                "cannot derive the trust-cg workspace root from CARGO_MANIFEST_DIR {}: \
+                 expected <workspace>/crates/trust-cg-sat-host, i.e. two ancestors. \
+                 Build this crate from inside the trust-cg workspace, or vendor it \
+                 with that directory layout preserved.",
+                manifest_dir.display()
+            )
+        })?
         .to_path_buf();
     let microsat_src = workspace_root.join("third_party/vendor/microsat/microsat.c");
     let propagate_trampoline = manifest_dir.join("src/propagate_trampoline.c");
     let drat_trampoline = manifest_dir.join("src/drat_trampoline.c");
+    let solver_lifecycle = manifest_dir.join("src/solver_lifecycle.c");
     let wrapper_header = manifest_dir.join("include/microsat_wrapper.h");
-    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by cargo"));
+    let out_dir = PathBuf::from(
+        env::var_os("OUT_DIR")
+            .ok_or("OUT_DIR is unset: run this build script through cargo, not directly")?,
+    );
     let microsat_renamed = out_dir.join("microsat_renamed.c");
 
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed={}", microsat_src.display());
     println!("cargo:rerun-if-changed={}", propagate_trampoline.display());
     println!("cargo:rerun-if-changed={}", drat_trampoline.display());
+    println!("cargo:rerun-if-changed={}", solver_lifecycle.display());
     println!("cargo:rerun-if-changed={}", wrapper_header.display());
 
-    let upstream =
-        fs::read_to_string(&microsat_src).expect("read third_party/vendor/microsat/microsat.c");
+    let upstream = fs::read_to_string(&microsat_src).map_err(|e| {
+        format!(
+            "read vendored MicroSAT source {}: {e}. The pristine upstream copy \
+             (commit 26985d9b) is expected at third_party/vendor/microsat/microsat.c; \
+             restore it from the trust-cg checkout, or correct the workspace layout \
+             this path was derived from.",
+            microsat_src.display()
+        )
+    })?;
     let rewritten = rewrite_definitions(&upstream);
-    fs::write(&microsat_renamed, &rewritten).unwrap_or_else(|e| {
-        panic!(
+    fs::write(&microsat_renamed, &rewritten).map_err(|e| {
+        format!(
             "write rewritten microsat to {}: {e}",
             microsat_renamed.display()
         )
-    });
+    })?;
 
     // Explicit -O3 + -march=native so the MicroSAT C baseline we ship
     // is built at the same optimisation tier a production-tuned C BCP
@@ -103,6 +135,8 @@ fn main() {
         .file(&microsat_renamed)
         .file(&propagate_trampoline)
         .file(&drat_trampoline)
+        .file(&solver_lifecycle)
+        .include(manifest_dir.join("include"))
         .warnings(false)
         .extra_warnings(false)
         .opt_level(3);
@@ -118,14 +152,30 @@ fn main() {
         .allowlist_function("parse")
         .allowlist_function("solve")
         .allowlist_function("initCDCL")
+        .allowlist_function("microsat_destroy")
         .allowlist_type("solver")
         .layout_tests(false)
         .generate()
-        .expect("bindgen generates microsat bindings");
+        .map_err(|e| {
+            format!(
+                "bindgen could not generate the MicroSAT bindings from {}: {e}. \
+                 bindgen parses the header with libclang: install it (Debian/Ubuntu \
+                 `libclang-dev`, macOS Xcode command line tools), or set LIBCLANG_PATH \
+                 to an existing installation, or check that the header still declares \
+                 `parse`/`solve`/`initCDCL` and `struct solver`.",
+                wrapper_header.display()
+            )
+        })?;
 
-    bindings
-        .write_to_file(out_dir.join("microsat_bindings.rs"))
-        .expect("bindgen writes microsat_bindings.rs");
+    let bindings_out = out_dir.join("microsat_bindings.rs");
+    bindings.write_to_file(&bindings_out).map_err(|e| {
+        format!(
+            "write generated MicroSAT bindings to {}: {e}",
+            bindings_out.display()
+        )
+    })?;
+
+    Ok(())
 }
 
 /// Apply the four definition-only renames to the upstream microsat.c
@@ -229,5 +279,43 @@ extern int trust_cg_decision_level_is_zero(struct solver* S);\n\
         forced_needle, forced_count
     );
     out = out.replace(forced_needle, forced_replacement);
+
+    // The standalone parser returns directly when an empty/conflicting unit
+    // clause proves UNSAT, skipping the sole fclose at the bottom of parse.
+    // In a long-lived host or Criterion loop that leaks one descriptor per
+    // UNSAT instance. Patch only the generated build copy.
+    let parse_unsat_needle = "      if (!size || ((size == 1) && S->false[clause[0]]))   // Check for empty clause or conflicting unit\n        return UNSAT;                                      // If either is found return UNSAT";
+    let parse_unsat_replacement = "      if (!size || ((size == 1) && S->false[clause[0]])) { // Check for empty clause or conflicting unit\n        fclose (input); return UNSAT; }                     // Close input before returning UNSAT";
+    let parse_unsat_count = out.matches(parse_unsat_needle).count();
+    assert_eq!(
+        parse_unsat_count, 1,
+        "expected exactly one parse-time UNSAT return sequence, found {parse_unsat_count}; \
+         the vendored MicroSAT source may no longer match commit 26985d9b"
+    );
+    out = out.replace(parse_unsat_needle, parse_unsat_replacement);
+
+    // Upstream assumes both allocations succeed. Keep its fail-fast API, but
+    // turn the resulting null-pointer crashes into clear non-zero exits. A
+    // future fallible parser API can surface these as Rust errors instead.
+    let fopen_needle = "  int tmp; FILE* input = fopen (filename, \"r\");                           // Read the CNF file";
+    let fopen_replacement = "  int tmp; FILE* input = fopen (filename, \"r\");                           // Read the CNF file\n  if (!input) { perror (\"microsat: fopen\"); exit (1); }";
+    let fopen_count = out.matches(fopen_needle).count();
+    assert_eq!(
+        fopen_count, 1,
+        "expected exactly one MicroSAT fopen site, found {fopen_count}; \
+         the vendored MicroSAT source may no longer match commit 26985d9b"
+    );
+    out = out.replace(fopen_needle, fopen_replacement);
+
+    let malloc_needle =
+        "  S->DB = (int *) malloc (sizeof (int) * S->mem_max); // Allocate the initial database";
+    let malloc_replacement = "  S->DB = (int *) malloc (sizeof (int) * S->mem_max); // Allocate the initial database\n  if (!S->DB) { fprintf (stderr, \"microsat: cannot allocate solver database\\n\"); exit (1); }";
+    let malloc_count = out.matches(malloc_needle).count();
+    assert_eq!(
+        malloc_count, 1,
+        "expected exactly one MicroSAT DB malloc site, found {malloc_count}; \
+         the vendored MicroSAT source may no longer match commit 26985d9b"
+    );
+    out = out.replace(malloc_needle, malloc_replacement);
     out
 }

@@ -345,3 +345,20 @@ fn bails_on_non_unit_step() {
     let mut func = build_butterfly(6);
     assert_eq!(run(&mut func), 0);
 }
+
+/// IDEMPOTENCE (the neon-bytesum / neon-fill bug class of 2026-08-27: a
+/// vectorizer that keeps the scalar loop as the remainder and then recognizes
+/// that remainder again on the next fixpoint iteration, nesting one zero-trip
+/// vector loop per iteration until the cap). After the first firing, further
+/// runs must change nothing.
+#[test]
+fn second_run_is_a_no_op() {
+    let mut func = build_butterfly(0);
+    assert_eq!(run(&mut func), 1, "first run must fire");
+    let (insts, blocks) = (func.insts.len(), func.blocks.len());
+    for again in 2..=4 {
+        assert_eq!(run(&mut func), 0, "run {again}: re-fired on its own output");
+        assert_eq!(func.insts.len(), insts, "run {again} added instructions");
+        assert_eq!(func.blocks.len(), blocks, "run {again} added blocks");
+    }
+}

@@ -77,9 +77,58 @@ use sha2::{Digest, Sha256};
 /// Certificate schema tag, first line of every stored `.alethecert`.
 const ALETHE_CERT_SCHEMA: &str = "tcg-alethe-cert-v2";
 
-/// Store directory from `TCG_PROOF_CERT_STORE`, or `None` (tier disabled).
+/// Store directory for per-box Alethe certs.
+///
+/// Resolution order: `TCG_NO_CERT_STORE` or the global proof-reuse kill switch
+/// `TCG_NO_PROOF_CACHE` disables the tier entirely; `TCG_PROOF_CERT_STORE`
+/// names an explicit directory; otherwise the per-box default
+/// `$XDG_CACHE_HOME/trust-cg/alethe-certs`, then
+/// `$HOME/.cache/trust-cg/alethe-certs` (the `cegis_cache_io` precedent).
+/// `None` when no location is resolvable — the tier is fail-closed-inert.
+///
+/// The default is safe to leave on everywhere: cert filenames are
+/// `verdict_cache_key_v2(solver-bytes-sha256, smt2)`, so entries from
+/// different solver builds (or test fixtures) can never collide, and the
+/// consume path re-validates every binding and re-runs the independent
+/// checker on every hit — a stale or foreign entry costs a miss, never an
+/// acceptance.
 fn store_dir() -> Option<PathBuf> {
-    std::env::var_os("TCG_PROOF_CERT_STORE").map(PathBuf::from)
+    store_dir_from(
+        std::env::var_os("TCG_NO_CERT_STORE").is_some(),
+        std::env::var_os("TCG_NO_PROOF_CACHE").is_some(),
+        std::env::var_os("TCG_PROOF_CERT_STORE").map(PathBuf::from),
+        std::env::var("XDG_CACHE_HOME").ok(),
+        std::env::var_os("HOME").map(PathBuf::from),
+    )
+}
+
+/// Env-free core of [`store_dir`], so the resolution order is testable
+/// without process-global environment races.
+fn store_dir_from(
+    no_cert_store: bool,
+    no_proof_cache: bool,
+    explicit: Option<PathBuf>,
+    xdg_cache_home: Option<String>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if no_cert_store || no_proof_cache {
+        return None;
+    }
+    if let Some(dir) = explicit {
+        return Some(dir);
+    }
+    if let Some(xdg) = xdg_cache_home {
+        let trimmed = xdg.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed).join("trust-cg").join("alethe-certs"));
+        }
+    }
+    if let Some(home) = home {
+        if !home.as_os_str().is_empty() {
+            return Some(home.join(".cache").join("trust-cg").join("alethe-certs"));
+        }
+    }
+    None
 }
 
 fn debug_enabled() -> bool {
@@ -361,10 +410,10 @@ fn resolve_clean_checker_path() -> Option<PathBuf> {
 
 /// Per-process capability memo keyed by path AND executable content identity.
 /// Replacing a binary at an unchanged path cannot inherit the old verdict.
-fn checker_capability_memo() -> &'static Mutex<HashMap<(PathBuf, String), Result<(), CheckerDefect>>>
-{
-    static MEMO: OnceLock<Mutex<HashMap<(PathBuf, String), Result<(), CheckerDefect>>>> =
-        OnceLock::new();
+type CheckerCapabilityMemo = Mutex<HashMap<(PathBuf, String), Result<(), CheckerDefect>>>;
+
+fn checker_capability_memo() -> &'static CheckerCapabilityMemo {
+    static MEMO: OnceLock<CheckerCapabilityMemo> = OnceLock::new();
     MEMO.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -396,13 +445,17 @@ fn clean_checker_capability(path: &Path) -> Result<String, CheckerDefect> {
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     // Another thread may have raced us here; only the inserting thread warns,
-    // so the diagnostic stays a single block however many threads probe.
-    if !memo.contains_key(&key) {
-        if let Err(defect) = &verdict {
-            warn_checker_unusable(path, defect);
-        }
-        memo.insert(key, verdict.clone());
-    }
+    // so the diagnostic stays a single block however many threads probe. Use
+    // the stored result in either case so all racers observe one verdict.
+    let verdict = memo
+        .entry(key)
+        .or_insert_with(|| {
+            if let Err(defect) = &verdict {
+                warn_checker_unusable(path, defect);
+            }
+            verdict
+        })
+        .clone();
     verdict.map(|()| identity)
 }
 
@@ -485,7 +538,7 @@ pub(crate) fn clean_checker_path() -> Option<PathBuf> {
     clean_checker_capability(&pb).ok().map(|_| pb)
 }
 
-fn clean_checker_path_and_identity() -> Option<(PathBuf, String)> {
+pub(crate) fn clean_checker_path_and_identity() -> Option<(PathBuf, String)> {
     let path = resolve_clean_checker_path()?;
     let identity = clean_checker_capability(&path).ok()?;
     Some((path, identity))
@@ -577,7 +630,7 @@ fn consume_verified_text(
     smt2: &str,
     checker: Option<(PathBuf, String)>,
 ) -> bool {
-    let Some(cert) = AletheCert::parse(&text) else {
+    let Some(cert) = AletheCert::parse(text) else {
         trace!("{verdict_key}: malformed cert, declining");
         return false;
     };
@@ -661,6 +714,7 @@ fn run_clean_verify_external(
 /// exact proof. Callers must obtain `checker` from [`clean_checker_path`], so
 /// a `false` here always means "this proof was checked and refused", never
 /// "this binary refuses everything".
+#[cfg(test)]
 pub(crate) fn carcara_verify(checker: &Path, smt2: &str, alethe_proof: &str) -> bool {
     // Re-establish capability for the exact bytes about to perform this replay.
     // `clean_checker_path()` and this call are separated by ordinary caller
@@ -673,7 +727,7 @@ pub(crate) fn carcara_verify(checker: &Path, smt2: &str, alethe_proof: &str) -> 
     carcara_verify_with_expected_checker(checker, &identity, smt2, alethe_proof)
 }
 
-fn carcara_verify_with_expected_checker(
+pub(crate) fn carcara_verify_with_expected_checker(
     checker: &Path,
     expected_checker_sha256: &str,
     smt2: &str,
@@ -761,6 +815,81 @@ fn ay_stdout_is_exact_unsat(status_success: bool, stdout: &str) -> bool {
 /// re-run the solver with Alethe proof emission, have Carcara confirm the proof
 /// BEFORE writing, and atomically persist the cert. Never mints unchecked;
 /// no-ops while recording, when the store is disabled, or on any failure.
+/// Persist a proof the CURRENT process just Carcara-verified against `smt2`,
+/// so the next identical compile on this box can skip the live derivation.
+///
+/// Unlike [`mint_alethe_cert`] this never re-runs the solver: the proof in
+/// hand is the one the independent checker accepted moments ago, and the
+/// consume path re-validates every binding (and re-runs the checker) on every
+/// hit — a bad write can only ever cost a cache miss, never an acceptance.
+pub(crate) fn persist_verified_alethe(
+    solver_path: &str,
+    smt2: &str,
+    obligation_name: &str,
+    alethe_proof: &str,
+    external_clean_checker_identity: &str,
+) {
+    let Some(dir) = store_dir() else {
+        return;
+    };
+    if crate::verdict_db::recording_active() {
+        return;
+    }
+    persist_verified_alethe_into(
+        &dir,
+        solver_path,
+        smt2,
+        obligation_name,
+        alethe_proof,
+        external_clean_checker_identity,
+    );
+}
+
+/// Env-free core of [`persist_verified_alethe`] (no store gate, no recording
+/// gate), so tests can drive the write path against explicit directories.
+/// Returns whether a cert was written.
+fn persist_verified_alethe_into(
+    dir: &Path,
+    solver_path: &str,
+    smt2: &str,
+    obligation_name: &str,
+    alethe_proof: &str,
+    external_clean_checker_identity: &str,
+) -> bool {
+    let Some(identity) = crate::ay_bridge::solver_identity_hash(solver_path) else {
+        return false;
+    };
+    let verdict_key = crate::ay_bridge::verdict_cache_key_v2(&identity, smt2);
+    let path = cert_path(dir, &verdict_key);
+    if path.exists() {
+        return false;
+    }
+    let cert = AletheCert {
+        producer_ay_identity: identity,
+        external_clean_checker_identity: external_clean_checker_identity.to_string(),
+        smt2_sha256: sha256_hex(smt2.as_bytes()),
+        obligation_name: obligation_name.to_string(),
+        smt2: smt2.to_string(),
+        alethe_proof: alethe_proof.to_string(),
+    };
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    // Unique tmp name: two rustc processes promoting the same obligation
+    // concurrently must not interleave on one tmp file (contents are
+    // identical either way, but a torn rename would strand debris).
+    let tmp = dir.join(format!(".{verdict_key}.{}.tmp", std::process::id()));
+    if std::fs::write(&tmp, cert.serialize()).is_err() {
+        return false;
+    }
+    if std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return false;
+    }
+    trace!("{verdict_key}: persisted promotion-time cert for {obligation_name:?}");
+    true
+}
+
 pub(crate) fn mint_alethe_cert(
     verdict_key: &str,
     solver_path: &str,
@@ -1117,6 +1246,100 @@ mod tests {
             smt2: smt2.to_string(),
             alethe_proof: proof.to_string(),
         }
+    }
+
+    #[test]
+    fn store_dir_resolution_order_and_kill_switches() {
+        let explicit = Some(PathBuf::from("/explicit/store"));
+        let xdg = Some("/xdg-cache".to_string());
+        let home = Some(PathBuf::from("/home/box"));
+
+        // Either kill switch wins over everything.
+        assert_eq!(
+            store_dir_from(true, false, explicit.clone(), xdg.clone(), home.clone()),
+            None
+        );
+        assert_eq!(
+            store_dir_from(false, true, explicit.clone(), xdg.clone(), home.clone()),
+            None
+        );
+        // Explicit override beats the per-box defaults.
+        assert_eq!(
+            store_dir_from(false, false, explicit, xdg.clone(), home.clone()),
+            Some(PathBuf::from("/explicit/store"))
+        );
+        // XDG_CACHE_HOME beats HOME.
+        assert_eq!(
+            store_dir_from(false, false, None, xdg, home.clone()),
+            Some(PathBuf::from("/xdg-cache/trust-cg/alethe-certs"))
+        );
+        // Blank XDG falls through to HOME.
+        assert_eq!(
+            store_dir_from(false, false, None, Some("  ".to_string()), home),
+            Some(PathBuf::from("/home/box/.cache/trust-cg/alethe-certs"))
+        );
+        // No location at all: tier stays inert.
+        assert_eq!(store_dir_from(false, false, None, None, None), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persist_writes_a_cert_the_consume_path_accepts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store");
+        let solver = dir.path().join("solverbin");
+        std::fs::write(&solver, b"promotion-fixture-solver").unwrap();
+        let smt2 = "(assert false)\n(check-sat)";
+        let proof = "(step t1 (cl) :rule false)";
+        // The consume replay runs the checker subprocess; a capable-transcript
+        // stub stands in for Clean exactly as in the probe tests above.
+        let checker = fake_checker(dir.path(), TRANSCRIPT_CAPABLE_STDOUT, "", 0);
+        let checker_id = crate::lrat_cert::checker_binary_sha256(&checker).unwrap();
+
+        assert!(persist_verified_alethe_into(
+            &store,
+            solver.to_str().unwrap(),
+            smt2,
+            "test:persist-roundtrip",
+            proof,
+            &checker_id,
+        ));
+        // Second persist of the same obligation is a no-op (file exists).
+        assert!(!persist_verified_alethe_into(
+            &store,
+            solver.to_str().unwrap(),
+            smt2,
+            "test:persist-roundtrip",
+            proof,
+            &checker_id,
+        ));
+
+        let id = crate::ay_bridge::solver_identity_hash(solver.to_str().unwrap()).unwrap();
+        let key = crate::ay_bridge::verdict_cache_key_v2(&id, smt2);
+        assert!(
+            cert_path(&store, &key).exists(),
+            "filename must be the derived key"
+        );
+        assert!(consume_verified_in(
+            &store,
+            &key,
+            solver.to_str().unwrap(),
+            smt2,
+            Some((checker, checker_id)),
+        ));
+        // A different solver identity must miss the same cert (tooth 2).
+        let other = dir.path().join("otherbin");
+        std::fs::write(&other, b"different-solver-bytes").unwrap();
+        assert!(!consume_verified_in(
+            &store,
+            &key,
+            other.to_str().unwrap(),
+            smt2,
+            Some((
+                fake_checker(dir.path(), TRANSCRIPT_CAPABLE_STDOUT, "", 0),
+                "55".repeat(32)
+            )),
+        ));
     }
 
     #[test]

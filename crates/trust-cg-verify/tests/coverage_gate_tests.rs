@@ -226,7 +226,13 @@ fn assert_inventory_matches_enum_source<T: std::fmt::Debug>(
 ///     that reusing the structurally-identical encode_ubfm_extract would be). Both
 ///     are emitted at the 32-bit AND 64-bit register forms, so the
 ///     width-polymorphic gate requires the w32 AND w64 proofs (both discharge
-///     Statistical). Bfm (insert), RorRI (not isel-emitted), Rbit stay fail-closed.
+///     Statistical). Bfm (insert) and Rbit stay fail-closed. RorRI is NO LONGER
+///     in that set: the rotate recognizer now emits it STANDALONE when the EOR
+///     does not fuse, and it is covered on BOTH counts its former deferred
+///     reason named — its own faithful W+X rotate obligations
+///     (all_ror_immediate_proofs) AND the per-instruction, width- and
+///     immediate-sensitive EXTR-alias reconstruction. Either alone would
+///     discharge the row; both are required to stay wired.
 ///   * +5 opcodes credited via the NEON BITWISE per-lane-intent extension:
 ///     NeonAndV, NeonOrrV, NeonEorV, NeonBicV, and NeonNotV — the V128 bitwise
 ///     vector ops — are bound to the FAITHFUL per-lane-intent == whole-register
@@ -268,7 +274,7 @@ fn assert_inventory_matches_enum_source<T: std::fmt::Debug>(
 ///   model + the silicon-validated NEON-FP differential bridge. +5 covered
 ///   (+1 to the denominator: NeonFcmgtV is a NEW opcode).
 ///
-/// AArch64 accepted-obligation coverage is 155/248. The 93 RED rows are all
+/// AArch64 accepted-obligation coverage is 156/248. The 92 RED rows are all
 /// explicit `DeferredUnfaithfulModel` findings. This ratio inventories evidence
 /// acceptance for emitted value/effect opcodes; it is not a formal-correctness
 /// percentage.
@@ -435,7 +441,8 @@ fn aarch64_emittable_coverage_is_honest_under_strict() {
     // operands, and shift amount; the AY suite refutes wrong shift kinds and
     // amounts. +2 emittable AND +2 covered. Complete packed-NZCV TST authority
     // later moves one existing row from deferred to covered; combined with the
-    // independent UMULL discharge below, this leaves 91 named RED rows.
+    // independent UMULL and standalone-RorRI discharges below, this leaves 90
+    // named RED rows before the StrbRO/StrhRO universe backfill.
     // 140/140 -> 141/141 (NeonRev64V): the NEON 32-bit pair swap (REV64 Vd.4S)
     // the AoS complex-butterfly vectorizer (neon_butterfly) emits to swap each
     // {rp, ip} pair in-register before the twiddle multiply. Moved from the
@@ -486,9 +493,20 @@ fn aarch64_emittable_coverage_is_honest_under_strict() {
     // inherit the unsigned zext proof. +1 covered, denominator unchanged;
     // 93 -> 92 named RED rows. The complete packed-NZCV TST W/X pair then
     // removes one more RED row, yielding 155/246 with 91 RED rows at that stage.
+    // RorRI — now emitted STANDALONE by the rotate recognizer when the EOR does
+    // not fuse — then left the deferred set with its faithful W+X rotate
+    // obligations (all_ror_immediate_proofs; wrong-amount / ROR-vs-LSR /
+    // rotate-direction refute controls), giving 156/246 with 90 RED rows.
     // StrbRO and StrhRO subsequently entered the audited universe as emitted
     // register-offset stores. Both fail closed pending a faithful memory-effect
-    // model, so the current inventory is 155/248 with 93 named RED rows.
+    // model, so the current inventory is 156/248 with 92 named RED rows.
+    // RorRI's credit is DOUBLY sourced and both sources must stay wired: the
+    // width-complete W+X registered rotate obligations AND the width- and
+    // immediate-sensitive per-instruction EXTR-alias reconstruction — exactly
+    // the two disjuncts its old deferred reason named as missing. The ordering
+    // of the last two moves is immaterial: taking StrbRO/StrhRO first gives
+    // 155/248 with 93 RED rows, and RorRI's discharge then lands on the same
+    // 156/248 inventory with 92 named RED rows.
     //
     // PUBLICATION HONESTY: the emitted value/effect denominator includes the 94
     // forms previously hidden in the historical fail-closed/covered-elsewhere
@@ -504,17 +522,17 @@ fn aarch64_emittable_coverage_is_honest_under_strict() {
     );
     assert_eq!(
         report.covered_count(),
-        155,
+        156,
         "AArch64 accepted-obligation count changed; do not re-admit X==X identities or hide \
          emitted value/effect debt outside the denominator:\n{}",
         report.audit_log()
     );
     assert!(
-        (report.coverage_percent() - (155.0 / 248.0 * 100.0)).abs() < f64::EPSILON,
-        "AArch64 accepted-obligation ratio drifted from the honest 155/248"
+        (report.coverage_percent() - (156.0 / 248.0 * 100.0)).abs() < f64::EPSILON,
+        "AArch64 accepted-obligation ratio drifted from the honest 156/248"
     );
 
-    // All 93 uncovered rows must be explicitly named model debt. A generic
+    // All 92 uncovered rows must be explicitly named model debt. A generic
     // mapping/discharge failure is a new wiring regression, while moving a row
     // back to the exclusion bucket is denominator shrinkage.
     assert!(
@@ -524,8 +542,8 @@ fn aarch64_emittable_coverage_is_honest_under_strict() {
     let failures = report.failures();
     assert_eq!(
         failures.len(),
-        93,
-        "AArch64 must have exactly the 93 pinned deferred rows:\n{}",
+        92,
+        "AArch64 must have exactly the 92 pinned deferred rows:\n{}",
         report.failure_summary()
     );
     assert!(
@@ -608,6 +626,22 @@ fn aarch64_tst_is_covered_by_complete_width_pair() {
         row.finding.is_none(),
         "TST must be covered by both packed-NZCV theorems: {}",
         row.note
+    );
+}
+
+/// RorRI is now emitted STANDALONE (the rotate recognizer emits it when the EOR
+/// does not fuse), so its coverage credit must come from the complete W+X rotate
+/// pair and the row must no longer sit in the deferred-value-op table.
+#[test]
+fn aarch64_ror_immediate_is_covered_by_complete_width_pair() {
+    let proofs = aarch64_width_polymorphic_proofs(AArch64Opcode::RorRI)
+        .expect("standalone RorRI must be width-complete gated");
+    assert_eq!(proofs.len(), 2);
+    assert!(proofs.iter().any(|p| p.encoded_width_bits == 32));
+    assert!(proofs.iter().any(|p| p.encoded_width_bits == 64));
+    assert!(
+        aarch64_deferred_value_op_reason(AArch64Opcode::RorRI).is_none(),
+        "RorRI is credited via all_ror_immediate_proofs and must not stay deferred"
     );
 }
 
@@ -831,14 +865,24 @@ fn x86_emittable_coverage_is_honest_under_strict() {
     // independently reconstructed SIB load/store family to I8 width.
     // The 162/191 -> 163/192 net: RolRI is inventoried and covered by the
     // existing RotL_I operand reconstruction; wrong direction/count refutes.
+    // The 163/192 -> 167/196 net (RMW Stage 1): the memory-destination RMW ALU
+    // quartet XorMR/AddMR/XorMRSib/AddMRSib. +4 emittable AND +4 covered — the
+    // MemRmw reconstruction composes the proven MemStore shape (address half +
+    // stored-value half) with the proven MemAlu shape (the REAL machine ALU
+    // encoder over a load of the same EA) on the shared
+    // `x86_reconstruct_effective_address`; wrong EA / Add-for-Xor /
+    // dropped-or-wrong src / plain-store-for-RMW all REFUTE (mem_rmw controls
+    // in reconstruction_x86.rs). NOTHING emits these opcodes yet: proofs land
+    // BEFORE the Stage-2 fusion peephole, whose admission gate is this very
+    // reconstruction discharging Valid.
     assert_eq!(
         report.emittable_count(),
-        192,
+        196,
         "x86-64 emitted value/effect denominator changed; update the pin deliberately"
     );
     assert_eq!(
         report.covered_count(),
-        163,
+        167,
         "x86-64 GENUINE (non-degenerate / reconstructed-Valid) emittable coverage changed; \
          update the pinned numbers deliberately — do NOT re-admit X==X identities to inflate this, \
          do NOT credit a memory op without a faithful independent effective-address encoder, and \
@@ -846,8 +890,8 @@ fn x86_emittable_coverage_is_honest_under_strict() {
         report.audit_log()
     );
     assert!(
-        (report.coverage_percent() - (163.0 / 192.0 * 100.0)).abs() < f64::EPSILON,
-        "x86-64 accepted-obligation ratio drifted from the honest 163/192"
+        (report.coverage_percent() - (167.0 / 196.0 * 100.0)).abs() < f64::EPSILON,
+        "x86-64 accepted-obligation ratio drifted from the honest 167/196"
     );
 
     let expected_red: std::collections::HashSet<_> = [
@@ -1083,7 +1127,7 @@ fn aarch64_universe_has_no_duplicates_and_matches_pinned_count() {
          were already classified EmittableNeedsProof but missing from the \
          explicit audit universe; both remain honest DeferredUnfaithfulModel \
          rows pending an independent faithful memory-effect model. \
-         The accepted/emitted-value-effect headline is 155/248 with 93 explicit \
+         The accepted/emitted-value-effect headline is 156/248 with 92 explicit \
          DeferredUnfaithfulModel RED rows; see \
          aarch64_emittable_coverage_is_honest_under_strict.)"
     );
@@ -1101,7 +1145,7 @@ fn x86_universe_has_no_duplicates_and_matches_pinned_count() {
     );
     assert_eq!(
         ALL_X86_OPCODES.len(),
-        225,
+        229,
         "x86-64 opcode count changed — a variant was added/removed. Update the array AND this \
          pinned count, and classify the new opcode in classify_x86 (the build already forced that). \
          (197 = 191 + the 2026-07-18 UNIVERSE BACKFILL of 6 opcodes that existed in the enum but \
@@ -1117,7 +1161,10 @@ fn x86_universe_has_no_duplicates_and_matches_pinned_count() {
          reconstruction that already proves MovRMSib — a composition of two proven \
          families, adding no new trust root. The +2 to 224 are the 8-bit SIB load/store \
          pair MovRM8Sib/MovMR8Sib; the +1 to 225 is RolRI. All three have real encoder, \
-         decoder, differential, and reconstructed-proof coverage.)"
+         decoder, differential, and reconstructed-proof coverage. The +4 to 229 are the \
+         memory-destination RMW ALU quartet XorMR/AddMR/XorMRSib/AddMRSib (RMW Stage 1): \
+         EmittableNeedsProof, covered by the MemRmw reconstruction — encoder, decode-check, \
+         and refutation-control coverage landed BEFORE any pass may emit them.)"
     );
 }
 
@@ -1249,9 +1296,11 @@ fn riscv_idiom_bindings_are_non_degenerate() {
 /// NaN-mishandling lowering REFUTES. Only the 7 SIMD/v128 ops remain HONESTLY
 /// DEFERRED — left RED — pending lane-vector semantics.
 ///
-/// TRUE HONEST HEADLINE: 109 / 111 of the value-equivalence denominator. The two
-/// emitted scalar constant forms remain explicit RED until their signed-LEB
-/// immediates are independently decoded. The three reserved v128 load/store/const
+/// TRUE HONEST HEADLINE: 111 / 113 of the value-equivalence denominator. The two
+/// INTEGER constant forms are credited by P4's independent signed-LEB decode; the
+/// two FLOAT constant forms (f32.const 0x43 / f64.const 0x44) are explicit RED
+/// named deferrals, because their immediates are raw IEEE-754 payloads that the
+/// signed-LEB decoder does not reach. The three reserved v128 load/store/const
 /// forms are never selected and remain outside the denominator.
 /// The four LANE-WISE v128 value ops (i32x4.add/mul, f32x4.add/mul) are now
 /// faithfully reconstructed lane-wise (a wrong sub-opcode / lane width REFUTES).
@@ -1261,54 +1310,65 @@ fn wasm_inventory_pins_accepted_and_deferred_rows() {
     // Always print the full audit so the allowlist stays visible in CI logs.
     eprintln!("{}", report.audit_log());
 
-    // The denominator is the 111 value-bearing ops: 83 reconstructable scalar + 2
+    // The denominator is the 113 value-bearing ops: 83 reconstructable scalar + 2
     // popcnt + 4 reinterpret + 8 int->FP convert + 8 saturating trunc + 4 SIMD
-    // lane-wise value ops + 2 emitted scalar constants. The 3 reserved v128
-    // forms (load/store/const) are never selected.
+    // lane-wise value ops + 4 emitted scalar constants (2 integer + 2 float).
+    // The 3 reserved v128 forms (load/store/const) are never selected.
     assert_eq!(
         report.emittable_count(),
-        111,
+        113,
         "wasm emittable (value-equivalence denominator) count changed — it must include the 4 \
-         SIMD lane-wise value ops and scalar constants but NOT the 3 never-selected v128 forms; update \
-         deliberately. Re-check classify_wasm and wasm_function_verifier::opcode_to_source_op."
+         SIMD lane-wise value ops and ALL FOUR scalar constants (i32/i64/f32/f64) but NOT the 3 \
+         never-selected v128 forms; update deliberately. Re-check classify_wasm and \
+         wasm_function_verifier::opcode_to_source_op."
     );
-    // COVERED = 83 scalar + 2 popcnt + 4 reinterpret + 16 conversion + 4 SIMD = 109,
-    // all via reconstruction.
+    // COVERED = 83 scalar + 2 popcnt + 4 reinterpret + 16 conversion + 4 SIMD
+    // = 109 via stack-machine reconstruction, PLUS the 2 INTEGER scalar
+    // constants, which P4 credits by a different path: reconstruction cannot
+    // help a constant (const == const is a self-equality), so their evidence is
+    // an INDEPENDENT spec-derived signed-LEB decode of the real emitted
+    // immediate at canonical length. 111 total; the 2 FLOAT constants are RED.
     assert_eq!(
         report.covered_count(),
-        109,
-        "wasm GENUINE covered count changed — must be 109 (83 scalar + 2 popcnt + 4 reinterpret + \
-         16 conversions + 4 SIMD lane-wise), ALL credited via stack-machine reconstruction. Do NOT \
-         inflate by crediting an op the evaluator cannot faithfully model.\n{}",
+        111,
+        "wasm GENUINE covered count changed — must be 111 (83 scalar + 2 popcnt + 4 reinterpret + \
+         16 conversions + 4 SIMD lane-wise via reconstruction, + 2 INTEGER scalar constants via \
+         the P4 independent LEB decode). Do NOT inflate by crediting an op no path can faithfully \
+         model — f32.const/f64.const carry raw IEEE-754 payloads the LEB decoder cannot read.\n{}",
         report.audit_log()
     );
     assert!(
-        (report.coverage_percent() - (109.0 / 111.0 * 100.0)).abs() < f64::EPSILON,
-        "wasm coverage_percent must be the honest 109/111"
+        (report.coverage_percent() - (111.0 / 113.0 * 100.0)).abs() < 0.01,
+        "wasm coverage_percent must be the honest 111/113"
     );
 
+    // EXACTLY TWO RED ROWS REMAIN, and both are NAMED deferrals. This is a
+    // statement about THIS gate only — the per-instruction value-equivalence
+    // inventory — and it is emphatically NOT a claim that the wasm lane is
+    // verified. The value-domain gate still carries its 4 named deferrals, the
+    // CFG family's bisimulation is deferred, and the ABI family's host-memory
+    // obligations are the host's. A new op that cannot be faithfully modelled
+    // belongs HERE as a DeferredUnfaithfulModel RED row, never allowlisted out.
     let failures = report.failures();
+    let red: Vec<&str> = failures.iter().map(|r| r.opcode_display.as_str()).collect();
     assert_eq!(
-        failures.len(),
-        2,
-        "wasm must have exactly the two scalar-constant RED rows:\n{}",
+        red,
+        vec!["wasm::F32Const", "wasm::F64Const"],
+        "the wasm denominator's RED rows must be exactly the two float constants:\n{}",
         report.failure_summary()
     );
-    let actual: std::collections::HashSet<_> = failures
-        .iter()
-        .map(|row| row.opcode_display.as_str())
-        .collect();
-    assert_eq!(
-        actual,
-        std::collections::HashSet::from(["wasm::I32Const", "wasm::I64Const"])
-    );
-    assert!(
-        failures.iter().all(|row| matches!(
-            &row.finding,
-            Some(CoverageFinding::DeferredUnfaithfulModel { .. })
-        )),
-        "wasm scalar constants must be explicit DeferredUnfaithfulModel debt"
-    );
+    for row in &failures {
+        assert!(
+            matches!(
+                row.finding,
+                Some(CoverageFinding::DeferredUnfaithfulModel { .. })
+            ),
+            "wasm RED row {} must be an explicit DeferredUnfaithfulModel with a true reason, \
+             never a wiring gap: {:?}",
+            row.opcode_display,
+            row.finding
+        );
+    }
 }
 
 /// LOCKS IN universe completeness for WebAssembly, same rationale as the
@@ -1323,10 +1383,10 @@ fn wasm_universe_has_no_duplicates_and_matches_pinned_count() {
         ALL_WASM_OPCODES,
     );
     // Release-baseline pin; the source comparison above is the systemic
-    // completeness check. The WasmOpcode::tests::opcode_count test pins 141 too.
+    // completeness check. The WasmOpcode::tests::opcode_count test pins 143 too.
     assert_eq!(
         ALL_WASM_OPCODES.len(),
-        141,
+        143,
         "wasm opcode count changed — a variant was added/removed. Update the array AND this \
          pinned count, and classify the new opcode in classify_wasm (the build already forced \
          that)."
@@ -1336,10 +1396,10 @@ fn wasm_universe_has_no_duplicates_and_matches_pinned_count() {
 /// LOCKS IN the DENOMINATOR-HONEST wasm partition.
 ///
 /// The value-equivalence denominator (classify_wasm EmittableNeedsProof) is now
-/// exactly 111 opcodes: the 83 reconstructable scalar value ops + the value-
+/// exactly 113 opcodes: the 83 reconstructable scalar value ops + the value-
 /// bearing ops that were wrongly allowlisted-out by the #71 bring-up (popcnt ×2,
 /// reinterpret ×4, int->FP convert ×8, saturating trunc ×8, SIMD lane ops ×4)
-/// plus the two emitted scalar constants. Only the
+/// plus the four emitted scalar constants (i32/i64 credited, f32/f64 RED). Only the
 /// GENUINELY STRUCTURAL ops (locals/globals, memory, control flow,
 /// calls) and the never-selected f.min/f.max are fail-closed-allowlisted with TRUE
 /// reasons; nop/unreachable are pseudo. This pins the partition so a value-bearing
@@ -1364,9 +1424,9 @@ fn wasm_classifier_partition_is_honest() {
         }
     }
     assert_eq!(
-        emittable, 111,
-        "the value-equivalence denominator is 109 accepted rows plus two emitted scalar constants; \
-         the 3 reserved v128 load/store/const forms are never selected"
+        emittable, 113,
+        "the value-equivalence denominator is 109 reconstructed rows plus the FOUR emitted scalar \
+         constants (i32/i64/f32/f64); the 3 reserved v128 load/store/const forms are never selected"
     );
     assert_eq!(
         pseudo, 2,
@@ -1374,7 +1434,7 @@ fn wasm_classifier_partition_is_honest() {
     );
     assert_eq!(
         allowlisted,
-        ALL_WASM_OPCODES.len() - 111 - 2,
+        ALL_WASM_OPCODES.len() - 113 - 2,
         "only GENUINELY-structural opcodes are fail-closed-allowlisted (no value-bearing op may \
          be allowlisted-out of the denominator); only the reserved never-selected v128 forms \
          stay excluded"
@@ -1451,11 +1511,11 @@ fn wasm_v128_lanewise_reconstructed_structural_allowlisted() {
             .find(|row| row.opcode_display == format!("wasm::{op:?}"))
             .unwrap_or_else(|| panic!("wasm::{op:?} missing from audit"));
         assert!(
-            matches!(
-                &row.finding,
-                Some(CoverageFinding::DeferredUnfaithfulModel { .. })
-            ),
-            "wasm::{op:?} must remain explicit scalar-constant RED debt"
+            row.finding.is_none(),
+            "wasm::{op:?} must be CREDITED by P4's independent signed-LEB immediate decode \
+             (wasm_encoding_proofs) — it stays IN the denominator, and if that decoder ever \
+             stops discharging it must return as an explicit DeferredUnfaithfulModel RED row \
+             rather than being allowlisted out"
         );
     }
 }
@@ -1588,7 +1648,10 @@ fn wasm_conversions_are_reconstructed_covered() {
 /// LOCKS IN that the WasmLowering registered proofs are all GENUINELY
 /// non-degenerate (the strict-gate honesty invariant for the registered witness
 /// set): the 54 shift/comparison/float-comparison/negate/cast obligations whose
-/// two sides are structurally distinct. No X==X self-equality may sneak back in.
+/// two sides are structurally distinct, plus the 32 P3 narrow-width obligations
+/// (`wasm_value_domain::narrow_width_proofs` — an `i32`-carried
+/// `u8`/`i8`/`u16`/`i16` respects its width invariant across the backend's
+/// wrapping arithmetic). No X==X self-equality may sneak back in.
 #[test]
 fn wasm_registered_proofs_are_non_degenerate() {
     use trust_cg_verify::proof_database::ProofCategory;
@@ -1606,8 +1669,9 @@ fn wasm_registered_proofs_are_non_degenerate() {
     });
     assert_eq!(
         proofs.len(),
-        54,
-        "the 54 genuine wasm refinement witnesses are registered"
+        86,
+        "the 54 genuine wasm refinement witnesses + the 32 P3 narrow-width obligations are \
+         registered"
     );
     for (name, genuine) in &proofs {
         assert!(
@@ -1699,10 +1763,10 @@ fn gate_reports_failure_for_an_emittable_opcode_with_no_proof() {
 /// honest within-emittable coverage is NO LONGER 100%. Reconstruction credit
 /// still requires the machine side to be rebuilt from the real opcode and
 /// operands. The publication inventory pins:
-///   * AArch64: 155/248 accepted, with 93 named RED rows.
-///   * x86-64: 163/192 accepted, with 29 named RED rows.
+///   * AArch64: 156/248 accepted, with 92 named RED rows.
+///   * x86-64: 167/196 accepted, with 29 named RED rows.
 ///   * RISC-V: 14/17 accepted, with 3 named RED rows.
-///   * WebAssembly: 109/111 accepted, with 2 named RED rows.
+///   * WebAssembly: 111/113 accepted, with 2 named RED rows.
 ///     Re-admitting an X==X identity, fake-covering a non-reconstructable opcode, or
 ///     moving emitted value/effect debt out of the denominator trips this test.
 #[test]
@@ -1824,23 +1888,41 @@ fn clean_tree_reports_honest_strict_emittable_coverage() {
     // arrangements, .16B and .8B), giving 151/244. EorRRLsl/EorRRLsr then add
     // two reconstructed shifted-source forms, giving 153/246. Umull then left
     // the deferred set via its faithful widening obligation, giving 154/246;
-    // complete packed-NZCV TST authority removes another RED row. The combined
-    // packed-NZCV TST authority yields 155/246 with 91 RED rows. Adding the
-    // previously omitted StrbRO/StrhRO audit rows produces the current
-    // 155/248 inventory with 93 explicit RED rows.
+    // the complete packed-NZCV TST W/X authority removes another RED row. The
+    // combined packed-NZCV TST authority yields 155/246 with 91 RED rows.
+    // RorRI (now emitted STANDALONE by the rotate recognizer when the EOR does
+    // not fuse) then left the deferred set on BOTH counts its deferred reason
+    // named — its faithful width-complete W+X rotate obligations
+    // (all_ror_immediate_proofs; wrong-amount / ROR-vs-LSR / rotate-direction
+    // refute controls) AND the width- and immediate-sensitive per-instruction
+    // EXTR-alias reconstruction — giving 156/246 with 90 RED rows. Adding the
+    // previously omitted StrbRO/StrhRO audit rows — both honest
+    // DeferredUnfaithfulModel pending a faithful memory-effect model —
+    // produces the current 156/248 inventory with 92 explicit RED rows.
+    // RorRI is ONE opcode and moves ONE row: both lines of work promoted the
+    // same row, so the union is 156/248 with 92 RED, NOT 157/248 with 91.
+    // (Reversing the last two moves — StrbRO/StrhRO first at 155/248 with 93
+    // RED rows, then RorRI — reaches the identical inventory.)
     assert_eq!(
         (aa_cov, aa_em),
-        (155, 248),
+        (156, 248),
         "AArch64 accepted-obligation inventory changed; update the pins deliberately \
          — do NOT re-admit X==X identities NOR fake-cover a non-reconstructable opcode"
     );
     assert_eq!(
         (x86_cov, x86_em),
-        (163, 192),
+        (167, 196),
         "x86-64 strict emittable coverage changed; update the pinned honest numbers deliberately \
          — do NOT re-admit X==X identities NOR fake-cover a non-reconstructable opcode. x86-64 is \
-         now at honest 163/192: 13 actively emitted former exclusions and 16 volatile memory \
-         forms are explicit DeferredUnfaithfulModel RED rows. The 155 -> 157 net (X10): the 32-bit \
+         now at honest 167/196: 13 actively emitted former exclusions and 16 volatile memory \
+         forms are explicit DeferredUnfaithfulModel RED rows. The 163 -> 167 net (RMW Stage 1): \
+         the memory-destination RMW ALU quartet XorMR/AddMR/XorMRSib/AddMRSib joins via the \
+         MemRmw reconstruction — the COMPOSITION of the proven MemStore shape (address half + \
+         stored-value half) and the proven MemAlu shape (the REAL encode_xor_rr/encode_add_rr \
+         over a load of the same EA) on the shared `x86_reconstruct_effective_address`; wrong EA / \
+         Add-for-Xor / dropped-or-wrong src / plain-store-for-RMW REFUTE (mem_rmw controls). \
+         Nothing emits the quartet yet: Stage-2's fusion peephole is admission-gated on this very \
+         reconstruction. The 155 -> 157 net (X10): the 32-bit \
          SIB MOV pair MovRM32Sib/MovMR32Sib joins the memory tier via the SAME SibMemAddr EA \
          reconstruction at I32 width (wrong base/index/scale/disp/width REFUTES). The \
          154 -> 155 net (X9 slice 3): \
@@ -1889,16 +1971,24 @@ fn clean_tree_reports_honest_strict_emittable_coverage() {
     // reinterpret + 16 conversion + 4 SIMD lane-wise = 109 (all via stack-machine
     // reconstruction; wrong byte / width / wiring / signedness / saturation / NaN /
     // SIMD sub-opcode / lane-width REFUTES). The 3 STRUCTURAL v128 forms
-    // (load/store/const) are never-selected and allowlisted-OUT, while scalar
-    // constants add two denominator-bearing RED rows. TRUE HONEST
-    // HEADLINE: 109/111.
+    // (load/store/const) are never-selected and allowlisted-OUT. The two INTEGER
+    // scalar constants are credited by P4's INDEPENDENT spec-derived signed-LEB
+    // decode of the real emitted immediate (reconstruction cannot help a constant
+    // — const == const is a self-equality). The two FLOAT constants joined the
+    // mirror with the same P4 work and are RED: their immediates are raw
+    // IEEE-754 payloads the LEB decoder does not reach.
+    // HEADLINE: 111/113 on THIS gate, which is not a claim that the lane is
+    // verified — see wasm_deferred_value_op_reason and the P3 value-domain
+    // deferrals.
     assert_eq!(
         (wasm_cov, wasm_em),
-        (109, 111),
-        "wasm emittable coverage changed from the honest 109/111 — a reconstructable opcode stopped \
+        (111, 113),
+        "wasm emittable coverage changed from 111/113 — a reconstructable opcode stopped \
          discharging Valid (bad), or a value-bearing op was allowlisted-OUT of the denominator to \
          inflate the headline (forbidden), or a structural v128 form was wrongly put back IN the \
-         denominator. Update deliberately."
+         denominator. If P4's LEB decoder stops discharging, the two integer constant rows must go \
+         RED again, never quietly allowlisted; f32.const/f64.const may only turn green on a real \
+         independent float-payload decode obligation. Update deliberately."
     );
 }
 
@@ -3230,7 +3320,7 @@ fn historical_comment_lines(lines: &[&str]) -> Vec<bool> {
 /// The first `N/M` token stated after `alias` on `line`.
 ///
 /// The scan stops at the next architecture name, because these ratios are
-/// routinely listed four-to-a-line ("x86-64 163/192 (29 RED), RISC-V 14/17
+/// routinely listed four-to-a-line ("x86-64 167/196 (29 RED), RISC-V 14/17
 /// ..."); without that bound a fixed window reads the *next* architecture's
 /// ratio and reports a false mismatch.
 ///

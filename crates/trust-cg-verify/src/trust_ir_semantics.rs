@@ -359,6 +359,18 @@ pub fn encode_trust_ir_ftrunc(_ty: Type, operand: SmtExpr) -> SmtExpr {
 /// exact and the group sum never wraps). Written independently of the machine
 /// encoder; a wrong emitted opcode reconstructs to a different machine
 /// expression and REFUTES this equality (the reconstruction's non-degeneracy).
+/// Encode the trust-ir `V2I64PackLanes` spec: build a v128 vector from two
+/// 64-bit lane values, `x` into lane 0 (bits 63:0), `y` into lane 1 (bits
+/// 127:64). This is the SOURCE side of the `PUNPCKLQDQ` reconstruction: the
+/// machine side is [`crate::x86_64_semantics::encode_punpcklqdq`] applied to
+/// the REAL emitted operands, and a wrong emitted opcode (a high-lane
+/// PUNPCKHQDQ pairing) or swapped non-commutative operand wiring reconstructs
+/// to a different machine expression and REFUTES this equality (the
+/// reconstruction's non-degeneracy, same rule as the byte-SAD above).
+pub fn encode_trust_ir_pack_low_qwords(x: SmtExpr, y: SmtExpr) -> SmtExpr {
+    crate::smt::concat_lanes(&[x, y], crate::smt::VectorArrangement::D2)
+}
+
 pub fn encode_trust_ir_byte_sad(a: SmtExpr, b: SmtExpr) -> SmtExpr {
     let mut lanes: Vec<SmtExpr> = Vec::with_capacity(2);
     for j in 0..2u32 {

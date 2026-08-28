@@ -1,9 +1,9 @@
 # trust-cg performance-evidence contract
 
-Version: v0.1.0, 2026-07-22.
+Applies to: the 0.x series. Contract terms last revised 2026-07-22.
 
 This contract defines the minimum evidence for a public trust-cg performance
-claim. v0.1.0 itself makes no aggregate compiler or SAT-solver performance
+claim. trust-cg itself makes no aggregate compiler or SAT-solver performance
 claim.
 
 ## Eligibility
@@ -117,7 +117,7 @@ an independently certified result.
 If a later correctness finding invalidates a number, retract it everywhere it
 was cited and retain a short explanation in the relevant study. The historical
 SAT `php-10-9` 6.1× end-to-end claim is withdrawn because it depended on an
-unsound analyze-driver path; it is not evidence for v0.1.0.
+unsound analyze-driver path; it is not evidence for any 0.x release.
 
 Changes to a benchmark threshold, corpus, oracle, timeout, or aggregation rule
 must be reviewed and versioned before the next eligible run, never adjusted in

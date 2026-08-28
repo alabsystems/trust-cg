@@ -200,21 +200,46 @@ pub fn proof_cbnz_equivalence_8bit() -> ProofObligation {
 
 /// Proof: the STANDALONE `TST Rn, Rm` NZCV effect, per condition code.
 ///
+/// `aarch64_deferred_value_op_reason` named exactly this gap before these
+/// obligations landed:
+///
+/// > TST is emitted for NZCV-producing bit tests, but no faithful standalone
+/// > NZCV obligation is registered; TST+branch fusion evidence does not
+/// > establish the unfused instruction's complete flag effect.
+///
 /// The fusion theorem (`TST;B.EQ ≡ TBZ`) only constrains Z on one code path. An
 /// unfused TST — one feeding a `CSEL`/`CSINC` rather than a branch, which is
-/// precisely what `and_cmp_fuse` can produce — needs its whole flag effect
-/// established and cannot inherit authority from the fusion theorem alone.
+/// precisely what `and_cmp_fuse` produces on `p2_collatz` — cannot inherit
+/// authority from the fusion theorem alone; it needs the flag effect its
+/// consumer reads established. The function verifier binds each TST to the
+/// obligation of that consumer's condition (`tst_nzcv_consumer_query`).
 ///
-/// These are focused model-consistency checks, not credited coverage proofs.
-/// For several condition codes the source predicate and the encoded flag model
-/// normalize to the same expression (or the same constant), so the universal
-/// non-degeneracy gate correctly bars the whole family from the proof database.
+/// These per-condition rows are CONSUMER VIEWS, and no individual one of them
+/// certifies an instruction that defines all four flags. That whole-instruction
+/// authority is the packed-NZCV theorem (`proof_tst_packed_nzcv`, below in this
+/// section), which the verifier binds when no in-block consumer pins a
+/// condition; `coverage_gate::aarch64_width_polymorphic_proofs` requires it at
+/// both widths before the opcode earns coverage. Both families are registered.
 ///
-/// The C/V cases are the load-bearing ones: logical ops CLEAR both, so `HS` is
-/// unsatisfiable and `LO` is a tautology after a TST — regardless of operands.
-/// That is the fact `and_cmp_fuse`'s C-flag guard depends on. The focused
-/// negative control below checks the local flag model, but TST remains deferred
-/// until an independently reconstructed machine-side obligation establishes it.
+/// Each obligation relates ARM's flag machinery (extract the MSB, compare the
+/// masked result to zero, then run `eval_condition`'s boolean algebra) to an
+/// INDEPENDENT source-level predicate — a different formulation, not the
+/// retracted `NZCV_* == NZCV_*` self-equalities of #62. Non-degeneracy is
+/// load-bearing here, not cosmetic: `encode_tst` defines Z as literally
+/// `(Rn & Rm) == 0`, so the "direct" Z predicates would restate the machine
+/// encoder term-for-term and be structurally degenerate (STRICT #61 credits
+/// them ZERO and `non_degeneracy_violations` reports them). EQ/NE therefore
+/// use the disjointness characterization `(Rn | Rm) == (Rn ^ Rm)`.
+///
+/// The C/V facts are load-bearing too: logical ops CLEAR both flags. `HS`/`LO`
+/// themselves reduce to bare constants on BOTH sides after `encode_tst`, so
+/// they admit no non-degenerate obligation and are deliberately absent (a
+/// consumer reading them after TST fails closed). The C-clear fact is pinned
+/// instead by the COMPOSITE C-readers `HI` (C ∧ ¬Z) and `LS` (¬C ∨ Z), whose
+/// machine sides run `eval_condition`'s full algebra: a data-dependent C — say
+/// `encode_tst` copy-pasted from `encode_cmp` — makes both REFUTE (see
+/// `tst_carry_cases_are_sensitive_to_the_carry_model`). That is the exact fact
+/// `and_cmp_fuse`'s C-flag guard rests on, provable instead of merely commented.
 fn tst_condition_obligation(
     cc: trust_cg_lower::isel::AArch64CC,
     width: u32,
@@ -250,19 +275,28 @@ pub fn proof_tst_nzcv_effect(width: u32) -> Vec<ProofObligation> {
     let zero = || SmtExpr::bv_const(0, width);
     let w = width;
 
+    // Z: EQ/NE decide whether Rn and Rm share any set bits. The source side is
+    // the DISJOINTNESS characterization `(Rn | Rm) == (Rn ^ Rm)` (OR loses
+    // nothing to XOR exactly when no bit is shared), NOT `(Rn & Rm) == 0`:
+    // `encode_tst` already defines Z as exactly that AND-form, so the direct
+    // predicate restates the machine encoder term-for-term — a structurally
+    // degenerate X==X of the #62 class. The disjointness form is an independent
+    // formulation over different connectives; a wrong machine side (ORR-based
+    // flags, a swapped condition) REFUTES.
+    let disjoint = || rn().bvor(rm()).eq_expr(rn().bvxor(rm()));
+
     vec![
-        // Z: EQ/NE decide whether the masked value is zero.
         tst_condition_obligation(
             trust_cg_lower::isel::AArch64CC::EQ,
             w,
             &format!("TST w{w}: EQ ≡ (Rn & Rm) == 0"),
-            masked().eq_expr(zero()),
+            disjoint(),
         ),
         tst_condition_obligation(
             trust_cg_lower::isel::AArch64CC::NE,
             w,
             &format!("TST w{w}: NE ≡ (Rn & Rm) != 0"),
-            masked().eq_expr(zero()).not_expr(),
+            disjoint().not_expr(),
         ),
         // N: MI/PL decide the sign of the masked value.
         tst_condition_obligation(
@@ -290,18 +324,55 @@ pub fn proof_tst_nzcv_effect(width: u32) -> Vec<ProofObligation> {
             &format!("TST w{w}: LT ≡ (Rn & Rm) <s 0 (V is cleared)"),
             masked().bvslt(zero()),
         ),
-        // C is cleared: HS is UNSATISFIABLE and LO is a TAUTOLOGY after TST.
-        // This is the fact and_cmp_fuse's guard rests on.
+        // GT/LE are ALSO well-defined N/Z-derived conditions after TST: with
+        // V cleared, GT = !Z && (N==V) collapses to (Rn & Rm) >s 0 and LE to
+        // (Rn & Rm) <=s 0 — the same class as MI/PL/GE/LT, and a consumer
+        // shape `and_cmp_fuse` legally produces (its carry guard permits
+        // GT/LE). An earlier revision omitted them under the FALSE rationale
+        // "never valid after TST's V-clear"; the review corrected that.
         tst_condition_obligation(
-            trust_cg_lower::isel::AArch64CC::HS,
+            trust_cg_lower::isel::AArch64CC::GT,
             w,
-            &format!("TST w{w}: HS is always FALSE (C is cleared)"),
+            &format!("TST w{w}: GT ≡ (Rn & Rm) >s 0 (V is cleared)"),
+            masked().bvsgt(zero()),
+        ),
+        tst_condition_obligation(
+            trust_cg_lower::isel::AArch64CC::LE,
+            w,
+            &format!("TST w{w}: LE ≡ (Rn & Rm) <=s 0 (V is cleared)"),
+            masked().bvsle(zero()),
+        ),
+        // C is cleared, so every C-dependent condition is CONSTANT after TST —
+        // the fact and_cmp_fuse's guard rests on. HS ("C") and LO ("not C")
+        // themselves cannot carry it as obligations: `eval_condition` reduces
+        // both sides to a bare constant, which is structurally degenerate and
+        // credits zero under STRICT #61, so those rows are deliberately absent.
+        // The composite C-readers HI (C ∧ ¬Z) and LS (¬C ∨ Z) pin the same
+        // fact non-degenerately: the machine side is eval_condition's full
+        // boolean algebra over the encoded flags, and a data-dependent C makes
+        // both refute.
+        //
+        // SCOPE (review #4, CRITICAL): the HI/LS rows exist ONLY as C-clear
+        // MODEL PINS. They are NEVER reachable as per-instruction consumer
+        // credit — `tst_condition_query` maps every C/V-observing consumer
+        // condition (HS/LO/HI/LS/VS/VC) to None. After TST those conditions
+        // are architecturally CONSTANT, so a consumer reading one is exactly
+        // the miscompile shape `and_cmp_fuse`'s carry guard
+        // (`cond_reads_carry`) exists to forbid: e.g. a regressed rewrite of
+        // `CMP z,#0; CSet HI` (z != 0) into `TST a,b; CSet HI` (constant
+        // false). Crediting the TST via the true-but-constant HI theorem
+        // would stamp that wrong-code shape Verified; failing closed keeps it
+        // a compile error.
+        tst_condition_obligation(
+            trust_cg_lower::isel::AArch64CC::HI,
+            w,
+            &format!("TST w{w}: HI is always FALSE (C is cleared)"),
             SmtExpr::bool_const(false),
         ),
         tst_condition_obligation(
-            trust_cg_lower::isel::AArch64CC::LO,
+            trust_cg_lower::isel::AArch64CC::LS,
             w,
-            &format!("TST w{w}: LO is always TRUE (C is cleared)"),
+            &format!("TST w{w}: LS is always TRUE (C is cleared)"),
             SmtExpr::bool_const(true),
         ),
     ]
@@ -1146,12 +1217,23 @@ pub fn all_cmp_combine_proofs_with_variants() -> Vec<ProofObligation> {
     proofs.push(proof_csinc_equivalence_8bit());
     proofs.push(proof_condition_inversion_8bit());
     proofs.push(proof_diamond_safety_8bit());
-    // Standalone TST authority, both emitted widths.  The per-condition
-    // obligations remain unit-level semantic regressions, but are deliberately
-    // not registered for proof credit: several simplify to tautological views
-    // of `encode_tst`, and no individual consumer view certifies an instruction
-    // that defines all four flags.  The packed obligations are the sole
-    // whole-instruction authority bindings used by the function verifier.
+    // Standalone TST NZCV effect, both widths. Registered so an UNFUSED `Tst`
+    // (one feeding a CSEL/CSINC rather than a branch, which is what
+    // `and_cmp_fuse` produces on p2_collatz) has the flag effect its consumer
+    // reads established — the gap `aarch64_deferred_value_op_reason` named for
+    // Tst, formerly the sole opcode blocker for proofs-on on 4 of 18 programs.
+    // The function verifier binds per-instruction via `tst_nzcv_consumer_query`
+    // (the consuming instruction's condition code selects the obligation).
+    proofs.extend(proof_tst_nzcv_effect(64));
+    proofs.extend(proof_tst_nzcv_effect(32));
+    // ...and the COMPLETE packed-NZCV authority at both emitted widths. No
+    // individual consumer view certifies an instruction that DEFINES all four
+    // flags, so these carry the whole-instruction authority: the verifier falls
+    // back to them when no in-block consumer binding applies
+    // (`operand_sensitive_or_opcode_query`), and
+    // `coverage_gate::aarch64_width_polymorphic_proofs` demands both widths
+    // before Tst earns opcode coverage. Both families are non-degenerate under
+    // STRICT #61 (see the tests below), so both are credited.
     proofs.push(proof_tst_packed_nzcv(64));
     proofs.push(proof_tst_packed_nzcv(32));
     // #62 retraction: drop degenerate X==X self-equalities (see CMPCOMBINE_RETRACTED_DEGENERATE).
@@ -1170,9 +1252,10 @@ mod tests {
     use crate::verify::VerificationResult;
 
     /// Helper: verify a proof obligation and assert it is Valid.
-    /// Every focused standalone-TST model check must discharge at both widths.
-    /// These per-condition checks remain unregistered; complete instruction
-    /// authority comes only from the non-degenerate packed-NZCV pair.
+    /// Every standalone-TST flag obligation must discharge, at both widths.
+    /// These per-condition rows are the CONSUMER views bound by
+    /// `tst_nzcv_consumer_query`; complete whole-instruction authority comes
+    /// from the packed-NZCV pair, checked separately below.
     #[test]
     fn tst_standalone_nzcv_obligations_discharge() {
         for width in [32u32, 64] {
@@ -1219,37 +1302,85 @@ mod tests {
         }
     }
 
-    /// The C-flag cases must be NON-VACUOUS. `HS ≡ false` and `LO ≡ true` are
+    /// The C-flag cases must be NON-VACUOUS. `HS ≡ false`/`LO ≡ true` and the
+    /// composite `HI ≡ false`/`LS ≡ true` are
     /// only true because logical ops CLEAR C; if `encode_tst` ever grew a
     /// data-dependent C (say by being copy-pasted from `encode_cmp`), these
     /// would break. Prove they are sensitive to that by flipping C and
-    /// requiring the obligation to STOP verifying — otherwise the pair could
+    /// requiring EVERY one of them to STOP verifying — otherwise they could
     /// pass for the wrong reason and `and_cmp_fuse`'s guard would rest on a
-    /// theorem that no longer holds.
+    /// theorem that no longer holds. HS/LO are checked here even though they
+    /// are not registered rows: the fact under test is `encode_tst`'s C model,
+    /// not any one obligation.
     #[test]
     fn tst_carry_cases_are_sensitive_to_the_carry_model() {
         let width = 64u32;
         let rn = SmtExpr::var("rn", width);
         let rm = SmtExpr::var("rm", width);
         let mut flags = crate::nzcv::encode_tst(rn.clone(), rm.clone(), width);
-        // Corrupt C to the SUBS/CMP form (data dependent) and re-check HS.
+        // Corrupt C to the SUBS/CMP form (data dependent) and re-check every
+        // C-observing condition: the constant HS/LO views and the composite
+        // HI/LS model pins must all stop verifying.
         flags.c = rn.bvuge(rm);
 
-        let corrupted = ProofObligation {
-            machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
-            name: "TST w64: HS with a CMP-style carry (must NOT verify)".to_string(),
-            trust_ir_expr: SmtExpr::bool_const(false),
-            aarch64_expr: crate::nzcv::eval_condition(trust_cg_lower::isel::AArch64CC::HS, &flags),
-            inputs: vec![("rn".to_string(), width), ("rm".to_string(), width)],
-            preconditions: vec![],
-            fp_inputs: vec![],
-            category: Some(crate::lowering_proof::TransvalCheckKind::PeepholeOptimization),
-        };
-        assert!(
-            !matches!(verify_by_evaluation(&corrupted), VerificationResult::Valid),
-            "HS ≡ false must depend on TST CLEARING carry; with a CMP-style \
-             data-dependent C it must stop verifying"
-        );
+        for (cc, source, label) in [
+            (
+                trust_cg_lower::isel::AArch64CC::HS,
+                SmtExpr::bool_const(false),
+                "HS ≡ false",
+            ),
+            (
+                trust_cg_lower::isel::AArch64CC::LO,
+                SmtExpr::bool_const(true),
+                "LO ≡ true",
+            ),
+            (
+                trust_cg_lower::isel::AArch64CC::HI,
+                SmtExpr::bool_const(false),
+                "HI ≡ false",
+            ),
+            (
+                trust_cg_lower::isel::AArch64CC::LS,
+                SmtExpr::bool_const(true),
+                "LS ≡ true",
+            ),
+        ] {
+            let corrupted = ProofObligation {
+                machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
+                name: format!("TST w64: {label} with a CMP-style carry (must NOT verify)"),
+                trust_ir_expr: source,
+                aarch64_expr: crate::nzcv::eval_condition(cc, &flags),
+                inputs: vec![("rn".to_string(), width), ("rm".to_string(), width)],
+                preconditions: vec![],
+                fp_inputs: vec![],
+                category: Some(crate::lowering_proof::TransvalCheckKind::PeepholeOptimization),
+            };
+            assert!(
+                !matches!(verify_by_evaluation(&corrupted), VerificationResult::Valid),
+                "{label} must depend on TST CLEARING carry; with a CMP-style \
+                 data-dependent C it must stop verifying"
+            );
+        }
+    }
+
+    /// STRICT #61 credits only structurally non-degenerate obligations, and the
+    /// manifest gate (`non_degeneracy_violations`) fails closed on any new
+    /// degenerate row — so every registered TST obligation must formulate its
+    /// source side independently of `encode_tst`'s own flag construction. The
+    /// packed whole-instruction pair is held to the same bar by
+    /// `tst_packed_nzcv_obligations_are_valid_and_non_degenerate`.
+    #[test]
+    fn tst_standalone_nzcv_obligations_are_structurally_non_degenerate() {
+        for width in [32u32, 64] {
+            for ob in proof_tst_nzcv_effect(width) {
+                assert!(
+                    !ob.is_degenerate(),
+                    "'{}' restates the machine encoder term-for-term; it can \
+                     never be credited and trips the non-degeneracy gate",
+                    ob.name
+                );
+            }
+        }
     }
 
     fn assert_valid(obligation: &ProofObligation) {
@@ -1399,10 +1530,13 @@ mod tests {
         let proofs = all_cmp_combine_proofs_with_variants();
         assert_eq!(
             proofs.len(),
-            8,
-            "expected 8 GENUINE proofs: the original 6 plus 2 complete packed-NZCV \
-             authority bindings. Per-condition TST regressions are intentionally not \
-             registered for proof credit. \
+            28,
+            "expected 28 GENUINE proofs: the original 6, plus 20 standalone-TST NZCV \
+             obligations (10 condition rows x 32- and 64-bit: EQ/NE/MI/PL/GE/LT/GT/LE \
+             consumer-bindable + HI/LS as C-clear model pins) registered to close the \
+             `aarch64_deferred_value_op_reason` gap for Tst, plus the 2 COMPLETE \
+             packed-NZCV whole-instruction authority bindings (w32/w64) the verifier \
+             and coverage gate use when no in-block consumer binding applies. \
              (15 degenerate CBZ/CBNZ-fusion + CmpSelectCombine X==X retracted in #62; \
              TST==TBZ/TBNZ + CSEL-swap remain)"
         );

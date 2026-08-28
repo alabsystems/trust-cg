@@ -1,6 +1,6 @@
-# trust-cg v0.1.0 limitations
+# trust-cg limitations
 
-trust-cg v0.1.0 is a research preview. It is suitable for evaluating the
+trust-cg is a 0.x research preview. It is suitable for evaluating the
 architecture, compiling the documented trust-ir subset, exercising the test
 and proof infrastructure, and developing the Trust toolchain. It is not a
 production compiler or a drop-in replacement for rustc, LLVM, or Cranelift.
@@ -38,7 +38,7 @@ claim wins.
 - Differential and triple-oracle tests cover named corpora. Passing them does
   not prove the absence of miscompilations outside those corpora.
 
-Unsupported input is intended to fail closed, but v0.1.0 is alpha software:
+Unsupported input is intended to fail closed, but trust-cg is alpha software:
 bugs, crashes, hangs, and wrong-code defects may still exist. Do not use its
 output for safety-, security-, financial-, or mission-critical systems.
 
@@ -58,7 +58,7 @@ The accepted trust-ir surface is incomplete. Important gaps include:
   boundary.
 
 Module-scoped `Ty::Refine` inputs are validated with trust-ir's refinement
-rules. v0.1.0 lowers the representation-identical base carrier only for the
+rules. trust-cg lowers the representation-identical base carrier only for the
 identity/signature pass-through subset; most ordinary operations that consume
 refined values still fail closed. The predicate is not optimization authority,
 and table-only type helpers reject refinements because they lack the containing
@@ -67,9 +67,9 @@ levels and fails closed beyond that limit.
 
 `Constant::Bytes` is executable as a complete top-level function-body
 `[u8; N]` constant when its element type, length, and optional UTF-8 claim
-validate. Nested Bytes fields and Bytes global initializers are not lowered in
-v0.1.0; module batching defers those forms instead of turning a per-function
-failure into a whole-batch fallback.
+validate. Nested Bytes fields and Bytes global initializers are not lowered;
+module batching defers those forms instead of turning a per-function failure
+into a whole-batch fallback.
 
 The imported global-address compatibility ABI reserves the positive bit-pattern
 interval `0xFADE_0000_0000_0000..0xFADF_0000_0000_0000` only in top-level
@@ -129,8 +129,22 @@ RISC-V 64 is experimental. It has real lowering and encoding infrastructure,
 but does not have the semantic breadth, proof emission, ABI/object maturity,
 or validation depth of the primary targets.
 
-Wasm-related code is a library/research surface, not a target accepted by the
-v0.1.0 `trust-cg` CLI.
+### WebAssembly (wasm32)
+
+`--target wasm32-unknown-unknown` (alias `wasm32`) routes to a closed-module
+lane: exactly one trust-ir module in, raw `.wasm` bytes out. It never
+constructs a register target, so it runs no optimization passes, no register
+allocation, and no object/linker path. WASI and emscripten imports, multiple
+inputs, and linker options are not accepted, and an explicit `-O`, `-g`,
+`--panic-unwind`, `--emit-proofs`, `--profile-generate`, `--profile-use`,
+`--cegis-superopt`, `--compile-artifact-cache`, `--trace`, or `--metrics` is
+refused by name rather than silently dropped. The lane emits no proof
+certificates. `wasm64` is not matched. Its evidence is the encoding,
+CFG-structural, and memory/call-ABI obligation families plus node-based
+differential and CFG-fuzz oracles; relooper bisimulation and a
+translation-validation verdict remain named deferrals, and the structural
+invariants are necessary conditions, not a proof that a module computes what
+its trust-ir computes.
 
 ## Rust integration
 
@@ -157,7 +171,7 @@ expanding recursive generic can exceed a budget even when it contains no
 `TCG-STEPBY-TYPE-SCAN` instead of risking an unbounded compiler scan. This is a
 known false-positive, fail-closed boundary.
 
-It is not a general Rust codegen backend in v0.1.0.
+It is not a general Rust codegen backend.
 
 ## Optimization and performance
 
@@ -187,7 +201,7 @@ It is not a general Rust codegen backend in v0.1.0.
   an unrelated, deliberately reconstructed same-length pair, so each
   `.sites`/`.raw` pair must be managed as one generation and treated only as
   performance guidance, never correctness or security authority.
-- No aggregate compiler-performance claim is made for v0.1.0.
+- This document makes no aggregate compiler-performance claim.
 - SAT-Comp and microbenchmark measurements apply only to the documented
   binaries, inputs, hosts, resource envelopes, and checker results. They do not
   imply end-to-end superiority over LLVM, Cranelift, or production SAT solvers.
@@ -197,7 +211,7 @@ publish a new performance comparison.
 
 ## Distribution and compatibility
 
-- v0.1.0 is a source-workspace release, not a crates.io package set.
+- The 0.x releases are source-workspace releases, not a crates.io package set.
 - It builds against exact revisions of companion Trust repositories. Those
   revisions must be present in the public release graph for an anonymous clone
   to build.

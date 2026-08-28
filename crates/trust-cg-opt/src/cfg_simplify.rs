@@ -125,55 +125,83 @@ fn run_cfg_simplify_impl(
     let mut ever_changed = false;
     // Safety bound to prevent infinite loops if sub-passes oscillate.
     let max_iterations: usize = 32;
+    // Every sub-pass wants fresh preds/succs. They used to be rebuilt before
+    // each one unconditionally (8 rebuilds per round); a sub-pass that returns
+    // `false` mutates nothing (each returns true for every edit it makes), so
+    // the edges it saw are still fresh for the next one. Rebuild only after a
+    // sub-pass reported a change: one rebuild per no-change round, the same
+    // fresh edges at every sub-pass entry and at exit.
+    let mut edges_fresh = false;
+    macro_rules! sub_pass {
+        ($changed:ident, $fresh:ident, $name:literal, $call:expr) => {
+            if !config.disables($name) {
+                if !$fresh {
+                    rebuild_cfg_edges(func);
+                    $fresh = true;
+                }
+                if $call {
+                    $changed = true;
+                    $fresh = false;
+                }
+            }
+        };
+    }
 
     // Iterate sub-passes until fixed point (bounded).
     for _ in 0..max_iterations {
         let mut changed = false;
-
-        rebuild_cfg_edges(func);
-
-        if !config.disables("unreachable") {
-            changed |= remove_unreachable_blocks(func, provenance.as_deref_mut());
+        sub_pass!(
+            changed,
+            edges_fresh,
+            "unreachable",
+            remove_unreachable_blocks(func, provenance.as_deref_mut())
+        );
+        sub_pass!(
+            changed,
+            edges_fresh,
+            "empty-blocks",
+            eliminate_empty_blocks(func, provenance.as_deref_mut())
+        );
+        sub_pass!(
+            changed,
+            edges_fresh,
+            "branch-targets",
+            simplify_branch_targets(func, provenance.as_deref_mut())
+        );
+        sub_pass!(
+            changed,
+            edges_fresh,
+            "uncond-fold",
+            fold_unconditional_branches(func, provenance.as_deref_mut())
+        );
+        sub_pass!(
+            changed,
+            edges_fresh,
+            "const-fold",
+            fold_constant_branches(func, provenance.as_deref_mut())
+        );
+        sub_pass!(
+            changed,
+            edges_fresh,
+            "dominated-zero",
+            resolve_dominated_zero_tests(func, provenance.as_deref_mut())
+        );
+        sub_pass!(
+            changed,
+            edges_fresh,
+            "dup-branches",
+            eliminate_duplicate_branches(func, provenance.as_deref_mut())
+        );
+        if !edges_fresh {
+            rebuild_cfg_edges(func);
+            edges_fresh = true;
         }
-        rebuild_cfg_edges(func);
-
-        if !config.disables("empty-blocks") {
-            changed |= eliminate_empty_blocks(func, provenance.as_deref_mut());
-        }
-        rebuild_cfg_edges(func);
-
-        if !config.disables("branch-targets") {
-            changed |= simplify_branch_targets(func, provenance.as_deref_mut());
-        }
-        rebuild_cfg_edges(func);
-
-        if !config.disables("uncond-fold") {
-            changed |= fold_unconditional_branches(func, provenance.as_deref_mut());
-        }
-        rebuild_cfg_edges(func);
-
-        if !config.disables("const-fold") {
-            changed |= fold_constant_branches(func, provenance.as_deref_mut());
-        }
-        rebuild_cfg_edges(func);
-
-        if !config.disables("dominated-zero") {
-            changed |= resolve_dominated_zero_tests(func, provenance.as_deref_mut());
-        }
-        rebuild_cfg_edges(func);
-
-        if !config.disables("dup-branches") {
-            changed |= eliminate_duplicate_branches(func, provenance.as_deref_mut());
-        }
-        rebuild_cfg_edges(func);
-
         if changed {
             ever_changed = true;
         } else {
             break;
         }
     }
-
     ever_changed
 }
 

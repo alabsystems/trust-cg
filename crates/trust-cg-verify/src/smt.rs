@@ -179,7 +179,7 @@ impl CExpr {
         let c = |e: &SmtExpr| CExpr::compile(e, inputs).map(Box::new);
         Some(match expr {
             SmtExpr::Var { name, width } if *width <= 64 => {
-                let slot = inputs.iter().position(|(n, _)| n == name)?;
+                let slot = input_slot(inputs, name)?;
                 CExpr::Var(slot, *width)
             }
             SmtExpr::BvConst { value, width } if *width <= 64 => CExpr::Const(mask(*value, *width)),
@@ -512,12 +512,131 @@ enum FlatOp {
 /// discarded, never observed. The whitelist in `compile` is what guarantees the
 /// totality: a general array `Select` that could error is EXCLUDED, while the
 /// accepted const/store/ite read is reduced completely to scalar operations.
+#[derive(Clone)]
 pub struct FlatProg {
     ops: Vec<FlatOp>,
     root: usize,
 }
 
+/// Rewrite a node's operand slots through `map` (old slot -> new slot).
+/// Width/constant payloads are untouched.
+fn remap_children(op: FlatOp, map: &[usize]) -> FlatOp {
+    use FlatOp::*;
+    let m = |i: usize| map[i];
+    match op {
+        Const(_) | Const128(_) | BoolConst(_) | Var(..) => op,
+        Add(a, b, w) => Add(m(a), m(b), w),
+        Sub(a, b, w) => Sub(m(a), m(b), w),
+        Mul(a, b, w) => Mul(m(a), m(b), w),
+        And(a, b, w) => And(m(a), m(b), w),
+        Or(a, b, w) => Or(m(a), m(b), w),
+        Xor(a, b, w) => Xor(m(a), m(b), w),
+        Shl(a, b, w) => Shl(m(a), m(b), w),
+        Lshr(a, b, w) => Lshr(m(a), m(b), w),
+        Ashr(a, b, w) => Ashr(m(a), m(b), w),
+        SDiv(a, b, w) => SDiv(m(a), m(b), w),
+        UDiv(a, b, w) => UDiv(m(a), m(b), w),
+        URem(a, b, w) => URem(m(a), m(b), w),
+        Neg(a, w) => Neg(m(a), w),
+        Trap(g, v) => Trap(m(g), m(v)),
+        Eq(a, b) => Eq(m(a), m(b)),
+        Not(a) => Not(m(a)),
+        Slt(a, b, w) => Slt(m(a), m(b), w),
+        Sge(a, b, w) => Sge(m(a), m(b), w),
+        Uge(a, b) => Uge(m(a), m(b)),
+        Sgt(a, b, w) => Sgt(m(a), m(b), w),
+        Sle(a, b, w) => Sle(m(a), m(b), w),
+        Ult(a, b) => Ult(m(a), m(b)),
+        Ugt(a, b) => Ugt(m(a), m(b)),
+        Ule(a, b) => Ule(m(a), m(b)),
+        BAnd(a, b) => BAnd(m(a), m(b)),
+        BOr(a, b) => BOr(m(a), m(b)),
+        Ite(c, t, e) => Ite(m(c), m(t), m(e)),
+        Extract(a, lo, w) => Extract(m(a), lo, w),
+        Concat(a, b, lw, w) => Concat(m(a), m(b), lw, w),
+        ZExt(a, w) => ZExt(m(a), w),
+        SExt(a, sw, w) => SExt(m(a), sw, w),
+        MemLoad(a, lw, sg, rw) => MemLoad(m(a), lw, sg, rw),
+    }
+}
+
+/// Operand slots of a node, for liveness marking.
+fn children_of(op: FlatOp) -> Vec<usize> {
+    use FlatOp::*;
+    match op {
+        Const(_) | Const128(_) | BoolConst(_) | Var(..) => vec![],
+        Neg(a, _)
+        | Not(a)
+        | Extract(a, _, _)
+        | ZExt(a, _)
+        | SExt(a, _, _)
+        | MemLoad(a, _, _, _) => vec![a],
+        Add(a, b, _)
+        | Sub(a, b, _)
+        | Mul(a, b, _)
+        | And(a, b, _)
+        | Or(a, b, _)
+        | Xor(a, b, _)
+        | Shl(a, b, _)
+        | Lshr(a, b, _)
+        | Ashr(a, b, _)
+        | SDiv(a, b, _)
+        | UDiv(a, b, _)
+        | URem(a, b, _)
+        | Slt(a, b, _)
+        | Sge(a, b, _)
+        | Sgt(a, b, _)
+        | Sle(a, b, _) => vec![a, b],
+        Trap(a, b)
+        | Eq(a, b)
+        | Uge(a, b)
+        | Ult(a, b)
+        | Ugt(a, b)
+        | Ule(a, b)
+        | BAnd(a, b)
+        | BOr(a, b) => vec![a, b],
+        Concat(a, b, _, _) => vec![a, b],
+        Ite(c, t, e) => vec![c, t, e],
+    }
+}
+
+/// The `base + literal` form of tape slot `i`, if it has one.
+///
+/// A `Var` is its own base at offset 0. `Add(x, Const(c), w)` (either operand
+/// order) at `w <= 64` extends `x`'s form by `c`, masked to `w`, provided the
+/// widths agree — a width change would alter the modulus the offsets live in
+/// and invalidate the comparison in `simplify` rule (2). Everything else has
+/// no form, so comparisons involving it are left alone.
+fn address_form(
+    ops: &[FlatOp],
+    i: usize,
+    addr: &[Option<(usize, u64, u32)>],
+) -> Option<(usize, u64, u32)> {
+    match ops[i] {
+        FlatOp::Var(_, w) if w <= 64 => Some((i, 0, w)),
+        FlatOp::Add(a, b, w) if w <= 64 => {
+            let (other, c) = match (ops.get(a), ops.get(b)) {
+                (_, Some(FlatOp::Const(c))) => (a, *c),
+                (Some(FlatOp::Const(c)), _) => (b, *c),
+                _ => return None,
+            };
+            let (base, off, ow) = (*addr.get(other)?)?;
+            if ow != w {
+                return None;
+            }
+            Some((base, mask(off.wrapping_add(c), w), w))
+        }
+        _ => None,
+    }
+}
+
 impl FlatProg {
+    /// Number of tape nodes. The sampling loop evaluates every node once per
+    /// sample, so this times the sample count IS the sweep's work.
+    pub fn op_count(&self) -> usize {
+        self.ops.len()
+    }
+
     /// Compile `expr` into the linear tape, resolving each `Var` to its `inputs`
     /// slot and hash-consing shared subexpressions. Returns `None` (caller falls
     /// back to `try_eval`) for any out-of-subset node or a `Var` absent from
@@ -526,7 +645,155 @@ impl FlatProg {
         let mut ops: Vec<FlatOp> = Vec::new();
         let mut dedup: HashMap<FlatOp, usize> = HashMap::new();
         let root = Self::go(expr, inputs, &mut ops, &mut dedup)?;
+        Some(FlatProg { ops, root }.simplify())
+    }
+
+    /// The tape BEFORE [`FlatProg::simplify`], for the differential test that
+    /// pins simplification as verdict-preserving. Test-only: the sampling path
+    /// must always take the simplified tape.
+    #[cfg(test)]
+    pub fn compile_unsimplified(expr: &SmtExpr, inputs: &[(String, u32)]) -> Option<FlatProg> {
+        let mut ops: Vec<FlatOp> = Vec::new();
+        let mut dedup: HashMap<FlatOp, usize> = HashMap::new();
+        let root = Self::go(expr, inputs, &mut ops, &mut dedup)?;
         Some(FlatProg { ops, root })
+    }
+
+    /// Fold the read-over-write address algebra, then drop everything the root
+    /// no longer reaches.
+    ///
+    /// # Why
+    ///
+    /// A scalar read from a store chain compiles to a ladder of
+    /// `Ite(Eq(addr_load, addr_store), stored_byte, rest)`. Every address in a
+    /// lowering obligation has the form `base + <literal>`, so each of those
+    /// `Eq` nodes has a verdict that does NOT depend on the sample — yet the
+    /// tape re-decided it on all 100,000 of them. On
+    /// `LDP_QF_ABV_I32_offset0` (the single most expensive obligation in a
+    /// proofs-ON compile) that ladder is 66 `Eq` + 64 `Ite` nodes out of 177,
+    /// i.e. 73% of the tape.
+    ///
+    /// # Soundness
+    ///
+    /// Three rewrites, each an identity on the tape's own semantics:
+    ///
+    /// 1. `Eq(a, a) -> true`. `FlatOp::Eq` is `SVal`'s derived `PartialEq` on
+    ///    two reads of the SAME slot, which is reflexive for every `SVal`
+    ///    variant INCLUDING `Poison` (documented on `SVal`: "`Poison ==
+    ///    Poison` is `true`"). So no poison guard is needed here — the fold
+    ///    returns precisely what the comparison returned.
+    /// 2. `Eq(x, y)` where both sides are `base + c` over the SAME base slot
+    ///    at the same width `w <= 64` -> `c_x == c_y`. `Add` masks to `w`, so
+    ///    each side evaluates to `mask(base + c, w)`; adding a fixed value is
+    ///    a bijection on `w`-bit words, so the two are equal exactly when the
+    ///    already-masked offsets are. This holds whatever `base` evaluates to,
+    ///    poison included, because `as_u64` maps `Poison` to a FIXED `u64` and
+    ///    both sides then take the same path.
+    /// 3. `Ite(c, t, e)` with a constant `c` -> that branch. Eager evaluation
+    ///    means the discarded branch was computed anyway and never observed
+    ///    (see the EAGER-EVAL SAFETY note above), so dropping it is invisible.
+    ///
+    /// The sweep verdict is therefore bit-for-bit unchanged; only the number
+    /// of tape nodes falls.
+    ///
+    /// # What it is worth
+    ///
+    /// Two bridge dylibs, interleaved A,B,A,B on child CPU, 11 reps
+    /// (`-Copt-level=2`, one CGU):
+    ///
+    /// ```text
+    ///   program   without    with     ratio   paired median delta
+    ///   empty     191.4ms   148.9ms   0.778        +48.1ms
+    ///   p3_gcd    236.6ms   195.2ms   0.825        +28.7ms
+    ///   h3_box    255.3ms   226.7ms   0.888        +31.6ms
+    /// ```
+    ///
+    /// Three programs, two independent statistics, same sign and same rough
+    /// size — 11-22% off a whole proofs-ON compile.
+    ///
+    /// The commit that introduced this quoted finer-grained figures (a
+    /// per-obligation 39.9ms -> 4.0ms, a CGU 87.9ms -> 51.9ms) taken from
+    /// single reads of the in-process `TCG_TIME` counter. Do not trust those:
+    /// repeating that counter nine times on an UNCHANGED binary spans
+    /// 31.7-57.6ms, so any step smaller than about 25ms is inside its noise.
+    /// The counter earns its keep for ATTRIBUTION — which phase, which
+    /// obligation, how many tape nodes — and the 177-node-to-3 collapse is a
+    /// structural fact, not a timing. For deltas, build two dylibs and
+    /// interleave. A sibling micro-optimisation that looked like a 7ms win on
+    /// the same counter measured as nothing under A/B and was reverted
+    /// (905475e5). `flatprog_matches_interpreter_differential_fuzz`
+    /// checks this against the interpreter, and
+    /// `simplify_preserves_evaluation_on_the_ldp_ladder` pins the specific
+    /// obligation that motivated it.
+    fn simplify(self) -> FlatProg {
+        let mut ops: Vec<FlatOp> = Vec::with_capacity(self.ops.len());
+        let mut dedup: HashMap<FlatOp, usize> = HashMap::new();
+        // Old slot -> new slot.
+        let mut map: Vec<usize> = vec![0; self.ops.len()];
+        // Per NEW slot: `(base slot, offset, width)` when the node is a
+        // `base + literal` address at width <= 64. `None` when it is not an
+        // address we can reason about.
+        let mut addr: Vec<Option<(usize, u64, u32)>> = Vec::with_capacity(self.ops.len());
+
+        for (old_index, old) in self.ops.iter().enumerate() {
+            let op = remap_children(*old, &map);
+            let slot = match op {
+                // (1) reflexive comparison
+                FlatOp::Eq(a, b) if a == b => {
+                    Self::push(&mut ops, &mut dedup, FlatOp::BoolConst(true))
+                }
+                // (2) same base, literal offsets
+                FlatOp::Eq(a, b) => match (addr[a], addr[b]) {
+                    (Some((ba, oa, wa)), Some((bb, ob, wb))) if ba == bb && wa == wb => {
+                        Self::push(&mut ops, &mut dedup, FlatOp::BoolConst(oa == ob))
+                    }
+                    _ => Self::push(&mut ops, &mut dedup, op),
+                },
+                // (3) constant-condition select
+                FlatOp::Ite(c, t, e) => match ops[c] {
+                    FlatOp::BoolConst(true) => t,
+                    FlatOp::BoolConst(false) => e,
+                    _ => Self::push(&mut ops, &mut dedup, op),
+                },
+                _ => Self::push(&mut ops, &mut dedup, op),
+            };
+            // `push` may return an EXISTING slot, whose address entry is
+            // already recorded; only a freshly appended slot needs one.
+            while addr.len() < ops.len() {
+                let i = addr.len();
+                addr.push(address_form(&ops, i, &addr));
+            }
+            map[old_index] = slot;
+        }
+        let root = map[self.root];
+        FlatProg { ops, root }.prune(root)
+    }
+
+    /// Drop every node the root does not reach, renumbering the rest. The
+    /// evaluator walks the WHOLE tape per sample, so a folded-away subtree
+    /// still costs its full price until it is physically removed.
+    fn prune(self, root: usize) -> FlatProg {
+        let mut live = vec![false; self.ops.len()];
+        live[root] = true;
+        for i in (0..self.ops.len()).rev() {
+            if !live[i] {
+                continue;
+            }
+            for c in children_of(self.ops[i]) {
+                live[c] = true;
+            }
+        }
+        let mut map = vec![usize::MAX; self.ops.len()];
+        let mut ops = Vec::with_capacity(self.ops.len());
+        for (i, op) in self.ops.iter().enumerate() {
+            if !live[i] {
+                continue;
+            }
+            map[i] = ops.len();
+            ops.push(remap_children(*op, &map));
+        }
+        let root = map[root];
+        FlatProg { ops, root }
     }
 
     /// Hash-cons `op`: return its existing slot if an identical node was already
@@ -556,7 +823,7 @@ impl FlatProg {
         // UF/UFDecl, ForAll/Exists) falls through to `_ => return None`.
         let op = match e {
             SmtExpr::Var { name, width } => {
-                let slot = inputs.iter().position(|(n, _)| n == name)?;
+                let slot = input_slot(inputs, name)?;
                 FlatOp::Var(slot, *width)
             }
             SmtExpr::BvConst { value, width } => {
@@ -1104,6 +1371,837 @@ impl FlatProg {
 /// (`bvsdiv`/`bvudiv`/`bvurem`/`TrapIfZero`) — the subset [`FlatProg`] adds over
 /// [`CExpr`]. Used by the DB soundness gate to count how many obligations now
 /// exercise the new division arms of the compiled fast path.
+// ---------------------------------------------------------------------------
+// Lane-batched evaluation
+// ---------------------------------------------------------------------------
+//
+// The statistical sweep evaluates one obligation's three tapes 100k times. The
+// scalar `FlatProg::eval` costs ~3ns per op: a `match` dispatch, a 32-byte
+// `SVal` push, and a tag check on every operand read, for one sample. A
+// `BatchProg` evaluates the SAME tape for `BATCH_LANES` samples per op
+// dispatch on plain `u64` lanes, which is what lets the compiler unroll or
+// vectorise the lane loop and amortise the dispatch. It is verdict-identical
+// to the scalar evaluator by construction — every lane rule below is the
+// matching `FlatProg::eval` arm with the `SVal` variants made explicit — and
+// pinned by the differential tests in `batch_equivalence`. What keeps it
+// simple is what it refuses: any tape that can hold a wide (`Bv128`) value is
+// left to the scalar evaluator, so every lane is a `u64` and the only per-lane
+// state beyond the value is a POISON bit (a `Trap` whose guard was zero).
+
+/// Samples evaluated per op dispatch by [`BatchProg`].
+pub(crate) const BATCH_LANES: usize = 8;
+
+/// The static sort of a tape slot: which `SVal` variant it holds when no trap
+/// has poisoned that lane. Poison is a per-lane property, never a static sort.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum LaneSort {
+    Bv,
+    Bv128,
+    Bool,
+}
+
+/// The root of a [`BatchProg`] evaluation: one value per lane, a poison mask
+/// (bit `l` set = lane `l` is `Poison`), and the root's static sort.
+pub(crate) struct BatchRoot {
+    /// Lane values, widened: a `Bv` lane is its u64 zero-extended, a `Bool`
+    /// lane is 0/1, a `Bv128` lane is the u128.
+    pub lanes: [u128; BATCH_LANES],
+    pub poison: u8,
+    pub sort: LaneSort,
+}
+
+impl BatchRoot {
+    /// `EvalResult::as_bool` per lane: Poison is false, otherwise non-zero.
+    #[inline]
+    pub fn lane_bool(&self, lane: usize) -> bool {
+        self.poison & (1 << lane) == 0 && self.lanes[lane] != 0
+    }
+    /// The `EvalResult` the scalar evaluator would have returned for `lane`
+    /// (the differential tests' oracle; production compares lanes directly).
+    #[cfg(test)]
+    pub fn lane_result(&self, lane: usize) -> EvalResult {
+        if self.poison & (1 << lane) != 0 {
+            EvalResult::Poison
+        } else {
+            match self.sort {
+                LaneSort::Bv => EvalResult::Bv(self.lanes[lane] as u64),
+                LaneSort::Bv128 => EvalResult::Bv128(self.lanes[lane]),
+                LaneSort::Bool => EvalResult::Bool(self.lanes[lane] != 0),
+            }
+        }
+    }
+}
+
+/// A [`FlatProg`] restricted to the tapes whose every slot is a `u64` (or a
+/// bool, carried as 0/1) — no `Const128`, no op of width > 64, no `Ite` that
+/// mixes sorts — evaluated `BATCH_LANES` samples at a time.
+#[derive(Clone)]
+pub(crate) struct BatchProg {
+    ops: Vec<FlatOp>,
+    sorts: Vec<LaneSort>,
+    root: usize,
+    has_trap: bool,
+}
+
+impl BatchProg {
+    /// The batched twin of `prog`, or `None` when any slot could hold a wide
+    /// value or a lane-varying sort — those tapes stay on the scalar path.
+    pub fn from_flat(prog: &FlatProg) -> Option<BatchProg> {
+        let mut sorts: Vec<LaneSort> = Vec::with_capacity(prog.ops.len());
+        let mut has_trap = false;
+        for op in &prog.ops {
+            let sort = match *op {
+                FlatOp::Const(_) | FlatOp::Var(..) => LaneSort::Bv,
+                FlatOp::Const128(_) => return None,
+                FlatOp::BoolConst(_) => LaneSort::Bool,
+                FlatOp::Add(_, _, w)
+                | FlatOp::Sub(_, _, w)
+                | FlatOp::Mul(_, _, w)
+                | FlatOp::And(_, _, w)
+                | FlatOp::Or(_, _, w)
+                | FlatOp::Xor(_, _, w)
+                | FlatOp::Shl(_, _, w)
+                | FlatOp::Lshr(_, _, w)
+                | FlatOp::Ashr(_, _, w)
+                | FlatOp::SDiv(_, _, w)
+                | FlatOp::UDiv(_, _, w)
+                | FlatOp::Neg(_, w) => {
+                    if w > 64 {
+                        return None;
+                    }
+                    LaneSort::Bv
+                }
+                // The scalar arm has no wide branch: always a `Bv`.
+                FlatOp::URem(..) | FlatOp::Extract(..) | FlatOp::MemLoad(..) => LaneSort::Bv,
+                FlatOp::Trap(_, v) => {
+                    has_trap = true;
+                    sorts[v]
+                }
+                FlatOp::Eq(..)
+                | FlatOp::Not(_)
+                | FlatOp::Slt(..)
+                | FlatOp::Sge(..)
+                | FlatOp::Sgt(..)
+                | FlatOp::Sle(..)
+                | FlatOp::Uge(..)
+                | FlatOp::Ult(..)
+                | FlatOp::Ugt(..)
+                | FlatOp::Ule(..)
+                | FlatOp::BAnd(..)
+                | FlatOp::BOr(..) => LaneSort::Bool,
+                FlatOp::Ite(_, t, e) => {
+                    if sorts[t] != sorts[e] {
+                        return None;
+                    }
+                    sorts[t]
+                }
+                FlatOp::Concat(_, _, _, width)
+                | FlatOp::ZExt(_, width)
+                | FlatOp::SExt(_, _, width) => {
+                    if width > 64 {
+                        return None;
+                    }
+                    LaneSort::Bv
+                }
+            };
+            sorts.push(sort);
+        }
+        Some(BatchProg {
+            ops: prog.ops.clone(),
+            sorts,
+            root: prog.root,
+            has_trap,
+        })
+    }
+
+    #[cfg(test)]
+    pub fn root_sort(&self) -> LaneSort {
+        self.sorts[self.root]
+    }
+
+    /// Evaluate the tape for `BATCH_LANES` samples. `inputs[slot][lane]` is
+    /// the environment value of input `slot` (the `EvalEnv` insertion index,
+    /// exactly what `FlatOp::Var` reads) for sample `lane`. `scratch` and
+    /// `poison` are reused across calls (one `[u64; 8]` + one mask per op).
+    pub fn eval_batch(
+        &self,
+        inputs: &[[u64; BATCH_LANES]],
+        scratch: &mut Vec<[u64; BATCH_LANES]>,
+        poison: &mut Vec<u8>,
+    ) -> BatchRoot {
+        if self.has_trap {
+            self.eval_batch_impl::<true>(inputs, scratch, poison)
+        } else {
+            self.eval_batch_impl::<false>(inputs, scratch, poison)
+        }
+    }
+
+    /// `P` = the tape contains a `Trap`, so lanes can be poisoned and every
+    /// operand read must apply `SVal::Poison`'s conversions (`as_u64` →
+    /// `u64::MAX`, `as_u128` → `u128::MAX`, `as_bool` → `false`). With `P`
+    /// false the poison mask is identically zero and those checks fold away.
+    #[inline(always)]
+    fn eval_batch_impl<const P: bool>(
+        &self,
+        inputs: &[[u64; BATCH_LANES]],
+        scratch: &mut Vec<[u64; BATCH_LANES]>,
+        poison: &mut Vec<u8>,
+    ) -> BatchRoot {
+        scratch.clear();
+        poison.clear();
+        for op in &self.ops {
+            let mut out = [0u64; BATCH_LANES];
+            let mut pm: u8 = 0;
+            // Operand reads, with the scalar evaluator's Poison conversions.
+            macro_rules! rd {
+                ($slot:expr, $l:expr) => {
+                    if P && poison[$slot] & (1u8 << $l) != 0 {
+                        u64::MAX
+                    } else {
+                        scratch[$slot][$l]
+                    }
+                };
+            }
+            macro_rules! rd128 {
+                ($slot:expr, $l:expr) => {
+                    if P && poison[$slot] & (1u8 << $l) != 0 {
+                        u128::MAX
+                    } else {
+                        scratch[$slot][$l] as u128
+                    }
+                };
+            }
+            macro_rules! rdb {
+                ($slot:expr, $l:expr) => {
+                    !(P && poison[$slot] & (1u8 << $l) != 0) && scratch[$slot][$l] != 0
+                };
+            }
+            macro_rules! lanes {
+                (|$l:ident| $body:expr) => {
+                    for $l in 0..BATCH_LANES {
+                        out[$l] = $body;
+                    }
+                };
+            }
+            match *op {
+                FlatOp::Const(v) => out = [v; BATCH_LANES],
+                // Rejected by `from_flat`.
+                FlatOp::Const128(_) => unreachable!("BatchProg holds no Const128"),
+                FlatOp::BoolConst(b) => out = [b as u64; BATCH_LANES],
+                FlatOp::Var(slot, w) => lanes!(|l| mask(inputs[slot][l], w)),
+                FlatOp::Add(a, b, w) => lanes!(|l| mask(rd!(a, l).wrapping_add(rd!(b, l)), w)),
+                FlatOp::Sub(a, b, w) => lanes!(|l| mask(rd!(a, l).wrapping_sub(rd!(b, l)), w)),
+                FlatOp::Mul(a, b, w) => lanes!(|l| mask(rd!(a, l).wrapping_mul(rd!(b, l)), w)),
+                FlatOp::And(a, b, w) => lanes!(|l| mask(rd!(a, l) & rd!(b, l), w)),
+                FlatOp::Or(a, b, w) => lanes!(|l| mask(rd!(a, l) | rd!(b, l), w)),
+                FlatOp::Xor(a, b, w) => lanes!(|l| mask(rd!(a, l) ^ rd!(b, l), w)),
+                FlatOp::Shl(a, b, w) => lanes!(|l| {
+                    let (av, bv) = (rd!(a, l), rd!(b, l));
+                    if bv >= w as u64 { 0 } else { mask(av << bv, w) }
+                }),
+                FlatOp::Lshr(a, b, w) => lanes!(|l| {
+                    let (av, bv) = (rd!(a, l), rd!(b, l));
+                    if bv >= w as u64 { 0 } else { mask(av >> bv, w) }
+                }),
+                FlatOp::Ashr(a, b, w) => lanes!(|l| {
+                    let av = sign_extend(rd!(a, l), w);
+                    let bv = rd!(b, l);
+                    if bv >= w as u64 {
+                        if av < 0 { mask(u64::MAX, w) } else { 0 }
+                    } else {
+                        mask((av >> bv) as u64, w)
+                    }
+                }),
+                FlatOp::SDiv(a, b, w) => lanes!(|l| {
+                    let av = sign_extend(rd!(a, l), w);
+                    let bv = sign_extend(rd!(b, l), w);
+                    if bv == 0 {
+                        0
+                    } else if av == i64::MIN && bv == -1 && w == 64 {
+                        mask(av as u64, w)
+                    } else {
+                        mask(av.wrapping_div(bv) as u64, w)
+                    }
+                }),
+                FlatOp::UDiv(a, b, w) => {
+                    lanes!(|l| rd!(a, l)
+                        .checked_div(rd!(b, l))
+                        .map(|q| mask(q, w))
+                        .unwrap_or(0))
+                }
+                FlatOp::URem(a, b, w) => lanes!(|l| {
+                    let (av, bv) = (rd!(a, l), rd!(b, l));
+                    if bv == 0 {
+                        mask(av, w)
+                    } else {
+                        mask(av % bv, w)
+                    }
+                }),
+                FlatOp::Neg(a, w) => lanes!(|l| mask((!rd!(a, l)).wrapping_add(1), w)),
+                FlatOp::Trap(g, v) => {
+                    for l in 0..BATCH_LANES {
+                        let bit = 1u8 << l;
+                        let guard_poison = P && poison[g] & bit != 0;
+                        if guard_poison || rd128!(g, l) == 0 {
+                            pm |= bit;
+                        } else {
+                            out[l] = scratch[v][l];
+                            if P && poison[v] & bit != 0 {
+                                pm |= bit;
+                            }
+                        }
+                    }
+                }
+                FlatOp::Eq(a, b) => {
+                    // `SVal == SVal`: same variant and payload. Poison equals only
+                    // Poison; different static sorts never compare equal.
+                    let same_sort = self.sorts[a] == self.sorts[b];
+                    for l in 0..BATCH_LANES {
+                        let bit = 1u8 << l;
+                        let (pa, pb) = (P && poison[a] & bit != 0, P && poison[b] & bit != 0);
+                        out[l] = if pa || pb {
+                            (pa && pb) as u64
+                        } else {
+                            (same_sort && scratch[a][l] == scratch[b][l]) as u64
+                        };
+                    }
+                }
+                FlatOp::Not(a) => lanes!(|l| (!rdb!(a, l)) as u64),
+                FlatOp::Slt(a, b, w) => {
+                    lanes!(|l| (sign_extend(rd!(a, l), w) < sign_extend(rd!(b, l), w)) as u64)
+                }
+                FlatOp::Sge(a, b, w) => {
+                    lanes!(|l| (sign_extend(rd!(a, l), w) >= sign_extend(rd!(b, l), w)) as u64)
+                }
+                FlatOp::Sgt(a, b, w) => {
+                    lanes!(|l| (sign_extend(rd!(a, l), w) > sign_extend(rd!(b, l), w)) as u64)
+                }
+                FlatOp::Sle(a, b, w) => {
+                    lanes!(|l| (sign_extend(rd!(a, l), w) <= sign_extend(rd!(b, l), w)) as u64)
+                }
+                FlatOp::Uge(a, b) => lanes!(|l| (rd!(a, l) >= rd!(b, l)) as u64),
+                FlatOp::Ult(a, b) => lanes!(|l| (rd!(a, l) < rd!(b, l)) as u64),
+                FlatOp::Ugt(a, b) => lanes!(|l| (rd!(a, l) > rd!(b, l)) as u64),
+                FlatOp::Ule(a, b) => lanes!(|l| (rd!(a, l) <= rd!(b, l)) as u64),
+                FlatOp::BAnd(a, b) => lanes!(|l| (rdb!(a, l) && rdb!(b, l)) as u64),
+                FlatOp::BOr(a, b) => lanes!(|l| (rdb!(a, l) || rdb!(b, l)) as u64),
+                FlatOp::Ite(c, t, e) => {
+                    for l in 0..BATCH_LANES {
+                        let bit = 1u8 << l;
+                        let src = if rdb!(c, l) { t } else { e };
+                        out[l] = scratch[src][l];
+                        if P && poison[src] & bit != 0 {
+                            pm |= bit;
+                        }
+                    }
+                }
+                FlatOp::Extract(o, low, width) => {
+                    lanes!(|l| ((rd128!(o, l) >> low) & mask128(u128::MAX, width)) as u64)
+                }
+                FlatOp::Concat(hi, lo, lo_width, width) => {
+                    lanes!(|l| mask128((rd128!(hi, l) << lo_width) | rd128!(lo, l), width) as u64)
+                }
+                FlatOp::ZExt(o, width) => lanes!(|l| mask(rd128!(o, l) as u64, width)),
+                FlatOp::SExt(o, src_width, width) => {
+                    lanes!(|l| mask(sign_extend(rd!(o, l), src_width) as u64, width))
+                }
+                FlatOp::MemLoad(address, load_bits, signed, result_width) => lanes!(|l| {
+                    let raw = mask(mem_load_mix(rd!(address, l)), load_bits);
+                    if signed {
+                        mask(sign_extend(raw, load_bits) as u64, result_width)
+                    } else {
+                        mask(raw, result_width)
+                    }
+                }),
+            }
+            scratch.push(out);
+            poison.push(pm);
+        }
+        BatchRoot {
+            lanes: scratch[self.root].map(|v| v as u128),
+            poison: poison[self.root],
+            sort: self.sorts[self.root],
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wide lane-batched evaluation
+// ---------------------------------------------------------------------------
+//
+// The NEON "lanewise-intent" obligations carry 128-bit values, which puts them
+// outside `BatchProg`'s u64 subset — and they are the heaviest tapes in the
+// registry (up to ~800 ops), so they were the sweeps left running at the
+// scalar evaluator's rate (~300ms of CPU on v3_popcount). `WideBatchProg` is
+// the same idea on `u128` lanes, and is the scalar evaluator's arms with the
+// `SVal` variants made explicit — INCLUDING the scalar path's asymmetries,
+// which must be mirrored, not fixed: `Var` always yields a narrow `Bv`
+// (`mask(u64, w)`), `URem`, the ordered comparisons and `MemLoad` read wide
+// operands through `as_u64` (truncating), and `Bv(x) == Bv128(x)` is FALSE.
+// A slot's sort is static (`Bv` / `Bv128` / `Bool`); an `Ite` whose branches
+// differ in sort is the one shape refused. Only tapes the narrow evaluator
+// refuses take this path (see `BatchTape`).
+
+/// A [`FlatProg`] evaluated `BATCH_LANES` samples at a time on `u128` lanes.
+#[derive(Clone)]
+pub(crate) struct WideBatchProg {
+    ops: Vec<FlatOp>,
+    sorts: Vec<LaneSort>,
+    root: usize,
+    has_trap: bool,
+}
+
+impl WideBatchProg {
+    /// The wide twin of `prog`, or `None` for an `Ite` mixing sorts.
+    pub fn from_flat(prog: &FlatProg) -> Option<WideBatchProg> {
+        let mut sorts: Vec<LaneSort> = Vec::with_capacity(prog.ops.len());
+        let mut has_trap = false;
+        let wide = |w: u32| {
+            if w > 64 {
+                LaneSort::Bv128
+            } else {
+                LaneSort::Bv
+            }
+        };
+        for op in &prog.ops {
+            let sort = match *op {
+                FlatOp::Const(_) | FlatOp::Var(..) => LaneSort::Bv,
+                FlatOp::Const128(_) => LaneSort::Bv128,
+                FlatOp::BoolConst(_) => LaneSort::Bool,
+                FlatOp::Add(_, _, w)
+                | FlatOp::Sub(_, _, w)
+                | FlatOp::Mul(_, _, w)
+                | FlatOp::And(_, _, w)
+                | FlatOp::Or(_, _, w)
+                | FlatOp::Xor(_, _, w)
+                | FlatOp::Shl(_, _, w)
+                | FlatOp::Lshr(_, _, w)
+                | FlatOp::Ashr(_, _, w)
+                | FlatOp::SDiv(_, _, w)
+                | FlatOp::UDiv(_, _, w)
+                | FlatOp::Neg(_, w) => wide(w),
+                // Always narrow in the scalar evaluator.
+                FlatOp::URem(..) | FlatOp::Extract(..) | FlatOp::MemLoad(..) => LaneSort::Bv,
+                FlatOp::Trap(_, v) => {
+                    has_trap = true;
+                    sorts[v]
+                }
+                FlatOp::Eq(..)
+                | FlatOp::Not(_)
+                | FlatOp::Slt(..)
+                | FlatOp::Sge(..)
+                | FlatOp::Sgt(..)
+                | FlatOp::Sle(..)
+                | FlatOp::Uge(..)
+                | FlatOp::Ult(..)
+                | FlatOp::Ugt(..)
+                | FlatOp::Ule(..)
+                | FlatOp::BAnd(..)
+                | FlatOp::BOr(..) => LaneSort::Bool,
+                FlatOp::Ite(_, t, e) => {
+                    if sorts[t] != sorts[e] {
+                        return None;
+                    }
+                    sorts[t]
+                }
+                FlatOp::Concat(_, _, _, width)
+                | FlatOp::ZExt(_, width)
+                | FlatOp::SExt(_, _, width) => wide(width),
+            };
+            sorts.push(sort);
+        }
+        Some(WideBatchProg {
+            ops: prog.ops.clone(),
+            sorts,
+            root: prog.root,
+            has_trap,
+        })
+    }
+
+    #[cfg(test)]
+    pub fn root_sort(&self) -> LaneSort {
+        self.sorts[self.root]
+    }
+
+    pub fn eval_batch(
+        &self,
+        inputs: &[[u64; BATCH_LANES]],
+        scratch: &mut Vec<[u128; BATCH_LANES]>,
+        poison: &mut Vec<u8>,
+    ) -> BatchRoot {
+        if self.has_trap {
+            self.eval_batch_impl::<true>(inputs, scratch, poison)
+        } else {
+            self.eval_batch_impl::<false>(inputs, scratch, poison)
+        }
+    }
+
+    /// `P` as in `BatchProg::eval_batch_impl`. Reads mirror `SVal`'s
+    /// conversions: `as_u64` is the low 64 bits (poison → `u64::MAX`),
+    /// `as_u128` the whole lane (poison → `u128::MAX`), `as_bool` non-zero
+    /// (poison → `false`).
+    #[inline(always)]
+    fn eval_batch_impl<const P: bool>(
+        &self,
+        inputs: &[[u64; BATCH_LANES]],
+        scratch: &mut Vec<[u128; BATCH_LANES]>,
+        poison: &mut Vec<u8>,
+    ) -> BatchRoot {
+        scratch.clear();
+        poison.clear();
+        for op in &self.ops {
+            let mut out = [0u128; BATCH_LANES];
+            let mut pm: u8 = 0;
+            macro_rules! rd64 {
+                ($slot:expr, $l:expr) => {
+                    if P && poison[$slot] & (1u8 << $l) != 0 {
+                        u64::MAX
+                    } else {
+                        scratch[$slot][$l] as u64
+                    }
+                };
+            }
+            macro_rules! rd128 {
+                ($slot:expr, $l:expr) => {
+                    if P && poison[$slot] & (1u8 << $l) != 0 {
+                        u128::MAX
+                    } else {
+                        scratch[$slot][$l]
+                    }
+                };
+            }
+            macro_rules! rdb {
+                ($slot:expr, $l:expr) => {
+                    !(P && poison[$slot] & (1u8 << $l) != 0) && scratch[$slot][$l] != 0
+                };
+            }
+            macro_rules! lanes {
+                (|$l:ident| $body:expr) => {
+                    for $l in 0..BATCH_LANES {
+                        out[$l] = $body;
+                    }
+                };
+            }
+            // Narrow-or-wide binary arithmetic, exactly the scalar arm's shape.
+            macro_rules! arith {
+                ($a:expr, $b:expr, $w:expr, |$x:ident, $y:ident| $wide:expr, |$p:ident, $q:ident| $narrow:expr) => {
+                    if $w > 64 {
+                        lanes!(|l| {
+                            let ($x, $y) = (rd128!($a, l), rd128!($b, l));
+                            mask128($wide, $w)
+                        })
+                    } else {
+                        lanes!(|l| {
+                            let ($p, $q) = (rd64!($a, l), rd64!($b, l));
+                            mask($narrow, $w) as u128
+                        })
+                    }
+                };
+            }
+            match *op {
+                FlatOp::Const(v) => out = [v as u128; BATCH_LANES],
+                FlatOp::Const128(v) => out = [v; BATCH_LANES],
+                FlatOp::BoolConst(b) => out = [b as u128; BATCH_LANES],
+                FlatOp::Var(slot, w) => lanes!(|l| mask(inputs[slot][l], w) as u128),
+                FlatOp::Add(a, b, w) => {
+                    arith!(a, b, w, |x, y| x.wrapping_add(y), |p, q| p.wrapping_add(q))
+                }
+                FlatOp::Sub(a, b, w) => {
+                    arith!(a, b, w, |x, y| x.wrapping_sub(y), |p, q| p.wrapping_sub(q))
+                }
+                FlatOp::Mul(a, b, w) => {
+                    arith!(a, b, w, |x, y| x.wrapping_mul(y), |p, q| p.wrapping_mul(q))
+                }
+                FlatOp::And(a, b, w) => arith!(a, b, w, |x, y| x & y, |p, q| p & q),
+                FlatOp::Or(a, b, w) => arith!(a, b, w, |x, y| x | y, |p, q| p | q),
+                FlatOp::Xor(a, b, w) => arith!(a, b, w, |x, y| x ^ y, |p, q| p ^ q),
+                FlatOp::Shl(a, b, w) => {
+                    if w > 64 {
+                        lanes!(|l| {
+                            let (av, bv) = (rd128!(a, l), rd128!(b, l));
+                            if bv >= w as u128 {
+                                0
+                            } else {
+                                mask128(av << bv, w)
+                            }
+                        })
+                    } else {
+                        lanes!(|l| {
+                            let (av, bv) = (rd64!(a, l), rd64!(b, l));
+                            if bv >= w as u64 {
+                                0
+                            } else {
+                                mask(av << bv, w) as u128
+                            }
+                        })
+                    }
+                }
+                FlatOp::Lshr(a, b, w) => {
+                    if w > 64 {
+                        lanes!(|l| {
+                            let (av, bv) = (rd128!(a, l), rd128!(b, l));
+                            if bv >= w as u128 {
+                                0
+                            } else {
+                                mask128(av >> bv, w)
+                            }
+                        })
+                    } else {
+                        lanes!(|l| {
+                            let (av, bv) = (rd64!(a, l), rd64!(b, l));
+                            if bv >= w as u64 {
+                                0
+                            } else {
+                                mask(av >> bv, w) as u128
+                            }
+                        })
+                    }
+                }
+                FlatOp::Ashr(a, b, w) => {
+                    if w > 64 {
+                        lanes!(|l| {
+                            let av = sign_extend128(rd128!(a, l), w);
+                            let bv = rd128!(b, l);
+                            if bv >= w as u128 {
+                                if av < 0 { mask128(u128::MAX, w) } else { 0 }
+                            } else {
+                                mask128((av >> bv) as u128, w)
+                            }
+                        })
+                    } else {
+                        lanes!(|l| {
+                            let av = sign_extend(rd64!(a, l), w);
+                            let bv = rd64!(b, l);
+                            (if bv >= w as u64 {
+                                if av < 0 { mask(u64::MAX, w) } else { 0 }
+                            } else {
+                                mask((av >> bv) as u64, w)
+                            }) as u128
+                        })
+                    }
+                }
+                FlatOp::SDiv(a, b, w) => {
+                    if w > 64 {
+                        lanes!(|l| {
+                            let av = sign_extend128(rd128!(a, l), w);
+                            let bv = sign_extend128(rd128!(b, l), w);
+                            if bv == 0 {
+                                0
+                            } else if av == i128::MIN && bv == -1 && w >= 128 {
+                                mask128(av as u128, w)
+                            } else {
+                                mask128(av.wrapping_div(bv) as u128, w)
+                            }
+                        })
+                    } else {
+                        lanes!(|l| {
+                            let av = sign_extend(rd64!(a, l), w);
+                            let bv = sign_extend(rd64!(b, l), w);
+                            (if bv == 0 {
+                                0
+                            } else if av == i64::MIN && bv == -1 && w == 64 {
+                                mask(av as u64, w)
+                            } else {
+                                mask(av.wrapping_div(bv) as u64, w)
+                            }) as u128
+                        })
+                    }
+                }
+                FlatOp::UDiv(a, b, w) => {
+                    if w > 64 {
+                        lanes!(|l| rd128!(a, l)
+                            .checked_div(rd128!(b, l))
+                            .map(|q| mask128(q, w))
+                            .unwrap_or(0))
+                    } else {
+                        lanes!(|l| rd64!(a, l)
+                            .checked_div(rd64!(b, l))
+                            .map(|q| mask(q, w))
+                            .unwrap_or(0) as u128)
+                    }
+                }
+                FlatOp::URem(a, b, w) => lanes!(|l| {
+                    let (av, bv) = (rd64!(a, l), rd64!(b, l));
+                    (if bv == 0 {
+                        mask(av, w)
+                    } else {
+                        mask(av % bv, w)
+                    }) as u128
+                }),
+                FlatOp::Neg(a, w) => {
+                    if w > 64 {
+                        lanes!(|l| mask128((!rd128!(a, l)).wrapping_add(1), w))
+                    } else {
+                        lanes!(|l| mask((!rd64!(a, l)).wrapping_add(1), w) as u128)
+                    }
+                }
+                FlatOp::Trap(g, v) => {
+                    for l in 0..BATCH_LANES {
+                        let bit = 1u8 << l;
+                        let guard_poison = P && poison[g] & bit != 0;
+                        if guard_poison || rd128!(g, l) == 0 {
+                            pm |= bit;
+                        } else {
+                            out[l] = scratch[v][l];
+                            if P && poison[v] & bit != 0 {
+                                pm |= bit;
+                            }
+                        }
+                    }
+                }
+                FlatOp::Eq(a, b) => {
+                    let same_sort = self.sorts[a] == self.sorts[b];
+                    for l in 0..BATCH_LANES {
+                        let bit = 1u8 << l;
+                        let (pa, pb) = (P && poison[a] & bit != 0, P && poison[b] & bit != 0);
+                        out[l] = if pa || pb {
+                            (pa && pb) as u128
+                        } else {
+                            (same_sort && scratch[a][l] == scratch[b][l]) as u128
+                        };
+                    }
+                }
+                FlatOp::Not(a) => lanes!(|l| (!rdb!(a, l)) as u128),
+                FlatOp::Slt(a, b, w) => {
+                    lanes!(|l| (sign_extend(rd64!(a, l), w) < sign_extend(rd64!(b, l), w)) as u128)
+                }
+                FlatOp::Sge(a, b, w) => {
+                    lanes!(|l| (sign_extend(rd64!(a, l), w) >= sign_extend(rd64!(b, l), w)) as u128)
+                }
+                FlatOp::Sgt(a, b, w) => {
+                    lanes!(|l| (sign_extend(rd64!(a, l), w) > sign_extend(rd64!(b, l), w)) as u128)
+                }
+                FlatOp::Sle(a, b, w) => {
+                    lanes!(|l| (sign_extend(rd64!(a, l), w) <= sign_extend(rd64!(b, l), w)) as u128)
+                }
+                FlatOp::Uge(a, b) => lanes!(|l| (rd64!(a, l) >= rd64!(b, l)) as u128),
+                FlatOp::Ult(a, b) => lanes!(|l| (rd64!(a, l) < rd64!(b, l)) as u128),
+                FlatOp::Ugt(a, b) => lanes!(|l| (rd64!(a, l) > rd64!(b, l)) as u128),
+                FlatOp::Ule(a, b) => lanes!(|l| (rd64!(a, l) <= rd64!(b, l)) as u128),
+                FlatOp::BAnd(a, b) => lanes!(|l| (rdb!(a, l) && rdb!(b, l)) as u128),
+                FlatOp::BOr(a, b) => lanes!(|l| (rdb!(a, l) || rdb!(b, l)) as u128),
+                FlatOp::Ite(c, t, e) => {
+                    for l in 0..BATCH_LANES {
+                        let bit = 1u8 << l;
+                        let src = if rdb!(c, l) { t } else { e };
+                        out[l] = scratch[src][l];
+                        if P && poison[src] & bit != 0 {
+                            pm |= bit;
+                        }
+                    }
+                }
+                FlatOp::Extract(o, low, width) => {
+                    lanes!(|l| (((rd128!(o, l) >> low) & mask128(u128::MAX, width)) as u64) as u128)
+                }
+                FlatOp::Concat(hi, lo, lo_width, width) => {
+                    lanes!(|l| {
+                        let result = mask128((rd128!(hi, l) << lo_width) | rd128!(lo, l), width);
+                        if width <= 64 {
+                            (result as u64) as u128
+                        } else {
+                            result
+                        }
+                    })
+                }
+                FlatOp::ZExt(o, width) => {
+                    if width > 64 {
+                        lanes!(|l| mask128(rd128!(o, l), width))
+                    } else {
+                        lanes!(|l| mask(rd128!(o, l) as u64, width) as u128)
+                    }
+                }
+                FlatOp::SExt(o, src_width, width) => {
+                    if width > 64 {
+                        lanes!(|l| mask128(sign_extend128(rd128!(o, l), src_width) as u128, width))
+                    } else {
+                        lanes!(|l| mask(sign_extend(rd64!(o, l), src_width) as u64, width) as u128)
+                    }
+                }
+                FlatOp::MemLoad(address, load_bits, signed, result_width) => lanes!(|l| {
+                    let raw = mask(mem_load_mix(rd64!(address, l)), load_bits);
+                    (if signed {
+                        mask(sign_extend(raw, load_bits) as u64, result_width)
+                    } else {
+                        mask(raw, result_width)
+                    }) as u128
+                }),
+            }
+            scratch.push(out);
+            poison.push(pm);
+        }
+        BatchRoot {
+            lanes: scratch[self.root],
+            poison: poison[self.root],
+            sort: self.sorts[self.root],
+        }
+    }
+}
+
+/// A tape on whichever batched evaluator accepts it: the u64 lanes when every
+/// slot is narrow, else the u128 lanes. `None` only for an `Ite` mixing sorts.
+#[derive(Clone)]
+pub(crate) enum BatchTape {
+    Narrow(BatchProg),
+    Wide(WideBatchProg),
+}
+
+/// Reused per-loop buffers for [`BatchTape::eval_batch`].
+#[derive(Default)]
+pub(crate) struct BatchScratch {
+    narrow: Vec<[u64; BATCH_LANES]>,
+    wide: Vec<[u128; BATCH_LANES]>,
+    poison: Vec<u8>,
+}
+
+impl BatchTape {
+    pub fn from_flat(prog: &FlatProg) -> Option<BatchTape> {
+        if let Some(narrow) = BatchProg::from_flat(prog) {
+            return Some(BatchTape::Narrow(narrow));
+        }
+        WideBatchProg::from_flat(prog).map(BatchTape::Wide)
+    }
+
+    #[cfg(test)]
+    pub fn is_wide(&self) -> bool {
+        matches!(self, BatchTape::Wide(_))
+    }
+
+    #[cfg(test)]
+    pub fn root_sort(&self) -> LaneSort {
+        match self {
+            BatchTape::Narrow(p) => p.root_sort(),
+            BatchTape::Wide(p) => p.root_sort(),
+        }
+    }
+
+    pub fn eval_batch(&self, inputs: &[[u64; BATCH_LANES]], s: &mut BatchScratch) -> BatchRoot {
+        match self {
+            BatchTape::Narrow(p) => p.eval_batch(inputs, &mut s.narrow, &mut s.poison),
+            BatchTape::Wide(p) => p.eval_batch(inputs, &mut s.wide, &mut s.poison),
+        }
+    }
+}
+
+/// The evaluation-environment slot of input `name`: its index among the
+/// DISTINCT input names in first-occurrence order. That is the slot
+/// `EvalEnv::insert` gives it when the inputs are inserted in order (a repeat
+/// of a name overwrites its slot instead of adding one), so compiled `Var`
+/// reads and the env agree even when an obligation repeats a name. Numbering
+/// by position in `inputs` instead read past the env on `[a, a, b]`.
+pub(crate) fn input_slot(inputs: &[(String, u32)], name: &str) -> Option<usize> {
+    let mut distinct: Vec<&str> = Vec::with_capacity(inputs.len());
+    for (n, _) in inputs {
+        let n = n.as_str();
+        if n == name {
+            return Some(distinct.len());
+        }
+        if !distinct.contains(&n) {
+            distinct.push(n);
+        }
+    }
+    None
+}
+
 pub fn expr_contains_division(expr: &SmtExpr) -> bool {
     if matches!(
         expr,
@@ -5176,7 +6274,7 @@ mod tests {
     }
 
     #[inline]
-    fn lcg(s: &mut u64) -> u64 {
+    pub(super) fn lcg(s: &mut u64) -> u64 {
         *s = s
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
@@ -5186,7 +6284,7 @@ mod tests {
     /// Random bitvector-sorted subset expression, width <= 64 (the >64 arms are
     /// covered by the division trees + handcrafted list). Every op is total, so
     /// eager tape evaluation cannot panic or diverge from the interpreter.
-    fn gen_bv(s: &mut u64, depth: u32) -> SmtExpr {
+    pub(super) fn gen_bv(s: &mut u64, depth: u32) -> SmtExpr {
         if depth == 0 || lcg(s) % 100 < 30 {
             match lcg(s) % 6 {
                 0 => SmtExpr::var("a", 8),
@@ -5225,7 +6323,7 @@ mod tests {
     }
 
     /// Random bool-sorted subset expression (comparisons + boolean connectives).
-    fn gen_bool(s: &mut u64, depth: u32) -> SmtExpr {
+    pub(super) fn gen_bool(s: &mut u64, depth: u32) -> SmtExpr {
         if depth == 0 || lcg(s) % 100 < 45 {
             let a = gen_bv(s, 1);
             let b = gen_bv(s, 1);
@@ -7059,5 +8157,662 @@ mod tests {
         let f = EvalResult::Bool(false);
         assert!(t.semantically_equal(&EvalResult::Bool(true)));
         assert!(!t.semantically_equal(&f));
+    }
+}
+
+#[cfg(test)]
+mod simplify_equivalence {
+    use super::*;
+
+    /// Evaluate both tapes at the same point and require identical results.
+    fn agree_at(plain: &FlatProg, simp: &FlatProg, env: &EvalEnv) -> bool {
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        plain.eval(env, &mut a) == simp.eval(env, &mut b)
+    }
+
+    fn env_for(inputs: &[(String, u32)], seed: &mut u64) -> EvalEnv {
+        let mut env = EvalEnv::default();
+        for (name, width) in inputs {
+            // Same LCG shape the samplers use; the point is coverage, not
+            // reproducing their exact stream.
+            *seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let v = if *width >= 64 {
+                *seed
+            } else {
+                *seed & ((1u64 << *width) - 1)
+            };
+            env.insert(name.clone(), v);
+        }
+        env
+    }
+
+    /// The obligation that motivated `simplify`: a store-chain read whose
+    /// address ladder is 73% of the tape. Pins both the collapse AND that the
+    /// collapse changed no value.
+    #[test]
+    fn simplify_preserves_evaluation_on_the_ldp_ladder() {
+        let ob = crate::memory_proofs::proof_ldp_qf_abv_i32_offset0();
+        let plain = FlatProg::compile_unsimplified(&ob.aarch64_expr, &ob.inputs).expect("compiles");
+        let simp = FlatProg::compile(&ob.aarch64_expr, &ob.inputs).expect("compiles");
+
+        assert!(
+            simp.op_count() * 8 < plain.op_count(),
+            "the address ladder should collapse by ~an order of magnitude, \
+             got {} -> {}",
+            plain.op_count(),
+            simp.op_count()
+        );
+
+        let mut seed = 0x5eed_1234_u64;
+        for _ in 0..20_000 {
+            let env = env_for(&ob.inputs, &mut seed);
+            assert!(
+                agree_at(&plain, &simp, &env),
+                "simplified tape diverged from the plain tape at {env:?}"
+            );
+        }
+    }
+
+    /// Every obligation the fixed registry can hand the evaluator, checked the
+    /// same way. This is the guard that matters: `simplify` runs on ALL of
+    /// them, so a rewrite that is wrong for any op shape fails here.
+    #[test]
+    fn simplify_preserves_evaluation_across_the_fixed_registry() {
+        let db = crate::proof_database::ProofDatabase::new();
+        let mut seed = 0xC0FFEE_u64;
+        let mut checked = 0usize;
+        for cp in db.all() {
+            let ob = &cp.obligation;
+            let (Some(plain), Some(simp)) = (
+                FlatProg::compile_unsimplified(&ob.aarch64_expr, &ob.inputs),
+                FlatProg::compile(&ob.aarch64_expr, &ob.inputs),
+            ) else {
+                continue; // out of the compiled subset on both sides
+            };
+            for _ in 0..200 {
+                let env = env_for(&ob.inputs, &mut seed);
+                assert!(
+                    agree_at(&plain, &simp, &env),
+                    "simplify changed the value of `{}` at {env:?}",
+                    ob.name
+                );
+            }
+            checked += 1;
+        }
+        assert!(
+            checked > 50,
+            "expected a broad registry sweep, checked {checked}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tape_census {
+    use super::*;
+
+    /// `simplify` is a compile-time cost paid once per obligation and a
+    /// per-sample saving paid 100,000 times, so silently losing it would be
+    /// expensive and invisible. This pins the aggregate effect over the whole
+    /// fixed registry rather than one obligation.
+    ///
+    /// Measured 2026-08-25: 1651 obligations, 39154 tape nodes -> 24918, i.e.
+    /// 36.4% removed. The floor below is deliberately slack (25%) — this is a
+    /// regression guard, not a target, and new obligations legitimately move
+    /// the ratio. It fails loudly if the fold stops firing.
+    #[test]
+    fn simplify_removes_a_third_of_the_registry_tape_mass() {
+        let db = crate::proof_database::ProofDatabase::new();
+        let (mut plain_total, mut simp_total, mut n) = (0usize, 0usize, 0usize);
+        for cp in db.all() {
+            let ob = &cp.obligation;
+            let (Some(plain), Some(simp)) = (
+                FlatProg::compile_unsimplified(&ob.aarch64_expr, &ob.inputs),
+                FlatProg::compile(&ob.aarch64_expr, &ob.inputs),
+            ) else {
+                continue;
+            };
+            assert!(
+                simp.op_count() <= plain.op_count(),
+                "simplify GREW `{}`: {} -> {}",
+                ob.name,
+                plain.op_count(),
+                simp.op_count()
+            );
+            plain_total += plain.op_count();
+            simp_total += simp.op_count();
+            n += 1;
+        }
+        assert!(n > 500, "expected the full registry, saw {n} obligations");
+        let removed = (plain_total - simp_total) as f64 / plain_total as f64;
+        assert!(
+            removed > 0.25,
+            "simplify removed only {:.1}% of {plain_total} tape nodes over {n} \
+             obligations; it was 36.4% when written, so the fold has stopped firing",
+            removed * 100.0
+        );
+    }
+}
+
+/// Differential pin of [`BatchProg`] against [`FlatProg::eval`]: lane by lane,
+/// value AND poison AND sort, on every registry tape, on the random-expression
+/// generator's whole subset, and on hand-built tapes for the ops the generator
+/// never emits with poisoned lanes forced.
+#[cfg(test)]
+mod batch_equivalence {
+    use super::tests::{gen_bool, gen_bv, lcg};
+    use super::*;
+
+    fn env_in_input_order(inputs: &[(String, u32)], vals: &[u64]) -> EvalEnv {
+        let mut env = EvalEnv::default();
+        for (k, (name, _)) in inputs.iter().enumerate() {
+            env.insert(name.clone(), vals[k]);
+        }
+        env
+    }
+
+    /// Compare `batches` batches of 8 samples; `pick(k, lane, rng)` chooses
+    /// input `k`'s raw value for a lane (so tests can force zeros for guards).
+    fn compare(
+        label: &str,
+        flat: &FlatProg,
+        batch: &BatchTape,
+        inputs: &[(String, u32)],
+        batches: usize,
+        seed: &mut u64,
+        pick: impl Fn(usize, usize, u64) -> u64,
+    ) -> usize {
+        let mut scratch: Vec<SVal> = Vec::new();
+        let mut bs = BatchScratch::default();
+        let mut lanes = vec![[0u64; BATCH_LANES]; inputs.len()];
+        let mut checks = 0;
+        for _ in 0..batches {
+            let mut envs: Vec<EvalEnv> = Vec::with_capacity(BATCH_LANES);
+            for l in 0..BATCH_LANES {
+                let vals: Vec<u64> = (0..inputs.len()).map(|k| pick(k, l, lcg(seed))).collect();
+                for k in 0..inputs.len() {
+                    lanes[k][l] = vals[k];
+                }
+                envs.push(env_in_input_order(inputs, &vals));
+            }
+            let root = batch.eval_batch(&lanes, &mut bs);
+            assert_eq!(root.sort, batch.root_sort());
+            for l in 0..BATCH_LANES {
+                let scalar = flat.eval(&envs[l], &mut scratch);
+                assert_eq!(
+                    root.lane_result(l),
+                    scalar,
+                    "{label}: lane {l} diverges at {:?}",
+                    envs[l]
+                );
+                checks += 1;
+            }
+        }
+        checks
+    }
+
+    /// Every tape of every registry obligation that is in the batch subset
+    /// agrees with the scalar evaluator on random inputs; and the subset is
+    /// most of the registry (the speed-up has to apply to something).
+    #[test]
+    fn registry_tapes_agree_lane_for_lane() {
+        let db = crate::proof_database::ProofDatabase::new();
+        let mut seed = 0xBA7C_4E5A_u64;
+        let (mut converted, mut wide, mut tapes, mut checks) = (0usize, 0usize, 0usize, 0usize);
+        for cp in db.all() {
+            let ob = &cp.obligation;
+            if ob.inputs.is_empty() {
+                continue;
+            }
+            let mut exprs: Vec<&SmtExpr> = vec![&ob.trust_ir_expr, &ob.aarch64_expr];
+            exprs.extend(ob.preconditions.iter());
+            for e in exprs {
+                let Some(flat) = FlatProg::compile(e, &ob.inputs) else {
+                    continue;
+                };
+                tapes += 1;
+                let Some(batch) = BatchTape::from_flat(&flat) else {
+                    continue;
+                };
+                converted += 1;
+                wide += batch.is_wide() as usize;
+                checks += compare(
+                    &ob.name,
+                    &flat,
+                    &batch,
+                    &ob.inputs,
+                    48,
+                    &mut seed,
+                    |_, _, r| r,
+                );
+                // Edge lanes: all-zero, all-one, alternating — division and
+                // trap guards live there.
+                checks += compare(
+                    &ob.name,
+                    &flat,
+                    &batch,
+                    &ob.inputs,
+                    4,
+                    &mut seed,
+                    |_, l, r| match l % 4 {
+                        0 => 0,
+                        1 => u64::MAX,
+                        2 => 1,
+                        _ => r,
+                    },
+                );
+            }
+        }
+        eprintln!(
+            "batch subset: {converted}/{tapes} registry tapes ({wide} on the wide evaluator), {checks} lane-checks, 0 divergences"
+        );
+        assert!(tapes >= 100, "registry unexpectedly small: {tapes} tapes");
+        assert!(
+            converted * 100 >= tapes * 99,
+            "batched evaluators cover only {converted}/{tapes} registry tapes"
+        );
+    }
+
+    /// The whole random generator subset (<= 64-bit arithmetic, compares,
+    /// ite) converts, and agrees.
+    #[test]
+    fn random_subset_expressions_agree_lane_for_lane() {
+        let inputs = vec![
+            ("a".to_string(), 8u32),
+            ("b".to_string(), 16u32),
+            ("c".to_string(), 32u32),
+            ("d".to_string(), 64u32),
+        ];
+        let mut gs: u64 = 0x5eed_0f_ba7c_4e5a;
+        let (mut exprs, mut checks) = (0usize, 0usize);
+        for i in 0..500 {
+            let e = if i % 3 == 0 {
+                gen_bool(&mut gs, 4)
+            } else {
+                gen_bv(&mut gs, 4)
+            };
+            let Some(flat) = FlatProg::compile(&e, &inputs) else {
+                continue;
+            };
+            let batch = BatchTape::from_flat(&flat).unwrap_or_else(|| {
+                panic!("generator expression #{i} left the batch subset: {e:?}")
+            });
+            exprs += 1;
+            let mut es = lcg(&mut gs);
+            checks += compare("random", &flat, &batch, &inputs, 12, &mut es, |_, _, r| r);
+            checks += compare(
+                "random-edges",
+                &flat,
+                &batch,
+                &inputs,
+                2,
+                &mut es,
+                |_, l, r| [0u64, 1, u64::MAX, 1u64 << 63, 0x80, 0x8000, 0x8000_0000, r][l],
+            );
+        }
+        assert!(exprs >= 400, "only {exprs} expressions compiled");
+        eprintln!("batch random subset: {exprs} exprs, {checks} lane-checks, 0 divergences");
+    }
+
+    /// The ops the generator never emits — Trap (poison), Extract, Concat,
+    /// zero/sign extension, memory loads, mixed-sort Eq — with poisoned lanes
+    /// forced (`a == 0` poisons `t`, `b == 0` poisons `t2`), and the wide
+    /// tapes the subset must refuse.
+    #[test]
+    fn traps_extracts_concats_extensions_and_loads_agree_lane_for_lane() {
+        let inputs = vec![
+            ("a".to_string(), 8u32),
+            ("b".to_string(), 16u32),
+            ("c".to_string(), 32u32),
+            ("d".to_string(), 64u32),
+        ];
+        let a = || SmtExpr::var("a", 8);
+        let b = || SmtExpr::var("b", 16);
+        let c = || SmtExpr::var("c", 32);
+        let d = || SmtExpr::var("d", 64);
+        let t = || c().trap_if_zero(a()); // Poison when a == 0
+        let t2 = || d().trap_if_zero(b()); // Poison when b == 0
+        let zext = |e: SmtExpr, extra: u32, width: u32| SmtExpr::ZeroExtend {
+            operand: Arc::new(e),
+            extra_bits: extra,
+            width,
+        };
+        let sext = |e: SmtExpr, extra: u32, width: u32| SmtExpr::SignExtend {
+            operand: Arc::new(e),
+            extra_bits: extra,
+            width,
+        };
+        let cases: Vec<(&str, SmtExpr)> = vec![
+            ("trap", t()),
+            ("trap+c", t().bvadd(c())),
+            ("trap==trap2", t().eq_expr(t2())),
+            ("trap==c", t().eq_expr(c())),
+            ("c==trap", c().eq_expr(t())),
+            (
+                "ite(a==0, trap, c)",
+                SmtExpr::ite(a().eq_expr(SmtExpr::bv_const(0, 8)), t(), c()),
+            ),
+            (
+                "ite(b==0, c, trap)",
+                SmtExpr::ite(b().eq_expr(SmtExpr::bv_const(0, 16)), c(), t()),
+            ),
+            ("!(trap==c)", t().eq_expr(c()).not_expr()),
+            ("a <s trap", c().bvslt(t())),
+            ("c udiv trap", c().bvudiv(t())),
+            ("trap urem c", t().bvurem(c())),
+            ("c sdiv trap", c().bvsdiv(t())),
+            ("trap ashr c", t().bvashr(c())),
+            ("trap shl c", t().bvshl(c())),
+            ("extract trap[15:0]", t().extract(15, 0)),
+            ("extract trap[31:16]", t().extract(31, 16)),
+            ("extract d[63:32]", d().extract(63, 32)),
+            ("extract d[7:3]", d().extract(7, 3)),
+            ("extract c[31:0]", c().extract(31, 0)),
+            ("concat c b", c().concat(b())),
+            ("concat a a", a().concat(a())),
+            ("concat trap a", t().concat(a())),
+            ("concat b trap2[7:0]", b().concat(t2().extract(7, 0))),
+            ("zext a 32", zext(a(), 24, 32)),
+            ("sext b 64", sext(b(), 48, 64)),
+            ("sext trap 64", sext(t(), 32, 64)),
+            ("zext trap 64", zext(t(), 32, 64)),
+            ("load s8->32", SmtExpr::mem_load(d(), 8, true, 32)),
+            ("load u16->64", SmtExpr::mem_load(d(), 16, false, 64)),
+            ("load u8 @trap2", SmtExpr::mem_load(t2(), 8, false, 32)),
+            ("bool == bv (mixed)", SmtExpr::bool_const(true).eq_expr(a())),
+            ("trap2 + d", t2().bvadd(d())),
+            ("neg trap", t().bvneg()),
+        ];
+        let mut seed = 0x7a4b_0000_dead_beefu64;
+        let (mut compiled, mut checks) = (0usize, 0usize);
+        for (label, e) in &cases {
+            let Some(flat) = FlatProg::compile(e, &inputs) else {
+                eprintln!("  (scalar compile refused `{label}` — not a batch-subset question)");
+                continue;
+            };
+            compiled += 1;
+            let batch = BatchTape::from_flat(&flat)
+                .unwrap_or_else(|| panic!("`{label}` should be in the batch subset"));
+            // Force poison lanes: a == 0 on lanes 0,3,5,6; b == 0 on lanes 1,3,6.
+            checks += compare(
+                label,
+                &flat,
+                &batch,
+                &inputs,
+                32,
+                &mut seed,
+                |k, l, r| match (k, l) {
+                    (0, 0 | 3 | 5 | 6) => 0,
+                    (1, 1 | 3 | 6) => 0,
+                    (2, 2) => 0,
+                    (3, 7) => u64::MAX,
+                    _ => r,
+                },
+            );
+        }
+        assert!(
+            compiled >= 28,
+            "only {compiled}/{} hand-built cases compiled",
+            cases.len()
+        );
+        eprintln!("batch hand-built: {compiled} cases, {checks} lane-checks, 0 divergences");
+
+        // Wide tapes: refused by the narrow evaluator, taken by the wide one.
+        for (label, wide) in [
+            ("concat d d (128)", d().concat(d())),
+            ("zext d 128", zext(d(), 64, 128)),
+            ("sext d 128", sext(d(), 64, 128)),
+        ] {
+            let flat = FlatProg::compile(&wide, &inputs).expect(label);
+            assert!(
+                BatchProg::from_flat(&flat).is_none(),
+                "`{label}` must be refused by the narrow path"
+            );
+            assert!(
+                BatchTape::from_flat(&flat).is_some_and(|t| t.is_wide()),
+                "`{label}` must take the wide path"
+            );
+        }
+    }
+
+    /// The wide evaluator on hand-built 128-bit tapes: every wide arm, the
+    /// scalar path's truncating reads (`URem`, ordered compares, `MemLoad`
+    /// through `as_u64`), `Bv` vs `Bv128` never equal, poison through wide
+    /// ops, and the narrow-inside-wide arms (a 64-bit sub-expression of a
+    /// 128-bit tape is still computed the narrow way).
+    #[test]
+    fn wide_tapes_agree_lane_for_lane() {
+        let inputs = vec![
+            ("a".to_string(), 8u32),
+            ("b".to_string(), 16u32),
+            ("c".to_string(), 32u32),
+            ("d".to_string(), 64u32),
+        ];
+        let a = || SmtExpr::var("a", 8);
+        let c = || SmtExpr::var("c", 32);
+        let d = || SmtExpr::var("d", 64);
+        let w = || d().concat(c().concat(c())); // 128-bit, from narrow parts
+        let w2 = || {
+            d().concat(d())
+                .bvxor(SmtExpr::bv_const(0x5a5a_5a5a, 128).bvshl(SmtExpr::bv_const(64, 128)))
+        };
+        let t = || w().trap_if_zero(a()); // Poison when a == 0 (128-bit value)
+        let zext = |e: SmtExpr, extra: u32, width: u32| SmtExpr::ZeroExtend {
+            operand: Arc::new(e),
+            extra_bits: extra,
+            width,
+        };
+        let sext = |e: SmtExpr, extra: u32, width: u32| SmtExpr::SignExtend {
+            operand: Arc::new(e),
+            extra_bits: extra,
+            width,
+        };
+        let k128 = |v: u64| SmtExpr::bv_const(v, 128);
+        let cases: Vec<(&str, SmtExpr)> = vec![
+            ("w", w()),
+            ("w+w2", w().bvadd(w2())),
+            ("w-w2", w().bvsub(w2())),
+            ("w*w2", w().bvmul(w2())),
+            ("w&w2 | w^w2", w().bvand(w2()).bvor(w().bvxor(w2()))),
+            ("w<<k", w().bvshl(k128(70))),
+            ("w<<w2 (count from data)", w().bvshl(w2())),
+            ("w>>u w2", w().bvlshr(w2())),
+            ("w>>u k", w().bvlshr(k128(64))),
+            ("w>>s w2", w().bvashr(w2())),
+            ("w>>s k", w().bvashr(k128(100))),
+            ("w sdiv w2", w().bvsdiv(w2())),
+            ("w udiv w2", w().bvudiv(w2())),
+            (
+                "MIN sdiv -1",
+                k128(0)
+                    .bvsub(k128(1))
+                    .bvshl(k128(127))
+                    .bvsdiv(k128(0).bvsub(k128(1))),
+            ),
+            (
+                "urem@64 on wide operands (as_u64 truncation)",
+                SmtExpr::BvURem {
+                    lhs: Arc::new(w()),
+                    rhs: Arc::new(w2()),
+                    width: 64,
+                },
+            ),
+            ("-w", w().bvneg()),
+            ("w == w2", w().eq_expr(w2())),
+            ("w == w", w().eq_expr(d().concat(c().concat(c())))),
+            ("Bv vs Bv128 never equal", zext(d(), 64, 128).eq_expr(d())),
+            ("w <s w2 (as_u64)", w().bvslt(w2())),
+            ("w <=s w2", w().bvsle(w2())),
+            ("w >u w2 (as_u64)", w().bvugt(w2())),
+            ("w >=u w2", w().bvuge(w2())),
+            (
+                "ite(a==0, w, w2)",
+                SmtExpr::ite(a().eq_expr(SmtExpr::bv_const(0, 8)), w(), w2()),
+            ),
+            ("extract w[127:64]", w().extract(127, 64)),
+            ("extract w[95:32]", w().extract(95, 32)),
+            ("extract w[7:0]", w().extract(7, 0)),
+            ("zext d 128", zext(d(), 64, 128)),
+            ("sext d 128", sext(d(), 64, 128)),
+            ("sext c 128", sext(c(), 96, 128)),
+            ("zext w[31:0] 128", zext(w().extract(31, 0), 96, 128)),
+            ("trap", t()),
+            ("trap + w2", t().bvadd(w2())),
+            ("trap == trap", t().eq_expr(w2().trap_if_zero(a()))),
+            ("trap == w", t().eq_expr(w())),
+            (
+                "ite(c==0, trap, w)",
+                SmtExpr::ite(c().eq_expr(SmtExpr::bv_const(0, 32)), t(), w()),
+            ),
+            ("extract trap[127:64]", t().extract(127, 64)),
+            ("trap >>u w2", t().bvlshr(w2())),
+            ("trap sdiv w2", t().bvsdiv(w2())),
+            ("!(trap == w)", t().eq_expr(w()).not_expr()),
+            (
+                "load @ w (as_u64 addr)",
+                SmtExpr::mem_load(w(), 16, true, 64),
+            ),
+            (
+                "narrow inside wide: (d+d) concat (c*c)",
+                d().bvadd(d()).concat(c().bvmul(c()).concat(c())),
+            ),
+        ];
+        let mut seed = 0x1de_a5ed_c0ff_ee00u64;
+        let (mut compiled, mut wide_count, mut checks) = (0usize, 0usize, 0usize);
+        for (label, e) in &cases {
+            let Some(flat) = FlatProg::compile(e, &inputs) else {
+                eprintln!("  (scalar compile refused `{label}`)");
+                continue;
+            };
+            compiled += 1;
+            let batch =
+                BatchTape::from_flat(&flat).unwrap_or_else(|| panic!("`{label}` should convert"));
+            wide_count += batch.is_wide() as usize;
+            checks += compare(
+                label,
+                &flat,
+                &batch,
+                &inputs,
+                32,
+                &mut seed,
+                |k, l, r| match (k, l) {
+                    (0, 0 | 3 | 5) => 0,
+                    (2, 1 | 3) => 0,
+                    (3, 2) => 0,
+                    (3, 6) => u64::MAX,
+                    (3, 7) => 1u64 << 63,
+                    _ => r,
+                },
+            );
+        }
+        assert!(
+            compiled >= 38,
+            "only {compiled}/{} wide cases compiled",
+            cases.len()
+        );
+        assert!(
+            wide_count >= 30,
+            "only {wide_count} cases took the wide path"
+        );
+        eprintln!(
+            "wide hand-built: {compiled} cases ({wide_count} wide), {checks} lane-checks, 0 divergences"
+        );
+    }
+
+    /// Random 128-bit expressions built from the narrow generator's outputs.
+    #[test]
+    fn random_wide_expressions_agree_lane_for_lane() {
+        let inputs = vec![
+            ("a".to_string(), 8u32),
+            ("b".to_string(), 16u32),
+            ("c".to_string(), 32u32),
+            ("d".to_string(), 64u32),
+        ];
+        fn to64(e: SmtExpr) -> SmtExpr {
+            match e.sort() {
+                SmtSort::BitVec(64) => e,
+                SmtSort::BitVec(w) if w < 64 => SmtExpr::ZeroExtend {
+                    operand: Arc::new(e),
+                    extra_bits: 64 - w,
+                    width: 64,
+                },
+                _ => SmtExpr::var("d", 64),
+            }
+        }
+        fn widen(s: &mut u64) -> SmtExpr {
+            // a 128-bit value from two narrow expressions
+            let hi = to64(gen_bv(s, 2));
+            let lo = to64(gen_bv(s, 2));
+            hi.concat(lo)
+        }
+        fn gen_wide(s: &mut u64, depth: u32) -> SmtExpr {
+            if depth == 0 {
+                return widen(s);
+            }
+            let x = gen_wide(s, depth - 1);
+            let y = gen_wide(s, depth - 1);
+            match lcg(s) % 14 {
+                0 => x.bvadd(y),
+                1 => x.bvsub(y),
+                2 => x.bvmul(y),
+                3 => x.bvand(y),
+                4 => x.bvor(y),
+                5 => x.bvxor(y),
+                6 => x.bvshl(y),
+                7 => x.bvlshr(y),
+                8 => x.bvashr(y),
+                9 => x.bvsdiv(y),
+                10 => x.bvudiv(y),
+                11 => x.bvneg(),
+                12 => SmtExpr::ite(gen_bool(s, 2), x, y),
+                _ => x.trap_if_zero(to64(gen_bv(s, 1))),
+            }
+        }
+        let mut gs: u64 = 0x1de_0000_0000_0001u64;
+        let (mut exprs, mut wide, mut checks) = (0usize, 0usize, 0usize);
+        for i in 0..300 {
+            let e = match i % 5 {
+                0 => gen_wide(&mut gs, 3).eq_expr(gen_wide(&mut gs, 2)),
+                1 => gen_wide(&mut gs, 3).bvslt(gen_wide(&mut gs, 2)),
+                2 => gen_wide(&mut gs, 3).extract(127, 64),
+                _ => gen_wide(&mut gs, 3),
+            };
+            let Some(flat) = FlatProg::compile(&e, &inputs) else {
+                continue;
+            };
+            let batch = BatchTape::from_flat(&flat)
+                .unwrap_or_else(|| panic!("wide expression #{i} did not convert: {e:?}"));
+            exprs += 1;
+            wide += batch.is_wide() as usize;
+            let mut es = lcg(&mut gs);
+            checks += compare(
+                "random-wide",
+                &flat,
+                &batch,
+                &inputs,
+                10,
+                &mut es,
+                |_, _, r| r,
+            );
+            checks += compare(
+                "random-wide-edges",
+                &flat,
+                &batch,
+                &inputs,
+                2,
+                &mut es,
+                |_, l, r| [0u64, 1, u64::MAX, 1u64 << 63, 0x80, 0x8000, 0x8000_0000, r][l],
+            );
+        }
+        assert!(exprs >= 250, "only {exprs} wide expressions compiled");
+        assert!(
+            wide * 10 >= exprs * 9,
+            "only {wide}/{exprs} took the wide path"
+        );
+        eprintln!(
+            "batch random wide: {exprs} exprs ({wide} wide), {checks} lane-checks, 0 divergences"
+        );
     }
 }

@@ -1,3 +1,9 @@
+[build]
+# Several integration-test targets are generated, multi-megabyte Rust sources.
+# Keep cold all-target builds within a laptop-safe memory envelope by default;
+# callers with more headroom can override this with CARGO_BUILD_JOBS.
+jobs = 2
+
 [env]
 # Proof database construction currently needs a larger debug-build stack than
 # libtest's default thread stack on macOS. Keep cargo-driven test lanes on the

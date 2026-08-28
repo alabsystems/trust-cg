@@ -4,11 +4,11 @@
 [trust-cg](../../README.md). It lowers a bounded subset of monomorphized rustc
 MIR into trust-ir and uses trust-cg to produce native code.
 
-> **Status — v0.1.0 research preview.** This bridge is an evaluation surface,
+> **Status — 0.x research preview.** This bridge is an evaluation surface,
 > not a general Rust codegen backend or a replacement for LLVM, Cranelift, or
 > rustc's production backends. It accepts selected MIR, layout, ABI, runtime,
 > and target shapes and deliberately rejects many others. Read the
-> [v0.1.0 limitations](../../LIMITATIONS.md) before evaluating generated code.
+> [trust-cg limitations](../../LIMITATIONS.md) before evaluating generated code.
 
 ## Why this is a standalone crate
 

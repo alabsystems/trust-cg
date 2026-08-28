@@ -822,6 +822,52 @@ fn enc2_family_alu() {
         }
     }
 
+    // Memory-DESTINATION RMW ALU: XOR/ADD [base+disp], r64 (the register is
+    // the SOURCE; the memory operand is read, modified, and written back).
+    for (op, m) in [(X86Opcode::XorMR, "xor"), (X86Opcode::AddMR, "add")] {
+        for src in [RAX, R9] {
+            for base in G64 {
+                for disp in DISPS {
+                    cases.push(Case::fixed(
+                        op,
+                        X86InstOperands::rm(src, base, disp),
+                        vec![format!("{m} qword ptr {}, {}", mem(base, disp), n64(src))],
+                        format!("{op:?} {},{}", mem(base, disp), n64(src)),
+                    ));
+                }
+            }
+        }
+    }
+    // Memory-destination RMW ALU, SIB forms: XOR/ADD [base+index*scale+disp], r64.
+    let rmw_sib_bases: [X86PReg; 5] = [RAX, RBP, RSP, R12, R13];
+    let rmw_sib_indexes: [X86PReg; 5] = [RCX, RBP, R9, R12, R14];
+    for (op, m) in [(X86Opcode::XorMRSib, "xor"), (X86Opcode::AddMRSib, "add")] {
+        for src in [RAX, R10] {
+            for base in rmw_sib_bases {
+                for index in rmw_sib_indexes {
+                    for scale in [1u8, 2, 4, 8] {
+                        for disp in [0i64, 8, -8, 0x100] {
+                            cases.push(Case::fixed(
+                                op,
+                                X86InstOperands::rm_sib(src, base, index, scale, disp),
+                                vec![format!(
+                                    "{m} qword ptr {}, {}",
+                                    mem_sib(base, index, scale, disp),
+                                    n64(src)
+                                )],
+                                format!(
+                                    "{op:?} {},{}",
+                                    mem_sib(base, index, scale, disp),
+                                    n64(src)
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // unary ALU
     for (op, m) in [
         (X86Opcode::Neg, "neg"),
@@ -1970,7 +2016,13 @@ fn lane_status(op: X86Opcode) -> LaneStatus {
         | O::TestRI
         | O::TestRM
         | O::AdcRR
-        | O::SbbRR => Covered("alu"),
+        | O::SbbRR
+        // Memory-destination RMW ALU (XOR/ADD [mem], r64, base+disp + SIB):
+        // differential cases live in enc2_family_alu.
+        | O::XorMR
+        | O::AddMR
+        | O::XorMRSib
+        | O::AddMRSib => Covered("alu"),
         // mov
         O::MovRR
         | O::MovRR32

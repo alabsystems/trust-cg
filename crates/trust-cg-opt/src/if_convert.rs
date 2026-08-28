@@ -5139,4 +5139,24 @@ mod tests {
         assert!(!tiny_loop_disabled_by(""));
         assert!(!tiny_loop_disabled_by("ifconv"));
     }
+
+    /// IDEMPOTENCE: once the diamond is a CSEL there is nothing left to
+    /// convert, so a second run must change nothing.
+    #[test]
+    fn second_run_is_a_no_op() {
+        let cmp = MachInst::new(AArch64Opcode::CmpRR, vec![vreg(0), vreg(1)]);
+        let true_mov = MachInst::new(AArch64Opcode::MovR, vec![vreg(2), vreg(3)]);
+        let false_mov = MachInst::new(AArch64Opcode::MovR, vec![vreg(2), vreg(4)]);
+        let mut func = make_diamond(cmp, CondCode::EQ, vec![true_mov], vec![false_mov]);
+        assert!(IfConversion.run(&mut func), "first run must fire");
+        let (insts, blocks) = (func.insts.len(), func.blocks.len());
+        for again in 2..=4 {
+            assert!(
+                !IfConversion.run(&mut func),
+                "run {again} re-fired on its own output"
+            );
+            assert_eq!(func.insts.len(), insts, "run {again} added instructions");
+            assert_eq!(func.blocks.len(), blocks, "run {again} added blocks");
+        }
+    }
 }

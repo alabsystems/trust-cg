@@ -145,6 +145,10 @@ fn find_one_merge(func: &X86ISelFunction) -> Option<(Block, Block)> {
 }
 
 fn merge_once(func: &mut X86ISelFunction, a: Block, b: Block) {
+    // Sole caller is `run`, immediately on a `find_one_merge` hit: that
+    // function proved `b` present (`blocks.contains_key(&b)`), `a` present
+    // (`sole_jmp_successor` starts with `blocks.get(&a)?`) and `a != b`, so
+    // removing `b` cannot be what removes `a`.
     let b_block = func.blocks.remove(&b).expect("checked present");
     let a_block = func.blocks.get_mut(&a).expect("checked present");
     // Drop `a`'s trailing `Jmp b` — control now falls straight into b's body.

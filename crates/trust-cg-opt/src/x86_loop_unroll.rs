@@ -365,11 +365,9 @@ fn analyze_counted_loop(
             return Err("chain revisits a block");
         }
         let cpreds = cfg.preds.get(&cur).unwrap_or(&empty);
-        let expected_pred = if chain.is_empty() {
-            header
-        } else {
-            *chain.last().unwrap()
-        };
+        // The chain's previous block, or `header` for the first link — the
+        // empty case IS `last() == None`, so one total expression covers both.
+        let expected_pred = *chain.last().unwrap_or(&header);
         if cpreds.as_slice() != [expected_pred] {
             return Err("chain block has extra predecessors");
         }
@@ -1423,6 +1421,9 @@ fn apply_unroll(func: &mut X86ISelFunction, plan: &UnrollPlan) {
     let after_c1 = plan.chain.get(1).copied().unwrap_or(plan.exit);
 
     // --- c1 becomes the merged unrolled body ---
+    // `apply_unroll` runs only on a plan `analyze_counted_loop` just returned,
+    // and that walk fetched EVERY chain member through `block(func, cur)?`
+    // before pushing it into `plan.chain`; `func` is untouched in between.
     let blk = func.blocks.get_mut(&c1).expect("chain head vanished");
     blk.insts.clear();
     blk.insts.extend(plan.seeds.iter().cloned());
@@ -1441,6 +1442,8 @@ fn apply_unroll(func: &mut X86ISelFunction, plan: &UnrollPlan) {
     for i in 1..plan.chain.len() {
         let b = plan.chain[i];
         let next = plan.chain.get(i + 1).copied().unwrap_or(plan.exit);
+        // Same recognition-time `block(func, cur)?` as `c1` above; this loop
+        // only clears and refills block bodies, it removes no block.
         let blk = func.blocks.get_mut(&b).expect("chain block vanished");
         blk.insts.clear();
         blk.insts.push(X86ISelInst::new(
@@ -1451,6 +1454,9 @@ fn apply_unroll(func: &mut X86ISelFunction, plan: &UnrollPlan) {
     }
 
     // --- Header: drop the compare chain; fall through to the merged body
+    // `analyze_counted_loop` read the header's successors through
+    // `block(func, header)?` before any of this plan existed, and the two
+    // rewrites above touch only chain blocks' bodies.
     let header = func
         .blocks
         .get_mut(&plan.header)

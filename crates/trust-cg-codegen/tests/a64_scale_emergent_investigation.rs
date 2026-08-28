@@ -1246,8 +1246,21 @@ fn interp_fold_binop_matches_native_oracle() {
     let flat = flatten_module(&funcs);
 
     // The extern shims, byte-for-byte the semantics of the roundtrip test's
-    // Rust shims, at the Apple-arm64 boundary trust-cg emits (out in x0,
-    // i128 args in CONSECUTIVE GPR pairs — verified against clang arm64).
+    // Rust shims, at the arm64 boundary trust-cg emits.
+    //
+    // This fixture uses the Apple-arm64 boundary selected by the empty target
+    // triple. DarwinPCS explicitly relaxes the base AAPCS64 even-register rule
+    // for 16-byte-aligned arguments, so an i128 pair after `out` starts at x1:
+    //
+    //     void checked_add(Option<i128> *out, i128 a, i128 b)
+    //         out=x0   a=x1:x2   b=x3:x4
+    //     void checked_shl(Option<i128> *out, i128 v, u32 s)
+    //         out=x0   v=x1:x2   s=w3
+    //
+    // Base AAPCS64 targets still use x2:x3 and x4:x5 here. Keeping the target
+    // variant explicit is important: forcing the base rule onto Darwin made
+    // TrustCG disagree with Clang at cross-backend boundaries. See the C.10
+    // note in trust-cg-lower/src/abi.rs.
     fn read_pair(m: &interp::Machine, lo: usize, hi: usize) -> i128 {
         ((m.regs[hi] as u128) << 64 | m.regs[lo] as u128) as i128
     }

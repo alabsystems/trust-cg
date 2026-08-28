@@ -101,7 +101,6 @@
 
 use std::ffi::CString;
 use std::hint::black_box;
-use std::mem::MaybeUninit;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::Ordering;
@@ -118,7 +117,7 @@ use trust_cg_jit_matrix::solver_kernel_abi::SolverKernelHandle;
 use trust_cg_sat_host::propagate::{
     JIT_KERNEL_CHOICE, JIT_KERNEL_WATCHED_LITERAL, PRIMARY_JIT_MODE, SHADOW_MODE,
 };
-use trust_cg_sat_host::sys;
+use trust_cg_sat_host::{OwnedMicroSatSolver, sys};
 
 /// MicroSAT's C state is process-global (the renamed
 /// `microsat_native_propagate` reads / writes through `S->DB`, watch lists,
@@ -180,85 +179,27 @@ fn decisions_as_jit_input(decisions: &[i32]) -> Vec<u32> {
         .collect()
 }
 
-/// Stack-allocated MicroSAT solver wrapper that frees `S->DB` on drop.
-/// `parse()` malloc's the DB; we own the rest of the struct on the stack.
-struct OwnedMicroSatSolver {
-    inner: MaybeUninit<sys::solver>,
-    initialised: bool,
+/// Parse a CNF fixture into a fresh, owning solver.
+fn parse_solver(cnf_path: &Path) -> (OwnedMicroSatSolver, i32) {
+    let c_path =
+        CString::new(cnf_path.to_string_lossy().into_owned()).expect("cnf path has no NUL bytes");
+    // SAFETY: benchmark inputs are committed, well-formed DIMACS fixtures.
+    unsafe { OwnedMicroSatSolver::parse(c_path.as_c_str()) }
 }
 
-impl OwnedMicroSatSolver {
-    /// Parse a CNF fixture into a fresh solver. Returns `(solver, parse_rc)`
-    /// where `parse_rc` is `sys::UNSAT` if the parser observed a root-level
-    /// contradiction, or `sys::SAT` otherwise.
-    fn parse_from(cnf_path: &Path) -> (Self, i32) {
-        let c_path = CString::new(cnf_path.to_string_lossy().into_owned())
-            .expect("cnf path has no NUL bytes");
-        let mut inner: MaybeUninit<sys::solver> = MaybeUninit::uninit();
-        // SAFETY: matches the upstream MicroSAT `main` pattern --
-        // `parse()` runs `initCDCL` and populates every field of `*S`
-        // it later reads before returning. Passing uninitialised memory
-        // is the documented usage.
-        let parse_rc = unsafe {
-            sys::parse(
-                inner.as_mut_ptr(),
-                c_path.as_ptr() as *mut std::os::raw::c_char,
-            )
-        };
-        let initialised = true; // parse() always reaches initCDCL, even on parse-rc UNSAT
-        (Self { inner, initialised }, parse_rc)
-    }
-
-    /// Pointer into the just-parsed solver. Caller must not retain the
-    /// pointer past this owner's drop.
-    fn as_mut_ptr(&mut self) -> *mut sys::solver {
-        self.inner.as_mut_ptr()
-    }
-
-    /// Push `decisions` onto the falseStack as decision literals (reason
-    /// = 0). Mirrors MicroSAT `solve()`'s decision-pushing sequence:
-    ///
-    /// ```text
-    /// S->false[-decision] = 1;
-    /// *(S->assigned++) = -decision;
-    /// S->reason[decision] = 0;
-    /// ```
-    fn push_decisions(&mut self, decisions: &[i32]) {
-        let s_ptr = self.inner.as_mut_ptr();
-        for &lit in decisions {
-            // SAFETY: `s_ptr` was initialised by `parse`, and the
-            // `false`/`reason`/`assigned` fields point into the
-            // initialised arena allocated by `initCDCL`. Decision
-            // literals stay within [-nVars, nVars] which is the
-            // arena's valid range.
-            unsafe {
-                // SAFETY rationale: `S->false_` is offset by +nVars at
-                // construction so indices in [-nVars, nVars] are valid.
-                let s = &mut *s_ptr;
-                *s.false_.offset(-lit as isize) = 1;
-                *s.assigned = -lit;
-                s.assigned = s.assigned.add(1);
-                *s.reason.offset(lit.unsigned_abs() as isize) = 0;
-            }
-        }
-    }
-}
-
-impl Drop for OwnedMicroSatSolver {
-    fn drop(&mut self) {
-        if !self.initialised {
-            return;
-        }
-        // SAFETY: `parse` ran `initCDCL`, which malloc'd `S->DB`. We
-        // own the struct here (it's about to go out of scope), so
-        // freeing the DB is the standalone analog of dropping the
-        // stack-allocated `S` at the end of MicroSAT's `main()`.
+/// Push `decisions` onto the falseStack as decision literals (reason = 0).
+/// Mirrors MicroSAT `solve()`'s decision-pushing sequence.
+fn push_decisions(owner: &mut OwnedMicroSatSolver, decisions: &[i32]) {
+    let s_ptr = owner.as_mut_ptr();
+    for &lit in decisions {
+        // SAFETY: the owner contains a parsed solver, and decision literals
+        // stay within [-nVars, nVars] for the selected fixtures.
         unsafe {
-            let s_ptr = self.inner.as_mut_ptr();
-            let db = (*s_ptr).DB;
-            if !db.is_null() {
-                libc::free(db as *mut libc::c_void);
-            }
+            let s = &mut *s_ptr;
+            *s.false_.offset(-lit as isize) = 1;
+            *s.assigned = -lit;
+            s.assigned = s.assigned.add(1);
+            *s.reason.offset(lit.unsigned_abs() as isize) = 0;
         }
     }
 }
@@ -317,11 +258,11 @@ fn parity_check(
     // MicroSAT C: separate solver per parity probe so this run's state
     // mutation doesn't bleed into the timed bench.
     let cnf_path = fixture_path(fixture);
-    let (mut owner, parse_rc) = OwnedMicroSatSolver::parse_from(&cnf_path);
+    let (mut owner, parse_rc) = parse_solver(&cnf_path);
     let microsat_rc = if parse_rc == sys::UNSAT {
         sys::UNSAT
     } else {
-        owner.push_decisions(decisions);
+        push_decisions(&mut owner, decisions);
         // SAFETY: post-parse solver is fully initialised.
         unsafe { microsat_native_propagate(owner.as_mut_ptr()) }
     };
@@ -389,9 +330,9 @@ fn bench_microsat_c_o3(c: &mut Criterion) {
             b.iter_batched(
                 || {
                     let _lock = SOLVER_LOCK.lock().expect("solver lock poisoned");
-                    let (mut owner, parse_rc) = OwnedMicroSatSolver::parse_from(&cnf_path_inner);
+                    let (mut owner, parse_rc) = parse_solver(&cnf_path_inner);
                     if parse_rc != sys::UNSAT {
-                        owner.push_decisions(&decisions_inner);
+                        push_decisions(&mut owner, &decisions_inner);
                     }
                     (owner, parse_rc)
                 },

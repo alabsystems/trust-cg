@@ -21,6 +21,7 @@ use trust_cg_opt::cache::StableHasher;
 
 use crate::jit_diagnostics::sha256_hex;
 use crate::target::{Target, TargetSpec};
+use crate::x86_64::{X86TargetFeature, X86TargetFeatures};
 
 /// Stable schema name for [`DeterministicArtifactManifest`].
 pub const JIT_ARTIFACT_MANIFEST_SCHEMA: &str = "trust-cg.artifact/v1";
@@ -136,6 +137,377 @@ pub const HOST_JIT_TARGET_FEATURE_PROFILE_DETECTED_HOST_FEATURES_KEY: &str =
 /// Manifest metadata key for the stable profile SHA-256 digest.
 pub const HOST_JIT_TARGET_FEATURE_PROFILE_SHA256_KEY: &str =
     "trust-cg.host_jit.target_feature_profile.sha256";
+
+/// Stable schema for the x86 host-JIT codegen profile selected by every
+/// function in one published executable buffer.
+///
+/// This is deliberately separate from
+/// [`HOST_JIT_TARGET_FEATURE_PROFILE_SCHEMA`]. The older manifest schema
+/// describes caller-provided target declarations plus host detection. This
+/// schema is compiler evidence derived from the final per-function
+/// [`crate::x86_64::X86MachineCodeEvidence::target_features`] values.
+pub const HOST_JIT_SELECTED_CODEGEN_PROFILE_SCHEMA: &str =
+    "trust-cg.host_jit.selected_codegen_profile.v1";
+
+/// Stable numeric version for [`HostJitSelectedCodegenProfile`].
+pub const HOST_JIT_SELECTED_CODEGEN_PROFILE_SCHEMA_VERSION: u32 = 1;
+
+/// Exact Trust Codegen x86 target-feature domain and evidence order.
+pub const HOST_JIT_SELECTED_CODEGEN_FEATURE_DOMAIN: [&str; 5] =
+    ["popcnt", "sse4.1", "sse4.2", "avx", "avx2"];
+
+/// Broader runtime-detection domain reported beside the selected codegen
+/// domain. These entries are engine self-observation, not external CPUID
+/// authority.
+pub const X86_64_DETECTED_HOST_FEATURE_DOMAIN: [&str; 13] = [
+    "sse2",
+    "sse3",
+    "ssse3",
+    "sse4.1",
+    "sse4.2",
+    "popcnt",
+    "aes",
+    "pclmulqdq",
+    "avx",
+    "avx2",
+    "fma",
+    "bmi1",
+    "bmi2",
+];
+
+/// Current x86 host-JIT target-feature selection policy.
+pub const HOST_JIT_SELECTED_CODEGEN_SELECTION_POLICY: &str =
+    "runtime_detected_all_supported_in_domain_v1";
+
+/// Evidence basis required before a selected codegen profile is constructed.
+pub const HOST_JIT_SELECTED_CODEGEN_EVIDENCE_BASIS: &str =
+    "uniform_per_function_x86_machine_code_target_features";
+
+/// Authority scope of the runtime feature detector carried by the profile.
+pub const HOST_JIT_SELECTED_CODEGEN_AUTHORITY_SCOPE: &str = "engine_self_observation";
+
+/// Failure to construct an internally consistent selected-codegen profile.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum HostJitSelectedCodegenProfileError {
+    /// The compiler's source-of-truth feature enum drifted from the stable
+    /// schema domain. Evidence publication must stop until the schema is
+    /// deliberately versioned.
+    #[error(
+        "x86 host-JIT selected-codegen schema domain {schema_domain:?} differs from compiler domain {compiler_domain:?}"
+    )]
+    CodegenFeatureDomainDrift {
+        /// Stable schema domain/order.
+        schema_domain: Vec<String>,
+        /// Compiler feature enum domain/order.
+        compiler_domain: Vec<String>,
+    },
+
+    /// The compiler-selected target-feature set differs from the current
+    /// policy's runtime-detected intersection with the codegen domain.
+    #[error(
+        "selected x86 host-JIT codegen features {selected_codegen_features:?} differ from the runtime-detected codegen-domain intersection {detected_codegen_features:?}"
+    )]
+    DetectedSelectionMismatch {
+        /// Features selected by the per-function machine-code evidence.
+        selected_codegen_features: Vec<String>,
+        /// Features implied by runtime detection and the codegen domain.
+        detected_codegen_features: Vec<String>,
+    },
+}
+
+/// Exact x86 host-JIT codegen profile selected by a compiled executable
+/// buffer.
+///
+/// `selected_codegen_features` uses the Trust Codegen domain/order, while
+/// `detected_host_features` uses the broader detector domain/order. The latter
+/// is explicitly engine self-observation and does not claim external CPUID or
+/// XCR0 authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostJitSelectedCodegenProfile {
+    /// Stable schema name.
+    schema: String,
+    /// Stable schema version.
+    schema_version: u32,
+    /// Canonical compiler target triple.
+    target_triple: String,
+    /// Target architecture spelling.
+    target_architecture: String,
+    /// Target pointer width in bits.
+    target_pointer_width_bits: u16,
+    /// Policy that selected the codegen features.
+    selection_policy: String,
+    /// Per-function evidence basis used to admit the profile.
+    evidence_basis: String,
+    /// Scope of the runtime detector evidence.
+    authority_scope: String,
+    /// Exact Trust Codegen x86 target-feature domain/order.
+    selected_codegen_feature_domain: Vec<String>,
+    /// Selected features, filtered in codegen-domain order.
+    selected_codegen_features: Vec<String>,
+    /// Broader host detector domain/order.
+    detected_host_feature_domain: Vec<String>,
+    /// Runtime-detected host features, filtered in detector-domain order.
+    detected_host_features: Vec<String>,
+    /// SHA-256 of [`Self::canonical_payload_json`].
+    profile_sha256: String,
+}
+
+impl HostJitSelectedCodegenProfile {
+    /// Construct a profile after the compiler has proven that every function's
+    /// actual machine-code evidence equals `selected_target_features`.
+    pub(crate) fn from_validated_x86_target_features(
+        target_triple: impl Into<String>,
+        selected_target_features: X86TargetFeatures,
+    ) -> Result<Self, HostJitSelectedCodegenProfileError> {
+        Self::from_validated_x86_target_features_and_detected_host(
+            target_triple,
+            selected_target_features,
+            detected_x86_64_host_features(),
+        )
+    }
+
+    fn from_validated_x86_target_features_and_detected_host(
+        target_triple: impl Into<String>,
+        selected_target_features: X86TargetFeatures,
+        detected_host_features: Vec<String>,
+    ) -> Result<Self, HostJitSelectedCodegenProfileError> {
+        let compiler_domain = X86TargetFeature::ALL.map(X86TargetFeature::name);
+        Self::validate_codegen_feature_domain(&compiler_domain)?;
+
+        let selected_codegen_features = selected_target_features
+            .enabled_feature_names()
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let detected_host_features = X86_64_DETECTED_HOST_FEATURE_DOMAIN
+            .iter()
+            .filter(|feature| {
+                detected_host_features
+                    .iter()
+                    .any(|detected| detected.as_str() == **feature)
+            })
+            .map(|feature| (*feature).to_owned())
+            .collect::<Vec<_>>();
+        let detected_codegen_features = HOST_JIT_SELECTED_CODEGEN_FEATURE_DOMAIN
+            .iter()
+            .filter(|feature| {
+                detected_host_features
+                    .iter()
+                    .any(|detected| detected.as_str() == **feature)
+            })
+            .map(|feature| (*feature).to_owned())
+            .collect::<Vec<_>>();
+        if selected_codegen_features != detected_codegen_features {
+            return Err(
+                HostJitSelectedCodegenProfileError::DetectedSelectionMismatch {
+                    selected_codegen_features,
+                    detected_codegen_features,
+                },
+            );
+        }
+
+        let mut profile = Self {
+            schema: HOST_JIT_SELECTED_CODEGEN_PROFILE_SCHEMA.to_owned(),
+            schema_version: HOST_JIT_SELECTED_CODEGEN_PROFILE_SCHEMA_VERSION,
+            target_triple: target_triple.into(),
+            target_architecture: "x86_64".to_owned(),
+            target_pointer_width_bits: 64,
+            selection_policy: HOST_JIT_SELECTED_CODEGEN_SELECTION_POLICY.to_owned(),
+            evidence_basis: HOST_JIT_SELECTED_CODEGEN_EVIDENCE_BASIS.to_owned(),
+            authority_scope: HOST_JIT_SELECTED_CODEGEN_AUTHORITY_SCOPE.to_owned(),
+            selected_codegen_feature_domain: HOST_JIT_SELECTED_CODEGEN_FEATURE_DOMAIN
+                .iter()
+                .map(|feature| (*feature).to_owned())
+                .collect(),
+            selected_codegen_features,
+            detected_host_feature_domain: X86_64_DETECTED_HOST_FEATURE_DOMAIN
+                .iter()
+                .map(|feature| (*feature).to_owned())
+                .collect(),
+            detected_host_features,
+            profile_sha256: String::new(),
+        };
+        profile.profile_sha256 = profile.computed_profile_sha256();
+        Ok(profile)
+    }
+
+    fn validate_codegen_feature_domain(
+        compiler_domain: &[&str],
+    ) -> Result<(), HostJitSelectedCodegenProfileError> {
+        if compiler_domain == HOST_JIT_SELECTED_CODEGEN_FEATURE_DOMAIN.as_slice() {
+            return Ok(());
+        }
+        Err(
+            HostJitSelectedCodegenProfileError::CodegenFeatureDomainDrift {
+                schema_domain: HOST_JIT_SELECTED_CODEGEN_FEATURE_DOMAIN
+                    .iter()
+                    .map(|feature| (*feature).to_owned())
+                    .collect(),
+                compiler_domain: compiler_domain
+                    .iter()
+                    .map(|feature| (*feature).to_owned())
+                    .collect(),
+            },
+        )
+    }
+
+    /// Stable schema name.
+    pub fn schema(&self) -> &str {
+        &self.schema
+    }
+
+    /// Stable schema version.
+    pub fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
+    /// Canonical compiler target triple.
+    pub fn target_triple(&self) -> &str {
+        &self.target_triple
+    }
+
+    /// Target architecture spelling.
+    pub fn target_architecture(&self) -> &str {
+        &self.target_architecture
+    }
+
+    /// Target pointer width in bits.
+    pub fn target_pointer_width_bits(&self) -> u16 {
+        self.target_pointer_width_bits
+    }
+
+    /// Policy that selected the codegen features.
+    pub fn selection_policy(&self) -> &str {
+        &self.selection_policy
+    }
+
+    /// Per-function evidence basis used to admit the profile.
+    pub fn evidence_basis(&self) -> &str {
+        &self.evidence_basis
+    }
+
+    /// Scope of the runtime detector evidence.
+    pub fn authority_scope(&self) -> &str {
+        &self.authority_scope
+    }
+
+    /// Exact Trust Codegen x86 target-feature domain/order.
+    pub fn selected_codegen_feature_domain(&self) -> &[String] {
+        &self.selected_codegen_feature_domain
+    }
+
+    /// Selected features, filtered in codegen-domain order.
+    pub fn selected_codegen_features(&self) -> &[String] {
+        &self.selected_codegen_features
+    }
+
+    /// Broader host detector domain/order.
+    pub fn detected_host_feature_domain(&self) -> &[String] {
+        &self.detected_host_feature_domain
+    }
+
+    /// Runtime-detected host features, filtered in detector-domain order.
+    pub fn detected_host_features(&self) -> &[String] {
+        &self.detected_host_features
+    }
+
+    /// SHA-256 of [`Self::canonical_payload_json`].
+    pub fn profile_sha256(&self) -> &str {
+        &self.profile_sha256
+    }
+
+    fn canonical_members(&self, include_digest: bool) -> BTreeMap<&'static str, serde_json::Value> {
+        fn strings(values: &[String]) -> serde_json::Value {
+            serde_json::Value::Array(
+                values
+                    .iter()
+                    .cloned()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            )
+        }
+
+        let mut members = BTreeMap::from([
+            (
+                "authority_scope",
+                serde_json::Value::String(self.authority_scope.clone()),
+            ),
+            (
+                "detected_host_feature_domain",
+                strings(&self.detected_host_feature_domain),
+            ),
+            (
+                "detected_host_features",
+                strings(&self.detected_host_features),
+            ),
+            (
+                "evidence_basis",
+                serde_json::Value::String(self.evidence_basis.clone()),
+            ),
+            ("schema", serde_json::Value::String(self.schema.clone())),
+            (
+                "schema_version",
+                serde_json::Value::from(self.schema_version),
+            ),
+            (
+                "selected_codegen_feature_domain",
+                strings(&self.selected_codegen_feature_domain),
+            ),
+            (
+                "selected_codegen_features",
+                strings(&self.selected_codegen_features),
+            ),
+            (
+                "selection_policy",
+                serde_json::Value::String(self.selection_policy.clone()),
+            ),
+            (
+                "target_architecture",
+                serde_json::Value::String(self.target_architecture.clone()),
+            ),
+            (
+                "target_pointer_width_bits",
+                serde_json::Value::from(self.target_pointer_width_bits),
+            ),
+            (
+                "target_triple",
+                serde_json::Value::String(self.target_triple.clone()),
+            ),
+        ]);
+        if include_digest {
+            members.insert(
+                "profile_sha256",
+                serde_json::Value::String(self.profile_sha256.clone()),
+            );
+        }
+        members
+    }
+
+    /// Canonical compact JSON hashed by `profile_sha256`.
+    pub fn canonical_payload_json(&self) -> String {
+        serde_json::to_string(&self.canonical_members(false))
+            .expect("selected-codegen profile contains only JSON-serializable values")
+    }
+
+    /// Canonical compact JSON including `profile_sha256`.
+    pub fn canonical_json(&self) -> String {
+        serde_json::to_string(&self.canonical_members(true))
+            .expect("selected-codegen profile contains only JSON-serializable values")
+    }
+
+    /// Recompute the canonical profile digest.
+    pub fn computed_profile_sha256(&self) -> String {
+        format!(
+            "sha256:{}",
+            sha256_hex(self.canonical_payload_json().as_bytes())
+        )
+    }
+
+    /// Whether `profile_sha256` matches the canonical payload.
+    pub fn verify_sha256(&self) -> bool {
+        self.profile_sha256 == self.computed_profile_sha256()
+    }
+}
 
 /// Stable 128-bit checksum used by the artifact contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -3498,6 +3870,128 @@ impl CanonicalEncode for DeterministicArtifactManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn selected_codegen_profile_fixture() -> HostJitSelectedCodegenProfile {
+        let selected = X86TargetFeatures::generic_x86_64()
+            .with_feature(X86TargetFeature::Popcnt)
+            .with_feature(X86TargetFeature::Sse41)
+            .with_feature(X86TargetFeature::Avx2);
+        HostJitSelectedCodegenProfile::from_validated_x86_target_features_and_detected_host(
+            "x86_64-test-host",
+            selected,
+            strings(["bmi2", "avx2", "aes", "popcnt", "sse4.1", "sse2"]),
+        )
+        .expect("fixture selection must equal the detected codegen-domain intersection")
+    }
+
+    #[test]
+    fn selected_codegen_profile_uses_exact_domains_and_canonical_orders() {
+        let profile = selected_codegen_profile_fixture();
+
+        assert_eq!(
+            profile.selected_codegen_feature_domain,
+            strings(["popcnt", "sse4.1", "sse4.2", "avx", "avx2"])
+        );
+        assert_eq!(
+            profile.selected_codegen_features,
+            strings(["popcnt", "sse4.1", "avx2"])
+        );
+        assert_eq!(
+            profile.detected_host_feature_domain,
+            strings([
+                "sse2",
+                "sse3",
+                "ssse3",
+                "sse4.1",
+                "sse4.2",
+                "popcnt",
+                "aes",
+                "pclmulqdq",
+                "avx",
+                "avx2",
+                "fma",
+                "bmi1",
+                "bmi2",
+            ])
+        );
+        assert_eq!(
+            profile.detected_host_features,
+            strings(["sse2", "sse4.1", "popcnt", "aes", "avx2", "bmi2"])
+        );
+        assert_ne!(
+            profile.selected_codegen_features, profile.detected_host_features,
+            "the exact codegen selection must remain distinct from broader host detection"
+        );
+        assert_eq!(
+            profile.authority_scope,
+            HOST_JIT_SELECTED_CODEGEN_AUTHORITY_SCOPE
+        );
+    }
+
+    #[test]
+    fn selected_codegen_profile_canonical_payload_and_digest_are_stable() {
+        let profile = selected_codegen_profile_fixture();
+        let expected_payload = concat!(
+            r#"{"authority_scope":"engine_self_observation","detected_host_feature_domain":["sse2","sse3","ssse3","sse4.1","sse4.2","popcnt","aes","pclmulqdq","avx","avx2","fma","bmi1","bmi2"],"detected_host_features":["sse2","sse4.1","popcnt","aes","avx2","bmi2"],"evidence_basis":"uniform_per_function_x86_machine_code_target_features","schema":"trust-cg.host_jit.selected_codegen_profile.v1","schema_version":1,"selected_codegen_feature_domain":["popcnt","sse4.1","sse4.2","avx","avx2"],"selected_codegen_features":["popcnt","sse4.1","avx2"],"selection_policy":"runtime_detected_all_supported_in_domain_v1","target_architecture":"x86_64","target_pointer_width_bits":64,"target_triple":"x86_64-test-host"}"#,
+        );
+
+        assert_eq!(profile.canonical_payload_json(), expected_payload);
+        assert_eq!(
+            profile.profile_sha256,
+            "sha256:9f1503dae53f00ca2c11cef20a8ff9ed806430730194d3b8d6a83f6c059bdc61"
+        );
+        assert!(profile.verify_sha256());
+
+        let canonical: serde_json::Value = serde_json::from_str(&profile.canonical_json())
+            .expect("canonical profile must be valid JSON");
+        assert_eq!(
+            canonical["profile_sha256"],
+            serde_json::Value::String(profile.profile_sha256.clone())
+        );
+
+        let mut tampered = profile;
+        tampered.selected_codegen_features.reverse();
+        assert!(!tampered.verify_sha256());
+    }
+
+    #[test]
+    fn selected_codegen_profile_rejects_detection_selection_mismatch() {
+        let selected = X86TargetFeatures::generic_x86_64()
+            .with_feature(X86TargetFeature::Popcnt)
+            .with_feature(X86TargetFeature::Sse41)
+            .with_feature(X86TargetFeature::Avx2);
+        let error =
+            HostJitSelectedCodegenProfile::from_validated_x86_target_features_and_detected_host(
+                "x86_64-test-host",
+                selected,
+                strings(["sse4.1", "popcnt"]),
+            )
+            .expect_err("selection not implied by detection must fail closed");
+
+        assert_eq!(
+            error,
+            HostJitSelectedCodegenProfileError::DetectedSelectionMismatch {
+                selected_codegen_features: strings(["popcnt", "sse4.1", "avx2"]),
+                detected_codegen_features: strings(["popcnt", "sse4.1"]),
+            }
+        );
+    }
+
+    #[test]
+    fn selected_codegen_profile_rejects_compiler_domain_drift_in_release() {
+        let error = HostJitSelectedCodegenProfile::validate_codegen_feature_domain(&[
+            "popcnt", "sse4.1", "sse4.2", "avx",
+        ])
+        .expect_err("schema/compiler domain drift must fail closed");
+
+        assert_eq!(
+            error,
+            HostJitSelectedCodegenProfileError::CodegenFeatureDomainDrift {
+                schema_domain: strings(["popcnt", "sse4.1", "sse4.2", "avx", "avx2"]),
+                compiler_domain: strings(["popcnt", "sse4.1", "sse4.2", "avx"]),
+            }
+        );
+    }
 
     fn assert_microsoft_x64_abi(abi: &AbiDescriptor) {
         assert_eq!(abi.name, "trust-cg-x86_64-windows");

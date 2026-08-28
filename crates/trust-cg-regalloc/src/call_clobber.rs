@@ -123,6 +123,16 @@ pub fn find_call_crossings(
     intervals: &BTreeMap<u32, LiveInterval>,
     inst_numbering: &BTreeMap<InstId, u32>,
 ) -> Vec<CallCrossing> {
+    find_call_crossings_in(func, intervals.values(), inst_numbering)
+}
+
+/// [`find_call_crossings`] over any interval sequence; the crossings' `live_across`
+/// lists follow the sequence's order (the map version iterates ascending id).
+pub fn find_call_crossings_in<'a>(
+    func: &MachFunction,
+    intervals: impl IntoIterator<Item = &'a LiveInterval> + Clone,
+    inst_numbering: &BTreeMap<InstId, u32>,
+) -> Vec<CallCrossing> {
     let mut crossings = Vec::new();
 
     for block in &func.blocks {
@@ -139,7 +149,7 @@ pub fn find_call_crossings(
 
             // Find all intervals that are live at this call.
             let mut live_across = Vec::new();
-            for interval in intervals.values() {
+            for interval in intervals.clone() {
                 if interval.is_live_at(call_idx) {
                     live_across.push(interval.vreg);
                 }

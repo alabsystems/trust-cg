@@ -365,3 +365,20 @@ fn bails_on_32bit_header_compare() {
 fn bails_on_stray_cmp_before_bcond() {
     assert_bails(Variant::StrayCmp, "stray compare clobbers the BCond flags");
 }
+
+/// IDEMPOTENCE: the guarded swap loop is its own fixpoint; a second run must
+/// change nothing.
+#[test]
+fn second_run_is_a_no_op() {
+    let (mut func, changed) = run(Variant::Good);
+    assert!(changed, "first run must fire");
+    let (insts, blocks) = (func.insts.len(), func.blocks.len());
+    for again in 2..=4 {
+        assert!(
+            !SwapRangeGuardPass::new().run(&mut func),
+            "run {again} re-fired on its own output"
+        );
+        assert_eq!(func.insts.len(), insts, "run {again} added instructions");
+        assert_eq!(func.blocks.len(), blocks, "run {again} added blocks");
+    }
+}

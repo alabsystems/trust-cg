@@ -8362,10 +8362,6 @@ pub fn all_x86_64_parity_flag_proofs() -> Vec<ProofObligation> {
 // Collect all proofs
 // ===========================================================================
 
-/// Return all x86-64 lowering proof obligations.
-///
-/// This provides a single entry point for running all x86-64 verification
-/// proofs, analogous to how the AArch64 proofs are collected.
 // ---------------------------------------------------------------------------
 // ROL (rotate-left by constant) lowering proofs
 // ---------------------------------------------------------------------------
@@ -8419,7 +8415,7 @@ pub fn all_x86_rol_proofs() -> Vec<ProofObligation> {
 ///
 /// 1. WRONG AMOUNT     — rotate by `k + 1`.
 /// 2. WRONG DIRECTION  — rotate RIGHT by `k` (i.e. `ROR`, halves swapped in
-///                       amount as well as order).
+///    amount as well as order).
 /// 3. HALF DROPPED     — only the `<< k` half, no wrap-around.
 #[cfg(test)]
 pub(crate) fn x86_rol_wrong_controls(
@@ -8453,6 +8449,10 @@ pub(crate) fn x86_rol_wrong_controls(
     ]
 }
 
+/// Return all x86-64 lowering proof obligations.
+///
+/// This provides a single entry point for running all x86-64 verification
+/// proofs, analogous to how the AArch64 proofs are collected.
 pub fn all_x86_64_proofs() -> Vec<ProofObligation> {
     let mut proofs = vec![
         // Control transfer

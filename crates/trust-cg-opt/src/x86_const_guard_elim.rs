@@ -22,6 +22,25 @@
 //! * `TrapDivZeroExact [d]` — trap iff `d == 0`. Deleted iff the tracked
 //!   constant of `d` is nonzero. (Gpr32 constants are stored
 //!   zero-extended by the tracker, so the low-32 zero test is exact.)
+//! * **Masked-range tier**: `TrapBoundsCheckExact [base, idx, Imm(b)]` is
+//!   also deleted when `idx` is tracked as MASK-BOUNDED: `AndRI` with a
+//!   non-negative immediate `m` bounds its destination by `m` unsigned
+//!   REGARDLESS of the other operand (`x & m <=u m` for any `x`), so
+//!   `m <u b` makes the assertion true on EVERY execution — the exact
+//!   table-lookup shape (`t[(x >> 4) & 15]` against bound 16) LLVM
+//!   discharges with value-range reasoning. Same-class copies propagate
+//!   the bound, any other def invalidates it, negative masks are never
+//!   tracked (a sign-extending immediate bounds nothing).
+//!
+//! Constants are tracked at two scopes: BLOCK-LOCAL (the original tracker:
+//! `MovRI` defines, copies propagate, any other def invalidates) and
+//! FUNCTION-WIDE UNIQUELY-DEFINED (a vreg whose only definition anywhere is
+//! one `MovRI` holds that constant at every use — defs dominate uses in ISel
+//! output, the same authority `fold_unique_const_into_imm_forms` uses; a
+//! vreg ever touched by a hidden-def opcode is disqualified). The second
+//! scope closes the preheader-materialized shape: p6_branch_match paid a
+//! per-iteration `test r,r ; je -> ud2` on the CONSTANT divisor 7 because
+//! the `MovRI 7` sits in the preheader while the trap sits in the loop body.
 //!
 //! Anything unproven is KEPT — the pass only ever removes a check whose
 //! trap condition provably cannot fire, which is the same authority under
@@ -43,6 +62,14 @@ use trust_cg_lower::{X86ISelFunction, X86ISelInst, X86ISelOperand};
 use crate::effects::x86_produces_value;
 use crate::x86_pass_manager::X86MachinePass;
 
+/// Kill switch for the masked-range tier alone: set
+/// `TCG_NO_X86_MASKED_GUARD_ELIM` (any value) to fall back to the
+/// exact-constant tiers, for a one-dylib A/B of the tier's effect.
+/// (`TCG_NO_X86_BCE` still disables the whole pass.)
+fn masked_tier_enabled() -> bool {
+    std::env::var_os("TCG_NO_X86_MASKED_GUARD_ELIM").is_none()
+}
+
 /// Const-index guard elimination for x86-64 ISel-output functions.
 pub struct X86ConstGuardElim;
 
@@ -58,11 +85,16 @@ impl X86MachinePass for X86ConstGuardElim {
 
 fn run_impl(func: &mut X86ISelFunction) -> bool {
     let mut changed = false;
+    let unique_consts = function_unique_consts(func);
     for block_id in func.block_order.clone() {
         let Some(block) = func.blocks.get_mut(&block_id) else {
             continue;
         };
         let mut constants: HashMap<VReg, i64> = HashMap::new();
+        // Unsigned INCLUSIVE upper bounds established by `AndRI` masks
+        // (see the masked-range tier in the module doc). Tracked with the
+        // same fail-closed discipline as `constants`.
+        let mut bounds: HashMap<VReg, u64> = HashMap::new();
         // Guard pseudos already EXECUTED on this straight-line path, keyed
         // by their exact operand list. If control reaches a second
         // identical pseudo with none of its vregs redefined since, the
@@ -76,10 +108,16 @@ fn run_impl(func: &mut X86ISelFunction) -> bool {
                 X86Opcode::TrapBoundsCheckExact => {
                     if let [_, X86ISelOperand::VReg(idx), X86ISelOperand::Imm(bound)] =
                         inst.operands.as_slice()
-                        && let Some(c) = constants.get(idx)
-                        && (*c as u64) < (*bound as u64)
                     {
-                        retain = false;
+                        let const_ok = constants
+                            .get(idx)
+                            .or_else(|| unique_consts.get(idx))
+                            .is_some_and(|c| (*c as u64) < (*bound as u64));
+                        let mask_ok = masked_tier_enabled()
+                            && bounds.get(idx).is_some_and(|ub| *ub < (*bound as u64));
+                        if const_ok || mask_ok {
+                            retain = false;
+                        }
                     }
                     if retain && guard_already_executed(&seen_guards, inst) {
                         retain = false;
@@ -90,7 +128,7 @@ fn run_impl(func: &mut X86ISelFunction) -> bool {
                 }
                 X86Opcode::TrapDivZeroExact => {
                     if let [X86ISelOperand::VReg(d)] = inst.operands.as_slice()
-                        && let Some(c) = constants.get(d)
+                        && let Some(c) = constants.get(d).or_else(|| unique_consts.get(d))
                         && *c != 0
                     {
                         retain = false;
@@ -130,11 +168,20 @@ fn run_impl(func: &mut X86ISelFunction) -> bool {
                 // conservative arm below plus this sweep).
                 invalidate_seen_guards(inst, &mut seen_guards);
                 update_tracker(inst, &mut constants);
+                update_bounds_tracker(inst, &mut bounds);
             }
         }
         if keep.iter().any(|k| !k) {
-            let mut it = keep.iter();
-            block.insts.retain(|_| *it.next().unwrap());
+            // `keep` got exactly one `push` per instruction in the scan above,
+            // so pairing it back by `zip` needs no length assumption at all —
+            // unlike `retain` with an iterator, which has to assert the closure
+            // is called once per element.
+            let insts = std::mem::take(&mut block.insts);
+            block.insts = insts
+                .into_iter()
+                .zip(keep)
+                .filter_map(|(inst, k)| k.then_some(inst))
+                .collect();
         }
     }
     changed
@@ -166,6 +213,62 @@ fn invalidate_seen_guards(inst: &X86ISelInst, seen: &mut Vec<(X86Opcode, Vec<X86
             .iter()
             .any(|op| matches!(op, X86ISelOperand::VReg(v) if v == d))
     });
+}
+
+/// FUNCTION-WIDE uniquely-defined constants: vregs whose ONLY definition
+/// anywhere in the function is a single `MovRI` (stored Gpr32-zero-extended
+/// like the block tracker). Sound because ISel output defines before use on
+/// every path, so the one reaching definition IS that `MovRI`. Fail-closed:
+/// a second def of any kind, or ANY appearance in a hidden-def opcode
+/// (`Xchg`/`Cmpxchg*` write operands the def convention does not model),
+/// disqualifies the vreg.
+fn function_unique_consts(func: &X86ISelFunction) -> HashMap<VReg, i64> {
+    use crate::effects::x86_produces_value as produces;
+    let mut value: HashMap<VReg, i64> = HashMap::new();
+    let mut disqualified: std::collections::HashSet<VReg> = std::collections::HashSet::new();
+    for block in func.blocks.values() {
+        for inst in &block.insts {
+            if matches!(
+                inst.opcode,
+                X86Opcode::Xchg | X86Opcode::Cmpxchg | X86Opcode::Cmpxchg8 | X86Opcode::Cmpxchg16
+            ) {
+                for op in &inst.operands {
+                    if let X86ISelOperand::VReg(v) = op {
+                        disqualified.insert(*v);
+                    }
+                }
+                continue;
+            }
+            if !produces(inst.opcode) {
+                continue;
+            }
+            let Some(X86ISelOperand::VReg(d)) = inst.operands.first() else {
+                continue;
+            };
+            if inst.opcode == X86Opcode::MovRI
+                && let [_, X86ISelOperand::Imm(v)] = inst.operands.as_slice()
+            {
+                let stored = match d.class {
+                    RegClass::Gpr32 => (*v as u32) as i64,
+                    _ => *v,
+                };
+                match value.entry(*d) {
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(stored);
+                    }
+                    std::collections::hash_map::Entry::Occupied(_) => {
+                        disqualified.insert(*d);
+                    }
+                }
+            } else {
+                disqualified.insert(*d);
+            }
+        }
+    }
+    for d in &disqualified {
+        value.remove(d);
+    }
+    value
 }
 
 /// Minimal fail-closed constant tracking: `MovRI` defines, exact
@@ -217,6 +320,63 @@ fn update_tracker(inst: &X86ISelInst, constants: &mut HashMap<VReg, i64>) {
     }
 }
 
+/// Masked-range tracking (the module doc's masked-range tier): `AndRI`
+/// with a non-negative immediate `m` bounds its destination by `m`
+/// unsigned for ANY value of the other operand, in both the tied
+/// 2-operand and the 3-operand form. Exact same-class `MovRR`/`MovRR32`
+/// copies propagate the bound (`MovRR32` zero-extends, which preserves
+/// it); every other def invalidates; hidden-def opcodes clear the map.
+/// A negative immediate is never tracked: its sign-extended encoding
+/// keeps high bits set and bounds nothing.
+fn update_bounds_tracker(inst: &X86ISelInst, bounds: &mut HashMap<VReg, u64>) {
+    match inst.opcode {
+        X86Opcode::Xchg | X86Opcode::Cmpxchg | X86Opcode::Cmpxchg8 | X86Opcode::Cmpxchg16 => {
+            bounds.clear();
+            return;
+        }
+        X86Opcode::AndRI => {
+            if let Some(X86ISelOperand::VReg(d)) = inst.operands.first()
+                && let Some(X86ISelOperand::Imm(m)) = inst.operands.last()
+                && matches!(inst.operands.len(), 2 | 3)
+            {
+                if *m >= 0 {
+                    bounds.insert(*d, *m as u64);
+                } else {
+                    bounds.remove(d);
+                }
+                return;
+            }
+        }
+        X86Opcode::MovRR | X86Opcode::MovRR32 => {
+            let want = if inst.opcode == X86Opcode::MovRR {
+                RegClass::Gpr64
+            } else {
+                RegClass::Gpr32
+            };
+            if let [X86ISelOperand::VReg(d), X86ISelOperand::VReg(s)] = inst.operands.as_slice()
+                && d.class == want
+                && s.class == want
+            {
+                match bounds.get(s).copied() {
+                    Some(v) => {
+                        bounds.insert(*d, v);
+                    }
+                    None => {
+                        bounds.remove(d);
+                    }
+                }
+                return;
+            }
+        }
+        _ => {}
+    }
+    if x86_produces_value(inst.opcode)
+        && let Some(X86ISelOperand::VReg(d)) = inst.operands.first()
+    {
+        bounds.remove(d);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,6 +415,90 @@ mod tests {
             .collect()
     }
 
+    fn make_two_block_func(b0: Vec<X86ISelInst>, b1: Vec<X86ISelInst>) -> X86ISelFunction {
+        let sig = Signature {
+            params: vec![],
+            returns: vec![],
+        };
+        let mut func = X86ISelFunction::new("guard_elim_two_block".to_string(), sig);
+        func.ensure_block(Block(0));
+        func.ensure_block(Block(1));
+        for inst in b0 {
+            func.push_inst(Block(0), inst);
+        }
+        for inst in b1 {
+            func.push_inst(Block(1), inst);
+        }
+        func.block_order = vec![Block(0), Block(1)];
+        func
+    }
+
+    #[test]
+    fn deletes_cross_block_unique_const_divisor_guard() {
+        // The p6_branch_match shape: `MovRI d, 7` in the PREHEADER, the
+        // div-zero guard inside the LOOP block — block-local tracking misses
+        // it; the function-wide unique-def scope proves it.
+        let mut f = make_two_block_func(
+            vec![X86ISelInst::new(X86Opcode::MovRI, vec![vr(1), imm(7)])],
+            vec![
+                X86ISelInst::new(X86Opcode::TrapDivZeroExact, vec![vr(1)]),
+                X86ISelInst::new(X86Opcode::Ret, vec![]),
+            ],
+        );
+        assert!(X86ConstGuardElim.run(&mut f));
+        assert!(
+            !f.blocks[&Block(1)]
+                .insts
+                .iter()
+                .any(|i| i.opcode == X86Opcode::TrapDivZeroExact),
+            "the cross-block constant divisor guard must be deleted"
+        );
+    }
+
+    #[test]
+    fn keeps_cross_block_guard_on_a_redefined_divisor() {
+        // A second def anywhere disqualifies the unique-const scope.
+        let mut f = make_two_block_func(
+            vec![X86ISelInst::new(X86Opcode::MovRI, vec![vr(1), imm(7)])],
+            vec![
+                X86ISelInst::new(X86Opcode::AddRR, vec![vr(1), vr(1), vr(2)]),
+                X86ISelInst::new(X86Opcode::TrapDivZeroExact, vec![vr(1)]),
+                X86ISelInst::new(X86Opcode::Ret, vec![]),
+            ],
+        );
+        assert!(!X86ConstGuardElim.run(&mut f));
+    }
+
+    #[test]
+    fn keeps_cross_block_guard_on_a_zero_constant() {
+        let mut f = make_two_block_func(
+            vec![X86ISelInst::new(X86Opcode::MovRI, vec![vr(1), imm(0)])],
+            vec![
+                X86ISelInst::new(X86Opcode::TrapDivZeroExact, vec![vr(1)]),
+                X86ISelInst::new(X86Opcode::Ret, vec![]),
+            ],
+        );
+        assert!(!X86ConstGuardElim.run(&mut f));
+    }
+
+    #[test]
+    fn deletes_cross_block_unique_const_bounds_check() {
+        let mut f = make_two_block_func(
+            vec![X86ISelInst::new(X86Opcode::MovRI, vec![vr(1), imm(5)])],
+            vec![
+                X86ISelInst::new(X86Opcode::TrapBoundsCheckExact, vec![vr(0), vr(1), imm(24)]),
+                X86ISelInst::new(X86Opcode::Ret, vec![]),
+            ],
+        );
+        assert!(X86ConstGuardElim.run(&mut f));
+        assert!(
+            !f.blocks[&Block(1)]
+                .insts
+                .iter()
+                .any(|i| i.opcode == X86Opcode::TrapBoundsCheckExact)
+        );
+    }
+
     #[test]
     fn deletes_statically_true_bounds_check() {
         let mut f = make_func(vec![
@@ -290,6 +534,86 @@ mod tests {
         ]);
         assert!(!X86ConstGuardElim.run(&mut f));
         assert_eq!(opcodes(&f).len(), 4);
+    }
+
+    #[test]
+    fn masked_index_in_bounds_deletes_check() {
+        // t[(x >> 4) & 15] against bound 16 — the b1_mispredict shape.
+        // ShrRI's def invalidates nothing useful; the AndRI mask alone
+        // bounds the index (15 <u 16) for ANY runtime x.
+        let mut f = make_func(vec![
+            X86ISelInst::new(X86Opcode::ShrRI, vec![vr(1), vr(2), imm(4)]),
+            X86ISelInst::new(X86Opcode::AndRI, vec![vr(1), imm(15)]),
+            X86ISelInst::new(X86Opcode::TrapBoundsCheckExact, vec![vr(1), vr(1), imm(16)]),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        assert!(X86ConstGuardElim.run(&mut f));
+        assert_eq!(
+            opcodes(&f),
+            vec![X86Opcode::ShrRI, X86Opcode::AndRI, X86Opcode::Ret]
+        );
+    }
+
+    #[test]
+    fn masked_index_three_operand_form_deletes_check() {
+        let mut f = make_func(vec![
+            X86ISelInst::new(X86Opcode::AndRI, vec![vr(1), vr(2), imm(7)]),
+            X86ISelInst::new(X86Opcode::TrapBoundsCheckExact, vec![vr(0), vr(1), imm(8)]),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        assert!(X86ConstGuardElim.run(&mut f));
+        assert_eq!(opcodes(&f), vec![X86Opcode::AndRI, X86Opcode::Ret]);
+    }
+
+    #[test]
+    fn mask_equal_to_bound_keeps_check() {
+        // idx <=u 16 admits idx == 16, and 16 >=u 16 traps: keep.
+        let mut f = make_func(vec![
+            X86ISelInst::new(X86Opcode::AndRI, vec![vr(1), imm(16)]),
+            X86ISelInst::new(X86Opcode::TrapBoundsCheckExact, vec![vr(0), vr(1), imm(16)]),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        assert!(!X86ConstGuardElim.run(&mut f));
+        assert_eq!(opcodes(&f).len(), 3);
+    }
+
+    #[test]
+    fn negative_mask_bounds_nothing() {
+        // & -8 (an alignment mask) keeps every high bit: no bound, keep.
+        let mut f = make_func(vec![
+            X86ISelInst::new(X86Opcode::AndRI, vec![vr(1), imm(-8)]),
+            X86ISelInst::new(X86Opcode::TrapBoundsCheckExact, vec![vr(0), vr(1), imm(16)]),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        assert!(!X86ConstGuardElim.run(&mut f));
+        assert_eq!(opcodes(&f).len(), 3);
+    }
+
+    #[test]
+    fn redefinition_invalidates_masked_bound() {
+        let mut f = make_func(vec![
+            X86ISelInst::new(X86Opcode::AndRI, vec![vr(1), imm(15)]),
+            X86ISelInst::new(X86Opcode::AddRR, vec![vr(1), vr(1), vr(2)]),
+            X86ISelInst::new(X86Opcode::TrapBoundsCheckExact, vec![vr(0), vr(1), imm(16)]),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        assert!(!X86ConstGuardElim.run(&mut f));
+        assert_eq!(opcodes(&f).len(), 4);
+    }
+
+    #[test]
+    fn copy_propagates_masked_bound() {
+        let mut f = make_func(vec![
+            X86ISelInst::new(X86Opcode::AndRI, vec![vr(1), imm(15)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vr(3), vr(1)]),
+            X86ISelInst::new(X86Opcode::TrapBoundsCheckExact, vec![vr(0), vr(3), imm(16)]),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        assert!(X86ConstGuardElim.run(&mut f));
+        assert_eq!(
+            opcodes(&f),
+            vec![X86Opcode::AndRI, X86Opcode::MovRR, X86Opcode::Ret]
+        );
     }
 
     #[test]

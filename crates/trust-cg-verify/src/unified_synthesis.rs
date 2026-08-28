@@ -2656,8 +2656,8 @@ mod tests {
         crate::ay_bridge::z3_available()
     }
 
-    /// The GPU-synthesis certification-gap probe (crate::formal_gap; the
-    /// `tests/support/cegis_alethe_gap.rs` pattern): re-run the EXACT
+    /// The GPU-synthesis certification-gap probe (`crate::formal_gap`):
+    /// re-run the EXACT
     /// obligation a failed candidate discharged — same builder, same
     /// `verify_n` clamp, same default config — through the same public
     /// `verify_with_ay` chain, and return `Some(reason)` ONLY for the

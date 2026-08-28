@@ -60,59 +60,179 @@ rejects duplicate_checked \
 rejects duplicate_result \
   $'Checked 241 declarations in 1ms\n  241 passed, 0 failed\n  241 passed, 0 failed\n'
 
+# The main workspace, rustc backend, and fuzz crate resolve dependencies as
+# three independent Cargo roots.  A root-only check lets either standalone
+# lock silently retain an older TrustIR/Clean/AY universe.  Exercise the
+# toolchain-free preflight against a coherent copy, then split one standalone
+# lock at a time and require a named refusal.
+LOCK_FIXTURE="${TMP}/dependency-locks"
+mkdir -p \
+  "$LOCK_FIXTURE/crates/rustc-codegen-trust-cg" \
+  "$LOCK_FIXTURE/fuzz"
+cp "$ROOT/Cargo.toml" "$LOCK_FIXTURE/Cargo.toml"
+cp "$ROOT/Cargo.lock" "$LOCK_FIXTURE/Cargo.lock"
+cp "$ROOT/crates/rustc-codegen-trust-cg/Cargo.lock" \
+  "$LOCK_FIXTURE/crates/rustc-codegen-trust-cg/Cargo.lock"
+cp "$ROOT/fuzz/Cargo.lock" "$LOCK_FIXTURE/fuzz/Cargo.lock"
+
+dependency_output=""
+if dependency_output="$(
+  TRUST_CG_DIR="$LOCK_FIXTURE" \
+    "$SOUNDNESS_CHECK" --validate-dependency-locks 2>&1
+)" && \
+   [ "$(printf '%s\n' "$dependency_output" | grep -Ec '^trust_ir_rev=[0-9a-f]{40}$')" -eq 1 ] && \
+   [ "$(printf '%s\n' "$dependency_output" | grep -Ec '^clean_rev=[0-9a-f]{40}$')" -eq 1 ] && \
+   [ "$(printf '%s\n' "$dependency_output" | grep -Ec '^ay_rev=[0-9a-f]{40}$')" -eq 1 ]; then
+  printf 'ok - independent dependency locks agree on one first-party graph\n'
+  PASS=$((PASS + 1))
+else
+  printf 'not ok - coherent independent dependency locks (output: %s)\n' \
+    "${dependency_output:-<empty>}" >&2
+  FAIL=$((FAIL + 1))
+fi
+
+replace_sha() {
+  local file="$1" old="$2" new="$3" tmp="${1}.tmp.$$"
+  sed "s/${old}/${new}/g" "$file" >"$tmp" && mv "$tmp" "$file"
+}
+
+trust_ir_rev="$(printf '%s\n' "$dependency_output" | sed -n 's/^trust_ir_rev=//p')"
+if [ "${#trust_ir_rev}" -eq 40 ]; then
+  split_trust_ir_rev="1111111111111111111111111111111111111111"
+  replace_sha \
+    "$LOCK_FIXTURE/fuzz/Cargo.lock" \
+    "$trust_ir_rev" \
+    "$split_trust_ir_rev"
+  if split_output="$(
+    TRUST_CG_DIR="$LOCK_FIXTURE" \
+      "$SOUNDNESS_CHECK" --validate-dependency-locks 2>&1
+  )"; then
+    printf 'not ok - split fuzz TrustIR lock unexpectedly passed: %s\n' "$split_output" >&2
+    FAIL=$((FAIL + 1))
+  elif printf '%s\n' "$split_output" | grep -Fq 'split first-party trust-ir revisions' && \
+       printf '%s\n' "$split_output" | grep -Fq 'fuzz/Cargo.lock'; then
+    printf 'ok - split fuzz TrustIR lock fails closed and names the divergent root\n'
+    PASS=$((PASS + 1))
+  else
+    printf 'not ok - split fuzz TrustIR lock diagnostic: %s\n' "$split_output" >&2
+    FAIL=$((FAIL + 1))
+  fi
+  replace_sha \
+    "$LOCK_FIXTURE/fuzz/Cargo.lock" \
+    "$split_trust_ir_rev" \
+    "$trust_ir_rev"
+else
+  printf 'not ok - coherent dependency output did not yield a TrustIR revision\n' >&2
+  FAIL=$((FAIL + 1))
+fi
+
+ay_rev="$(printf '%s\n' "$dependency_output" | sed -n 's/^ay_rev=//p')"
+if [ "${#ay_rev}" -eq 40 ]; then
+  split_ay_rev="2222222222222222222222222222222222222222"
+  replace_sha \
+    "$LOCK_FIXTURE/crates/rustc-codegen-trust-cg/Cargo.lock" \
+    "$ay_rev" \
+    "$split_ay_rev"
+  if split_output="$(
+    TRUST_CG_DIR="$LOCK_FIXTURE" \
+      "$SOUNDNESS_CHECK" --validate-dependency-locks 2>&1
+  )"; then
+    printf 'not ok - split rustc AY lock unexpectedly passed: %s\n' "$split_output" >&2
+    FAIL=$((FAIL + 1))
+  elif printf '%s\n' "$split_output" | grep -Fq 'split first-party ay revisions' && \
+       printf '%s\n' "$split_output" | grep -Fq 'crates/rustc-codegen-trust-cg/Cargo.lock'; then
+    printf 'ok - split rustc AY lock fails closed and names the divergent root\n'
+    PASS=$((PASS + 1))
+  else
+    printf 'not ok - split rustc AY lock diagnostic: %s\n' "$split_output" >&2
+    FAIL=$((FAIL + 1))
+  fi
+else
+  printf 'not ok - coherent dependency output did not yield an AY revision\n' >&2
+  FAIL=$((FAIL + 1))
+fi
+
 # Exercise the same high-level Clean build and micro-diversity gate runners the
 # constellation uses. The fake Cargo process makes the wrapper's effective
 # environment and argv observable and creates the release binary expected by
 # the build guard. Any missing/narrowed override, leaked Trust-only flag, or
 # command drift fails this regression.
+#
+# KEYED ON THE HOST TRIPLE, never on uname. The production lane selects the
+# `[target.<triple>]` stanza by asking `rustc -vV` for the host triple
+# (soundness_check.sh's clean_host_triple), so a fixture hardcoded to
+# aarch64-apple-darwin exercises the flag-replacement path on exactly one
+# machine and is inert everywhere else — the same Darwin-only assumption
+# 7a8ea174 removed from the production script. Key the fixture on this host so
+# the replacement is actually tested wherever the gate runs.
+HOST_TRIPLE="$(rustc -vV 2>/dev/null | awk '/^host:/ { print $2; exit }')"
+if [ -z "${HOST_TRIPLE}" ]; then
+  printf 'not ok - no rustc on PATH: the Clean stock-cargo lane cannot be tested\n' >&2
+  printf '%d passed, %d failed\n' "$PASS" "$((FAIL + 1))"
+  exit 1
+fi
+# Cargo's environment spelling of the same triple, e.g.
+# aarch64-unknown-linux-gnu -> CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS.
+HOST_TRIPLE_ENV="CARGO_TARGET_$(printf '%s' "$HOST_TRIPLE" | tr 'a-z-' 'A-Z_')_RUSTFLAGS"
+
 FAKE_CARGO_DIR="${TMP}/fake-bin"
 FAKE_CARGO="${FAKE_CARGO_DIR}/cargo"
 FAKE_CLEAN="${TMP}/fake-clean"
+FAKE_HOME="${TMP}/fake-home"
 CARGO_AUDIT="${TMP}/clean-cargo.audit"
-mkdir -p "$FAKE_CARGO_DIR" "$FAKE_CLEAN/.cargo" "${TMP}/fake-home"
+mkdir -p "$FAKE_CARGO_DIR" "$FAKE_CLEAN/.cargo" "${FAKE_HOME}/.cargo/bin"
+# soundness_check.sh prepends "$HOME/.cargo/bin" to PATH and then asks rustc for
+# the host triple. This sandbox supplies a fake HOME and a PATH carrying no
+# toolchain, so without a resolvable rustc the production script refuses BEFORE
+# running cargo at all and the audit log is never written — a red that reads as
+# a flag-isolation failure but is really a missing compiler. Expose the real
+# compiler BINARY (not the rustup shim, which needs the real HOME) and nothing
+# else, so `cargo` still resolves to the fake below.
+ln -sf "$(rustc --print sysroot)/bin/rustc" "${FAKE_HOME}/.cargo/bin/rustc"
 printf '%s\n' \
-  '[target.aarch64-apple-darwin]' \
+  "[target.${HOST_TRIPLE}]" \
   'rustflags = ["-C", "target-cpu=native", "-Ztrust-verify=off"]' \
   >"$FAKE_CLEAN/.cargo/config.toml"
-printf '%s\n' \
-  '#!/usr/bin/env bash' \
-  'set -u' \
-  '{' \
-  '  printf '\''target_flags=%s\n'\'' "${CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS-<unset>}"' \
-  '  printf '\''rustflags=%s\n'\'' "${RUSTFLAGS-<unset>}"' \
-  '  printf '\''encoded_rustflags=%s\n'\'' "${CARGO_ENCODED_RUSTFLAGS-<unset>}"' \
-  '  printf '\''target_dir=%s\n'\'' "${CARGO_TARGET_DIR-<unset>}"' \
-  '  printf '\''args='\''' \
-  '  printf '\''<%s>'\'' "$@"' \
-  '  printf '\''\n'\''' \
-  '} >>"$SOUNDNESS_CARGO_AUDIT_LOG"' \
-  'case "${1-}" in' \
-  '  build)' \
-  '    mkdir -p "${CARGO_TARGET_DIR}/release"' \
-  '    : >"${CARGO_TARGET_DIR}/release/clean"' \
-  '    chmod +x "${CARGO_TARGET_DIR}/release/clean"' \
-  '    ;;' \
-  '  test)' \
-  '    printf '\''test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n'\''' \
-  '    ;;' \
-  '  *) exit 91 ;;' \
-  'esac' >"$FAKE_CARGO"
+sed "s/@HOST_TRIPLE_ENV@/${HOST_TRIPLE_ENV}/g" >"$FAKE_CARGO" <<'FAKE_CARGO_SCRIPT'
+#!/usr/bin/env bash
+set -u
+{
+  printf 'target_flags=%s\n' "${@HOST_TRIPLE_ENV@-<unset>}"
+  printf 'rustflags=%s\n' "${RUSTFLAGS-<unset>}"
+  printf 'encoded_rustflags=%s\n' "${CARGO_ENCODED_RUSTFLAGS-<unset>}"
+  printf 'target_dir=%s\n' "${CARGO_TARGET_DIR-<unset>}"
+  printf 'args='
+  printf '<%s>' "$@"
+  printf '\n'
+} >>"$SOUNDNESS_CARGO_AUDIT_LOG"
+case "${1-}" in
+  build)
+    mkdir -p "${CARGO_TARGET_DIR}/release"
+    : >"${CARGO_TARGET_DIR}/release/clean"
+    chmod +x "${CARGO_TARGET_DIR}/release/clean"
+    ;;
+  test)
+    printf 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n'
+    ;;
+  *) exit 91 ;;
+esac
+FAKE_CARGO_SCRIPT
 chmod +x "$FAKE_CARGO"
 
-EXPECTED_CLEAN_WRAPPER_RUSTFLAGS='<unset>'
-if [ "$(uname -s 2>/dev/null)" = 'Darwin' ] && \
-   [ "$(uname -m 2>/dev/null)" = 'arm64' ]; then
-  EXPECTED_CLEAN_WRAPPER_RUSTFLAGS='-C target-cpu=native'
-fi
+# The audited stanza is this host's now, so the wrapper must REPLACE it with the
+# stock tune-only value on every host: the expectation is no longer conditional.
+EXPECTED_CLEAN_WRAPPER_RUSTFLAGS='-C target-cpu=native'
 
 if output="$(
-  CLEAN_DIR="$FAKE_CLEAN" \
-  SOUNDNESS_CARGO_AUDIT_LOG="$CARGO_AUDIT" \
-  HOME="${TMP}/fake-home" \
-  PATH="${FAKE_CARGO_DIR}:/usr/bin:/bin" \
-  CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS='-Ztrust-verify=poison' \
-  RUSTFLAGS='-Ztrust-verify=poison' \
-  CARGO_ENCODED_RUSTFLAGS='poison' \
+  env \
+    CLEAN_DIR="$FAKE_CLEAN" \
+    SOUNDNESS_CARGO_AUDIT_LOG="$CARGO_AUDIT" \
+    HOME="$FAKE_HOME" \
+    PATH="${FAKE_CARGO_DIR}:/usr/bin:/bin" \
+    "${HOST_TRIPLE_ENV}=-Ztrust-verify=poison" \
+    CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS='-Ztrust-verify=poison' \
+    RUSTFLAGS='-Ztrust-verify=poison' \
+    CARGO_ENCODED_RUSTFLAGS='poison' \
     "$SOUNDNESS_CHECK" --self-test-clean-cargo-command 2>&1
 )" && \
    [ "$(grep -c '^target_flags=<unset>$' "$CARGO_AUDIT")" -eq 2 ] && \
@@ -246,15 +366,22 @@ fi
 # Adding even a compatible flag changes what a global RUSTFLAGS replacement
 # would discard. The lane must stop for a new audit instead of silently
 # weakening Clean's configuration.
+# The drift must sit in THIS HOST's stanza: a Trust-only flag in another
+# triple's stanza is inert (Cargo selects at most the host stanza) and the
+# production lane documents it as such, so a Darwin-keyed fixture asserts
+# nothing on any other host. The refusal names the triple it audited, which is
+# why the expected message is built from the host triple rather than spelled
+# out — it read `unaudited aarch64 rustflags` until 7a8ea174 generalized it.
 printf '%s\n' \
-  '[target.aarch64-apple-darwin]' \
+  "[target.${HOST_TRIPLE}]" \
   'rustflags = ["-C", "target-cpu=native", "-D", "warnings", "-Ztrust-verify=off"]' \
   >"$REAL_CLEAN/.cargo/config.toml"
 if output="$(CLEAN_DIR="$REAL_CLEAN" "$SOUNDNESS_CHECK" --self-test-clean-cargo-command 2>&1)"; then
   printf 'not ok - rejects unaudited Clean rustflag drift (unexpected success: %s)\n' \
     "$output" >&2
   FAIL=$((FAIL + 1))
-elif printf '%s\n' "$output" | grep -q 'refusing stock Clean cargo lane: unaudited aarch64 rustflags'; then
+elif printf '%s\n' "$output" | \
+     grep -q "refusing stock Clean cargo lane: unaudited ${HOST_TRIPLE} rustflags"; then
   printf 'ok - rejects unaudited Clean rustflag drift\n'
   PASS=$((PASS + 1))
 else

@@ -489,6 +489,13 @@ fn tier0_obligation_memo() -> &'static Mutex<HashMap<ProofObligation, bool>> {
 /// for this process. Opt out with `TCG_NO_VERDICT_DB=1` /
 /// `TCG_NO_PROOF_CACHE=1`.
 pub(crate) fn tier0_lookup_obligation(obligation: &ProofObligation) -> bool {
+    // No tier-0 solver on this host (a per-process constant): every path
+    // below answers `false`, so answer it here — before the env reads, the
+    // global memo lock and the full-obligation hash that ran per instruction
+    // of every certificate walk.
+    if tier0_solver().is_none() {
+        return false;
+    }
     if std::env::var_os("TCG_NO_VERDICT_DB").is_some()
         || crate::env_lock::var_os("TCG_NO_PROOF_CACHE").is_some()
     {

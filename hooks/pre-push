@@ -53,6 +53,36 @@ if [ ! -x "$gate" ]; then
   exit 1
 fi
 
+# --- fast pre-flight: rustfmt ------------------------------------------------
+#
+# `scripts/check_fmt.sh` existed with NOTHING calling it, and went red three
+# separate times in one sweep — each break found days later by someone else,
+# never by the author who landed it. That is a coverage hole, not a strict
+# gate: the soundness meta-gate below is a proof gate and has no formatting
+# leg, so nothing in this repo ever asked.
+#
+# It runs FIRST and it is cheap: 7 s over the whole workspace, measured, no
+# build. Cheap enough that there is no case for sampling only changed files,
+# and running it before the meta-gate means a formatting slip costs seven
+# seconds instead of being discovered after several minutes of proof work.
+#
+# Deterministic by construction: rust-toolchain.toml pins 1.97.1 WITH the
+# rustfmt component and the repo commits a rustfmt.toml, so every clone gets
+# the same answer. The gate reports and never rewrites — `cargo fmt --all`
+# applies it deliberately.
+fmt_gate="$repo_root/scripts/check_fmt.sh"
+if [ -x "$fmt_gate" ]; then
+  echo "pre-push: rustfmt pre-flight (scripts/check_fmt.sh)…"
+  if ! "$fmt_gate"; then
+    echo "" >&2
+    echo "pre-push: ✗ rustfmt gate FAILED — push to main BLOCKED." >&2
+    echo "          Apply with: cargo fmt --all" >&2
+    echo "          Emergency override (discouraged): git push --no-verify" >&2
+    exit 1
+  fi
+  echo "pre-push: ✓ rustfmt clean."
+fi
+
 echo "pre-push: push to 'main' detected → running the soundness meta-gate."
 echo "pre-push: (this runs the FULL cross-repo constellation; it can take several minutes.)"
 "$gate" --pinned

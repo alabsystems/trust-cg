@@ -113,6 +113,14 @@ x86_opcode_table! {
     ImulRMSib,
     MovRM32Sib,
     MovMR32Sib,
+    // The Stage-2 RMW fusion peephole's read-modify-write stores. Nothing
+    // emits them in Stage 1, but this fuzzer must still cover them: it asserts
+    // the encoder never PANICS on any opcode, and an unemitted opcode reached
+    // through a malformed operand shape is exactly the case that would.
+    XorMR,
+    AddMR,
+    XorMRSib,
+    AddMRSib,
 }
 
 fn opcode_strategy() -> impl Strategy<Value = X86Opcode> {

@@ -1639,10 +1639,10 @@ mod tests {
     fn test_verifier_nzcv() {
         let verifier = Verifier::new();
         let report = verifier.verify_nzcv();
-        // #62: 4 degenerate NZCV flag X==X retracted, and the degenerate UGE/HS
-        // pair removed from comparison+branch (reconstruction-credited). Now:
-        // 9 cmp (32) + 9 cmp (64) + 9 branch (32) + 9 branch (64) = 36.
-        assert_eq!(report.total(), 36);
+        // #62: 4 degenerate NZCV flag X==X retracted. The UGE/HS pair it also
+        // removed is back since the C flag is derived from the adder carry-out
+        // (nzcv.rs): 10 cmp (32) + 10 cmp (64) + 10 branch (32) + 10 branch (64).
+        assert_eq!(report.total(), 40);
         assert!(
             report.all_valid(),
             "NZCV proofs failed:\n{}",

@@ -45,6 +45,8 @@ use trust_cg_lower::{X86ISelFunction, X86ISelInst, X86ISelOperand};
 
 use crate::x86_pass_manager::X86MachinePass;
 
+use crate::mach_view::CfgAnalysis;
+
 /// Mint a fresh vreg of `class` (the same discipline as the vectorizer's
 /// helpers: bump `next_vreg`, record nominal width by class).
 fn fresh_vreg(func: &mut X86ISelFunction, class: RegClass) -> VReg {
@@ -63,6 +65,12 @@ fn fresh_vreg(func: &mut X86ISelFunction, class: RegClass) -> VReg {
 /// are willing to replicate into each predecessor latch. The Setcc compare
 /// idiom is 6-9 instructions; 12 leaves headroom without bloating code.
 const MAX_THREADED_HEADER_INSTS: usize = 12;
+
+/// Minimum TOTAL instruction count across a loop's body for rotation to be
+/// worth a threaded copy (a64 `loop_latch_layout` parity: rotating tiny
+/// vectorizer-residual loops measured as an ANTI-lever there — +4.6% — and
+/// the copy itself is the cost).
+const MIN_ROTATE_LOOP_INSTS: usize = 8;
 
 /// Loop rotation / pure-test jump threading for x86-64 ISel functions.
 pub struct X86LoopRotate;
@@ -216,6 +224,70 @@ fn rename_copy(func: &mut X86ISelFunction, insts: &[X86ISelInst]) -> Vec<X86ISel
 }
 
 fn run_impl(func: &mut X86ISelFunction) -> bool {
+    // LOOP-AWARE ADMISSION (a64 `loop_latch_layout` driver policy: innermost
+    // loops only, body size floor) is available behind
+    // `TCG_X86_ROTATE_ADMISSION=1` — and it is 🛑 REFUTED AS A DEFAULT on
+    // x86. Paired A/B, TWO reps (2026-08-26): p7_sieve legacy 0.742x/0.749x
+    // vs admission 1.070x/1.028x (~+40%, reproduced); p8 ~+7% both reps;
+    // p7's win comes exactly from threading its many SMALL and NON-innermost
+    // loops. The a64 evidence (+5% from rotating
+    // p7-class OUTER loops) does not transfer because the cost models differ:
+    // a64 rotation INSERTS a split-latch block, x86 threading COPIES a <=12
+    // instruction pure-test header into an existing latch — cheap enough that
+    // breadth wins. The machinery + tests stay for future tuning experiments
+    // (e.g. floor-only variants); the default is the proven sweep.
+    if std::env::var_os("TCG_X86_ROTATE_ADMISSION").is_some() {
+        let mut changed = false;
+        // Bounded by block count: each iteration threads at most one latch.
+        for _ in 0..func.block_order.len() {
+            if !thread_one_admitted_latch(func) {
+                break;
+            }
+            changed = true;
+        }
+        return changed;
+    }
+    run_legacy_sweep(func)
+}
+
+/// One admitted rewrite per FRESH loop-forest computation (the a64 driver
+/// discipline). Returns whether a latch was threaded.
+fn thread_one_admitted_latch(func: &mut X86ISelFunction) -> bool {
+    let cfg = CfgAnalysis::compute(func);
+    for lp in &cfg.loops {
+        // INNERMOST only: no OTHER loop's header inside this body.
+        let innermost = !cfg
+            .loops
+            .iter()
+            .any(|o| o.header != lp.header && lp.body.contains(&o.header));
+        if !innermost {
+            continue;
+        }
+        // Size floor over the whole body.
+        let body_insts: usize = lp
+            .body
+            .iter()
+            .filter_map(|b| func.blocks.get(b))
+            .map(|blk| blk.insts.len())
+            .sum();
+        if body_insts < MIN_ROTATE_LOOP_INSTS {
+            continue;
+        }
+        // Latches are sorted by block index (mach_view policy) — determinism.
+        for &l in &lp.latches {
+            if try_thread_edge(func, l, lp.header) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The pre-admission behavior: sweep every block once in layout order and
+/// thread every eligible `Jmp H` back edge, no loop analysis. Kept verbatim
+/// behind `TCG_X86_ROTATE_NO_ADMISSION` so the admission policy can be A/B'd
+/// inside one dylib.
+fn run_legacy_sweep(func: &mut X86ISelFunction) -> bool {
     let mut changed = false;
     let order = func.block_order.clone();
     for l in order {
@@ -287,6 +359,72 @@ fn run_impl(func: &mut X86ISelFunction) -> bool {
     changed
 }
 
+/// Attempt to thread the single back edge `l -> h`: `l` must end with an
+/// unconditional `Jmp h` (single successor), `h` must be a threadable
+/// pure-test header laid out before `l`, and the header's liveness-safety
+/// scan must pass. Identical mechanics to the legacy sweep's per-edge body;
+/// the admitted driver supplies (l, h) from the natural-loop forest instead
+/// of discovering them by layout order.
+fn try_thread_edge(func: &mut X86ISelFunction, l: Block, h: Block) -> bool {
+    {
+        let Some(lb) = func.blocks.get(&l) else {
+            return false;
+        };
+        let Some(last) = lb.insts.last() else {
+            return false;
+        };
+        if last.opcode != X86Opcode::Jmp {
+            return false;
+        }
+        let Some(X86ISelOperand::Block(t)) = last.operands.first() else {
+            return false;
+        };
+        if *t != h || lb.successors.len() != 1 || lb.successors[0] != h || h == l {
+            return false;
+        }
+    }
+    // Back edges only (h laid out before l) — the loop-rotation profile;
+    // forward threading stays cfg_simplify's job.
+    let pos = |b: Block| func.block_order.iter().position(|x| *x == b);
+    match (pos(h), pos(l)) {
+        (Some(hp), Some(lp)) if hp < lp => {}
+        _ => return false,
+    }
+    let Some(header_insts) = threadable_header(func, h) else {
+        return false;
+    };
+    let n = header_insts.len();
+    let (taken, fall, cc) = {
+        let jcc = &header_insts[n - 2];
+        let jmp = &header_insts[n - 1];
+        let (Some(X86ISelOperand::CondCode(cc)), Some(X86ISelOperand::Block(t))) =
+            (jcc.operands.first(), jcc.operands.get(1))
+        else {
+            return false;
+        };
+        let Some(X86ISelOperand::Block(f)) = jmp.operands.first() else {
+            return false;
+        };
+        (*t, *f, *cc)
+    };
+    let mut copy = rename_copy(func, &header_insts[..n - 2]);
+    copy.push(X86ISelInst::new(
+        X86Opcode::Jcc,
+        vec![X86ISelOperand::CondCode(cc), X86ISelOperand::Block(taken)],
+    ));
+    copy.push(X86ISelInst::new(
+        X86Opcode::Jmp,
+        vec![X86ISelOperand::Block(fall)],
+    ));
+    let Some(lb) = func.blocks.get_mut(&l) else {
+        return false;
+    };
+    lb.insts.pop(); // the old `Jmp H`
+    lb.insts.extend(copy);
+    lb.successors = vec![taken, fall];
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,11 +490,15 @@ mod tests {
             X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(Block(3))]),
         );
         func.blocks.get_mut(&Block(1)).unwrap().successors = vec![Block(2), Block(3)];
-        // body/latch: v0 = v0 + v1 ; jmp header
-        func.push_inst(
-            Block(2),
-            X86ISelInst::new(X86Opcode::AddRR, vec![vr(0), vr(0), vr(1)]),
-        );
+        // body/latch: enough real work to clear MIN_ROTATE_LOOP_INSTS
+        // (admission floor — tiny residual loops are deliberately declined),
+        // then jmp header.
+        for _ in 0..MIN_ROTATE_LOOP_INSTS {
+            func.push_inst(
+                Block(2),
+                X86ISelInst::new(X86Opcode::AddRR, vec![vr(0), vr(0), vr(1)]),
+            );
+        }
         func.push_inst(
             Block(2),
             X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(Block(1))]),
@@ -375,6 +517,182 @@ mod tests {
         assert_eq!(latch.insts[k - 1].opcode, X86Opcode::Jmp);
         // The copied CmpRI reads the SAME vreg (v0 — not defined in the copy).
         assert_eq!(latch.insts[k - 3].operands[0], vr(0));
+    }
+
+    /// Build the positive fixture with a configurable latch filler count.
+    fn counted_loop_fixture(filler: usize) -> X86ISelFunction {
+        let mut func = empty_func("rot_adm");
+        func.push_inst(
+            Block(0),
+            X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(Block(1))]),
+        );
+        func.blocks.get_mut(&Block(0)).unwrap().successors = vec![Block(1)];
+        func.push_inst(
+            Block(1),
+            X86ISelInst::new(X86Opcode::CmpRI, vec![vr(0), X86ISelOperand::Imm(7)]),
+        );
+        func.push_inst(
+            Block(1),
+            X86ISelInst::new(
+                X86Opcode::Jcc,
+                vec![
+                    X86ISelOperand::CondCode(trust_cg_ir::X86CondCode::NE),
+                    X86ISelOperand::Block(Block(2)),
+                ],
+            ),
+        );
+        func.push_inst(
+            Block(1),
+            X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(Block(3))]),
+        );
+        func.blocks.get_mut(&Block(1)).unwrap().successors = vec![Block(2), Block(3)];
+        for _ in 0..filler {
+            func.push_inst(
+                Block(2),
+                X86ISelInst::new(X86Opcode::AddRR, vec![vr(0), vr(0), vr(1)]),
+            );
+        }
+        func.push_inst(
+            Block(2),
+            X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(Block(1))]),
+        );
+        func.blocks.get_mut(&Block(2)).unwrap().successors = vec![Block(1)];
+        func.push_inst(Block(3), X86ISelInst::new(X86Opcode::Ret, vec![]));
+        func
+    }
+
+    /// ADMISSION: a loop under the size floor is deliberately DECLINED — the
+    /// a64 pass measured tiny-residual rotation as an anti-lever (+4.6%),
+    /// and the threaded header copy is itself the cost.
+    #[test]
+    fn admission_declines_a_tiny_loop() {
+        let mut func = counted_loop_fixture(1); // 3 header + 2 latch = 5 < floor
+        assert!(
+            !thread_one_admitted_latch(&mut func),
+            "tiny loop must be declined by admission"
+        );
+        let latch = func.blocks.get(&Block(2)).unwrap();
+        assert_eq!(
+            latch.insts.last().unwrap().opcode,
+            X86Opcode::Jmp,
+            "latch must keep its unconditional back edge"
+        );
+    }
+
+    /// ADMISSION: an OUTER loop (another loop's header inside its body) is
+    /// declined even when its own latch threads — the a64 pass measured
+    /// outer-loop rotation as a +5% regression (p7-class) and restricts
+    /// rotation to innermost loops.
+    #[test]
+    fn admission_declines_an_outer_loop_latch() {
+        // outer header B1 -> inner loop {B2 (inner header), B4 (inner latch)}
+        // -> outer latch B5 -> B1; exit B3.
+        let mut func = empty_func("rot_outer");
+        func.push_inst(
+            Block(0),
+            X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(Block(1))]),
+        );
+        func.blocks.get_mut(&Block(0)).unwrap().successors = vec![Block(1)];
+        // outer header: pure test -> B2 (body) / B3 (exit)
+        func.push_inst(
+            Block(1),
+            X86ISelInst::new(X86Opcode::CmpRI, vec![vr(0), X86ISelOperand::Imm(9)]),
+        );
+        func.push_inst(
+            Block(1),
+            X86ISelInst::new(
+                X86Opcode::Jcc,
+                vec![
+                    X86ISelOperand::CondCode(trust_cg_ir::X86CondCode::NE),
+                    X86ISelOperand::Block(Block(2)),
+                ],
+            ),
+        );
+        func.push_inst(
+            Block(1),
+            X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(Block(3))]),
+        );
+        func.blocks.get_mut(&Block(1)).unwrap().successors = vec![Block(2), Block(3)];
+        // inner header: pure test -> B4 (inner latch) / B5 (outer latch)
+        func.push_inst(
+            Block(2),
+            X86ISelInst::new(X86Opcode::CmpRI, vec![vr(1), X86ISelOperand::Imm(3)]),
+        );
+        func.push_inst(
+            Block(2),
+            X86ISelInst::new(
+                X86Opcode::Jcc,
+                vec![
+                    X86ISelOperand::CondCode(trust_cg_ir::X86CondCode::NE),
+                    X86ISelOperand::Block(Block(4)),
+                ],
+            ),
+        );
+        func.push_inst(
+            Block(2),
+            X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(Block(5))]),
+        );
+        func.blocks.get_mut(&Block(2)).unwrap().successors = vec![Block(4), Block(5)];
+        // exit
+        func.push_inst(Block(3), X86ISelInst::new(X86Opcode::Ret, vec![]));
+        // inner latch: filler + jmp inner header
+        for _ in 0..MIN_ROTATE_LOOP_INSTS {
+            func.push_inst(
+                Block(4),
+                X86ISelInst::new(X86Opcode::AddRR, vec![vr(1), vr(1), vr(2)]),
+            );
+        }
+        func.push_inst(
+            Block(4),
+            X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(Block(2))]),
+        );
+        func.blocks.get_mut(&Block(4)).unwrap().successors = vec![Block(2)];
+        // outer latch: filler + jmp outer header
+        for _ in 0..MIN_ROTATE_LOOP_INSTS {
+            func.push_inst(
+                Block(5),
+                X86ISelInst::new(X86Opcode::AddRR, vec![vr(0), vr(0), vr(2)]),
+            );
+        }
+        func.push_inst(
+            Block(5),
+            X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(Block(1))]),
+        );
+        func.blocks.get_mut(&Block(5)).unwrap().successors = vec![Block(1)];
+        // empty_func pre-creates only blocks 0..4; place the two latch blocks
+        // in layout order (headers before their latches, exit last).
+        func.block_order = vec![Block(0), Block(1), Block(2), Block(4), Block(5), Block(3)];
+
+        assert!(
+            thread_one_admitted_latch(&mut func),
+            "the INNER latch must still thread"
+        );
+        assert!(
+            !thread_one_admitted_latch(&mut func),
+            "and nothing else is admitted (outer latch declined)"
+        );
+        // Inner latch threaded (conditional back edge)...
+        let inner_latch = func.blocks.get(&Block(4)).unwrap();
+        assert_eq!(inner_latch.successors.len(), 2, "inner latch threaded");
+        // ...but the OUTER latch keeps its unconditional back edge.
+        let outer_latch = func.blocks.get(&Block(5)).unwrap();
+        assert_eq!(
+            outer_latch.insts.last().unwrap().opcode,
+            X86Opcode::Jmp,
+            "outer-loop latch must NOT be threaded (innermost-only admission)"
+        );
+        assert_eq!(outer_latch.successors, vec![Block(1)]);
+    }
+
+    /// The DEFAULT sweep threads the tiny loop (admission is opt-in and
+    /// refuted as a default — see `run_impl`'s comment).
+    #[test]
+    fn default_sweep_threads_the_tiny_loop() {
+        let mut func = counted_loop_fixture(1);
+        assert!(
+            run_legacy_sweep(&mut func),
+            "default sweep must thread the tiny loop"
+        );
     }
 
     /// A header containing a memory load must NOT be threaded.

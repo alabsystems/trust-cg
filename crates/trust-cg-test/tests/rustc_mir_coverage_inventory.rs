@@ -133,7 +133,7 @@ fn replacement_ledger_forbids_full_replacement_overclaiming() {
 
     for required in [
         "trust-cg is **not** ready to replace LLVM, rustc's production codegen backends",
-        "v0.1.0 is a source-only research",
+        "is a source-only\nresearch preview with useful fail-closed slices",
         "It does not mean complete language, target, ABI, object, or proof",
         "| Rust frontend bridge | Experimental and partial |",
         "| AArch64 backend | Useful partial path |",
@@ -414,7 +414,7 @@ fn rust_mono_item_driver_admits_no_unverified_variant() {
 fn rustc_direct_aggregate_abi_gate_remains_exact_after_lower_aarch64_formal_result_materialization()
 {
     // By-value aggregate function boundaries are admitted only through a
-    // *layout-driven* path: `memory_aggregate_layout` consults rustc
+    // *layout-driven* path: `memory_aggregate_layout_uncached` consults rustc
     // `tcx.layout_of`, walks variants/tag-encoding/field offsets, and requires
     // every field leaf to be a supported scalar (`validate_memory_aggregate_field_leaves`).
     // Anything the layout walk cannot model — unsized aggregates, non-scalar
@@ -426,13 +426,45 @@ fn rustc_direct_aggregate_abi_gate_remains_exact_after_lower_aarch64_formal_resu
     let source = read_repo_file("crates/rustc-codegen-trust-cg/src/lib.rs");
     let doc = read_repo_file("rustc-mir-coverage-inventory.md");
 
+    // The gate itself lives in `memory_aggregate_layout_uncached`;
+    // `memory_aggregate_layout` is a thin memoizing wrapper over it (the layout
+    // is a pure function of the type and was being rebuilt ~10x per compile).
+    // Anchor on the function that CARRIES the gate, and separately require that
+    // every public entry still reaches it -- a memo that answered without
+    // consulting the layout walk would be exactly the guessed ABI this test
+    // exists to forbid.
     let agg_layout = source
+        .split("fn memory_aggregate_layout_uncached<'tcx>(")
+        .nth(1)
+        .expect("memory_aggregate_layout_uncached must remain the aggregate ABI gate")
+        .split("\nfn ")
+        .next()
+        .expect("memory_aggregate_layout_uncached body must be bounded");
+
+    // Every public entry reaches the gate: the owned wrapper delegates to the
+    // shared one, and the shared one computes through `_uncached` on a miss.
+    let agg_wrapper = source
         .split("fn memory_aggregate_layout<'tcx>(")
         .nth(1)
-        .expect("memory_aggregate_layout must remain the aggregate ABI gate")
+        .expect("memory_aggregate_layout must remain the public aggregate ABI entry")
         .split("\nfn ")
         .next()
         .expect("memory_aggregate_layout body must be bounded");
+    assert!(
+        agg_wrapper.contains("memory_aggregate_layout_shared(tcx, ty)"),
+        "the public aggregate ABI entry must delegate to the shared (memoized) gate"
+    );
+    let agg_shared = source
+        .split("fn memory_aggregate_layout_shared<'tcx>(")
+        .nth(1)
+        .expect("memory_aggregate_layout_shared must exist")
+        .split("\nfn ")
+        .next()
+        .expect("memory_aggregate_layout_shared body must be bounded");
+    assert!(
+        agg_shared.contains("memory_aggregate_layout_uncached(tcx, ty)"),
+        "the memoized gate must compute through the layout-driven gate on a miss"
+    );
 
     // The aggregate ABI is derived from rustc layout, not guessed.
     assert!(

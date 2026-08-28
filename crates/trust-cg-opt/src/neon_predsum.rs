@@ -1887,6 +1887,13 @@ impl PredSumChainRecognized {
 /// the scalar loop remains correct by construction and finishes the
 /// `< width` tail (15 / 31 elements max).
 fn apply_chain(func: &mut MachFunction, rec: &PredSumChainRecognized) -> bool {
+    // IDEMPOTENCE: never vectorize the remainder loop of a loop this pass
+    // already vectorized (see `crate::vector_remainder`).
+    if rec.reductions.iter().any(|r| {
+        crate::vector_remainder::preheader_folds_neon_lane_into(func, rec.preheader, r.acc)
+    }) {
+        return false;
+    }
     let vf = VF;
     let arr_code = ARR_S4;
     let elem_code = ELEM_S;
@@ -2070,6 +2077,9 @@ fn apply_chain(func: &mut MachFunction, rec: &PredSumChainRecognized) -> bool {
         ctx.memo.clear();
         for (ri, red) in rec.reductions.iter().enumerate() {
             ctx.acc = red.acc;
+            // `vacc[ri]` was collected from `(0..unroll)` in the preheader
+            // above, and `k` ranges over that same `0..unroll` — one immutable
+            // `let` (`if wide { UNROLL_CHAIN } else { UNROLL }`) drives both.
             let acc = vacc[ri]
                 .get(k)
                 .copied()
@@ -2374,6 +2384,11 @@ struct LowerCtx {
 }
 
 fn apply(func: &mut MachFunction, rec: &Recognized) -> bool {
+    // IDEMPOTENCE: never vectorize the remainder loop of a loop this pass
+    // already vectorized (see `crate::vector_remainder`).
+    if crate::vector_remainder::preheader_folds_neon_lane_into(func, rec.preheader, rec.acc) {
+        return false;
+    }
     // Per-width parameters: lanes per vector iteration, element size, NEON
     // codes, and the horizontal-reduce shape. i32 = `.4S` (sign-extension
     // guard); i64 = `.2D` (precheck + unsigned guard — see the module docs and

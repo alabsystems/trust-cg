@@ -2020,4 +2020,20 @@ mod tests {
         f.block_mut(BlockId(0)).insts.insert(pos, id);
         assert!(!run_pass(&mut f), "escaped address must fail closed");
     }
+
+    /// IDEMPOTENCE: the sunk nest has nothing left to sink, so a second run must change nothing.
+    #[test]
+    fn second_run_is_a_no_op() {
+        let mut func = make_nest(true);
+        assert!(run_pass(&mut func), "first run must fire");
+        let (insts, blocks) = (func.insts.len(), func.blocks.len());
+        for again in 2..=4 {
+            assert!(
+                !(run_pass(&mut func)),
+                "run {again} re-fired on its own output"
+            );
+            assert_eq!(func.insts.len(), insts, "run {again} added instructions");
+            assert_eq!(func.blocks.len(), blocks, "run {again} added blocks");
+        }
+    }
 }

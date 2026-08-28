@@ -732,10 +732,8 @@ fn align_heads(func: &mut MachFunction, pad_heads: bool) -> bool {
     //
     // Kill switch: `TCG_LOOP_ALIGN_NO_FORFEIT_PIN=1` restores the
     // pin-only-when-something-was-padded policy.
-    if had_backward && !forfeit_pin_disabled() {
-        if !func_placement_disabled() {
-            func.text_align_log2 = func.text_align_log2.max(LOOP_HEAD_ALIGN_LOG2);
-        }
+    if had_backward && !forfeit_pin_disabled() && !func_placement_disabled() {
+        func.text_align_log2 = func.text_align_log2.max(LOOP_HEAD_ALIGN_LOG2);
     }
     false
 }

@@ -98,7 +98,10 @@ fn build_diamond() -> MachFunction {
     func.append_inst(then_b, mov_11_id);
 
     // join: RET
-    let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+    // Signature returns [I64] -> the ABI places the result in X0, so the RET
+    // must carry X0 as an implicit use (matches ISel's
+    // `AppleAArch64ABI::required_return_pregs(&[Type::I64])`).
+    let ret = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
     let ret_id = func.push_inst(ret);
     func.append_inst(join_b, ret_id);
 

@@ -39,7 +39,6 @@
 
 use std::ffi::CString;
 use std::hint::black_box;
-use std::mem::MaybeUninit;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::Ordering;
@@ -52,7 +51,7 @@ use trust_cg_sat_host::propagate::{
     JIT_DIVERGENCE_COUNT, JIT_KERNEL_CHOICE, JIT_KERNEL_WATCHED_LITERAL, SHADOW_MODE,
     reset_jit_shadow_for_tests,
 };
-use trust_cg_sat_host::sys;
+use trust_cg_sat_host::{OwnedMicroSatSolver, sys};
 
 /// MicroSAT's C state is process-global. Hold this around every solve
 /// to keep concurrent criterion measurement frames from clobbering
@@ -93,19 +92,13 @@ fn corpus_fixtures() -> Vec<(String, PathBuf)> {
 fn solve_path(cnf_path: &Path) -> i32 {
     let c_path =
         CString::new(cnf_path.to_string_lossy().into_owned()).expect("cnf path has no NULs");
-    let mut solver: MaybeUninit<sys::solver> = MaybeUninit::uninit();
-    // SAFETY: matches the upstream MicroSAT `main` pattern. `parse`
-    // runs `initCDCL` and populates the solver before any read; `solve`
-    // is only called when parse did not short-circuit to UNSAT.
+    // SAFETY: benchmark inputs are committed, well-formed DIMACS fixtures.
+    let (mut solver, parse_rc) = unsafe { OwnedMicroSatSolver::parse(c_path.as_c_str()) };
     unsafe {
-        let parse_rc = sys::parse(
-            solver.as_mut_ptr(),
-            c_path.as_ptr() as *mut std::os::raw::c_char,
-        );
         if parse_rc == sys::UNSAT {
             return sys::UNSAT;
         }
-        sys::solve(solver.as_mut_ptr())
+        solver.solve()
     }
 }
 

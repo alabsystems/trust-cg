@@ -24,6 +24,7 @@ struct solver {
 int  parse    (struct solver* s, char* filename);
 int  solve    (struct solver* s);
 void initCDCL (struct solver* s, int n, int m);
+void microsat_destroy(struct solver* s);
 
 #ifdef __cplusplus
 }

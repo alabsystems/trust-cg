@@ -247,6 +247,9 @@ fn run_ptr_iv_sr(func: &mut MachFunction, mut provenance: Option<&mut Provenance
     // emitted bytes deterministic.
     let headers: Vec<BlockId> = loops.all_loops().map(|lp| lp.header).collect();
     for header in headers {
+        // `headers` was collected from `loops.all_loops()` one statement above
+        // and `loops` is never mutated in this function, so every key it holds
+        // is still a key of the same `LoopAnalysis`.
         let lp = loops
             .get_loop(header)
             .expect("header collected from this analysis");
@@ -997,6 +1000,12 @@ fn clone_chain_into_preheader(
         clones.push(clone);
     }
     insert_before_terminator(func, shape.preheader, clones, fallback_loc);
+    // A non-empty chain (the empty case returned above) always ends with the
+    // def of `index`: `resolve_affine` pushes `def.inst_id` — the single def of
+    // the vreg it resolved — after the operand sub-chains, and `def_sites` and
+    // the `mapping` loop above enumerate def operands with the SAME
+    // `aarch64_def_operand_positions` oracle, so that def's `index` operand was
+    // just inserted.
     *mapping
         .get(&index)
         .expect("index vreg is defined by the last chain member")

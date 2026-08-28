@@ -1533,8 +1533,8 @@ fn find_natural_loops(
 mod tests {
     use super::*;
 
+    use std::cell::Cell;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicI64, Ordering};
 
     use trust_cg_ir::X86CondCode;
     use trust_cg_lower::function::Signature;
@@ -1557,13 +1557,30 @@ mod tests {
         false
     }
 
-    static LAST_ADMIT_STEP: AtomicI64 = AtomicI64::new(i64::MIN);
-    static LAST_ADMIT_STRIDE: AtomicI64 = AtomicI64::new(i64::MIN);
+    // THREAD-LOCAL, not a shared static. The harness runs tests in parallel and
+    // MORE THAN ONE test installs this recorder — `passthrough_param_canonicalizes`
+    // expects step 1 while `admission_gate_receives_the_emitted_step_and_stride`
+    // expects step 3 — so with a global (the previous `AtomicI64` pair) each
+    // could observe the other's store. Resetting to `i64::MIN` at the top of
+    // each test does not help: the race is against a concurrent test, not
+    // against a stale value. That failed roughly one run in four.
+    thread_local! {
+        static LAST_ADMIT_STEP: Cell<i64> = const { Cell::new(i64::MIN) };
+        static LAST_ADMIT_STRIDE: Cell<i64> = const { Cell::new(i64::MIN) };
+    }
+
+    /// Second, independent layer over the same race: every test that installs
+    /// `admit_recording` also serializes on this lock, so the two recorder
+    /// tests never run concurrently in the first place. The thread-local cells
+    /// above are what actually make the recorder race-free (they hold even if a
+    /// future test forgets this lock); the lock additionally keeps the
+    /// *observed* recording ordered for anyone reading these tests, and is the
+    /// safety net if the cells are ever demoted back to shared state.
     static ADMIT_RECORDING_LOCK: Mutex<()> = Mutex::new(());
     fn admit_recording(width: u32, step: i64, stride: i64) -> bool {
         assert_eq!(width, 64, "v1 admits Gpr64 carriers only");
-        LAST_ADMIT_STEP.store(step, Ordering::SeqCst);
-        LAST_ADMIT_STRIDE.store(stride, Ordering::SeqCst);
+        LAST_ADMIT_STEP.set(step);
+        LAST_ADMIT_STRIDE.set(stride);
         true
     }
 
@@ -1732,18 +1749,18 @@ mod tests {
         // Make the increment step 3 via the three-address AddRI form.
         let body = &mut func.blocks.get_mut(&Block(2)).unwrap().insts;
         body[2] = X86ISelInst::new(X86Opcode::AddRI, vec![vreg(6), vreg(1), imm(3)]);
-        LAST_ADMIT_STEP.store(i64::MIN, Ordering::SeqCst);
-        LAST_ADMIT_STRIDE.store(i64::MIN, Ordering::SeqCst);
+        LAST_ADMIT_STEP.set(i64::MIN);
+        LAST_ADMIT_STRIDE.set(i64::MIN);
         let r = vr(func.next_vreg);
         let mut pass = X86StrengthReduce::new(admit_recording);
         assert!(pass.run_on_function(&mut func));
         assert_eq!(
-            LAST_ADMIT_STEP.load(Ordering::SeqCst),
+            LAST_ADMIT_STEP.get(),
             3,
             "the admission gate must see the same step the rewrite uses"
         );
         assert_eq!(
-            LAST_ADMIT_STRIDE.load(Ordering::SeqCst),
+            LAST_ADMIT_STRIDE.get(),
             24,
             "the admission gate must see the same stride the rewrite uses"
         );
@@ -2606,15 +2623,15 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut func = make_passthrough_param_loop();
         let r = vr(func.next_vreg);
-        LAST_ADMIT_STEP.store(i64::MIN, Ordering::SeqCst);
-        LAST_ADMIT_STRIDE.store(i64::MIN, Ordering::SeqCst);
+        LAST_ADMIT_STEP.set(i64::MIN);
+        LAST_ADMIT_STRIDE.set(i64::MIN);
         let mut pass = X86StrengthReduce::new(admit_recording);
         assert!(
             pass.run_on_function(&mut func),
             "the pass-through-param shape must reduce against the OUTER IV"
         );
-        assert_eq!(LAST_ADMIT_STEP.load(Ordering::SeqCst), 1);
-        assert_eq!(LAST_ADMIT_STRIDE.load(Ordering::SeqCst), 24);
+        assert_eq!(LAST_ADMIT_STEP.get(), 1);
+        assert_eq!(LAST_ADMIT_STRIDE.get(), 24);
 
         // The inner-loop multiply became a mov of the recurrence.
         let inner = insts(&func, Block(4));

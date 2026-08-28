@@ -8,7 +8,8 @@
 use std::collections::HashSet;
 
 use trust_cg_ir::{
-    AArch64Opcode as Op, BlockId, MachFunction, MachInst, MachOperand, RegClass, Signature, VReg,
+    AArch64Opcode as Op, BlockId, MachFunction, MachInst, MachOperand, RegClass, Signature,
+    StackSlot, VReg,
 };
 
 use super::*;
@@ -138,13 +139,12 @@ fn kill_switch_disables_pass() {
     // With TCG_NO_MAC_REG_BLOCK set, run() is a no-op even on a fireable shape.
     // (We only assert the enable gate here; end-to-end firing is covered by the
     // differential matmul fuzz.)
-    // SAFETY: opt lib tests run with --test-threads=1 (no concurrent env races).
-    unsafe { std::env::set_var("TCG_NO_MAC_REG_BLOCK", "1") };
+    let env_scope = crate::env_lock::override_scope();
+    let _kill_switch = crate::env_lock::ScopedEnvVar::set(&env_scope, "TCG_NO_MAC_REG_BLOCK", "1");
     let mut pass = MacRegBlock::new();
     let (mut f, _, _, _) = build_counted_loop(24, 0, 1, false);
     assert!(!<MacRegBlock as MachinePass>::run(&mut pass, &mut f));
     assert_eq!(pass.fired(), 0);
-    unsafe { std::env::remove_var("TCG_NO_MAC_REG_BLOCK") };
 }
 
 /// WRONG-CODE REGRESSION (2026-08-17): recognition used to accept any positive
@@ -210,4 +210,177 @@ fn pair_writeback_rejects_out_of_range_lane_offset() {
     // tile is TILE = 64 ((64-2)*8 = 496 <= 504) and TILE = 66 is one past it.
     assert!(pair_writeback_ok(8, 8, 64));
     assert!(!pair_writeback_ok(8, 8, 66)); // (66-2)*8 = 512 > 504
+}
+
+fn nx(id: u32) -> MachOperand {
+    MachOperand::VReg(VReg {
+        id,
+        class: RegClass::Gpr64,
+    })
+}
+fn ni(v: i64) -> MachOperand {
+    MachOperand::Imm(v)
+}
+fn nbl(b: BlockId) -> MachOperand {
+    MachOperand::Block(b)
+}
+
+/// The bridge's 3-deep bounds-checked scalar matmul nest (N = 24, L = 576,
+/// element scale 8, a/b/c in three distinct stack slots):
+/// `for i { for k { aik = a[i*N+k]; for j { c[i*N+j] = c[i*N+j] + aik*b[k*N+j] } } }`.
+fn build_matmul_nest() -> MachFunction {
+    let mut func = MachFunction::new("k".to_string(), Signature::new(vec![], vec![]));
+    let pre = func.entry;
+    let ihdr = func.create_block();
+    let kpre = func.create_block();
+    let khdr = func.create_block();
+    let kbody = func.create_block();
+    let kbody2 = func.create_block();
+    let jhdr = func.create_block();
+    let bc1 = func.create_block();
+    let bc2 = func.create_block();
+    let work = func.create_block();
+    let jlatch = func.create_block();
+    let klatch = func.create_block();
+    let ilatch = func.create_block();
+    let exit = func.create_block();
+    let trap = func.create_block();
+    let push = |func: &mut MachFunction, blk: BlockId, op, ops| {
+        let id = func.push_inst(MachInst::new(op, ops));
+        func.append_inst(blk, id);
+    };
+    use AArch64Opcode::*;
+    let sp = MachOperand::PReg(trust_cg_ir::aarch64_regs::SP);
+    let (sc, sb, sa) = (
+        func.alloc_stack_slot(StackSlot::new(576 * 8, 8)),
+        func.alloc_stack_slot(StackSlot::new(576 * 8, 8)),
+        func.alloc_stack_slot(StackSlot::new(576 * 8, 8)),
+    );
+    push(
+        &mut func,
+        pre,
+        AddPCRel,
+        vec![nx(0), sp.clone(), MachOperand::StackSlot(sc)],
+    ); // c
+    push(
+        &mut func,
+        pre,
+        AddPCRel,
+        vec![nx(1), sp.clone(), MachOperand::StackSlot(sb)],
+    ); // b
+    push(
+        &mut func,
+        pre,
+        AddPCRel,
+        vec![nx(8), sp.clone(), MachOperand::StackSlot(sa)],
+    ); // a
+    push(&mut func, pre, Movz, vec![nx(5), ni(24)]); // N
+    push(&mut func, pre, Movz, vec![nx(6), ni(8)]); // scale
+    push(&mut func, pre, Movz, vec![nx(9), ni(0)]); // zero, copied into the inner ivs
+    push(&mut func, pre, Movz, vec![nx(3), ni(0)]); // i
+    push(&mut func, pre, B, vec![nbl(ihdr)]);
+
+    push(&mut func, ihdr, CmpRI, vec![nx(3), ni(24)]);
+    push(&mut func, ihdr, BCond, vec![ni(CC_LT), nbl(kpre)]);
+    push(&mut func, ihdr, B, vec![nbl(exit)]);
+
+    push(&mut func, kpre, MovR, vec![nx(4), nx(9)]); // k = 0
+    push(&mut func, kpre, B, vec![nbl(khdr)]);
+
+    push(&mut func, khdr, CmpRI, vec![nx(4), ni(24)]);
+    push(&mut func, khdr, BCond, vec![ni(CC_LT), nbl(kbody)]);
+    push(&mut func, khdr, B, vec![nbl(ilatch)]);
+
+    push(&mut func, kbody, Madd, vec![nx(20), nx(3), nx(5), nx(4)]); // aidx = i*N + k
+    push(&mut func, kbody, CmpRI, vec![nx(20), ni(576)]);
+    push(&mut func, kbody, BCond, vec![ni(CC_LO), nbl(kbody2)]);
+    push(&mut func, kbody, B, vec![nbl(trap)]);
+
+    push(&mut func, kbody2, Madd, vec![nx(21), nx(20), nx(6), nx(8)]); // aaddr
+    push(&mut func, kbody2, LdrRI, vec![nx(2), nx(21), ni(0)]); // aik
+    push(&mut func, kbody2, MovR, vec![nx(7), nx(9)]); // j = 0
+    push(&mut func, kbody2, B, vec![nbl(jhdr)]);
+
+    push(&mut func, jhdr, CmpRI, vec![nx(7), ni(24)]);
+    push(&mut func, jhdr, BCond, vec![ni(CC_LT), nbl(bc1)]);
+    push(&mut func, jhdr, B, vec![nbl(klatch)]);
+
+    push(&mut func, bc1, Madd, vec![nx(10), nx(3), nx(5), nx(7)]); // cidx
+    push(&mut func, bc1, CmpRI, vec![nx(10), ni(576)]);
+    push(&mut func, bc1, BCond, vec![ni(CC_LO), nbl(bc2)]);
+    push(&mut func, bc1, B, vec![nbl(trap)]);
+
+    push(&mut func, bc2, Madd, vec![nx(11), nx(4), nx(5), nx(7)]); // bidx
+    push(&mut func, bc2, CmpRI, vec![nx(11), ni(576)]);
+    push(&mut func, bc2, BCond, vec![ni(CC_LO), nbl(work)]);
+    push(&mut func, bc2, B, vec![nbl(trap)]);
+
+    push(&mut func, work, Madd, vec![nx(12), nx(10), nx(6), nx(0)]); // caddr
+    push(&mut func, work, LdrRI, vec![nx(13), nx(12), ni(0)]); // cval
+    push(&mut func, work, Madd, vec![nx(14), nx(11), nx(6), nx(1)]); // baddr
+    push(&mut func, work, LdrRI, vec![nx(15), nx(14), ni(0)]); // bval
+    push(&mut func, work, Madd, vec![nx(16), nx(2), nx(15), nx(13)]); // aik*b + c
+    push(&mut func, work, StrRI, vec![nx(16), nx(12), ni(0)]);
+    push(&mut func, work, B, vec![nbl(jlatch)]);
+
+    push(&mut func, jlatch, AddRI, vec![nx(7), nx(7), ni(1)]);
+    push(&mut func, jlatch, B, vec![nbl(jhdr)]);
+    push(&mut func, klatch, AddRI, vec![nx(4), nx(4), ni(1)]);
+    push(&mut func, klatch, B, vec![nbl(khdr)]);
+    push(&mut func, ilatch, AddRI, vec![nx(3), nx(3), ni(1)]);
+    push(&mut func, ilatch, B, vec![nbl(ihdr)]);
+    push(&mut func, exit, Ret, vec![]);
+    push(&mut func, trap, Ret, vec![]);
+
+    for (a, b) in [
+        (pre, ihdr),
+        (ihdr, kpre),
+        (ihdr, exit),
+        (kpre, khdr),
+        (khdr, kbody),
+        (khdr, ilatch),
+        (kbody, kbody2),
+        (kbody, trap),
+        (kbody2, jhdr),
+        (jhdr, bc1),
+        (jhdr, klatch),
+        (bc1, bc2),
+        (bc1, trap),
+        (bc2, work),
+        (bc2, trap),
+        (work, jlatch),
+        (jlatch, jhdr),
+        (klatch, khdr),
+        (ilatch, ihdr),
+    ] {
+        func.add_edge(a, b);
+    }
+    func
+}
+
+#[test]
+fn fires_on_the_matmul_nest() {
+    let mut func = build_matmul_nest();
+    let mut pass = MacRegBlock::new();
+    assert!(
+        pass.run(&mut func),
+        "the 3-deep matmul nest must register-block"
+    );
+}
+
+/// IDEMPOTENCE: the blocked nest no longer contains the scalar j-loop shape,
+/// so a second run must change nothing.
+#[test]
+fn second_run_is_a_no_op() {
+    let mut func = build_matmul_nest();
+    assert!(MacRegBlock::new().run(&mut func), "first run must fire");
+    let (insts, blocks) = (func.insts.len(), func.blocks.len());
+    for again in 2..=4 {
+        assert!(
+            !MacRegBlock::new().run(&mut func),
+            "run {again} re-fired on its own output"
+        );
+        assert_eq!(func.insts.len(), insts, "run {again} added instructions");
+        assert_eq!(func.blocks.len(), blocks, "run {again} added blocks");
+    }
 }

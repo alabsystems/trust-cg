@@ -3020,15 +3020,15 @@ fn rewrite_i32_induction_store_loops(
     func: &mut MachFunction,
     loop_analysis: &LoopAnalysis,
     mut provenance: Option<&mut ProvenanceMap>,
+    maps: &mut VecMaps,
 ) -> Vec<VectorizationResult> {
     let mut results = Vec::new();
     let loops: Vec<_> = loop_analysis.all_loops().cloned().collect();
     // The scan is read-only, so one map serves every match attempt. A rewrite
     // can grow the arena even when it fails partway, so the map is rebuilt
     // after any rewrite call that does not return.
-    let mut defs = build_def_map(func);
     for lp in loops {
-        let Some(idiom) = match_i32_induction_store_loop(func, &lp, &defs) else {
+        let Some(idiom) = match_i32_induction_store_loop(func, &lp, &maps.defs) else {
             continue;
         };
         if let Some(result) =
@@ -3037,7 +3037,8 @@ fn rewrite_i32_induction_store_loops(
             results.push(result);
             return results;
         }
-        defs = build_def_map(func);
+        // A failed attempt may have touched the function: rebuild for the next loop.
+        *maps = VecMaps::build(func);
     }
     results
 }
@@ -4184,18 +4185,18 @@ fn rewrite_reverse_accumulation_loops(
     loop_analysis: &LoopAnalysis,
     proof_facts: &HashMap<InstId, Vec<ProofFact>>,
     mut provenance: Option<&mut ProvenanceMap>,
+    maps: &mut VecMaps,
 ) -> Vec<VectorizationResult> {
     let mut results = Vec::new();
     let loops: Vec<_> = loop_analysis.all_loops().cloned().collect();
     // The scan is read-only, so one map serves every match attempt. A rewrite
     // can grow the arena even when it fails partway, so the map is rebuilt
     // after any rewrite call that does not return.
-    let mut defs = build_def_map(func);
     for lp in loops {
-        if !reverse_accumulation_loop_is_proof_accepted(func, &lp, proof_facts, &defs) {
+        if !reverse_accumulation_loop_is_proof_accepted(func, &lp, proof_facts, &maps.defs) {
             continue;
         }
-        let Some(idiom) = match_reverse_accumulation_loop(func, &lp, &defs) else {
+        let Some(idiom) = match_reverse_accumulation_loop(func, &lp, &maps.defs) else {
             continue;
         };
         if let Some(result) =
@@ -4204,7 +4205,8 @@ fn rewrite_reverse_accumulation_loops(
             results.push(result);
             return results;
         }
-        defs = build_def_map(func);
+        // A failed attempt may have touched the function: rebuild for the next loop.
+        *maps = VecMaps::build(func);
     }
     results
 }
@@ -4573,8 +4575,8 @@ fn try_match_contains4_masked_root(
 fn find_contains4_masked_idioms(
     func: &MachFunction,
     defs: &HashMap<u32, InstId>,
+    use_counts: &HashMap<u32, usize>,
 ) -> Vec<Contains4MaskedIdiom> {
-    let use_counts = build_vreg_use_counts(func);
     let mut idioms = Vec::new();
 
     for block_id in func.block_order.iter().copied() {
@@ -5043,9 +5045,12 @@ fn rewrite_contains4_masked_slp(
     enable_scanner_memory_rewrite: bool,
     enable_scanner_batch_rewrite: bool,
     mut provenance: Option<&mut ProvenanceMap>,
-    defs: &HashMap<u32, InstId>,
-) -> Vec<VectorizationResult> {
-    let idioms = find_contains4_masked_idioms(func, defs);
+    maps: &VecMaps,
+) -> (Vec<VectorizationResult>, bool) {
+    // `attempted`: an attempt may allocate vregs or insert instructions before
+    // it bails, so the caller's maps are stale after one even with no rewrite.
+    let idioms = find_contains4_masked_idioms(func, &maps.defs, &maps.use_counts);
+    let attempted = !idioms.is_empty();
     let mut consumed = HashSet::new();
     let mut results = Vec::new();
 
@@ -5070,7 +5075,7 @@ fn rewrite_contains4_masked_slp(
         }
     }
 
-    results
+    (results, attempted)
 }
 
 /// Upgrade a VReg operand from its scalar register class to the SIMD
@@ -6437,18 +6442,48 @@ impl VectorizationPass {
         // sweep and the contains4 idiom scan (the scan runs before any SLP
         // rewrite fires). Dropped right after: every later phase may mutate
         // the function and must build its own map.
-        let defs = build_def_map(func);
+        // One def-map + use-count build per run, shared by every tier below and
+        // rebuilt only after a rewrite ATTEMPT (an attempt may allocate vregs
+        // or insert instructions before it bails, so "attempted" — not
+        // "succeeded" — is the invalidation event; each tier reports it).
+        // PREFILTER (exact): the contains4 masked-SLP root is an `AndRR` over
+        // an `OrrRR` chain of `CSet` bits produced by `CmpRR`s; without all
+        // four opcodes in the live block lists that rewriter cannot fire, and
+        // the loop rewriters need a loop. When neither can fire, skip the
+        // def/use-map build entirely (the reports the loop sweep would have
+        // produced are empty without loops).
+        let has = |op: AArch64Opcode| {
+            func.block_order
+                .iter()
+                .flat_map(|b| func.block(*b).insts.iter())
+                .any(|&i| func.inst(i).opcode == op)
+        };
+        let contains4_possible = has(AArch64Opcode::AndRR)
+            && has(AArch64Opcode::CSet)
+            && has(AArch64Opcode::CmpRR)
+            && has(AArch64Opcode::OrrRR);
+        if !contains4_possible && loop_analysis.is_empty() {
+            self.reverse_accumulation_reports = Vec::new();
+            return false;
+        }
+        let mut maps = VecMaps::build(func);
         self.reverse_accumulation_reports =
-            reverse_accumulation_reports(func, loop_analysis, &self.proof_facts, &defs);
+            reverse_accumulation_reports(func, loop_analysis, &self.proof_facts, &maps.defs);
 
-        let slp_results = rewrite_contains4_masked_slp(
-            func,
-            self.enable_contains4_scanner_memory_rewrite,
-            self.enable_contains4_scanner_batch_rewrite,
-            provenance.as_deref_mut(),
-            &defs,
-        );
-        drop(defs);
+        let (slp_results, slp_attempted) = if contains4_possible {
+            rewrite_contains4_masked_slp(
+                func,
+                self.enable_contains4_scanner_memory_rewrite,
+                self.enable_contains4_scanner_batch_rewrite,
+                provenance.as_deref_mut(),
+                &maps,
+            )
+        } else {
+            (Vec::new(), false)
+        };
+        if slp_attempted {
+            maps = VecMaps::build(func);
+        }
         let mut changed = !slp_results.is_empty();
         self.results.extend(slp_results);
 
@@ -6456,20 +6491,24 @@ impl VectorizationPass {
             return changed;
         }
 
-        let store_loop_results =
-            rewrite_i32_induction_store_loops(func, loop_analysis, provenance.as_deref_mut());
+        let store_loop_results = rewrite_i32_induction_store_loops(
+            func,
+            loop_analysis,
+            provenance.as_deref_mut(),
+            &mut maps,
+        );
         if !store_loop_results.is_empty() {
             self.results.extend(store_loop_results);
             let dom = DomTree::compute(func);
             let refreshed_loop_analysis = LoopAnalysis::compute(func, &dom);
-            // The store-loop rewrite mutated the function; the entry map is
-            // stale, so this sweep gets a fresh one.
-            let defs = build_def_map(func);
+            // The store-loop rewrite mutated the function; the maps are stale,
+            // so this sweep gets fresh ones.
+            maps = VecMaps::build(func);
             self.reverse_accumulation_reports = reverse_accumulation_reports(
                 func,
                 &refreshed_loop_analysis,
                 &self.proof_facts,
-                &defs,
+                &maps.defs,
             );
             if refreshed_loop_analysis.is_empty() {
                 return true;
@@ -6479,6 +6518,7 @@ impl VectorizationPass {
                 &refreshed_loop_analysis,
                 &self.proof_facts,
                 provenance.as_deref_mut(),
+                &mut maps,
             );
             if !reverse_accumulation_results.is_empty() {
                 self.results.extend(reverse_accumulation_results);
@@ -6492,6 +6532,7 @@ impl VectorizationPass {
             loop_analysis,
             &self.proof_facts,
             provenance.as_deref_mut(),
+            &mut maps,
         );
         if !reverse_accumulation_results.is_empty() {
             self.results.extend(reverse_accumulation_results);
@@ -6505,9 +6546,9 @@ impl VectorizationPass {
         let mut loops: Vec<_> = loop_analysis.all_loops().cloned().collect();
         loops.sort_by_key(|lp| std::cmp::Reverse(lp.depth));
 
-        // One map pair for the whole sweep instead of two per loop. Rebuilt
-        // only where the function actually changes — see the rewrite arm below.
-        let mut maps = VecMaps::build(func);
+        // `maps` is fresh here: every tier above rebuilt it after any attempt.
+        // Rebuilt only where the function actually changes — see the rewrite
+        // arm below.
 
         for lp in &loops {
             if let Some(plan) = analyze_loop_with(func, lp, &cost_model, &maps) {
@@ -6578,8 +6619,8 @@ impl MachinePass for VectorizationPass {
     }
 
     fn run_with_analyses(&mut self, func: &mut MachFunction, analyses: &mut AnalysisCache) -> bool {
-        let loop_analysis = analyses.loop_analysis(func).clone();
-        self.run_with_loop_analysis(func, &loop_analysis, None)
+        let loop_analysis = analyses.loop_analysis(func);
+        self.run_with_loop_analysis(func, loop_analysis, None)
     }
 
     fn run_with_provenance(
@@ -6598,8 +6639,8 @@ impl MachinePass for VectorizationPass {
         analyses: &mut AnalysisCache,
         provenance: &mut ProvenanceMap,
     ) -> bool {
-        let loop_analysis = analyses.loop_analysis(func).clone();
-        self.run_with_loop_analysis(func, &loop_analysis, Some(provenance))
+        let loop_analysis = analyses.loop_analysis(func);
+        self.run_with_loop_analysis(func, loop_analysis, Some(provenance))
     }
 
     fn set_proof_optimization_metadata(&mut self, metadata: &ProofOptimizationMetadata) {
@@ -9127,7 +9168,8 @@ mod tests {
 
         let dom = DomTree::compute(&func);
         let la = LoopAnalysis::compute(&func, &dom);
-        let results = rewrite_i32_induction_store_loops(&mut func, &la, None);
+        let mut maps = VecMaps::build(&func);
+        let results = rewrite_i32_induction_store_loops(&mut func, &la, None, &mut maps);
 
         assert_eq!(results.len(), 1);
         assert_eq!(func.num_blocks(), initial_blocks + 3);
@@ -9237,7 +9279,8 @@ mod tests {
 
         let dom = DomTree::compute(&func);
         let la = LoopAnalysis::compute(&func, &dom);
-        let results = rewrite_i32_induction_store_loops(&mut func, &la, None);
+        let mut maps = VecMaps::build(&func);
+        let results = rewrite_i32_induction_store_loops(&mut func, &la, None, &mut maps);
 
         assert_eq!(results.len(), 1);
         assert_eq!(count_opcode(&func, AArch64Opcode::NeonSt1Post), 1);
@@ -9353,7 +9396,8 @@ mod tests {
         let la = LoopAnalysis::compute(&func, &dom);
         assert_eq!(la.all_loops().count(), 1, "post-SROA CFG remains natural");
 
-        let results = rewrite_i32_induction_store_loops(&mut func, &la, None);
+        let mut maps = VecMaps::build(&func);
+        let results = rewrite_i32_induction_store_loops(&mut func, &la, None, &mut maps);
 
         assert_eq!(results.len(), 1);
         assert_eq!(count_opcode(&func, AArch64Opcode::NeonSt1Post), 1);
@@ -9496,7 +9540,8 @@ mod tests {
         let initial_blocks = func.num_blocks();
         let dom = DomTree::compute(&func);
         let la = LoopAnalysis::compute(&func, &dom);
-        let results = rewrite_i32_induction_store_loops(&mut func, &la, None);
+        let mut maps = VecMaps::build(&func);
+        let results = rewrite_i32_induction_store_loops(&mut func, &la, None, &mut maps);
 
         assert_eq!(results.len(), 1);
         assert_eq!(count_opcode(&func, AArch64Opcode::NeonSt1Post), 1);
@@ -9550,7 +9595,8 @@ mod tests {
 
         let dom = DomTree::compute(&func);
         let la = LoopAnalysis::compute(&func, &dom);
-        let results = rewrite_i32_induction_store_loops(&mut func, &la, None);
+        let mut maps = VecMaps::build(&func);
+        let results = rewrite_i32_induction_store_loops(&mut func, &la, None, &mut maps);
 
         assert_eq!(results.len(), 1);
         assert_eq!(count_opcode(&func, AArch64Opcode::NeonSt1Post), 1);
@@ -9573,7 +9619,8 @@ mod tests {
 
         let dom = DomTree::compute(&func);
         let la = LoopAnalysis::compute(&func, &dom);
-        let results = rewrite_i32_induction_store_loops(&mut func, &la, None);
+        let mut maps = VecMaps::build(&func);
+        let results = rewrite_i32_induction_store_loops(&mut func, &la, None, &mut maps);
 
         assert!(
             results.is_empty(),
@@ -9590,7 +9637,8 @@ mod tests {
 
         let dom = DomTree::compute(&func);
         let la = LoopAnalysis::compute(&func, &dom);
-        let results = rewrite_i32_induction_store_loops(&mut func, &la, None);
+        let mut maps = VecMaps::build(&func);
+        let results = rewrite_i32_induction_store_loops(&mut func, &la, None, &mut maps);
 
         assert!(
             results.is_empty(),
@@ -10524,7 +10572,11 @@ mod tests {
     fn test_contains4_masked_slp_pattern_recognized_without_loop() {
         let (func, fixture) = make_contains4_masked_function(Contains4MaskedOptions::default());
 
-        let idioms = find_contains4_masked_idioms(&func, &build_def_map(&func));
+        let idioms = find_contains4_masked_idioms(
+            &func,
+            &build_def_map(&func),
+            &build_vreg_use_counts(&func),
+        );
 
         assert_eq!(idioms.len(), 1);
         assert_eq!(idioms[0].and_inst, fixture.final_and.unwrap());
@@ -10613,7 +10665,11 @@ mod tests {
             ..Contains4MaskedOptions::default()
         });
 
-        let idioms = find_contains4_masked_idioms(&func, &build_def_map(&func));
+        let idioms = find_contains4_masked_idioms(
+            &func,
+            &build_def_map(&func),
+            &build_vreg_use_counts(&func),
+        );
 
         assert_eq!(idioms.len(), 1);
         let memory_chunk = idioms[0]

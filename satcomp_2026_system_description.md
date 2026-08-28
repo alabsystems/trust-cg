@@ -5,6 +5,12 @@ package targets the SAT-Competition 2026 No-Limits (Sequential) submission
 format; it is a research artifact, not a claim of state-of-the-art SAT
 performance.
 
+This document describes that v0.1.0 submission package specifically, and the
+version labels below are deliberate: they match the `ARG TRUST_CG_REF=v0.1.0`
+pin in [`docker/sat-comp-2026/Dockerfile`](docker/sat-comp-2026/Dockerfile), so
+the commands reproduce the submitted artifact rather than the current tree. The
+current trust-cg release is 0.4.0; see [`CHANGELOG.md`](CHANGELOG.md).
+
 - Solver: `trust-cg-sat`
 - Release: `v0.1.0`
 - Author: Andrew Yates, independent

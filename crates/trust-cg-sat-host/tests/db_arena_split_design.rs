@@ -11,36 +11,27 @@
 
 use std::ffi::CString;
 use std::io::Write;
-use std::mem::MaybeUninit;
 
 use tempfile::NamedTempFile;
 
 use trust_cg_sat_host::scratch_arena::{
     SCRATCH_BIND_MARGIN, SYNTHETIC_CLAUSE_OVERHEAD, ScratchArena,
 };
-use trust_cg_sat_host::sys;
+use trust_cg_sat_host::{OwnedMicroSatSolver, sys};
 
 /// Helper: parse a CNF into a MicroSAT solver suitable for binding a
-/// scratch arena to. Returns the `MaybeUninit<sys::solver>` (so the
-/// caller can pass `solver.as_mut_ptr()` to `bind_to_solver`) and the
-/// `parse_rc` so the test can branch on parse-time UNSAT.
-fn parse_solver(cnf: &str) -> (MaybeUninit<sys::solver>, i32) {
+/// scratch arena to. Returns the owning solver (so the caller can pass
+/// `solver.as_mut_ptr()` to `bind_to_solver`) and the `parse_rc` so the test
+/// can branch on parse-time UNSAT.
+fn parse_solver(cnf: &str) -> (OwnedMicroSatSolver, i32) {
     let mut file = NamedTempFile::new().expect("create tempfile");
     file.write_all(cnf.as_bytes()).expect("write cnf");
     file.flush().expect("flush cnf");
     let c_path = CString::new(file.path().to_string_lossy().into_owned()).expect("path to CString");
 
-    let mut solver: MaybeUninit<sys::solver> = MaybeUninit::uninit();
-    // SAFETY: `parse` calls `initCDCL` which initialises every field
-    // the rest of MicroSAT will read, matching the upstream `main`
-    // construction pattern used elsewhere in this crate's tests.
-    let parse_rc = unsafe {
-        sys::parse(
-            solver.as_mut_ptr(),
-            c_path.as_ptr() as *mut std::os::raw::c_char,
-        )
-    };
-    (solver, parse_rc)
+    // SAFETY: the helper writes a well-formed DIMACS file and keeps it open
+    // for the duration of parse.
+    unsafe { OwnedMicroSatSolver::parse(c_path.as_c_str()) }
 }
 
 #[test]
@@ -80,12 +71,6 @@ fn allocate_single_synthetic_clause_returns_db_offset_reason() {
     assert_eq!(read_c, 3);
     let terminator = unsafe { *db.offset(clause0_offset + 4) };
     assert_eq!(terminator, 0, "clause must be 0-terminated");
-
-    // Free the DB by hand (the solver struct lives on our stack and
-    // has no destructor).
-    if !solver_ref.DB.is_null() {
-        unsafe { libc::free(solver_ref.DB as *mut libc::c_void) };
-    }
 }
 
 #[test]
@@ -136,11 +121,6 @@ fn many_allocations_advance_cursor_and_stay_in_range() {
             .is_none(),
         "live-DB reason values must not show up as scratch"
     );
-
-    let solver_ref = unsafe { &*s_ptr };
-    if !solver_ref.DB.is_null() {
-        unsafe { libc::free(solver_ref.DB as *mut libc::c_void) };
-    }
 }
 
 #[test]
@@ -171,11 +151,6 @@ fn reset_clears_cursor_without_freeing_memory() {
         scratch_base + 1,
         "first post-reset allocation must occupy slot 0"
     );
-
-    let solver_ref = unsafe { &*s_ptr };
-    if !solver_ref.DB.is_null() {
-        unsafe { libc::free(solver_ref.DB as *mut libc::c_void) };
-    }
 }
 
 #[test]
@@ -202,11 +177,6 @@ fn overflow_returns_error_does_not_corrupt_state() {
         second.is_err(),
         "second allocation must overflow once arena is full"
     );
-
-    let solver_ref = unsafe { &*s_ptr };
-    if !solver_ref.DB.is_null() {
-        unsafe { libc::free(solver_ref.DB as *mut libc::c_void) };
-    }
 }
 
 #[test]
@@ -228,11 +198,6 @@ fn bind_rejects_collision_with_live_db() {
         bind_result.is_err(),
         "bind must refuse a reservation that crowds the live DB"
     );
-
-    let solver_ref = unsafe { &*s_ptr };
-    if !solver_ref.DB.is_null() {
-        unsafe { libc::free(solver_ref.DB as *mut libc::c_void) };
-    }
 }
 
 #[test]
@@ -262,11 +227,6 @@ fn watch_invariant_unchanged_after_synthetic_allocation() {
         "live DB region (watch lists etc.) must be byte-identical \
          before vs after synthetic allocations"
     );
-
-    let solver_ref = unsafe { &*s_ptr };
-    if !solver_ref.DB.is_null() {
-        unsafe { libc::free(solver_ref.DB as *mut libc::c_void) };
-    }
 }
 
 #[test]
@@ -290,9 +250,4 @@ fn lookup_reason_distinguishes_db_from_scratch_ranges() {
 
     let scratch_reason = arena.allocate_synthetic_clause(4, &[1, 2, 3]).unwrap();
     assert!(arena.lookup_reason(scratch_reason).is_some());
-
-    let solver_ref = unsafe { &*s_ptr };
-    if !solver_ref.DB.is_null() {
-        unsafe { libc::free(solver_ref.DB as *mut libc::c_void) };
-    }
 }

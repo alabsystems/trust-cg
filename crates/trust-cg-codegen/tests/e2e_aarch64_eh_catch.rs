@@ -84,7 +84,12 @@ fn build_tc_try() -> IrMachFunction {
     ));
     func.append_inst(entry, mov0);
 
-    let ret0 = func.push_inst(IrMachInst::new(IrOpcode::Ret, vec![]));
+    // The AArch64 authority gate requires a `Ret` to carry EXACTLY the ABI
+    // return-register implicit-use alias set that production ISel attaches via
+    // `AppleAArch64ABI::required_return_pregs(&sig_returns)`. This signature
+    // returns [I32], which classifies to `Reg(X0)`, so the required set is
+    // exactly {X0}. A bare `Ret` is malformed IR, not a shorthand.
+    let ret0 = func.push_inst(IrMachInst::new(IrOpcode::Ret, vec![]).with_implicit_uses(&[X0]));
     func.append_inst(entry, ret0);
 
     // --- bb1: the landing pad (catch(...)) ---
@@ -109,7 +114,7 @@ fn build_tc_try() -> IrMachFunction {
     ));
     func.append_inst(lpad, mov42);
 
-    let ret42 = func.push_inst(IrMachInst::new(IrOpcode::Ret, vec![]));
+    let ret42 = func.push_inst(IrMachInst::new(IrOpcode::Ret, vec![]).with_implicit_uses(&[X0]));
     func.append_inst(lpad, ret42);
 
     func
@@ -381,7 +386,8 @@ fn build_forty() -> IrMachFunction {
         vec![IrOperand::PReg(X0), IrOperand::Imm(40)],
     ));
     func.append_inst(entry, mov);
-    let ret = func.push_inst(IrMachInst::new(IrOpcode::Ret, vec![]));
+    // Returns [I32] -> ABI return-register alias set is exactly {X0}.
+    let ret = func.push_inst(IrMachInst::new(IrOpcode::Ret, vec![]).with_implicit_uses(&[X0]));
     func.append_inst(entry, ret);
     func
 }

@@ -475,13 +475,13 @@ pub fn coalesce_copies_tuned_with_numbering(
             // `d <- op(d, ..)` latch update) and a pass-through copy relating
             // the same two coalescing classes (block-param chains).
             let overlap_ok = |dst_interval: &LiveInterval, src_interval: &LiveInterval| {
-                overlap_is_copy_point_only(dst_interval, src_interval, inst_id, &inst_numbering)
+                overlap_is_copy_point_only(dst_interval, src_interval, inst_id, inst_numbering)
                     || (!tuning.kill_def_producers.is_empty()
                         && overlap_positions_all_mergeable(OverlapMergeQuery {
                             dst_interval,
                             src_interval,
                             copy_inst: inst_id,
-                            inst_numbering: &inst_numbering,
+                            inst_numbering,
                             pos_to_inst: &pos_to_inst,
                             func,
                             parent: &parent,

@@ -352,6 +352,13 @@ pub struct GreedyAllocator {
     /// Physical registers reserved at specific instruction positions by
     /// implicit defs, such as call-clobbered ABI registers.
     reserved_regs: BTreeMap<PReg, Vec<u32>>,
+    /// Candidate preg -> sorted, deduplicated UNION of `reserved_regs[k]` over
+    /// every key `k` with `allocator_pregs_overlap(k, preg)`. `reserved_regs`
+    /// is never mutated after construction (only read by the two reserved
+    /// checks), so the memo cannot go stale; it turns the per-candidate
+    /// predicate scan over every reserved key (one per caller-saved VIEW per
+    /// call site on AArch64) into one lookup.
+    reserved_union: std::cell::RefCell<BTreeMap<PReg, Vec<u32>>>,
     /// Maximum eviction cascade depth (default 10).
     max_cascade_depth: u32,
 
@@ -444,6 +451,7 @@ impl GreedyAllocator {
             hints,
             hint_exempt: BTreeMap::new(),
             reserved_regs,
+            reserved_union: std::cell::RefCell::new(BTreeMap::new()),
             max_cascade_depth: 10,
             intervals: interval_map,
             assignment: BTreeMap::new(),
@@ -710,12 +718,73 @@ impl GreedyAllocator {
         preg: PReg,
         exempt: &[u32],
     ) -> bool {
-        self.reserved_regs.iter().any(|(&reserved_preg, points)| {
-            allocator_pregs_overlap(reserved_preg, preg)
-                && points
-                    .iter()
-                    .any(|&pos| interval.is_live_at(pos) && !exempt.contains(&pos))
+        self.with_reserved_points(preg, |pts| {
+            pts.iter()
+                .any(|&pos| interval.is_live_at(pos) && !exempt.contains(&pos))
         })
+    }
+
+    /// Run `f` over the union of reserved positions of every reserved key
+    /// overlapping `preg` (memoized per candidate; see `reserved_union`).
+    /// An existential over the union equals the existential over the
+    /// per-key lists it is the union of, so both consumers are unchanged.
+    fn with_reserved_points<R>(&self, preg: PReg, f: impl FnOnce(&[u32]) -> R) -> R {
+        if let Some(pts) = self.reserved_union.borrow().get(&preg) {
+            return f(pts);
+        }
+        let mut pts: Vec<u32> = Vec::new();
+        for (&reserved_preg, points) in &self.reserved_regs {
+            if allocator_pregs_overlap(reserved_preg, preg) {
+                pts.extend_from_slice(points);
+            }
+        }
+        pts.sort_unstable();
+        pts.dedup();
+        let r = f(&pts);
+        self.reserved_union.borrow_mut().insert(preg, pts);
+        r
+    }
+
+    /// Whether the segment / assignment stores can be probed for `preg` by
+    /// DIRECT lookup of `preg` and its aliases. Both stores are keyed by
+    /// `p ∪ aliasing_pregs(p)` for every assigned `p` (see [`Self::assign`]),
+    /// so for every register whose overlap relation IS its alias closure
+    /// (X/W, V/D/S/H/B, the x86 views, unknown encodings) the only keys that
+    /// can overlap `preg` are `preg` and its aliases. The SP/XZR root class is
+    /// the exception — `regs_overlap` relates SP, WSP, XZR and WZR to each
+    /// other although they are not aliases — and keeps the predicate scan, so
+    /// the direct lookup is unconditionally identical to it.
+    #[inline]
+    fn direct_alias_lookup(preg: PReg) -> bool {
+        crate::x86_adapter::is_x86_preg(preg)
+            || trust_cg_ir::aarch64_regs::reg_root(preg) != Some((31, 0))
+    }
+
+    /// Visit every entry of `map` whose key overlaps `preg`; stops and
+    /// returns true as soon as `f` does.
+    fn any_overlapping_entry<T>(
+        map: &BTreeMap<PReg, T>,
+        preg: PReg,
+        mut f: impl FnMut(&T) -> bool,
+    ) -> bool {
+        if Self::direct_alias_lookup(preg) {
+            if let Some(entry) = map.get(&preg)
+                && f(entry)
+            {
+                return true;
+            }
+            for alias in aliasing_pregs(preg) {
+                if let Some(entry) = map.get(&alias)
+                    && f(entry)
+                {
+                    return true;
+                }
+            }
+            false
+        } else {
+            map.iter()
+                .any(|(&key_preg, entry)| allocator_pregs_overlap(key_preg, preg) && f(entry))
+        }
     }
 
     /// Visit every assigned vreg whose physical storage overlaps `preg`
@@ -724,43 +793,30 @@ impl GreedyAllocator {
     /// for the boolean "does anything interfere" queries this serves.
     /// Returns true as soon as `f` returns true.
     fn any_assigned_vreg_overlapping(&self, preg: PReg, mut f: impl FnMut(VReg) -> bool) -> bool {
-        for (&assigned_preg, assigned_vregs) in &self.preg_assignments {
-            if allocator_pregs_overlap(assigned_preg, preg) {
-                for &v in assigned_vregs {
-                    if f(v) {
-                        return true;
-                    }
-                }
-            }
-        }
-        false
+        Self::any_overlapping_entry(&self.preg_assignments, preg, |assigned_vregs| {
+            assigned_vregs.iter().any(|&v| f(v))
+        })
     }
 
     /// Check whether any interval assigned to a specific `preg` overlaps `interval`.
     fn interferes_with_preg(&self, vreg: VReg, preg: PReg, interval: &LiveInterval) -> bool {
-        for (&key_preg, entry) in &self.preg_segments {
-            if !allocator_pregs_overlap(key_preg, preg) {
-                continue;
-            }
-            for r in &interval.ranges {
+        let hit = Self::any_overlapping_entry(&self.preg_segments, preg, |entry| {
+            interval.ranges.iter().any(|r| {
                 // Any segment starting inside [start, end) overlaps; so does
                 // a predecessor that reaches past `start`. Entry segments are
                 // pairwise disjoint, so no earlier segment can reach further
                 // than the predecessor does.
-                if entry
+                entry
                     .range(r.start..r.end)
                     .any(|(_, &(_, seg_vreg))| seg_vreg != vreg)
-                {
-                    return true;
-                }
-                if entry
-                    .range(..r.start)
-                    .next_back()
-                    .is_some_and(|(_, &(end, seg_vreg))| end > r.start && seg_vreg != vreg)
-                {
-                    return true;
-                }
-            }
+                    || entry
+                        .range(..r.start)
+                        .next_back()
+                        .is_some_and(|(_, &(end, seg_vreg))| end > r.start && seg_vreg != vreg)
+            })
+        });
+        if hit {
+            return true;
         }
         self.segment_overflow
             .iter()
@@ -785,10 +841,8 @@ impl GreedyAllocator {
         interval: &LiveInterval,
     ) -> Vec<VReg> {
         let mut found: Vec<VReg> = Vec::new();
-        for (&key_preg, entry) in &self.preg_segments {
-            if !allocator_pregs_overlap(key_preg, preg) {
-                continue;
-            }
+        // Visiting order is irrelevant: `found` is sorted and deduplicated below.
+        Self::any_overlapping_entry(&self.preg_segments, preg, |entry| {
             for r in &interval.ranges {
                 for (_, &(_, seg_vreg)) in entry.range(r.start..r.end) {
                     if seg_vreg != exclude {
@@ -802,7 +856,8 @@ impl GreedyAllocator {
                     found.push(seg_vreg);
                 }
             }
-        }
+            false
+        });
         for &(key_preg, start, end, seg_vreg) in &self.segment_overflow {
             if seg_vreg != exclude
                 && allocator_pregs_overlap(key_preg, preg)
@@ -1207,25 +1262,20 @@ impl GreedyAllocator {
     /// Check whether a physical register is occupied at a specific
     /// program point by any interval other than `exclude_vreg_id`.
     fn is_occupied_at(&self, preg: PReg, pos: u32, exclude_vreg: VReg) -> bool {
-        if self.reserved_regs.iter().any(|(&reserved_preg, points)| {
-            allocator_pregs_overlap(reserved_preg, preg) && points.contains(&pos)
-        }) {
+        if self.with_reserved_points(preg, |pts| pts.binary_search(&pos).is_ok()) {
             return true;
         }
 
         // Segments within an entry are pairwise disjoint, so at most one can
         // contain `pos`: the one with the greatest start <= pos.
-        for (&key_preg, entry) in &self.preg_segments {
-            if !allocator_pregs_overlap(key_preg, preg) {
-                continue;
-            }
-            if entry
+        let hit = Self::any_overlapping_entry(&self.preg_segments, preg, |entry| {
+            entry
                 .range(..=pos)
                 .next_back()
                 .is_some_and(|(_, &(end, seg_vreg))| end > pos && seg_vreg != exclude_vreg)
-            {
-                return true;
-            }
+        });
+        if hit {
+            return true;
         }
         self.segment_overflow
             .iter()
@@ -1506,6 +1556,87 @@ mod tests {
             GreedyAllocator::new_with_reserved(intervals, &regs, BTreeMap::new(), reserved);
         let result = alloc.allocate().unwrap();
 
+        assert!(result.allocation.is_empty());
+        assert_eq!(alloc.spilled.len(), 1);
+    }
+
+    /// The SP/XZR root class is the one place where `regs_overlap` relates
+    /// registers that are NOT aliases of each other (SP, WSP, XZR and WZR all
+    /// root to (31, 0)), so the alias-direct segment/assignment lookup would
+    /// miss an occupant recorded under the other member. `direct_alias_lookup`
+    /// keeps the predicate scan for that class; this pins the verifier's
+    /// counterexample pool: with SP and XZR both allocatable, two overlapping
+    /// intervals must NOT both be assigned (the pre-memo allocator spilled the
+    /// lighter one), and a reservation on WZR must block SP.
+    /// The alias-direct lookups in `any_overlapping_entry` rest on ONE fact:
+    /// for every register outside the SP/XZR root class, `regs_overlap(k, p)`
+    /// holds exactly when `k == p` or `k` is in `aliasing_pregs(p)` (and the
+    /// relation is symmetric). This pins that fact over the WHOLE AArch64
+    /// encoding space, and that the SP/XZR class is the only exception — if a
+    /// new register view is ever added without an alias entry, this fails
+    /// before the allocator silently double-books it.
+    #[test]
+    fn alias_closure_equals_overlap_relation_except_sp_xzr_class() {
+        let all: Vec<PReg> = (0u16..=255).map(PReg::new).collect();
+        let root = |p: PReg| trust_cg_ir::aarch64_regs::reg_root(p);
+        let (mut checked, mut exceptions) = (0usize, Vec::new());
+        for &a in &all {
+            for &b in &all {
+                let overlap = trust_cg_ir::regs::regs_overlap(a, b);
+                let alias = a == b || aliasing_pregs(a).contains(&b);
+                checked += 1;
+                if overlap != alias {
+                    exceptions.push((a, b));
+                    assert!(
+                        root(a) == Some((31, 0)) && root(b) == Some((31, 0)),
+                        "overlap/alias disagree outside the SP/XZR class: {a:?} vs {b:?} (overlap={overlap}, alias={alias})"
+                    );
+                }
+                assert_eq!(
+                    overlap,
+                    trust_cg_ir::regs::regs_overlap(b, a),
+                    "overlap not symmetric: {a:?} {b:?}"
+                );
+                assert!(!GreedyAllocator::direct_alias_lookup(a) || root(a) != Some((31, 0)));
+            }
+        }
+        assert!(checked == 256 * 256);
+        assert!(
+            !exceptions.is_empty(),
+            "the SP/XZR exceptions must exist (they are why the guard exists)"
+        );
+    }
+
+    #[test]
+    fn sp_xzr_root_class_keeps_the_overlap_scan() {
+        use trust_cg_ir::aarch64_regs::{SP, WZR, XZR};
+        let intervals = vec![
+            make_interval(0, &[(0, 10)], 2.0),
+            make_interval(1, &[(0, 10)], 1.0),
+        ];
+        let mut regs = BTreeMap::new();
+        regs.insert(RegClass::Gpr64, vec![SP, XZR]);
+        let mut alloc = GreedyAllocator::new(intervals, &regs, BTreeMap::new());
+        let result = alloc.allocate().unwrap();
+        assert_eq!(
+            result.allocation.len(),
+            1,
+            "SP and XZR overlap: only one interval may hold one"
+        );
+        assert_eq!(alloc.spilled.len(), 1);
+        assert!(!GreedyAllocator::direct_alias_lookup(SP));
+        assert!(!GreedyAllocator::direct_alias_lookup(XZR));
+        assert!(GreedyAllocator::direct_alias_lookup(PReg::new(0)));
+
+        // Reserved on WZR at position 5 blocks SP for an interval live there.
+        let intervals = vec![make_interval(0, &[(0, 10)], 1.0)];
+        let mut regs = BTreeMap::new();
+        regs.insert(RegClass::Gpr64, vec![SP]);
+        let mut reserved = BTreeMap::new();
+        reserved.insert(WZR, vec![5]);
+        let mut alloc =
+            GreedyAllocator::new_with_reserved(intervals, &regs, BTreeMap::new(), reserved);
+        let result = alloc.allocate().unwrap();
         assert!(result.allocation.is_empty());
         assert_eq!(alloc.spilled.len(), 1);
     }

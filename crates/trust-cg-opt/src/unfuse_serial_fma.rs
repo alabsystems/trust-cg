@@ -100,6 +100,17 @@ fn run_on_loops(func: &mut MachFunction, loops: &LoopAnalysis) -> bool {
     if !serial_unfuse_enabled() || loops.is_empty() {
         return false;
     }
+    // PREFILTER (exact): the only rewrite trigger is a fused `FmaddRR`; without
+    // one in the function there is nothing to un-fuse, so skip the def-map build
+    // and per-loop chain scan. Integer programs have no FMA at all.
+    if !func
+        .block_order
+        .iter()
+        .flat_map(|b| func.block(*b).insts.iter())
+        .any(|&i| func.inst(i).opcode == AArch64Opcode::FmaddRR)
+    {
+        return false;
+    }
     let all: Vec<NaturalLoop> = loops.all_loops().cloned().collect();
     let max_chains = env_usize("TCG_UNFUSE_FMA_MAXCHAINS", 2);
     let fdefs = fn_def_map(func);
@@ -768,5 +779,21 @@ mod tests {
         assert_eq!(fused.to_bits(), 0x3970_0000_0000_0000);
         assert_eq!(unfused.to_bits(), 0);
         assert_ne!(fused.to_bits(), unfused.to_bits());
+    }
+
+    /// IDEMPOTENCE: the licensed FMA is split and its license consumed, so a second run must change nothing.
+    #[test]
+    fn second_run_is_a_no_op() {
+        let (mut func, _fmadd_id) = build_inplace_loop(TestBound::Runtime, true);
+        assert!(UnfuseSerialFma.run(&mut func), "first run must fire");
+        let (insts, blocks) = (func.insts.len(), func.blocks.len());
+        for again in 2..=4 {
+            assert!(
+                !(UnfuseSerialFma.run(&mut func)),
+                "run {again} re-fired on its own output"
+            );
+            assert_eq!(func.insts.len(), insts, "run {again} added instructions");
+            assert_eq!(func.blocks.len(), blocks, "run {again} added blocks");
+        }
     }
 }

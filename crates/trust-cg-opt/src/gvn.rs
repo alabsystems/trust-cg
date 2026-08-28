@@ -62,8 +62,8 @@
 //!
 //! Reference: LLVM `GVN.cpp`, Briggs & Cooper "Value Numbering"
 
+use crate::fast_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
 
 use trust_cg_ir::regs::preg_class;
 use trust_cg_ir::{
@@ -74,8 +74,8 @@ use trust_cg_ir::{
 use crate::cache::StableHasher;
 use crate::dom::DomTree;
 use crate::effects::{
-    MemoryEffect, aarch64_def_operand_positions, aarch64_use_operand_positions, has_tied_def_use,
-    opcode_effect, reads_flags, writes_flags,
+    MemoryEffect, aarch64_def_operand_positions, has_tied_def_use, opcode_effect, reads_flags,
+    writes_flags,
 };
 use crate::pass_manager::{AnalysisCache, MachinePass};
 use crate::proof_opts::{
@@ -144,8 +144,8 @@ impl MachinePass for GlobalValueNumbering {
     }
 
     fn run_with_analyses(&mut self, func: &mut MachFunction, analyses: &mut AnalysisCache) -> bool {
-        let dom = analyses.domtree(func).clone();
-        let run = run_gvn(func, &dom, None);
+        let dom = analyses.domtree(func);
+        let run = run_gvn(func, dom, None);
         publish_gvn_observability(run.stats, run.certificates);
         run.changed
     }
@@ -167,8 +167,8 @@ impl MachinePass for GlobalValueNumbering {
         analyses: &mut AnalysisCache,
         provenance: &mut ProvenanceMap,
     ) -> bool {
-        let dom = analyses.domtree(func).clone();
-        let run = run_gvn(func, &dom, Some(provenance));
+        let dom = analyses.domtree(func);
+        let run = run_gvn(func, dom, Some(provenance));
         publish_gvn_observability(run.stats, run.certificates);
         run.changed
     }
@@ -302,9 +302,9 @@ struct LoadEntry {
 impl ScopedValueTable {
     fn new() -> Self {
         Self {
-            vreg_to_vn: HashMap::new(),
-            expr_table: HashMap::new(),
-            load_table: HashMap::new(),
+            vreg_to_vn: HashMap::default(),
+            expr_table: HashMap::default(),
+            load_table: HashMap::default(),
             scope_stack: Vec::new(),
         }
     }
@@ -525,12 +525,12 @@ fn run_gvn(
     let mut alloc = ValNumAllocator::new();
     let mut table = ScopedValueTable::new();
     let def_counts = count_defs(func);
-    let mut imm_vns: HashMap<i64, ValNum> = HashMap::new();
-    let mut fimm_vns: HashMap<u64, ValNum> = HashMap::new();
+    let mut imm_vns: HashMap<i64, ValNum> = HashMap::default();
+    let mut fimm_vns: HashMap<u64, ValNum> = HashMap::default();
     let mut stats = GvnStats::default();
 
     // Replacement map: eliminated def vreg -> vreg of leader def.
-    let mut replacements: HashMap<VReg, VReg> = HashMap::new();
+    let mut replacements: HashMap<VReg, VReg> = HashMap::default();
 
     // Instructions to remove.
     let mut dead_insts: Vec<InstId> = Vec::new();
@@ -597,22 +597,21 @@ fn run_gvn(
         let block = func.block(block_id);
         for &inst_id in block.insts.clone().iter() {
             let inst = func.inst_mut(inst_id);
-            let def_positions: HashSet<usize> =
-                aarch64_def_operand_positions(inst.opcode, inst.operands.len())
-                    .into_iter()
-                    .collect();
-            let use_positions = aarch64_use_operand_positions(inst.opcode, inst.operands.len());
-
-            for i in use_positions {
-                if def_positions.contains(&i) {
-                    continue;
+            // Def positions as a bitmask over operand slots and the uses through
+            // the visitor: no per-instruction HashSet or position Vecs. A use
+            // that is also a def (a tied operand) is skipped exactly as before.
+            let n = inst.operands.len();
+            let def_mask = crate::effects::def_position_mask(inst.opcode, n);
+            crate::effects::aarch64_for_each_use_position(inst.opcode, n, |i| {
+                if i < 64 && def_mask & (1u64 << i) != 0 {
+                    return;
                 }
                 if let MachOperand::VReg(vreg) = &inst.operands[i]
                     && let Some(replacement) = replacements.get(vreg)
                 {
                     inst.operands[i] = MachOperand::VReg(*replacement);
                 }
-            }
+            });
         }
     }
 
@@ -651,7 +650,7 @@ struct ProofDependentLoadElimination {
 }
 
 fn count_defs(func: &MachFunction) -> HashMap<VReg, u32> {
-    let mut counts: HashMap<VReg, u32> = HashMap::new();
+    let mut counts: HashMap<VReg, u32> = HashMap::default();
 
     for block_id in &func.block_order {
         let block = func.block(*block_id);
@@ -684,11 +683,16 @@ fn has_non_primary_def(inst: &MachInst) -> bool {
     explicit_def_positions(inst).into_iter().any(|idx| idx != 0)
 }
 
-/// Value-number one dominator-tree node.
+/// Value-number ONE dominator-tree node: this block's instructions.
 ///
 /// Kept separate from [`dom_walk_gvn`] so the tree walk can use an explicit
-/// stack. A dominator chain is common in MIR because every call terminates a
-/// block; recursing once per block exhausted rustc's stack on long functions.
+/// stack. The walk used to recurse once per dominator-tree node, which
+/// overflows the stack on the straight-line shape that real code produces
+/// constantly: in MIR every CALL terminates a basic block, so a function body
+/// that is just a long sequence of calls has a dominator tree that is a CHAIN,
+/// one node deep per call. A 480-function program whose `main` calls each in
+/// turn reached ~960 chained blocks and killed rustc with SIGSEGV inside this
+/// walk -- a compiler crash on ordinary code, not on anything pathological.
 #[allow(clippy::too_many_arguments)]
 fn gvn_process_block(
     func: &MachFunction,
@@ -854,9 +858,15 @@ fn gvn_process_block(
 
 /// Iterative dominator-tree walk with scope push/pop.
 ///
-/// An `Exit` marker follows each node's children on the explicit LIFO stack,
-/// preserving the recursive traversal's scope lifetime and child order. The
-/// load table saved by the old stack frame travels on that marker.
+/// Exactly the previous recursive traversal, with an explicit work stack: a
+/// node is ENTERED (push scope, process the block), then its `Exit` marker is
+/// pushed BEFORE its children so the scope is popped only after the whole
+/// subtree has been walked. Children are pushed in reverse so a LIFO stack
+/// visits them in dominator-tree order -- the same order the recursion used.
+/// That preserves the recursive traversal's scope lifetime and child order.
+///
+/// The saved outer load table rides on the `Exit` entry, which is where the
+/// recursion kept it in its own stack frame.
 #[allow(clippy::too_many_arguments)]
 fn dom_walk_gvn(
     func: &MachFunction,
@@ -875,6 +885,8 @@ fn dom_walk_gvn(
 ) {
     enum Step {
         Enter(BlockId),
+        /// Pop the scope opened by the matching `Enter`, restoring the load
+        /// table that entry took away.
         Exit(HashMap<LoadKey, LoadEntry>),
     }
 
@@ -899,6 +911,8 @@ fn dom_walk_gvn(
                     proof_dependent_load_eliminations,
                 );
 
+                // Exit first, children after: LIFO pops the children before the
+                // exit, so the scope closes only once the subtree is done.
                 work.push(Step::Exit(outer_load_table));
                 for &child in dom.children(block_id).iter().rev() {
                     work.push(Step::Enter(child));
@@ -3092,12 +3106,33 @@ mod tests {
 
     /// A dominator chain deep enough to overflow the old recursive walk must
     /// remain ordinary data for the iterative implementation.
+    ///
+    /// The dominator walk used to recurse once per dominator-tree node. That is
+    /// fine on a balanced tree and fatal on a chain -- and a chain is exactly
+    /// what ordinary code produces, because in MIR every CALL terminates a
+    /// basic block. A program whose `main` is a long run of calls has a
+    /// dominator tree one node deep per call; at ~960 such blocks rustc died
+    /// with SIGSEGV inside this pass. That is a compiler crash on ordinary
+    /// code, reached by a 480-function program with a straight-line `main`.
+    ///
+    /// The depth is chosen so the test actually DISCRIMINATES. Grafting this
+    /// test onto the previous recursive walk and running it:
+    ///
+    ///     N =  10_000   recursive: passes   <- would have been a useless test
+    ///     N =  50_000   recursive: "fatal runtime error: stack overflow"
+    ///     N = 200_000   recursive: "fatal runtime error: stack overflow"
+    ///
+    /// The iterative walk passes all three (0.09s at 50_000). 10_000 was the
+    /// first number tried and it proved nothing -- test threads get a generous
+    /// stack, so a shallower chain survives even the recursion. Anything that
+    /// re-introduces recursion here dies as a hard crash at 50_000.
     #[test]
     fn dom_chain_of_50k_blocks_does_not_overflow_the_stack() {
         const N: u32 = 50_000;
         let mut func =
             MachFunction::new("test_gvn_chain".to_string(), Signature::new(vec![], vec![]));
 
+        // The entry block computes v2 = v0 + v1 and falls into the chain.
         let entry = func.entry;
         let head = func.push_inst(MachInst::new(
             AArch64Opcode::AddRR,
@@ -3115,6 +3150,8 @@ mod tests {
             ));
             func.append_inst(previous, branch);
             func.add_edge(previous, next);
+            // Something to value-number in every block, so the walk does real
+            // work at each level rather than trivially passing through.
             let add = func.push_inst(MachInst::new(
                 AArch64Opcode::AddRR,
                 vec![vreg(100 + index), vreg(0), vreg(1)],
@@ -3127,15 +3164,22 @@ mod tests {
         func.append_inst(previous, ret);
 
         let mut gvn = GlobalValueNumbering;
-        assert!(gvn.run(&mut func));
-        for block in blocks {
+        assert!(
+            gvn.run(&mut func),
+            "GVN should still find the redundant adds down the chain"
+        );
+
+        // Every `v0 + v1` after the first is dominated by the entry block's
+        // copy, so each chained block's add is redundant and must be gone.
+        for &block in &blocks {
             assert!(
                 !func
                     .block(block)
                     .insts
                     .iter()
                     .any(|&id| func.inst(id).opcode == AArch64Opcode::AddRR),
-                "redundant add survived in {block:?}",
+                "redundant add should have been eliminated in every chained \
+                 block; it survived in {block:?}",
             );
         }
     }

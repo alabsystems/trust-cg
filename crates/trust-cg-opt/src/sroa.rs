@@ -144,27 +144,29 @@ impl MachinePass for ScalarReplacementOfAggregates {
 }
 
 fn run_impl(func: &mut MachFunction, provenance: Option<&mut ProvenanceMap>) -> bool {
-    // 1. Build VReg -> definer instruction map so we can recognise a
-    //    load/store base that came from an AddPCRel or AddRI chain.
-    let def_of = build_vreg_def_map(func);
-
-    // 1b. VRegs with more than one definition. The address tracer assumes SSA;
-    //     a multi-defined vreg (e.g. a lowered loop phi assigned the slot
-    //     address on one edge and a non-slot pointer on another) must never be
-    //     treated as a pure slot-address alias. See build_multidef_set.
-    let multidef = build_multidef_set(func);
-
-    // 2. Count every use of every VReg across the function. This lets us
-    //    confirm that when we eliminate a root/derived vreg, the def is
-    //    truly dead (no surprise reader).
-    let use_count = collect_vreg_use_counts(func);
-
-    // 3. Find every "root" AddPCRel that materialises a stack-slot address.
+    // Roots first: every "root" AddPCRel that materialises a stack-slot
+    // address. Without one there is nothing to do, and the maps below are
+    // pure functions of `func` that nothing mutates before the rewrites, so
+    // building them later (or never) reads the same values.
     let roots = collect_stack_slot_roots(func);
-
     if roots.is_empty() {
         return false;
     }
+
+    // 1 + 1b in ONE walk: VReg -> definer instruction (last definer in block
+    //    order, as before), so we can recognise a load/store base that came
+    //    from an AddPCRel or AddRI chain; and the VRegs with more than one
+    //    definition. The address tracer assumes SSA; a multi-defined vreg
+    //    (e.g. a lowered loop phi assigned the slot address on one edge and a
+    //    non-slot pointer on another) must never be treated as a pure
+    //    slot-address alias. See build_def_map_and_multidef.
+    let (def_of, multidef) = build_def_map_and_multidef(func);
+
+    // 2. Every use of every VReg across the function, built on demand: only
+    //    `all_uses_covered` reads it, and only once a slot's trace succeeded
+    //    for every root. It confirms that when we eliminate a root/derived
+    //    vreg, the def is truly dead (no surprise reader).
+    let mut use_count: Option<HashMap<VReg, u32>> = None;
 
     let mut rewrites: Vec<SlotRewrite> = Vec::new();
     let mut next_scalar_vreg = func.next_vreg;
@@ -205,7 +207,8 @@ fn run_impl(func: &mut MachFunction, provenance: Option<&mut ProvenanceMap>) -> 
         // every root/derived vreg: if `use_count` disagrees with what we
         // walked, there's an unknown reader (e.g., a backward edge we
         // didn't revisit) and we must bail.
-        if !plan.all_uses_covered(&use_count) {
+        let use_count = use_count.get_or_insert_with(|| collect_vreg_use_counts(func));
+        if !plan.all_uses_covered(use_count) {
             continue 'slot_loop;
         }
 
@@ -238,22 +241,7 @@ fn def_vreg(inst: &MachInst) -> Option<VReg> {
 }
 
 /// Map every modeled VReg definition to the instruction that defined it.
-fn build_vreg_def_map(func: &MachFunction) -> HashMap<VReg, InstId> {
-    let mut out = HashMap::new();
-    for block_id in &func.block_order {
-        let block = func.block(*block_id);
-        for &inst_id in &block.insts {
-            let inst = func.inst(inst_id);
-            for_each_inst_def(inst, |v| {
-                out.insert(v, inst_id);
-            });
-        }
-    }
-    out
-}
-
-/// VRegs that are DEFINED by more than one instruction.
-///
+/// The multi-def set: VRegs DEFINED by more than one instruction.
 /// The address-tracing model assumes SSA: each root/derived-address vreg is
 /// produced by exactly one instruction (the AddPCRel root or the MovR/AddRI
 /// alias we followed). A vreg with multiple defs breaks that assumption — most
@@ -263,21 +251,26 @@ fn build_vreg_def_map(func: &MachFunction) -> HashMap<VReg, InstId> {
 /// `Ldr [%v]` as a read of the slot even on iterations where `%v` holds the
 /// loaded runtime pointer — a miscompile (an infinite pointer-chasing loop:
 /// gcc-c-torture 20000801-2). Any derived vreg appearing here forces a bail-out.
-fn build_multidef_set(func: &MachFunction) -> HashSet<VReg> {
-    let mut seen: HashSet<VReg> = HashSet::new();
-    let mut multi: HashSet<VReg> = HashSet::new();
+///
+/// `def_of`: the last definer of each VReg in block order (`insert` overwrites,
+/// exactly as the separate def-map walk did). `multidef`: a VReg whose insert
+/// returned a previous definer was already defined — exactly the
+/// `!seen.insert(v)` of the separate multi-def walk. One traversal for both.
+fn build_def_map_and_multidef(func: &MachFunction) -> (HashMap<VReg, InstId>, HashSet<VReg>) {
+    let mut def_of = HashMap::new();
+    let mut multi = HashSet::new();
     for block_id in &func.block_order {
         let block = func.block(*block_id);
         for &inst_id in &block.insts {
             let inst = func.inst(inst_id);
             for_each_inst_def(inst, |v| {
-                if !seen.insert(v) {
+                if def_of.insert(v, inst_id).is_some() {
                     multi.insert(v);
                 }
             });
         }
     }
-    multi
+    (def_of, multi)
 }
 
 /// Count how many times each VReg appears at a modeled use position.
@@ -3815,5 +3808,65 @@ mod tests {
             !changed,
             "non-pure call must still escape — no partial-escape rewrite"
         );
+    }
+
+    /// The single-slot, no-escape struct-local pattern of
+    /// `struct_local_store_store_load_is_sroa_eliminated`, as a builder.
+    fn sroa_struct_local_fixture() -> MachFunction {
+        use trust_cg_ir::regs::SP;
+        let mut func = new_func();
+        let entry = func.entry;
+        let slot = with_slot(&mut func, 16, 8);
+        func.next_vreg = 20;
+        push(
+            &mut func,
+            entry,
+            MachInst::new(
+                AArch64Opcode::AddPCRel,
+                vec![g64(10), MachOperand::PReg(SP), MachOperand::StackSlot(slot)],
+            ),
+        );
+        push(
+            &mut func,
+            entry,
+            MachInst::new(AArch64Opcode::AddRI, vec![g64(11), g64(10), imm(8)]),
+        );
+        push(
+            &mut func,
+            entry,
+            MachInst::new(AArch64Opcode::StrRI, vec![g64(0), g64(10), imm(0)]),
+        );
+        push(
+            &mut func,
+            entry,
+            MachInst::new(AArch64Opcode::StrRI, vec![g64(1), g64(11), imm(0)]),
+        );
+        push(
+            &mut func,
+            entry,
+            MachInst::new(AArch64Opcode::LdrRI, vec![g64(2), g64(10), imm(0)]),
+        );
+        push(&mut func, entry, MachInst::new(AArch64Opcode::Ret, vec![]));
+        func
+    }
+
+    /// IDEMPOTENCE: once the slot is scalarised nothing addresses it, so a
+    /// second run must change nothing.
+    #[test]
+    fn second_run_is_a_no_op() {
+        let mut func = sroa_struct_local_fixture();
+        assert!(
+            ScalarReplacementOfAggregates.run(&mut func),
+            "first run must fire"
+        );
+        let (insts, blocks) = (func.insts.len(), func.blocks.len());
+        for again in 2..=4 {
+            assert!(
+                !ScalarReplacementOfAggregates.run(&mut func),
+                "run {again} re-fired on its own output"
+            );
+            assert_eq!(func.insts.len(), insts, "run {again} added instructions");
+            assert_eq!(func.blocks.len(), blocks, "run {again} added blocks");
+        }
     }
 }

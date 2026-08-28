@@ -29,7 +29,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 trust-cg-drat-trim = { workspace = true }
 criterion = "0.5"
-libc = "0.2"
 
 [[bench]]
 name = "satlib_jit_shadow_bench"

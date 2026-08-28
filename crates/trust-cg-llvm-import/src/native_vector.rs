@@ -225,6 +225,17 @@ pub(crate) enum NativeForm {
     BinOp,
     /// `phi <S> [...]` — a V128 block parameter.
     Phi,
+    /// `call <S> @llvm.fmuladd.v<N><ty>(<S> %a, <S> %b, <S> %c)` — the packed
+    /// fused multiply-add, one NEON `FMLA` (after a copy seeding the tied
+    /// accumulator).
+    ///
+    /// ONLY `llvm.fmuladd` is admitted, never strict `llvm.fma`. `fmuladd`
+    /// PERMITS fusion, so lowering it to a single-rounded `FMLA` is legal and
+    /// the machine instruction may still be split back apart later under the
+    /// `FMULADD_MAY_UNFUSE` license. `llvm.fma` REQUIRES fusion, so it must
+    /// never share a representation that something is allowed to unfuse —
+    /// splitting it would round TWICE. Strict `fma` therefore scalarizes.
+    Fmuladd,
     /// `extractelement <S> %v, <ity> K` (constant lane).
     ExtractElement,
     /// `insertelement <S> %v, <T> %x, <ity> K` (constant lane).
@@ -459,8 +470,64 @@ fn is_lane0_broadcast_mask(clause: &str, out_lanes: u32) -> bool {
 fn fp_form_admitted(form: &NativeForm) -> bool {
     matches!(
         form,
-        NativeForm::Load | NativeForm::Store | NativeForm::BinOp | NativeForm::Phi
+        NativeForm::Load
+            | NativeForm::Store
+            | NativeForm::BinOp
+            | NativeForm::Phi
+            | NativeForm::Fmuladd
+            | NativeForm::SplatLane0 { .. }
     )
+}
+
+/// Recognize `<S> @llvm.fmuladd.v<N><ty>(<S> %a, <S> %b, <S> %c)` — the tail of
+/// a `call` line, with the opcode already stripped.
+///
+/// PURE: returns `None` for anything that is not exactly this form, so the
+/// caller can fall through to the generic operand scan without having mutated
+/// anything. Returns the shared shape and the three raw `<ty> <val>` clauses.
+///
+/// Every check is an equality against a name DERIVED from the result shape, so
+/// a width disagreement anywhere — result vs overload, or operand vs result —
+/// declines instead of guessing. `llvm.fmuladd.v4f64` is well-formed LLVM and
+/// declines here; strict `llvm.fma.v*` declines because it is not the licensed
+/// name.
+fn parse_native_fmuladd(tail: &str) -> Option<(Shape, [String; 3])> {
+    let (ty, callee) = split_ty_val(tail)?;
+    let shape = native_shape(&ty)?;
+    let (name, args) = callee.split_once('(')?;
+    let args = args.strip_suffix(')')?;
+    if name.trim() != fmuladd_overload_for(shape)? {
+        return None;
+    }
+    let (a, rest) = crate::parser::split_comma(args)?;
+    let (b, c) = crate::parser::split_comma(&rest)?;
+    let operands = [a, b, c];
+    for clause in &operands {
+        let (arg_ty, _) = split_ty_val(clause)?;
+        if native_shape(&arg_ty) != Some(shape) {
+            return None;
+        }
+    }
+    Some((shape, operands))
+}
+
+/// The ONE `llvm.fmuladd` overload name that lowers natively for `shape`, or
+/// `None` if that shape has no packed FMA.
+///
+/// Deliberately a total function over the native shapes rather than a name
+/// parse: the overload string and the shape must agree EXACTLY, so deriving
+/// the expected name from the shape and comparing makes a mismatch impossible
+/// to miss. `llvm.fmuladd.v4f64` is well-formed LLVM but is not a machine
+/// register, so it yields `None` here and scalarizes.
+///
+/// Integer shapes have no FMA at all and are not merely unimplemented: there
+/// is no such intrinsic.
+pub(crate) fn fmuladd_overload_for(shape: Shape) -> Option<&'static str> {
+    match (shape.elem, shape.lanes) {
+        (NativeElem::F32, 4) => Some("@llvm.fmuladd.v4f32"),
+        (NativeElem::F64, 2) => Some("@llvm.fmuladd.v2f64"),
+        _ => None,
+    }
 }
 
 /// Describe one instruction line for the planner. `None` means the line has no
@@ -510,6 +577,21 @@ fn describe_forms(result: Option<&str>, rest: &str) -> Option<Desc> {
     }
     let opcode = rest.split_whitespace().next().unwrap_or("");
     let tail = peel_flags(rest[opcode.len()..].trim_start());
+
+    // `tail call` / `musttail call` / `notail call`: the marker PRECEDES the
+    // opcode, so the first token is the marker and not `call`. clang emits
+    // `tail call` for essentially every intrinsic, so failing to read past it
+    // silently makes a `call` arm unreachable — which is exactly what happened
+    // the first time this was written. The marker is a stack-reuse hint and
+    // carries no lane semantics, so dropping it is safe; anything that is not
+    // a recognised form still falls through to the generic operand scan.
+    let (opcode, tail) = match opcode {
+        "tail" | "musttail" | "notail" => {
+            let inner = tail.split_whitespace().next().unwrap_or("");
+            (inner, peel_flags(tail[inner.len()..].trim_start()))
+        }
+        _ => (opcode, tail),
+    };
 
     // Default: vector-typed but not eligible. Recording it with `form: None`
     // still matters — the planner reads `vec_operands` to learn which native
@@ -590,6 +672,27 @@ fn describe_forms(result: Option<&str>, rest: &str) -> Option<Desc> {
                 desc.form = Some(NativeForm::BinOp);
             }
             return Some(desc);
+        }
+        "call" => {
+            // `call <S> @llvm.fmuladd.v<N><ty>(<S> %a, <S> %b, <S> %c)`.
+            //
+            // Parsed with NO side effects first, and this arm takes over ONLY
+            // on a full match. Every other call — a different intrinsic, a
+            // non-native width, a malformed argument list — must fall through
+            // to the generic operand scan at the bottom of this function, or
+            // its vector operands never get recorded, never get exploded into
+            // lanes at their definition, and the scalarized text then
+            // references a `%v#vi` that nothing defines.
+            if let Some((shape, operands)) = parse_native_fmuladd(tail) {
+                for clause in &operands {
+                    push(&mut desc, clause);
+                }
+                desc.result_shape = Some(shape);
+                if eligible_operands && result.is_some() {
+                    desc.form = Some(NativeForm::Fmuladd);
+                }
+                return Some(desc);
+            }
         }
         "phi" => {
             let (ty, incoming) = split_ty_val(tail)?;
@@ -1088,7 +1191,12 @@ pub(crate) fn plan_function(body: &[(Option<String>, String)], enabled: bool) ->
 //     provenance rule this planner does not model.
 //   * every vector CAST (`trunc`, `zext`, `sext`, `bitcast`, `fptosi`, …) —
 //     `validate_cast_shape` admits only scalar source/destination types.
-//   * `llvm.fmuladd.v*` / `llvm.fma.v*` — `vector.fma` has no adapter arm.
+//   * STRICT `llvm.fma.v*` — it REQUIRES fusion, so it must never be carried
+//     by a representation something is licensed to split back into
+//     `fmul`+`fadd`; that would round TWICE. Only the fusion-OPTIONAL
+//     `llvm.fmuladd.v4f32` / `.v2f64` are admitted (-> `FMLA .4s/.2d`), and
+//     only at those two shapes: `llvm.fmuladd.v4f64` is well-formed LLVM but
+//     is not a machine register.
 //   * `llvm.vector.reduce.*` — no adapter arm; the scalarizer's left-to-right
 //     fold is already the exact ordered-reduction semantics.
 //   * every `shufflevector` mask other than the lane-0 broadcast, including
@@ -1130,6 +1238,108 @@ mod tests {
         // Not a vector.
         assert!(native_shape("i32").is_none());
         assert!(native_shape("<{ i32, i8 }>").is_none());
+    }
+
+    /// clang writes `tail call` for essentially every intrinsic, so the tail
+    /// marker — not the shape, not the overload — is what decides whether the
+    /// `call` arm is reachable at all. The first version of this code matched
+    /// only a bare `call` and was silently dead on every real input while
+    /// still passing a hand-written `call`-spelled test.
+    #[test]
+    fn packed_fmuladd_is_recognized_through_the_tail_marker() {
+        for marker in ["call", "tail call", "musttail call", "notail call"] {
+            let p = plan(&[
+                (Some("a"), "load <4 x float>, ptr %p, align 4"),
+                (Some("b"), "load <4 x float>, ptr %q, align 4"),
+                (Some("c"), "load <4 x float>, ptr %r, align 4"),
+                (
+                    Some("d"),
+                    &format!(
+                        "{marker} <4 x float> @llvm.fmuladd.v4f32(<4 x float> %a, \
+                         <4 x float> %b, <4 x float> %c)"
+                    ),
+                ),
+                (None, "store <4 x float> %d, ptr %p, align 4"),
+            ]);
+            assert_eq!(
+                p.form("d"),
+                Some(&NativeForm::Fmuladd),
+                "`{marker}` must reach the packed-fmuladd arm"
+            );
+            assert!(p.is_native("d"), "`{marker}` fmuladd must go native");
+        }
+    }
+
+    #[test]
+    fn packed_fmuladd_admits_only_the_licensed_name_and_matching_widths() {
+        // Strict `llvm.fma` REQUIRES fusion and must never be carried by a
+        // representation something may unfuse — it has no packed form here.
+        assert!(
+            parse_native_fmuladd(
+                "<4 x float> @llvm.fma.v4f32(<4 x float> %a, <4 x float> %b, <4 x float> %c)"
+            )
+            .is_none()
+        );
+        // Well-formed LLVM, but not a machine register.
+        assert!(
+            parse_native_fmuladd(
+                "<4 x double> @llvm.fmuladd.v4f64(<4 x double> %a, <4 x double> %b, \
+             <4 x double> %c)"
+            )
+            .is_none()
+        );
+        // Overload disagrees with the result shape.
+        assert!(
+            parse_native_fmuladd(
+                "<2 x double> @llvm.fmuladd.v4f32(<2 x double> %a, <2 x double> %b, \
+             <2 x double> %c)"
+            )
+            .is_none()
+        );
+        // An operand disagrees with the result shape.
+        assert!(
+            parse_native_fmuladd(
+                "<4 x float> @llvm.fmuladd.v4f32(<4 x float> %a, <2 x double> %b, \
+             <4 x float> %c)"
+            )
+            .is_none()
+        );
+        // The real thing, at both admitted shapes.
+        assert!(
+            parse_native_fmuladd(
+                "<4 x float> @llvm.fmuladd.v4f32(<4 x float> %a, <4 x float> %b, <4 x float> %c)"
+            )
+            .is_some()
+        );
+        assert!(
+            parse_native_fmuladd(
+                "<2 x double> @llvm.fmuladd.v2f64(<2 x double> %a, <2 x double> %b, \
+             <2 x double> %c)"
+            )
+            .is_some()
+        );
+    }
+
+    /// A call the packed-fmuladd arm DECLINES must still fall through to the
+    /// generic operand scan. If it returns early instead, the operands are
+    /// never recorded, never exploded into lanes at their definition, and the
+    /// scalarized text references a `%v#vi` that nothing defines — which is
+    /// exactly the `SSA value used but never defined` failure this caused.
+    #[test]
+    fn a_declined_call_still_records_its_vector_operands() {
+        let d = describe(
+            Some("r"),
+            "tail call <4 x float> @llvm.fma.v4f32(<4 x float> %a, <4 x float> %b, \
+             <4 x float> %c)",
+        )
+        .expect("a vector-typed call is never irrelevant");
+        assert!(d.form.is_none(), "strict fma has no native form");
+        for operand in ["a", "b", "c"] {
+            assert!(
+                d.vec_operands.iter().any(|o| o == operand),
+                "declined call must still record %{operand} so it gets lane-exploded"
+            );
+        }
     }
 
     #[test]

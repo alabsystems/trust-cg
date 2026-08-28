@@ -999,6 +999,50 @@ pub enum X86Opcode {
     /// Appended after MovRM8Sib to preserve older implicit opcode
     /// discriminants.
     MovMR8Sib,
+    /// `XOR [base + disp], r64` — `REX.W 31 /r` with a memory-destination
+    /// ModRM (mod != 11): a read-modify-write that loads the 8-byte slot,
+    /// XORs the register into it, and stores the result back. Operand schema
+    /// `[MemAddr, src]`, mirroring `MovMR`.
+    ///
+    /// Flags contract: writes CF/OF (cleared) and SF/ZF/PF (defined); AF is
+    /// UNDEFINED — the logic-op mask, not the ADD mask.
+    ///
+    /// Producer: the Stage-2 RMW fusion peephole (load/ALU/store triples with
+    /// structurally identical EAs). Nothing emits this opcode in Stage 1; it
+    /// exists so the reconstruction proof and all plumbing land first.
+    ///
+    /// Appended after MovMR8Sib to preserve older implicit opcode
+    /// discriminants.
+    XorMR,
+    /// `ADD [base + disp], r64` — `REX.W 01 /r` with a memory-destination
+    /// ModRM: RMW add into an 8-byte slot. Operand schema `[MemAddr, src]`.
+    ///
+    /// Flags contract: defines CF/OF/SF/ZF/AF/PF (the full ADD mask).
+    ///
+    /// Producer: the Stage-2 RMW fusion peephole; nothing emits it in Stage 1.
+    ///
+    /// Appended after XorMR to preserve older implicit opcode discriminants.
+    AddMR,
+    /// `XOR [base + index*scale + disp], r64` — `REX.W 31 /r` + SIB: the
+    /// scaled-index sibling of `XorMR`, standing to it as `MovMRSib` stands to
+    /// `MovMR`. Operand schema `[SibMemAddr, src]`.
+    ///
+    /// Flags contract: identical to `XorMR` (logic mask, AF undefined).
+    ///
+    /// Producer: the Stage-2 RMW fusion peephole; nothing emits it in Stage 1.
+    ///
+    /// Appended after AddMR to preserve older implicit opcode discriminants.
+    XorMRSib,
+    /// `ADD [base + index*scale + disp], r64` — `REX.W 01 /r` + SIB: the
+    /// scaled-index sibling of `AddMR`. Operand schema `[SibMemAddr, src]`.
+    ///
+    /// Flags contract: identical to `AddMR` (full ADD mask).
+    ///
+    /// Producer: the Stage-2 RMW fusion peephole; nothing emits it in Stage 1.
+    ///
+    /// Appended after XorMRSib to preserve older implicit opcode
+    /// discriminants.
+    AddMRSib,
 }
 
 impl X86Opcode {
@@ -1050,6 +1094,15 @@ impl X86Opcode {
             | VolatileMovssMR | VolatileMovsdMR | VolatileMovdquMR | VolatileMovdqaMR => {
                 InstFlags::WRITES_MEMORY.union(InstFlags::HAS_SIDE_EFFECTS)
             }
+
+            // Memory-destination RMW ALU (XOR/ADD [mem], r64): reads AND
+            // writes the slot. Must never fall into the pure `_ => EMPTY`
+            // wildcard — modeling an RMW as pure lets DCE/LICM delete or
+            // hoist the store (a miscompile), so this arm carries all three
+            // flags and is pinned by the memory_store_opcodes unit test.
+            XorMR | AddMR | XorMRSib | AddMRSib => InstFlags::READS_MEMORY
+                .union(InstFlags::WRITES_MEMORY)
+                .union(InstFlags::HAS_SIDE_EFFECTS),
 
             // Compare/test (set RFLAGS = side effect)
             CmpRR | CmpRI | CmpRI8 | TestRR | TestRI | Ucomisd | Ucomiss | BtRI => {
@@ -1544,6 +1597,20 @@ mod tests {
             X86Opcode::MovMRSib,
         ] {
             let flags = op.default_flags();
+            assert!(flags.contains(InstFlags::WRITES_MEMORY), "{:?}", op);
+            assert!(flags.contains(InstFlags::HAS_SIDE_EFFECTS), "{:?}", op);
+        }
+        // Memory-destination RMW ALU: reads the slot too. These MUST carry
+        // all three flags — the `_ => EMPTY` wildcard in default_flags would
+        // otherwise silently model them as pure (DCE/LICM miscompile).
+        for op in &[
+            X86Opcode::XorMR,
+            X86Opcode::AddMR,
+            X86Opcode::XorMRSib,
+            X86Opcode::AddMRSib,
+        ] {
+            let flags = op.default_flags();
+            assert!(flags.contains(InstFlags::READS_MEMORY), "{:?}", op);
             assert!(flags.contains(InstFlags::WRITES_MEMORY), "{:?}", op);
             assert!(flags.contains(InstFlags::HAS_SIDE_EFFECTS), "{:?}", op);
         }

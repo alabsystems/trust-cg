@@ -900,6 +900,29 @@ fn check_loop_completeness(
                     continue;
                 };
                 for used in non_terminator_value_uses(&node.inst) {
+                    // A dead `Copy` OF THE VERY VALUE carried unchanged is not a
+                    // dropped update. `d = Copy(p)` means `d == p`, so threading
+                    // `p` threads `d` — there is nothing stale to observe.
+                    //
+                    // This is what the frontend emits when a loop body assigns a
+                    // loop-INVARIANT and the destination is dead after the loop:
+                    //
+                    //     let t0 = p2.wrapping_add(p2);
+                    //     let mut a1 = 0;
+                    //     while i < 4 { a1 = t0; i += 1; }   // a1 never read again
+                    //
+                    // `t0` threads as an identity phi (param `p`), the body emits
+                    // `a1 := Copy(p)`, and the back-edge re-threads `p`. That is
+                    // CORRECT, and sub-check (3) rejected it: the copy is dead, it
+                    // uses a carried-unchanged param, and it is trivially the same
+                    // type. Five of the ten bridge-fuzz declines were this.
+                    //
+                    // Restricted to `Copy` — a genuine update (`BinOp`, `ICmp`,
+                    // a load) still fires, which is what
+                    // `rejects_stale_rethread_of_header_param` pins.
+                    if matches!(&node.inst, Inst::Copy { operand, .. } if *operand == used) {
+                        continue;
+                    }
                     let same_type = value_ty.get(&used) == Some(dead_ty);
                     if same_type && carried_unchanged(used) {
                         out.push(SsaViolation::LoopCarriedValueNotThreaded {
@@ -2088,6 +2111,136 @@ mod tests {
 
         f.blocks = vec![bb0, bb1, bb2, bb3];
         f
+    }
+
+    /// The loop body ASSIGNS A LOOP-INVARIANT to a local that is dead after the
+    /// loop:
+    ///
+    /// ```text
+    ///   let t0 = p2.wrapping_add(p2);
+    ///   let mut a1 = 0;
+    ///   while i < 4 { a1 = t0; i += 1; }    // a1 never read again
+    /// ```
+    ///
+    /// `t0` threads as an IDENTITY phi (slot 0), the body emits `a1 := Copy(p0)`,
+    /// and the back-edge re-threads slot 0 unchanged. That is correct — `t0` does
+    /// not change — but it matches sub-check (3)'s shape exactly: a dead node,
+    /// using a carried-unchanged param, of the same type.
+    ///
+    /// ```text
+    ///   bb0: %0 = const 7 ; %1 = const 0 ; br bb1(%0, %1)
+    ///   bb1(%10, %11): %2 = const 4 ; %3 = %11 <s %2 ; condbr %3, bb2, bb3
+    ///   bb2: %4 = copy %10        ; a1 := t0  -- DEAD, and identical to %10
+    ///        %5 = const 1 ; %6 = add %11, %5
+    ///        br bb1(%10, %6)      ; slot 0 re-threaded unchanged: CORRECT
+    ///   bb3: return %10
+    /// ```
+    fn dead_invariant_copy_loop() -> Function {
+        let mut f = empty_fn();
+
+        let mut bb0 = Block::new(b(0));
+        bb0.body.push(
+            InstrNode::new(Inst::Const {
+                ty: Ty::I32,
+                value: Constant::Int(7),
+            })
+            .with_result(v(0)),
+        );
+        bb0.body.push(
+            InstrNode::new(Inst::Const {
+                ty: Ty::I32,
+                value: Constant::Int(0),
+            })
+            .with_result(v(1)),
+        );
+        bb0.body.push(InstrNode::new(Inst::Br {
+            target: b(1),
+            args: vec![v(0), v(1)],
+        }));
+
+        let mut bb1 = Block::new(b(1))
+            .with_param(v(10), Ty::I32)
+            .with_param(v(11), Ty::I32);
+        bb1.body.push(
+            InstrNode::new(Inst::Const {
+                ty: Ty::I32,
+                value: Constant::Int(4),
+            })
+            .with_result(v(2)),
+        );
+        bb1.body.push(
+            InstrNode::new(Inst::ICmp {
+                op: ICmpOp::Slt,
+                ty: Ty::I32,
+                lhs: v(11),
+                rhs: v(2),
+            })
+            .with_result(v(3)),
+        );
+        bb1.body.push(InstrNode::new(Inst::CondBr {
+            cond: v(3),
+            then_target: b(2),
+            then_args: vec![],
+            else_target: b(3),
+            else_args: vec![],
+        }));
+
+        let mut bb2 = Block::new(b(2));
+        // `a1 = t0`: a COPY of the carried-unchanged param, and dead afterwards.
+        bb2.body.push(
+            InstrNode::new(Inst::Copy {
+                ty: Ty::I32,
+                operand: v(10),
+            })
+            .with_result(v(4)),
+        );
+        bb2.body.push(
+            InstrNode::new(Inst::Const {
+                ty: Ty::I32,
+                value: Constant::Int(1),
+            })
+            .with_result(v(5)),
+        );
+        bb2.body.push(
+            InstrNode::new(Inst::BinOp {
+                op: BinOp::Add,
+                ty: Ty::I32,
+                lhs: v(11),
+                rhs: v(5),
+            })
+            .with_result(v(6)),
+        );
+        bb2.body.push(InstrNode::new(Inst::Br {
+            target: b(1),
+            args: vec![v(10), v(6)],
+        }));
+
+        let mut bb3 = Block::new(b(3));
+        bb3.body.push(InstrNode::new(Inst::Return {
+            values: vec![v(10)],
+        }));
+
+        f.blocks = vec![bb0, bb1, bb2, bb3];
+        f
+    }
+
+    /// ACCEPT: `d = Copy(p)` where slot `p` is re-threaded unchanged is NOT a
+    /// dropped update — `d == p`, so threading `p` threads `d`.
+    ///
+    /// Sub-check (3) fired here before, rejecting a CORRECT function. Five of
+    /// the ten bridge-fuzz declines at -O3 were this shape, and the recovery
+    /// took that gate from 47 MATCH / 28 declined to 55 / 20 with no new
+    /// WRONG-ANSWER. The companion negative test
+    /// `rejects_stale_rethread_of_header_param` keeps a GENUINE dropped update
+    /// (an `add`, not a copy) rejected.
+    #[test]
+    fn accepts_dead_copy_of_carried_unchanged_param() {
+        let f = dead_invariant_copy_loop();
+        assert!(
+            check_function(&f).is_ok(),
+            "a dead COPY of the very param re-threaded unchanged must be accepted: {:?}",
+            check_function(&f)
+        );
     }
 
     /// REJECT (finding #1, stale-rethread): a header param re-threaded UNCHANGED

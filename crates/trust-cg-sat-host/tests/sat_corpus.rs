@@ -31,7 +31,6 @@ use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::fs;
 use std::io::Write;
-use std::mem::MaybeUninit;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
@@ -48,7 +47,7 @@ use trust_cg_sat_host::drat_recorder::{
 use trust_cg_sat_host::propagate::{
     JIT_DIVERGENCE_COUNT, JIT_PRIMARY_RETURNS, PRIMARY_JIT_MODE, reset_jit_shadow_for_tests,
 };
-use trust_cg_sat_host::sys;
+use trust_cg_sat_host::{OwnedMicroSatSolver, sys};
 
 /// MicroSAT is *process-global* (it holds the DRAT recorder + the
 /// link-redirected propagate symbol). Cargo runs integration tests in
@@ -138,20 +137,13 @@ fn load_manifest() -> Manifest {
 fn solve_path(cnf_path: &Path) -> i32 {
     let c_path =
         CString::new(cnf_path.to_string_lossy().into_owned()).expect("cnf path contains no NULs");
-    let mut solver: MaybeUninit<sys::solver> = MaybeUninit::uninit();
-    // SAFETY: matches the upstream `main` in microsat.c. `parse` calls
-    // `initCDCL` and fully populates the solver before any subsequent
-    // read; `solve` is only called when parse did not short-circuit to
-    // UNSAT.
+    // SAFETY: corpus fixtures are committed, well-formed DIMACS files.
+    let (mut solver, parse_rc) = unsafe { OwnedMicroSatSolver::parse(c_path.as_c_str()) };
     unsafe {
-        let parse_rc = sys::parse(
-            solver.as_mut_ptr(),
-            c_path.as_ptr() as *mut std::os::raw::c_char,
-        );
         if parse_rc == sys::UNSAT {
             return sys::UNSAT;
         }
-        sys::solve(solver.as_mut_ptr())
+        solver.solve()
     }
 }
 

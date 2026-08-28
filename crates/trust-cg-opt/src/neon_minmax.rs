@@ -2314,6 +2314,13 @@ fn materialize_const(func: &mut MachFunction, pre: InstId, k: i64, class: RegCla
 /// independent reductions). Purely ADDITIVE: splices a vector main loop between
 /// the preheader and the header and never edits the scalar chain.
 fn apply_chain(func: &mut MachFunction, rec: &ChainRecognized) -> bool {
+    // IDEMPOTENCE: never vectorize the remainder loop of a loop this pass
+    // already vectorized (see `crate::vector_remainder`).
+    if rec.reductions.iter().any(|r| {
+        crate::vector_remainder::preheader_folds_neon_lane_into(func, rec.preheader, r.acc)
+    }) {
+        return false;
+    }
     let vf = VF;
     let arr_code = ARR_S4;
     let elem_code = ELEM_S;
@@ -2418,6 +2425,9 @@ fn apply_chain(func: &mut MachFunction, rec: &ChainRecognized) -> bool {
             let Some(&vterm) = loaded.get(&(red.base.id, k)) else {
                 return false;
             };
+            // `vacc[ri]` was collected from `(0..UNROLL)` in the preheader
+            // above, and `k` ranges over that same `0..UNROLL` — same constant,
+            // same function, no resize in between.
             let acc = vacc[ri]
                 .get(k)
                 .copied()
@@ -2536,6 +2546,11 @@ struct LowerCtx {
 }
 
 fn apply(func: &mut MachFunction, rec: &Recognized) -> bool {
+    // IDEMPOTENCE: never vectorize the remainder loop of a loop this pass
+    // already vectorized (see `crate::vector_remainder`).
+    if crate::vector_remainder::preheader_folds_neon_lane_into(func, rec.preheader, rec.acc) {
+        return false;
+    }
     // Per-width parameters (mirrors neon_predsum): i32 = `.4S` + sxtw guard;
     // i64 = `.2D` + precheck + unsigned guard.
     let (vf, elem_bytes, arr_code, elem_code, const_class) = if rec.is_i64 {

@@ -360,8 +360,8 @@ fn manifest() -> Vec<SoundnessInvariant> {
         // ---- (H) the 4 headline pins + honest-red discipline ---------------
         SoundnessInvariant {
             id: "H",
-            description: "The 4 accepted-obligation pins (AArch64 155/248, RISC-V 14/17, \
-                          WASM 109/111, x86-64 163/192 accepted/emitted-value-effect) hold, and \
+            description: "The 4 accepted-obligation pins (AArch64 156/248, RISC-V 14/17, \
+                          WASM 111/113, x86-64 167/196 accepted/emitted-value-effect) hold, and \
                           every uncovered row is an explicit DeferredUnfaithfulModel rather than \
                           a wiring gap. These are evidence-inventory ratios, not formal-proof or \
                           compiler-correctness percentages. AArch64 \
@@ -399,13 +399,19 @@ fn manifest() -> Vec<SoundnessInvariant> {
                           per-instruction lowering theorem. The publication audit restored all \
                           emitted value/effect families to the denominator. The current \
                           publication audit reached 151/244 with 93 RED rows after adding six \
-                          volatile load/store forms; EorRRLsl/EorRRLsr then added two \
-                          reconstructed shifted-source forms, yielding 153/246 with 93 RED rows; \
-                          Umull then left the deferred set via its faithful zext64 widening \
-                          obligation, and complete packed-NZCV TST authority removed another \
-                          RED row. StrbRO/StrhRO then entered the explicit audit universe as \
-                          two honest memory-effect gaps. The combined inventory is 155/248 \
-                          with 93 RED rows.",
+                          volatile load/store forms; EorRRLsl/EorRRLsr (the p1_xorshift \
+                          shifted-source EOR fusion) then entered covered via the \
+                          shifted-source operand reconstruction, yielding 153/246 with 93 RED \
+                          rows; Umull then left the deferred set via its faithful zext64 \
+                          widening obligation, and complete packed-NZCV TST authority removed \
+                          another RED row (155/246 with 91 RED rows); then RorRI (the rotate \
+                          recognizer's standalone form, emitted when the EOR does not fuse) \
+                          left the deferred table via its faithful W+X rotate obligations \
+                          (all_ror_immediate_proofs) — a width- and immediate-sensitive \
+                          EXTR-alias reconstruction — giving 156/246 with 90 RED rows. \
+                          StrbRO/StrhRO then entered the explicit audit universe as two \
+                          honest memory-effect gaps. The combined inventory is 156/248 \
+                          with 92 RED rows.",
             enforcement: InProcess {
                 check_name: "inproc_headline_pins_and_honest",
                 reexercise: inproc_headline_pins_and_honest,
@@ -1176,16 +1182,40 @@ fn inproc_headline_pins_and_honest() {
         // (all_neon_rbit_proofs; identity/byte-swap[REV16.8B]/16-bit-lane-reverse
         // refute controls). Publication re-audit then withdrew opcode-wide
         // MOVN/MOVK credit. The publication audit restored all emitted
-        // value/effect families to the denominator. Six volatile forms and
-        // NeonRev32V bring the inventory to 151/244 with 93 explicit deferred
-        // rows. EorRRLsl/EorRRLsr reach 153/246. UMULL's faithful widening
-        // theorem and complete packed-NZCV TST authority each remove one more
-        // deferred row, yielding 155/246 with 91 deferred rows. StrbRO/StrhRO
-        // add two honest register-offset store gaps to the current inventory.
-        (GateArch::AArch64, 248usize, 155usize),
+        // value/effect families to the denominator. Six new volatile load/store
+        // forms bring the pin to 145 accepted / 244 total with 99 deferred rows;
+        // NeonRev32V then left the deferred set with faithful .16B + .8B
+        // byte-reverse obligations, giving 146 accepted / 244 total with 98
+        // deferred rows, and the remaining publication-audit promotions bring the
+        // inventory to 151 accepted / 244 total with 93 explicit deferred rows.
+        // EorRRLsl/EorRRLsr (the p1_xorshift shifted-source EOR fusion, bd5acdc6)
+        // then added two reconstructed shifted-source forms — +2 emittable,
+        // +2 covered, RED rows unchanged — giving 153 accepted / 246 total.
+        // UMULL's faithful zext64 widening theorem and complete packed-NZCV TST
+        // authority each remove one more deferred row, yielding 155 accepted /
+        // 246 total with 91 deferred rows. RorRI (emitted STANDALONE by the
+        // rotate recognizer when the EOR does not fuse) then left the deferred
+        // set via its faithful W+X rotate obligations (all_ror_immediate_proofs)
+        // — a width- and immediate-sensitive EXTR-alias reconstruction — giving
+        // 156 accepted / 246 total with 90 RED rows. StrbRO/StrhRO add two
+        // honest register-offset store gaps to the current inventory: 156
+        // accepted / 248 total with 92 RED rows (matching coverage_gate_tests'
+        // deliberate pin). RorRI is ONE opcode and moves ONE row: both lines of
+        // work promoted the SAME row (one crediting the width-complete W+X
+        // rotate obligations, the other the EXTR-alias reconstruction), so the
+        // union is 156/248 with 92 RED, NOT 157/248 with 91. Both sources of
+        // that credit must stay wired.
+        (GateArch::AArch64, 248usize, 156usize),
         (GateArch::RiscV, 17usize, 14usize),
-        (GateArch::Wasm, 111usize, 109usize),
-        (GateArch::X86_64, 192usize, 163usize),
+        // P4 closed the two INTEGER scalar-constant rows with an independent LEB
+        // decode, and put the two FLOAT constant forms into the mirror as named
+        // RED deferrals (their immediates are raw IEEE-754 payloads, not LEB128).
+        (GateArch::Wasm, 113usize, 111usize),
+        // RMW Stage 1: +4 emittable AND +4 covered — the memory-destination
+        // RMW ALU quartet XorMR/AddMR/XorMRSib/AddMRSib, covered by the
+        // MemRmw reconstruction (MemStore ∘ MemAlu composition; nothing
+        // emits the quartet until the Stage-2 admission-gated peephole).
+        (GateArch::X86_64, 196usize, 167usize),
     ] {
         let report = on_large_stack(move || CoverageGate::new().audit(arch));
         for row in report.failures() {

@@ -270,8 +270,50 @@ fn fake_lean5_script(name: &str, body: &str) -> PathBuf {
         .permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(&path, perms).expect("fake Lean5 script should be executable");
+
+    // ETXTBSY. `execve` fails while ANY process holds a WRITE fd on the target
+    // inode. We closed ours above, but the test harness runs these tests on
+    // several threads: if a sibling thread forked (to spawn ITS fake Lean5)
+    // during the window our file was open for writing, that child inherited a
+    // duplicate of our write fd and keeps THIS inode busy until it reaches its
+    // own exec. O_CLOEXEC does not help — the fd is closed AT exec, and the
+    // window is before it.
+    //
+    // The condition is transient and per-inode, so probing here with a retry
+    // settles it permanently: once one exec of this path succeeds, nothing ever
+    // writes the file again, so the library's later spawn cannot see ETXTBSY.
+    // Without this the binary failed roughly 3 runs in 8 concurrently while
+    // passing 6 of 6 under `--test-threads=1`, surfacing as an unrelated-looking
+    // assertion — `lean5-unavailable` instead of the fake's version string,
+    // because a spawn failure falls back to the default version metadata.
+    // `spawn` reports the exec failure itself, so the probe never has to let the
+    // script RUN — two of these fixtures `sleep 2` to exercise the timeout path,
+    // and waiting on them here would add that to every run.
+    for attempt in 0..100 {
+        match std::process::Command::new(&path)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(mut child) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break;
+            }
+            Err(err) if err.raw_os_error() == Some(ETXTBSY) && attempt < 99 => {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Err(err) => panic!("fake Lean5 script at {path:?} is not executable: {err}"),
+        }
+    }
     path
 }
+
+/// `ETXTBSY` is 26 on Linux and macOS alike; spelled out so the test needs no
+/// libc dependency.
+#[cfg(unix)]
+const ETXTBSY: i32 = 26;
 
 #[test]
 fn placeholder_transport_fixture_verifies_and_records_replay_metadata() {

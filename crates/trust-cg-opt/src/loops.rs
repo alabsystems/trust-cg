@@ -60,7 +60,16 @@ pub struct LoopAnalysis {
     /// reproducible. Header-ordered iteration is total and stable.
     loops: BTreeMap<BlockId, NaturalLoop>,
     /// Map from block -> innermost loop header containing it.
-    block_to_loop: HashMap<BlockId, BlockId>,
+    /// Innermost loop per block, built ON FIRST USE.
+    ///
+    /// It is derived purely from `loops` and has no consumer in the
+    /// loop-rotation driver, which is the hottest caller of
+    /// `LoopAnalysis::compute` by a wide margin -- it rebuilds this analysis
+    /// once per single-loop rewrite. Building the map eagerly there was a sort
+    /// plus one hash insert per block of every loop body, thrown away every
+    /// time. The six real consumers (`ext_addr`, `if_convert`, `layout`) pay
+    /// for it on first `containing_loop` / `is_in_loop`.
+    block_to_loop: std::cell::OnceCell<HashMap<BlockId, BlockId>>,
 }
 
 impl LoopAnalysis {
@@ -81,14 +90,19 @@ impl LoopAnalysis {
                 // Keep the latch that has the highest RPO number (latest).
                 // For simplicity, just update if this latch is different.
             } else {
-                let preheader = find_preheader(func, *header, &body);
+                // `preheader` is left unset here ON PURPOSE: the pass below
+                // recomputes it for EVERY loop from the complete merged body,
+                // so anything computed at this point is unconditionally
+                // overwritten. Computing it here as well was a second
+                // `find_preheader` walk per loop whose result is always
+                // discarded.
                 loops.insert(
                     *header,
                     NaturalLoop {
                         header: *header,
                         latch: *latch,
                         body,
-                        preheader,
+                        preheader: None,
                         depth: 1,
                         parent: None,
                     },
@@ -110,21 +124,29 @@ impl LoopAnalysis {
         // Step 3: Compute nesting depth and parent relationships.
         compute_nesting(&mut loops);
 
-        // Step 4: Build block-to-loop mapping (innermost loop).
-        let mut block_to_loop: HashMap<BlockId, BlockId> = HashMap::new();
-        // Sort loops by body size (smallest = innermost) to ensure innermost wins.
-        let mut sorted_loops: Vec<_> = loops.values().collect();
-        sorted_loops.sort_by_key(|l| std::cmp::Reverse(l.body.len()));
-        for lp in sorted_loops {
-            for &block in &lp.body {
-                block_to_loop.insert(block, lp.header);
-            }
-        }
-
         Self {
             loops,
-            block_to_loop,
+            block_to_loop: std::cell::OnceCell::new(),
         }
+    }
+
+    /// The block -> innermost-loop-header map, built on first use.
+    ///
+    /// Identical construction to the historical eager build: loops are visited
+    /// largest body first so the SMALLEST (innermost) containing loop is the
+    /// last writer for each block.
+    fn block_to_loop(&self) -> &HashMap<BlockId, BlockId> {
+        self.block_to_loop.get_or_init(|| {
+            let mut map: HashMap<BlockId, BlockId> = HashMap::new();
+            let mut sorted_loops: Vec<_> = self.loops.values().collect();
+            sorted_loops.sort_by_key(|l| std::cmp::Reverse(l.body.len()));
+            for lp in sorted_loops {
+                for &block in &lp.body {
+                    map.insert(block, lp.header);
+                }
+            }
+            map
+        })
     }
 
     /// Returns the loop with the given header, if it exists.
@@ -134,14 +156,14 @@ impl LoopAnalysis {
 
     /// Returns the innermost loop containing `block`, if any.
     pub fn containing_loop(&self, block: BlockId) -> Option<&NaturalLoop> {
-        self.block_to_loop
+        self.block_to_loop()
             .get(&block)
             .and_then(|h| self.loops.get(h))
     }
 
     /// Returns true if `block` is inside any loop.
     pub fn is_in_loop(&self, block: BlockId) -> bool {
-        self.block_to_loop.contains_key(&block)
+        self.block_to_loop().contains_key(&block)
     }
 
     /// Returns all loops.
@@ -237,29 +259,53 @@ fn find_preheader(
 fn compute_nesting(loops: &mut BTreeMap<BlockId, NaturalLoop>) {
     let headers: Vec<BlockId> = loops.keys().copied().collect();
 
-    for &h1 in &headers {
+    // Parents are decided read-only over `loops`, then applied. Deciding and
+    // mutating in one pass forced a full `body` clone per outer iteration
+    // purely to satisfy the borrow checker.
+    let mut parents: Vec<(BlockId, BlockId)> = Vec::new();
+    // Bodies and their lengths, indexed by POSITION in `headers`, so the
+    // O(L^2) scan below indexes slices instead of re-indexing the `BTreeMap`
+    // L(L-1) times per build. On the compile-scaling `loops` shape at n=120 the
+    // function carries 240 natural loops and this analysis is rebuilt once per
+    // rewrite, so that was ~13.8M B-tree descents per compile. Same predicate,
+    // same order, same result -- only the lookup changes.
+    let bodies: Vec<&HashSet<BlockId>> = headers.iter().map(|h| &loops[h].body).collect();
+    let lens: Vec<usize> = bodies.iter().map(|b| b.len()).collect();
+    for (i1, &h1) in headers.iter().enumerate() {
         let mut best_parent: Option<BlockId> = None;
         let mut best_parent_size = usize::MAX;
 
-        let body1 = loops[&h1].body.clone();
-
-        for &h2 in &headers {
-            if h1 == h2 {
+        for (i2, &h2) in headers.iter().enumerate() {
+            if i1 == i2 {
                 continue;
             }
-            let body2 = &loops[&h2].body;
 
             // Check if loop h1 is contained in loop h2.
-            if body1.is_subset(body2) && body1.len() < body2.len() && body2.len() < best_parent_size
+            //
+            // ORDER MATTERS FOR COST, NOT FOR RESULT. All three tests are pure,
+            // so the conjunction is the same predicate in any order -- but
+            // `is_subset` walks all of `body1` hashing into `body2`, while the
+            // two length tests are O(1) and reject the overwhelming majority of
+            // pairs. This is O(L^2) in the loop count and is rebuilt on every
+            // driver iteration of the loop-rotation pass, so on a function with
+            // many SIBLING loops (all equal size, none contained in another)
+            // the subset walk was pure waste on every pair.
+            if lens[i1] < lens[i2]
+                && lens[i2] < best_parent_size
+                && bodies[i1].is_subset(bodies[i2])
             {
                 best_parent = Some(h2);
-                best_parent_size = body2.len();
+                best_parent_size = lens[i2];
             }
         }
 
-        if let Some(parent_header) = best_parent
-            && let Some(lp) = loops.get_mut(&h1)
-        {
+        if let Some(parent_header) = best_parent {
+            parents.push((h1, parent_header));
+        }
+    }
+    drop(bodies);
+    for (child, parent_header) in parents {
+        if let Some(lp) = loops.get_mut(&child) {
             lp.parent = Some(parent_header);
         }
     }

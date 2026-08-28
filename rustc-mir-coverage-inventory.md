@@ -127,7 +127,7 @@ closed on these call targets, the frontend **intercepts a fixed, audited set**
 and lowers each to a supported `trust-ir` primitive. The resulting operation is
 eligible for the same evidence machinery as a source-level operator; that does
 not by itself prove the surrounding compilation end to end. `wrapping_*` maps
-to the corresponding two's-complement modular `Add`/`Sub`/`Mul` operation.
+to the corresponding two's-complement modular operation; see the table below.
 
 Intercepted and lowered for the current ≤64-bit scalar-integer slice (the live
 match arms are in `crates/rustc-codegen-trust-cg/src/lib.rs`):
@@ -135,6 +135,7 @@ match arms are in `crates/rustc-codegen-trust-cg/src/lib.rs`):
 | Method / intrinsic | Lowers to | Intercept site |
 | --- | --- | --- |
 | `wrapping_add` / `wrapping_sub` / `wrapping_mul` | `Add` / `Sub` / `Mul` (modular) | `wrapping_binop_method` / `lower_wrapping_method_call` |
+| `wrapping_div` / `wrapping_rem`, constant nonzero non-`-1` divisor only | `SDiv`/`UDiv` / `SRem`/`URem` | `wrapping_binop_method` |
 | `saturating_add` / `saturating_sub` | `Overflow` + clamp `Select` | `saturating_*` intercept |
 | `overflowing_{add,sub,mul,div,rem,shl,shr}` | checked op + flag | overflowing intercept |
 | `rotate_left` / `rotate_right` | `Shl`/`LShr`/`Or` compose | bit-manip intercept |

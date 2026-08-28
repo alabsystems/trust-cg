@@ -1847,6 +1847,7 @@ fn reject_unsupported_x86_isel_inst(
     reject_unsupported_x86_target_feature_isel_inst(inst, target_features)?;
     reject_unsupported_x86_sib_isel_inst(inst)?;
     reject_unsupported_x86_three_address_rm_alu_isel_inst(inst)?;
+    reject_unsupported_x86_mem_rmw_isel_inst(inst)?;
     Ok(())
 }
 
@@ -1895,6 +1896,8 @@ fn reject_unsupported_x86_sib_isel_inst(inst: &X86ISelInst) -> Result<(), X86Pip
             | X86Opcode::MovssRMSib
             | X86Opcode::MovRM8Sib
             | X86Opcode::MovMR8Sib
+            | X86Opcode::XorMRSib
+            | X86Opcode::AddMRSib
     ) && !inst
         .operands
         .iter()
@@ -1918,6 +1921,33 @@ fn reject_unsupported_x86_three_address_rm_alu_isel_inst(
     {
         return Err(X86PipelineError::ISel(format!(
             "{:?}: three-address RM ALU ISel operands are not supported; emit two-address form [dst, mem] or insert an explicit MOV before this opcode",
+            inst.opcode
+        )));
+    }
+    Ok(())
+}
+
+/// Memory-destination RMW ALU shape guard: exactly `[mem, src_reg]`, with the
+/// memory operand kind matching the opcode family (`MemAddr` for the base+disp
+/// forms, `SibMemAddr` for the SIB forms). Anything else fails closed here
+/// rather than resolving into a silently wrong encoding.
+fn reject_unsupported_x86_mem_rmw_isel_inst(inst: &X86ISelInst) -> Result<(), X86PipelineError> {
+    let mem_ok = |op: &X86ISelOperand| match inst.opcode {
+        X86Opcode::XorMR | X86Opcode::AddMR => matches!(op, X86ISelOperand::MemAddr { .. }),
+        _ => matches!(op, X86ISelOperand::SibMemAddr { .. }),
+    };
+    if matches!(
+        inst.opcode,
+        X86Opcode::XorMR | X86Opcode::AddMR | X86Opcode::XorMRSib | X86Opcode::AddMRSib
+    ) && !(inst.operands.len() == 2
+        && mem_ok(&inst.operands[0])
+        && matches!(
+            inst.operands[1],
+            X86ISelOperand::VReg(_) | X86ISelOperand::PReg(_)
+        ))
+    {
+        return Err(X86PipelineError::ISel(format!(
+            "{:?}: memory-destination RMW ALU requires exactly [mem, src_reg] operands",
             inst.opcode
         )));
     }
@@ -2667,12 +2697,31 @@ fn resolve_inst_operands(inst: &X86ISelInst, alloc: &HashMap<VReg, X86PReg>) -> 
                 }
             }
         }
-        X86Opcode::MovMRSib | X86Opcode::MovMR32Sib | X86Opcode::MovMR8Sib => {
+        X86Opcode::MovMRSib
+        | X86Opcode::MovMR32Sib
+        | X86Opcode::MovMR8Sib
+        // Memory-destination RMW ALU, SIB forms: same [SibMemAddr, src]
+        // resolution as the SIB stores (dst field holds the source register).
+        | X86Opcode::XorMRSib
+        | X86Opcode::AddMRSib => {
             for op in &inst.operands {
                 if resolve_sib_memaddr_operand(op, alloc, &mut ops) {
                     continue;
                 }
                 if ops.dst.is_none() {
+                    ops.dst = resolve_operand(op, alloc);
+                }
+            }
+        }
+        // Memory-destination RMW ALU, base+disp forms: same [MemAddr, src]
+        // resolution as the MovMR* stores (dst field holds the source
+        // register, base/disp from the memory operand).
+        X86Opcode::XorMR | X86Opcode::AddMR => {
+            for op in &inst.operands {
+                if let X86ISelOperand::MemAddr { base, disp } = op {
+                    ops.base = resolve_operand(base, alloc);
+                    ops.disp = *disp as i64;
+                } else if ops.dst.is_none() {
                     ops.dst = resolve_operand(op, alloc);
                 }
             }
@@ -2839,7 +2888,7 @@ fn x86_jcc_erratum_pad(
 
     let last = pos + unit_len - 1;
     let crosses = pos / X86_JCC_BOUNDARY != last / X86_JCC_BOUNDARY;
-    let ends_on_boundary = (last + 1) % X86_JCC_BOUNDARY == 0;
+    let ends_on_boundary = (last + 1).is_multiple_of(X86_JCC_BOUNDARY);
     if !crosses && !ends_on_boundary {
         return None;
     }
@@ -4214,6 +4263,438 @@ fn x86_try_rename_coalesce_copy(
     true
 }
 
+// ---------------------------------------------------------------------------
+// Post-fixup XMM bridge-copy collapse (runtime performance)
+// ---------------------------------------------------------------------------
+//
+// The XMM analogue of the GPR bridge collapses above. `fixup_two_address`
+// inserts a `MovdqaRR` bridge before every tied packed op whose allocated
+// destination differs from its first source (`movdqa %s, %d ; paddd %x, %d`).
+// The GPR coalescer anchors only on `X86Opcode::MovRR` and roots every
+// register through `x86_containing_gpr64`, which returns `None` for XMM — so
+// these bridges survived untouched (v1_saxpy carries 8 collapsible MovdqaRR
+// per 16 lanes in its hot loop).
+//
+// The collapse rewrites the tied op's destination to the bridge SOURCE and
+// deletes the bridge:
+//
+// ```text
+//   movdqa %xmm2, %xmm3          ; d <- s        (bridge, at copy_pos)
+//   paddd  %xmm8, %xmm3          ; [d, ghost s, x]
+// ==>
+//   paddd  %xmm8, %xmm2          ; [s, ghost s, x]  self-tied: no bridge needed
+// ```
+//
+// with later reads of `d` renamed to `s` (the result now lives in `s`).
+//
+// SOUNDNESS mirrors the GPR arms, simplified by the flat XMM file: XMM has no
+// sub-register lattice (root = identity), and neither `MovdqaRR` nor any
+// collapsible packed op touches RFLAGS, so no flag reasoning is needed.
+// Conditions, each fail-closed:
+//
+// * `s` must be DEAD after the op — post-collapse the op overwrites `s` with
+//   its result, destroying the value the original stream kept there. Any read
+//   of `s` (any width) before a FULL 128-bit redefinition declines; a PARTIAL
+//   redefinition (MovssRR/MovsdRR merge the untouched lanes, Pinsrd/Pinsrq
+//   insert one lane — all read their destination) is a read barrier, not a
+//   kill. No full redefinition before block end requires `s` outside the
+//   block's XMM live-out.
+// * Every read of `d` from `copy_pos + 2` to `d`'s next full redefinition is
+//   renamed to `s`, so each must be a PURE use (a tied read-modify of `d`
+//   cannot be renamed without redirecting its def) and must precede the first
+//   redefinition of `s` (after which `s` no longer carries `d`'s value). If
+//   `d` is never fully redefined in-block, `d` must be outside the XMM
+//   live-out (deleting the bridge drops the edge-commit of `d`).
+// * Calls and returns are hard barriers (XMM argument/return registers,
+//   wholesale caller-saved clobbers), and any instruction with implicit XMM
+//   behavior (`Pblendvb` reads XMM0 without naming it — cf.
+//   `x86_function_uses_pblendvb_implicit_xmm0`) declines both scans outright.
+//
+// ⚑ THE GHOST-SOURCE SHAPE (the trap documented at
+// `x86_try_collapse_bridge_into_lea`): a fixed-up tied op KEEPS its
+// three-address operands `[dst, ghost_src1, src2]`, so operand 1 resolves to
+// the copy's SOURCE `s`, not to `d`. Matching `operands[1] == d` made the
+// LEA arm fire zero times before it was corrected. The rewrite therefore
+// reuses `copy.operands[1]` for the op's destination slot (the cfa78287
+// lesson: NEVER re-spell operands as raw PRegs — that orphans the vreg
+// identity TV-5 tracks), leaving the op self-tied `[s, s, x]`, byte-identical
+// in encoding to the `dst == src1` form the fixup leaves alone.
+//
+// PROOF PERIMETER: zero new opcodes. The arm only deletes `MovdqaRR` copies
+// and re-spells operands of already-proven ops.
+
+/// Kill switch for the XMM bridge-copy collapse (disables ONLY this arm; the
+/// GPR arms and the single-sweep behavior they had before it are unaffected).
+fn x86_xmm_bridge_collapse_enabled() -> bool {
+    crate::env_lock::var_os("TCG_NO_X86_XMM_BRIDGE_COLLAPSE").is_none()
+}
+
+/// Opcodes that FULLY define their 128-bit XMM destination (operand 0)
+/// without merging any old destination lanes.
+///
+/// This is the kill/full-redefinition allowlist for the XMM scans and
+/// liveness. Deliberately EXCLUDED (their absence makes them read barriers,
+/// which fails closed): `MovssRR`/`MovsdRR` (register-register forms merge
+/// the upper lanes), `Pinsrd`/`Pinsrq` (insert one lane, read the rest),
+/// `Pblendvb` (tied AND implicitly reads XMM0), and every conversion/scalar
+/// op not named here. Omitting a genuine full def only over-approximates
+/// liveness and declines more collapses — never unsound.
+fn x86_opcode_full_xmm_def(opcode: X86Opcode) -> bool {
+    use X86Opcode::*;
+    matches!(
+        opcode,
+        MovdqaRR
+            | MovdquRM
+            | MovdqaRM
+            | MovqToXmm
+            | Pshufd
+            | Pand
+            | Pandn
+            | Por
+            | Pxor
+            | Pcmpeqb
+            | Pcmpeqw
+            | Pcmpeqd
+            | Pcmpeqq
+            | Pcmpgtb
+            | Pcmpgtw
+            | Pcmpgtd
+            | Pcmpgtq
+            | Paddb
+            | Paddw
+            | Paddd
+            | Paddq
+            | Psubb
+            | Psubw
+            | Psubd
+            | Psubq
+            | Pmullw
+            | Pmulld
+            | Pmuludq
+            | Psadbw
+            | Punpcklbw
+            | Punpckldq
+            | Punpckhbw
+            | Punpcklqdq
+            | Packuswb
+            | Pslld
+            | Psrld
+            | Psrad
+            | Psllq
+            | Psrlq
+            | Addps
+            | Subps
+            | Mulps
+            | Divps
+            | Addpd
+            | Subpd
+            | Mulpd
+            | Divpd
+            | Andps
+            | Andpd
+    )
+}
+
+/// Implicit XMM uses of an instruction: `Pblendvb`'s fixed XMM0 selector,
+/// call-argument XMM registers, and the SysV/Windows XMM return registers.
+/// Implicit XMM DEFS (a call clobbering every caller-saved XMM) are
+/// deliberately NOT modeled: the scans treat calls as hard barriers, and for
+/// liveness omitting a kill only over-approximates, which is safe — the GPR
+/// mirror (`x86_inst_implicit_gpr64_roots`) makes the same choice.
+fn x86_inst_implicit_xmm_uses(inst: &X86ISelInst, uses: &mut Vec<X86PReg>) {
+    if inst.opcode == X86Opcode::Pblendvb {
+        uses.push(x86_64_regs::XMM0);
+    }
+    if inst.flags.is_call() {
+        for arg in &inst.call_arg_regs {
+            if arg.reg.is_xmm() {
+                uses.push(arg.reg);
+            }
+        }
+    }
+    if inst.flags.is_return() {
+        // XMM return-value registers (SysV pairs use XMM0:XMM1; Windows uses
+        // XMM0 only — modeling both only over-approximates).
+        uses.push(x86_64_regs::XMM0);
+        uses.push(x86_64_regs::XMM1);
+    }
+}
+
+/// XMM read set of an instruction (explicit machine-use operands + implicit).
+fn x86_inst_xmm_use_regs(inst: &X86ISelInst, alloc: &HashMap<VReg, X86PReg>) -> Vec<X86PReg> {
+    let mut regs = Vec::new();
+    for i in 0..inst.operands.len() {
+        if x86_operand_is_machine_use(inst, i) {
+            let mut pregs = Vec::new();
+            x86_operand_resolved_pregs(&inst.operands[i], alloc, &mut pregs);
+            for p in pregs {
+                if p.is_xmm() {
+                    regs.push(p);
+                }
+            }
+        }
+    }
+    x86_inst_implicit_xmm_uses(inst, &mut regs);
+    regs
+}
+
+/// XMM FULL-kill set of an instruction. Partial writers (lane merges) are NOT
+/// kills; omitting a kill only over-approximates liveness, which is safe.
+fn x86_inst_xmm_kill_regs(inst: &X86ISelInst, alloc: &HashMap<VReg, X86PReg>) -> Vec<X86PReg> {
+    let mut kills = Vec::new();
+    if x86_opcode_full_xmm_def(inst.opcode) {
+        for i in 0..inst.operands.len() {
+            if x86_operand_access(inst, i).is_def
+                && let Some(p) = resolve_operand(&inst.operands[i], alloc)
+                && p.is_xmm()
+            {
+                kills.push(p);
+            }
+        }
+    }
+    kills
+}
+
+/// Conservative per-block XMM live-out via iterative backward liveness — the
+/// XMM analogue of [`compute_x86_gpr64_live_out`]. The XMM root is the
+/// identity (no sub-register lattice), so no root mapping is needed.
+fn compute_x86_xmm_live_out(
+    func: &X86ISelFunction,
+    alloc: &HashMap<VReg, X86PReg>,
+) -> HashMap<LirBlock, HashSet<X86PReg>> {
+    let mut live_in: HashMap<LirBlock, HashSet<X86PReg>> = HashMap::new();
+    for b in &func.block_order {
+        live_in.insert(*b, HashSet::new());
+    }
+
+    let mut changed = true;
+    let mut guard = 0usize;
+    let cap = func.block_order.len().saturating_mul(4).max(16);
+    while changed && guard < cap {
+        changed = false;
+        guard += 1;
+        for block in func.block_order.iter().rev() {
+            let Some(blk) = func.blocks.get(block) else {
+                continue;
+            };
+            let mut live: HashSet<X86PReg> = HashSet::new();
+            for succ in &blk.successors {
+                if let Some(s_in) = live_in.get(succ) {
+                    live.extend(s_in.iter().copied());
+                }
+            }
+            for inst in blk.insts.iter().rev() {
+                for k in x86_inst_xmm_kill_regs(inst, alloc) {
+                    live.remove(&k);
+                }
+                for u in x86_inst_xmm_use_regs(inst, alloc) {
+                    live.insert(u);
+                }
+            }
+            if live_in.get(block) != Some(&live) {
+                live_in.insert(*block, live);
+                changed = true;
+            }
+        }
+    }
+
+    // FAIL-CLOSED on non-convergence, exactly as in the GPR analogue: exiting
+    // the MAY-analysis fixpoint early UNDER-approximates live-out, so report
+    // every XMM register live-out for every block — the collapse then refuses
+    // all merges (a pure missed-optimization, never a miscompile).
+    if changed {
+        let all: HashSet<X86PReg> = (64u16..80).map(X86PReg::new).collect();
+        return func
+            .block_order
+            .iter()
+            .map(|block| (*block, all.clone()))
+            .collect();
+    }
+
+    let mut live_out: HashMap<LirBlock, HashSet<X86PReg>> = HashMap::new();
+    for block in &func.block_order {
+        let Some(blk) = func.blocks.get(block) else {
+            continue;
+        };
+        let mut lo = HashSet::new();
+        for succ in &blk.successors {
+            if let Some(s_in) = live_in.get(succ) {
+                lo.extend(s_in.iter().copied());
+            }
+        }
+        live_out.insert(*block, lo);
+    }
+    live_out
+}
+
+/// Try to collapse the `MovdqaRR` bridge at `copy_pos` (`d <- s`, both XMM,
+/// distinct) into the adjacent tied packed op at `copy_pos + 1`. On success
+/// the op's destination slot is rewritten to the copy's own source spelling
+/// (self-tying it), later reads of `d` in the rename window are rewritten to
+/// `s` in place, and `true` is returned so the caller can delete the copy.
+///
+/// See the section comment above for the soundness conditions; every check
+/// here fails closed.
+fn x86_try_collapse_xmm_bridge_into_op(
+    insts: &mut [X86ISelInst],
+    copy_pos: usize,
+    d: X86PReg,
+    s: X86PReg,
+    block_xmm_live_out: &HashSet<X86PReg>,
+    alloc: &HashMap<VReg, X86PReg>,
+) -> bool {
+    let Some(op) = insts.get(copy_pos + 1) else {
+        return false;
+    };
+
+    // The op must be a tied packed op whose two-address fixup bridges with
+    // MovdqaRR, in the post-fixup GHOST-SOURCE shape: operand 0 resolves to
+    // the bridge destination `d`, operand 1 (the encoder-ignored ghost) still
+    // resolves to the bridge SOURCE `s` (see the section comment).
+    if x86_two_address_lhs_operand_index(op) != Some(1)
+        || x86_two_address_fixup_copy_opcode(op) != X86Opcode::MovdqaRR
+        || op.flags != op.opcode.default_flags()
+        || op.proof_origin.is_some()
+        || resolve_operand(&op.operands[0], alloc) != Some(d)
+        || resolve_operand(&op.operands[1], alloc) != Some(s)
+    {
+        return false;
+    }
+    // ⚑ No remaining source may resolve to `d`. The fixup never produces this
+    // shape (an rhs aliasing dst takes the swap or scratch path instead), but
+    // a prior rename sweep could in principle introduce it, and post-collapse
+    // such a source would read a register nothing writes anymore.
+    for idx in 2..op.operands.len() {
+        let mut pregs = Vec::new();
+        x86_operand_resolved_pregs(&op.operands[idx], alloc, &mut pregs);
+        if pregs.contains(&d) {
+            return false;
+        }
+    }
+
+    // (a) `s` must be dead after the op: no read of `s` before a FULL 128-bit
+    // redefinition; partial redefinitions are read barriers; calls, returns,
+    // and implicit-XMM instructions decline.
+    let mut s_dead = false;
+    for inst in insts.iter().skip(copy_pos + 2) {
+        if inst.flags.is_call() || inst.flags.is_return() {
+            return false;
+        }
+        if inst.opcode == X86Opcode::Pblendvb {
+            return false;
+        }
+        // Reads before writes (x86 reads every source before writing).
+        for idx in 0..inst.operands.len() {
+            if x86_operand_is_machine_use(inst, idx) {
+                let mut pregs = Vec::new();
+                x86_operand_resolved_pregs(&inst.operands[idx], alloc, &mut pregs);
+                if pregs.contains(&s) {
+                    return false;
+                }
+            }
+        }
+        let mut defines_s = false;
+        for idx in 0..inst.operands.len() {
+            if x86_operand_access(inst, idx).is_def
+                && resolve_operand(&inst.operands[idx], alloc) == Some(s)
+            {
+                defines_s = true;
+            }
+        }
+        if defines_s {
+            if x86_opcode_full_xmm_def(inst.opcode) {
+                s_dead = true;
+                break;
+            }
+            // Partial redefinition merges `s`'s old lanes: a read barrier.
+            return false;
+        }
+    }
+    if !s_dead && block_xmm_live_out.contains(&s) {
+        return false;
+    }
+
+    // (b) Rename window: every read of `d` from `copy_pos + 2` until `d`'s
+    // next full redefinition must be a PURE use and precede the first
+    // redefinition of `s`.
+    let mut last_d_read: Option<usize> = None;
+    let mut s_redefined = false;
+    let mut d_fully_redefined = false;
+    let mut i = copy_pos + 2;
+    while i < insts.len() {
+        let inst = &insts[i];
+        if inst.flags.is_call() || inst.flags.is_return() {
+            return false;
+        }
+        if inst.opcode == X86Opcode::Pblendvb {
+            return false;
+        }
+        let mut reads_d = false;
+        for idx in 0..inst.operands.len() {
+            if !x86_operand_is_machine_use(inst, idx) {
+                continue;
+            }
+            let mut pregs = Vec::new();
+            x86_operand_resolved_pregs(&inst.operands[idx], alloc, &mut pregs);
+            if pregs.contains(&d) {
+                // A tied read-modify of `d` cannot be renamed without also
+                // redirecting its def.
+                if x86_operand_access(inst, idx).is_def {
+                    return false;
+                }
+                reads_d = true;
+            }
+        }
+        if reads_d {
+            if s_redefined {
+                return false;
+            }
+            last_d_read = Some(i);
+        }
+        for idx in 0..inst.operands.len() {
+            if !x86_operand_access(inst, idx).is_def {
+                continue;
+            }
+            let Some(p) = resolve_operand(&inst.operands[idx], alloc) else {
+                continue;
+            };
+            if p == s {
+                // ANY write to `s` (full or partial) ends its value's window.
+                s_redefined = true;
+            }
+            if p == d {
+                if x86_opcode_full_xmm_def(inst.opcode) {
+                    d_fully_redefined = true;
+                } else {
+                    // A partial redefinition of `d` merges lanes this collapse
+                    // no longer produces.
+                    return false;
+                }
+            }
+        }
+        if d_fully_redefined {
+            break;
+        }
+        i += 1;
+    }
+    if !d_fully_redefined && block_xmm_live_out.contains(&d) {
+        return false;
+    }
+
+    // Apply. ⚑ REUSE THE COPY'S OWN SOURCE OPERAND for the op's destination
+    // slot (cfa78287): re-spelling it as a raw PReg would orphan the vreg
+    // identity TV-5 tracks. The op becomes self-tied `[s, s, x]` — the
+    // encoding is byte-identical to the fixup's `dst == src1` form.
+    let src_spelling = insts[copy_pos].operands[1].clone();
+    insts[copy_pos + 1].operands[0] = src_spelling;
+    if let Some(last) = last_d_read {
+        for inst in &mut insts[copy_pos + 2..=last] {
+            x86_rename_reads_pdst_to_psrc(inst, d, s, alloc);
+        }
+    }
+    true
+}
+
 /// Bisect kill-switch for the post-fixup redundant-`MovRR` coalescer:
 /// `TRUST_CG_DISABLE_PASSES=x86_movrr_coalesce`.
 fn x86_movrr_coalesce_disabled() -> bool {
@@ -4230,10 +4711,19 @@ fn coalesce_x86_redundant_movrr_copies(
     alloc: &HashMap<VReg, X86PReg>,
 ) -> usize {
     let live_out = compute_x86_gpr64_live_out(func, alloc);
+    // Kill switch checked ONCE per invocation. With the XMM arm disabled the
+    // function runs exactly one sweep per block, bit-identical to its
+    // pre-XMM-arm behavior (the fixpoint below never iterates).
+    let xmm_arm_enabled = x86_xmm_bridge_collapse_enabled();
+    let xmm_live_out = xmm_arm_enabled.then(|| compute_x86_xmm_live_out(func, alloc));
     let mut total = 0usize;
 
     for block in func.block_order.clone() {
         let blk_live_out = live_out.get(&block).cloned().unwrap_or_default();
+        let blk_xmm_live_out = xmm_live_out
+            .as_ref()
+            .and_then(|m| m.get(&block).cloned())
+            .unwrap_or_default();
 
         let mut insts = {
             let Some(b) = func.blocks.get_mut(&block) else {
@@ -4242,121 +4732,46 @@ fn coalesce_x86_redundant_movrr_copies(
             std::mem::take(&mut b.insts)
         };
 
-        let mut delete = vec![false; insts.len()];
-        let mut pos = 0;
-        while pos < insts.len() {
-            // An instruction already scheduled for deletion is not a valid
-            // anchor: a collapsed pair must not be re-examined, and the
-            // rename path must never fire on an instruction that is going away
-            // and rewrite uses against something that will not exist.
-            if delete[pos] {
-                pos += 1;
-                continue;
-            }
-            if insts[pos].opcode == X86Opcode::MovRR
-                && insts[pos].operands.len() == 2
-                && let Some(pdst) = resolve_operand(&insts[pos].operands[0], alloc)
-                && let Some(psrc) = resolve_operand(&insts[pos].operands[1], alloc)
-                && let Some(pdst_root) = x86_64_regs::x86_containing_gpr64(pdst)
-                && let Some(psrc_root) = x86_64_regs::x86_containing_gpr64(psrc)
-            {
-                if pdst_root == psrc_root {
-                    // Identity 64-bit self-move (a genuine no-op): drop it.
-                    if pdst == psrc {
-                        delete[pos] = true;
-                        total += 1;
-                    }
-                } else if x86_try_rename_coalesce_copy(
-                    &mut insts,
-                    pos,
-                    pdst,
-                    psrc,
-                    pdst_root,
-                    psrc_root,
-                    &blk_live_out,
-                    alloc,
-                ) {
-                    delete[pos] = true;
-                    total += 1;
-                } else if let Some(b_reg) = x86_try_collapse_bridge_into_lea(
-                    &insts, pos, pdst, psrc, pdst_root, psrc_root, alloc,
-                ) {
-                    // `mov d,a ; add d,d,b`  =>  `lea d,[a+b]`; drop the bridge.
-                    //
-                    // ⚑ REUSE THE ADD'S OWN OPERANDS. Rebuilding these from raw
-                    // `PReg`s discards the VREG identity they carry, and the
-                    // destination vreg then has no definition at this
-                    // instruction even though its register is still written.
-                    // TV-5 tracks vregs, so it walks back to that vreg's
-                    // previous def and — if a call sits in between — correctly
-                    // refuses with `call-severed-vreg-read`. That failed CLOSED
-                    // on 7 of the 18 bench programs at -O2/-O3. Operands 0/1/2
-                    // are already exactly `d`, `a` and `b` (see the predicate),
-                    // so the faithful rewrite changes the opcode and repackages
-                    // the two sources — it never re-spells them.
-                    let add_idx = pos + 1;
-                    let [dst_op, a_op, b_op] = insts[add_idx].operands.as_slice() else {
-                        unreachable!("the predicate matched a three-operand AddRR");
-                    };
-                    let (dst_op, a_op, b_op) = (dst_op.clone(), a_op.clone(), b_op.clone());
-                    insts[add_idx].opcode = X86Opcode::LeaSib;
-                    insts[add_idx].flags = X86Opcode::LeaSib.default_flags();
-                    insts[add_idx].operands = vec![
-                        dst_op,
-                        X86ISelOperand::SibMemAddr {
-                            base: Box::new(a_op),
-                            index: Box::new(b_op),
-                            scale: 1,
-                            disp: 0,
-                        },
-                    ];
-                    if std::env::var_os("TCG_X86_BRIDGE_LEA_LOG").is_some() {
-                        eprintln!(
-                            "[bridge-lea] ACCEPT lea {:?} <- [{:?} + {:?}] in `{}`",
-                            pdst, psrc, b_reg, func.name,
-                        );
-                    }
-                    delete[pos] = true;
-                    total += 1;
-                } else if let Some(k) = x86_try_collapse_bridge_into_lea_imm(
-                    &insts, pos, pdst, psrc, pdst_root, psrc_root, alloc,
-                ) {
-                    // `mov d,a ; add d,d,IMM`  =>  `lea d,[a+IMM]`; drop the bridge.
-                    //
-                    // ⚑ SAME RULE AS THE REGISTER ARM: reuse the add's OWN
-                    // operands. Rebuilding the base from a raw `PReg` discards
-                    // the VREG identity it carries, leaving the destination vreg
-                    // with no definition at this instruction even though its
-                    // register is still written — which TV-5 correctly refuses,
-                    // failing CLOSED on 7 of 18 programs (cfa78287). Operand 1
-                    // is already exactly `a`, so the faithful rewrite changes the
-                    // opcode and repackages that one source; it never re-spells it.
-                    let add_idx = pos + 1;
-                    let [dst_op, a_op, _imm_op] = insts[add_idx].operands.as_slice() else {
-                        unreachable!("the predicate matched a three-operand AddRI");
-                    };
-                    let (dst_op, a_op) = (dst_op.clone(), a_op.clone());
-                    insts[add_idx].opcode = X86Opcode::Lea;
-                    insts[add_idx].flags = X86Opcode::Lea.default_flags();
-                    insts[add_idx].operands = vec![
-                        dst_op,
-                        X86ISelOperand::MemAddr {
-                            base: Box::new(a_op),
-                            disp: k,
-                        },
-                    ];
-                    if std::env::var_os("TCG_X86_BRIDGE_LEA_LOG").is_some() {
-                        eprintln!(
-                            "[bridge-lea] ACCEPT lea {:?} <- [{:?} + {}] in `{}`",
-                            pdst, psrc, k, func.name,
-                        );
-                    }
-                    delete[pos] = true;
-                    total += 1;
-                } else if pos > 0
-                    && !delete[pos - 1]
-                    && x86_try_collapse_producer_writeback(
-                        &insts,
+        // FIXPOINT (XMM arm only): a sweep's scans see to-be-deleted copies
+        // still in `insts` (deletion materializes at rebuild), so a collapse
+        // whose legality depends on ANOTHER bridge's deletion — p4's
+        // punpcklqdq-after-paddq chains, where the earlier bridge's source is
+        // redefined by the later bridge's copy — only becomes visible on the
+        // next sweep over the rebuilt stream. Cap 4 sweeps; v1_saxpy's
+        // bridges all collapse in sweep 1. The staleness of the pre-computed
+        // live-outs stays safe across sweeps: every mutation (copy deletion,
+        // destination re-spelling, read renames dominated by an in-block def)
+        // only shrinks live-ins, so the live-outs remain over-approximations.
+        let mut sweep = 0usize;
+        loop {
+            sweep += 1;
+            let sweep_start_total = total;
+            let mut delete = vec![false; insts.len()];
+            let mut pos = 0;
+            while pos < insts.len() {
+                // An instruction already scheduled for deletion is not a valid
+                // anchor: a collapsed pair must not be re-examined, and the
+                // rename path must never fire on an instruction that is going away
+                // and rewrite uses against something that will not exist.
+                if delete[pos] {
+                    pos += 1;
+                    continue;
+                }
+                if insts[pos].opcode == X86Opcode::MovRR
+                    && insts[pos].operands.len() == 2
+                    && let Some(pdst) = resolve_operand(&insts[pos].operands[0], alloc)
+                    && let Some(psrc) = resolve_operand(&insts[pos].operands[1], alloc)
+                    && let Some(pdst_root) = x86_64_regs::x86_containing_gpr64(pdst)
+                    && let Some(psrc_root) = x86_64_regs::x86_containing_gpr64(psrc)
+                {
+                    if pdst_root == psrc_root {
+                        // Identity 64-bit self-move (a genuine no-op): drop it.
+                        if pdst == psrc {
+                            delete[pos] = true;
+                            total += 1;
+                        }
+                    } else if x86_try_rename_coalesce_copy(
+                        &mut insts,
                         pos,
                         pdst,
                         psrc,
@@ -4364,51 +4779,184 @@ fn coalesce_x86_redundant_movrr_copies(
                         psrc_root,
                         &blk_live_out,
                         alloc,
-                    )
-                {
-                    // Redirect the producer's destination to the writeback's
-                    // destination, then drop the writeback. `dst == src1` then
-                    // makes `fixup_two_address` insert no bridge either.
-                    let prod_idx = pos - 1;
-                    insts[prod_idx].operands[0] = insts[pos].operands[0].clone();
-                    // The two-address bridge that established the OLD tie
-                    // (`mov d, a`, inserted by `fixup_two_address` right before
-                    // the producer) now defines a register that is dead: the
-                    // producer no longer writes `d`, nothing sits between the
-                    // bridge and the producer, and `d`'s deadness after the
-                    // writeback was just proven. Drop it too — otherwise the
-                    // rewrite trades one instruction for another instead of
-                    // removing two.
-                    if prod_idx > 0
-                        && !delete[prod_idx - 1]
-                        && insts[prod_idx - 1].opcode == X86Opcode::MovRR
-                        && insts[prod_idx - 1].proof_origin.is_none()
-                        && insts[prod_idx - 1].operands.len() == 2
-                        && resolve_operand(&insts[prod_idx - 1].operands[0], alloc) == Some(psrc)
+                    ) {
+                        delete[pos] = true;
+                        total += 1;
+                    } else if let Some(b_reg) = x86_try_collapse_bridge_into_lea(
+                        &insts, pos, pdst, psrc, pdst_root, psrc_root, alloc,
+                    ) {
+                        // `mov d,a ; add d,d,b`  =>  `lea d,[a+b]`; drop the bridge.
+                        //
+                        // ⚑ REUSE THE ADD'S OWN OPERANDS. Rebuilding these from raw
+                        // `PReg`s discards the VREG identity they carry, and the
+                        // destination vreg then has no definition at this
+                        // instruction even though its register is still written.
+                        // TV-5 tracks vregs, so it walks back to that vreg's
+                        // previous def and — if a call sits in between — correctly
+                        // refuses with `call-severed-vreg-read`. That failed CLOSED
+                        // on 7 of the 18 bench programs at -O2/-O3. Operands 0/1/2
+                        // are already exactly `d`, `a` and `b` (see the predicate),
+                        // so the faithful rewrite changes the opcode and repackages
+                        // the two sources — it never re-spells them.
+                        let add_idx = pos + 1;
+                        let [dst_op, a_op, b_op] = insts[add_idx].operands.as_slice() else {
+                            unreachable!("the predicate matched a three-operand AddRR");
+                        };
+                        let (dst_op, a_op, b_op) = (dst_op.clone(), a_op.clone(), b_op.clone());
+                        insts[add_idx].opcode = X86Opcode::LeaSib;
+                        insts[add_idx].flags = X86Opcode::LeaSib.default_flags();
+                        insts[add_idx].operands = vec![
+                            dst_op,
+                            X86ISelOperand::SibMemAddr {
+                                base: Box::new(a_op),
+                                index: Box::new(b_op),
+                                scale: 1,
+                                disp: 0,
+                            },
+                        ];
+                        if std::env::var_os("TCG_X86_BRIDGE_LEA_LOG").is_some() {
+                            eprintln!(
+                                "[bridge-lea] ACCEPT lea {:?} <- [{:?} + {:?}] in `{}`",
+                                pdst, psrc, b_reg, func.name,
+                            );
+                        }
+                        delete[pos] = true;
+                        total += 1;
+                    } else if let Some(k) = x86_try_collapse_bridge_into_lea_imm(
+                        &insts, pos, pdst, psrc, pdst_root, psrc_root, alloc,
+                    ) {
+                        // `mov d,a ; add d,d,IMM`  =>  `lea d,[a+IMM]`; drop the bridge.
+                        //
+                        // ⚑ SAME RULE AS THE REGISTER ARM: reuse the add's OWN
+                        // operands. Rebuilding the base from a raw `PReg` discards
+                        // the VREG identity it carries, leaving the destination vreg
+                        // with no definition at this instruction even though its
+                        // register is still written — which TV-5 correctly refuses,
+                        // failing CLOSED on 7 of 18 programs (cfa78287). Operand 1
+                        // is already exactly `a`, so the faithful rewrite changes the
+                        // opcode and repackages that one source; it never re-spells it.
+                        let add_idx = pos + 1;
+                        let [dst_op, a_op, _imm_op] = insts[add_idx].operands.as_slice() else {
+                            unreachable!("the predicate matched a three-operand AddRI");
+                        };
+                        let (dst_op, a_op) = (dst_op.clone(), a_op.clone());
+                        insts[add_idx].opcode = X86Opcode::Lea;
+                        insts[add_idx].flags = X86Opcode::Lea.default_flags();
+                        insts[add_idx].operands = vec![
+                            dst_op,
+                            X86ISelOperand::MemAddr {
+                                base: Box::new(a_op),
+                                disp: k,
+                            },
+                        ];
+                        if std::env::var_os("TCG_X86_BRIDGE_LEA_LOG").is_some() {
+                            eprintln!(
+                                "[bridge-lea] ACCEPT lea {:?} <- [{:?} + {}] in `{}`",
+                                pdst, psrc, k, func.name,
+                            );
+                        }
+                        delete[pos] = true;
+                        total += 1;
+                    } else if pos > 0
+                        && !delete[pos - 1]
+                        && x86_try_collapse_producer_writeback(
+                            &insts,
+                            pos,
+                            pdst,
+                            psrc,
+                            pdst_root,
+                            psrc_root,
+                            &blk_live_out,
+                            alloc,
+                        )
                     {
-                        delete[prod_idx - 1] = true;
+                        // Redirect the producer's destination to the writeback's
+                        // destination, then drop the writeback. `dst == src1` then
+                        // makes `fixup_two_address` insert no bridge either.
+                        let prod_idx = pos - 1;
+                        insts[prod_idx].operands[0] = insts[pos].operands[0].clone();
+                        // The two-address bridge that established the OLD tie
+                        // (`mov d, a`, inserted by `fixup_two_address` right before
+                        // the producer) now defines a register that is dead: the
+                        // producer no longer writes `d`, nothing sits between the
+                        // bridge and the producer, and `d`'s deadness after the
+                        // writeback was just proven. Drop it too — otherwise the
+                        // rewrite trades one instruction for another instead of
+                        // removing two.
+                        if prod_idx > 0
+                            && !delete[prod_idx - 1]
+                            && insts[prod_idx - 1].opcode == X86Opcode::MovRR
+                            && insts[prod_idx - 1].proof_origin.is_none()
+                            && insts[prod_idx - 1].operands.len() == 2
+                            && resolve_operand(&insts[prod_idx - 1].operands[0], alloc)
+                                == Some(psrc)
+                        {
+                            delete[prod_idx - 1] = true;
+                            total += 1;
+                        }
+                        if std::env::var_os("TCG_X86_COPY_OP_WRITEBACK_LOG").is_some() {
+                            eprintln!(
+                                "[copy-op-writeback] ACCEPT {:?} ops={:?} dest {:?} <- {:?} in `{}`",
+                                insts[prod_idx].opcode,
+                                insts[prod_idx].operands,
+                                pdst,
+                                psrc,
+                                func.name,
+                            );
+                        }
+                        delete[pos] = true;
                         total += 1;
                     }
-                    if std::env::var_os("TCG_X86_COPY_OP_WRITEBACK_LOG").is_some() {
+                } else if xmm_arm_enabled
+                    && insts[pos].opcode == X86Opcode::MovdqaRR
+                    && insts[pos].operands.len() == 2
+                    && insts[pos].proof_origin.is_none()
+                    && insts[pos].flags == X86Opcode::MovdqaRR.default_flags()
+                    && let Some(d) = resolve_operand(&insts[pos].operands[0], alloc)
+                    && let Some(s) = resolve_operand(&insts[pos].operands[1], alloc)
+                    && d.is_xmm()
+                    && s.is_xmm()
+                    && d != s
+                    && x86_try_collapse_xmm_bridge_into_op(
+                        &mut insts,
+                        pos,
+                        d,
+                        s,
+                        &blk_xmm_live_out,
+                        alloc,
+                    )
+                {
+                    // The tied op at pos + 1 is now self-tied on the bridge
+                    // source; the bridge itself is dead. Drop it.
+                    if std::env::var_os("TCG_X86_XMM_BRIDGE_COLLAPSE_LOG").is_some() {
                         eprintln!(
-                            "[copy-op-writeback] ACCEPT {:?} ops={:?} dest {:?} <- {:?} in `{}`",
-                            insts[prod_idx].opcode, insts[prod_idx].operands, pdst, psrc, func.name,
+                            "[xmm-bridge-collapse] ACCEPT {:?} ops={:?} bridge {:?} <- {:?} in `{}`",
+                            insts[pos + 1].opcode,
+                            insts[pos + 1].operands,
+                            d,
+                            s,
+                            func.name,
                         );
                     }
                     delete[pos] = true;
                     total += 1;
                 }
+                pos += 1;
             }
-            pos += 1;
+
+            let rebuilt: Vec<X86ISelInst> = insts
+                .into_iter()
+                .enumerate()
+                .filter_map(|(idx, inst)| if delete[idx] { None } else { Some(inst) })
+                .collect();
+            insts = rebuilt;
+            if !xmm_arm_enabled || total == sweep_start_total || sweep >= 4 {
+                break;
+            }
         }
 
-        let rebuilt: Vec<X86ISelInst> = insts
-            .into_iter()
-            .enumerate()
-            .filter_map(|(idx, inst)| if delete[idx] { None } else { Some(inst) })
-            .collect();
         if let Some(b) = func.blocks.get_mut(&block) {
-            b.insts = rebuilt;
+            b.insts = insts;
         }
     }
 
@@ -7741,6 +8289,43 @@ fn admit_x86_strength_reduce_recurrence(width: u32, step: i64, stride: i64) -> b
     admitted
 }
 
+/// Fail-closed proof admission for the peephole's memory-destination RMW
+/// fusion (b1 RMW arc Stage 2): admit CREATING a fused
+/// `XorMR`/`AddMR`/`XorMRSib`/`AddMRSib` ONLY when that opcode's
+/// representative reconstruction obligations discharge `Valid` — the SAME
+/// `x86_reconstruction_discharges_valid` criterion the coverage gate credits
+/// the opcode with (`coverage_gate.rs::audit_x86`). If the Stage-1
+/// reconstruction arm were ever missing, mis-tabled, or failing to discharge,
+/// this returns `false`, the peephole never rewrites, and the opcode is never
+/// emitted: architecture-enforced fail-closed, not convention.
+///
+/// Admission gate, not a rejection gate: `false` leaves the (correct,
+/// itself proof-covered) load/ALU/store triple in place and the compile
+/// proceeds unoptimized — it never fails the compile. Injected into
+/// `X86Peephole::new` because trust-cg-opt must not depend on trust-cg-verify
+/// (same callback-injection pattern as `admit_x86_ifconv_cc_inversion` /
+/// `admit_x86_strength_reduce_recurrence`). Memoized per opcode; the
+/// underlying discharge is additionally deduped by the content-keyed
+/// obligation memo inside trust-cg-verify.
+fn admit_x86_mem_rmw(opcode: trust_cg_ir::X86Opcode) -> bool {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    static ADMITTED: OnceLock<Mutex<HashMap<trust_cg_ir::X86Opcode, bool>>> = OnceLock::new();
+    let memo = ADMITTED.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(&admitted) = memo.lock().expect("mem-rmw admission memo").get(&opcode) {
+        return admitted;
+    }
+    let admitted = trust_cg_verify::x86_64_function_verifier::reconstruction_discharges_valid(
+        opcode,
+        &trust_cg_verify::VerificationConfig::default(),
+    );
+    memo.lock()
+        .expect("mem-rmw admission memo")
+        .insert(opcode, admitted);
+    admitted
+}
+
 /// Sentinel S5 — expand surviving proof-only bounds-check carriers into real
 /// runtime checks.
 ///
@@ -9738,12 +10323,19 @@ fn estimate_inst_size(inst: &X86ISelInst) -> usize {
         }
         X86Opcode::ImulRM => estimate_x86_base_disp_rm_alu_size(inst, 2),
 
+        // Memory-destination RMW ALU, base+disp forms: REX.W + one-byte ALU
+        // opcode + ModRM + disp — the same length class as AddRM.
+        X86Opcode::XorMR | X86Opcode::AddMR => estimate_x86_base_disp_rm_alu_size(inst, 1),
+
         // RIP-relative GPR forms: 7 bytes (REX.W + opcode + ModRM + disp32).
         // MovRipRelTlv is byte-identical to MovRipRel (only the reloc differs).
         X86Opcode::LeaRip | X86Opcode::MovRipRel | X86Opcode::MovRipRelTlv => 7,
 
         // SIB memory: up to 9 bytes (REX.W + opcode + ModRM + SIB + disp32).
         X86Opcode::MovRMSib | X86Opcode::MovsxdRMSib | X86Opcode::MovMRSib | X86Opcode::LeaSib => 9,
+        // Memory-destination RMW ALU, SIB forms: REX.W + one-byte ALU opcode +
+        // ModRM + SIB + disp32 = 9 bytes max (same class as MovMRSib).
+        X86Opcode::XorMRSib | X86Opcode::AddMRSib => 9,
         // 32-bit SIB MOVs: optional REX + opcode + ModRM + SIB + disp32 = 8.
         X86Opcode::MovRM32Sib | X86Opcode::MovMR32Sib => 8,
         // 8-bit SIB MOVs: optional (or FORCED, for SPL/BPL/SIL/DIL) REX +
@@ -11570,6 +12162,10 @@ fn opcode_has_def(opcode: X86Opcode) -> bool {
         | VolatileMovMR | VolatileMovssMR | VolatileMovsdMR | VolatileMovdquMR
         | VolatileMovdqaMR => false,
 
+        // Memory-destination RMW ALU: destination is the memory slot; every
+        // register operand (source value + address components) is a use.
+        XorMR | AddMR | XorMRSib | AddMRSib => false,
+
         // Stack manipulation: implicit RSP modification, no register def.
         Push => false,
 
@@ -11867,6 +12463,11 @@ fn x86_uninitialized_spill_read(func: &X86ISelFunction, spill_disps: &HashSet<i3
     if spill_disps.is_empty() {
         return None;
     }
+    // DELIBERATE EXCLUSION: the memory-destination RMW ALU opcodes
+    // (XorMR/AddMR/XorMRSib/AddMRSib) are NOT store forms here — an RMW READS
+    // the slot before writing it, so the default classification (rbp-mem
+    // operand = read) is the fail-closed one. Adding them would let an RMW
+    // count as the slot's initializing store and hide an uninitialized read.
     let is_store_form = |op: X86Opcode| {
         matches!(
             op,
@@ -12446,6 +13047,11 @@ fn x86_sib_opcode_base_only_form(opcode: X86Opcode) -> Option<X86Opcode> {
         X86Opcode::ImulRMSib => Some(X86Opcode::ImulRM),
         X86Opcode::MovRM32Sib => Some(X86Opcode::MovRM32),
         X86Opcode::MovMR32Sib => Some(X86Opcode::MovMR32),
+        // Memory-destination RMW ALU: required so the 3-distinct-spilled-GPR
+        // overflow replay can sequentialize the EA into one scratch and swap
+        // to the base-only form within the two-scratch budget.
+        X86Opcode::XorMRSib => Some(X86Opcode::XorMR),
+        X86Opcode::AddMRSib => Some(X86Opcode::AddMR),
         _ => None,
     }
 }
@@ -13265,7 +13871,10 @@ impl X86Pipeline {
                 trust_cg_opt::X86LoopInvariantCodeMotion::pure_only(),
             ))
             .with_pass(Box::new(trust_cg_opt::X86CopyPropagation))
-            .with_pass(Box::new(trust_cg_opt::X86Peephole))
+            // RMW fusion inside the peephole is admission-gated on the REAL
+            // reconstruction discharge (fail-closed `|_| false` default in
+            // `X86Peephole::default`).
+            .with_pass(Box::new(trust_cg_opt::X86Peephole::new(admit_x86_mem_rmw)))
             .with_pass(Box::new(trust_cg_opt::X86DeadCodeElimination));
         if x86_if_convert_enabled() {
             pm = pm.with_pass(Box::new(trust_cg_opt::X86IfConvert::new(
@@ -13312,7 +13921,7 @@ impl X86Pipeline {
         // Kill switch: `TCG_NO_STRENGTH_REDUCE`.
         let mut pm = trust_cg_opt::X86PassManager::new();
         if x86_vectorize_enabled() {
-            pm = pm.with_pass(Box::new(trust_cg_opt::X86Vectorize));
+            pm = pm.with_pass(Box::new(trust_cg_opt::X86Vectorize::default()));
         }
         // The invariant stack-slot load tier (O2+ only; kill switch
         // `TCG_NO_LICM_LOADS`) additionally hoists provably invariant,
@@ -13377,7 +13986,9 @@ impl X86Pipeline {
             .with_pass(Box::new(trust_cg_opt::X86BlockMerge::new()))
             .with_pass(Box::new(trust_cg_opt::X86CopyPropagation))
             .with_pass(Box::new(trust_cg_opt::X86CommonSubexpressionElimination))
-            .with_pass(Box::new(trust_cg_opt::X86Peephole));
+            // RMW fusion inside the peephole is admission-gated on the REAL
+            // reconstruction discharge — see `admit_x86_mem_rmw`.
+            .with_pass(Box::new(trust_cg_opt::X86Peephole::new(admit_x86_mem_rmw)));
         // Dominated-identical-compare bounds-check elimination (safety-critical,
         // sound by construction). Runs AFTER the peephole's cmp+setcc+zero-test
         // +Jcc fusion, which collapses the frontend's materialized-boolean
@@ -18162,7 +18773,7 @@ mod tests {
                 31,
                 X86Opcode::Ret,
                 &ret_ops,
-                &[ret.clone()],
+                std::slice::from_ref(&ret),
                 0,
                 &HashMap::new()
             ),
@@ -21077,6 +21688,30 @@ mod tests {
                 "{cc:?} -> {cc:?} (no inversion) must be refused"
             );
         }
+    }
+
+    /// The production RMW-fusion admission callback: the four Stage-1 RMW
+    /// opcodes are admitted because (and ONLY because) their representative
+    /// reconstruction obligations discharge `Valid` — the same criterion the
+    /// coverage gate credits them with. Anything else is refused outright
+    /// (fail-closed: no reconstruction arm, no emission).
+    #[test]
+    fn admit_x86_mem_rmw_admits_only_reconstruction_covered_rmw_opcodes() {
+        for op in [
+            X86Opcode::XorMR,
+            X86Opcode::AddMR,
+            X86Opcode::XorMRSib,
+            X86Opcode::AddMRSib,
+        ] {
+            assert!(
+                admit_x86_mem_rmw(op),
+                "{op:?} lost its Stage-1 reconstruction discharge"
+            );
+        }
+        // Non-reconstructable opcodes are refused (fail-closed), and the
+        // memoized second query keeps the admitted verdict.
+        assert!(!admit_x86_mem_rmw(X86Opcode::Ret));
+        assert!(admit_x86_mem_rmw(X86Opcode::XorMRSib));
     }
 
     #[test]
@@ -29803,6 +30438,530 @@ mod tests {
             X86ISelOperand::PReg(RBX),
             "ghost untouched"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // XMM bridge-copy collapse
+    // -----------------------------------------------------------------------
+
+    /// Build the v1_saxpy-shaped accept fixture: a `MovdqaRR` bridge feeding
+    /// a tied `Paddd` whose ghost operand still names the bridge source, a
+    /// downstream store reading the bridge destination, and a `Jmp` to a
+    /// `Ret` block (so the copy block itself carries no call/return barrier).
+    fn xmm_bridge_paddd_fixture() -> X86ISelFunction {
+        use trust_cg_ir::x86_64_regs::{XMM2, XMM3, XMM8};
+
+        let (b0, b1) = (Block(0), Block(1));
+        let mut func = minimal_func("xmm_bridge_paddd");
+        func.ensure_block(b1);
+        //   movdqa %xmm2, %xmm3        (bridge: d=XMM3 <- s=XMM2)
+        //   paddd  [XMM3, ghost=XMM2, XMM8]
+        //   movdqu [%rax], %xmm3       (read of d)
+        //   jmp b1
+        // b1: ret
+        func.push_inst(
+            b0,
+            X86ISelInst::new(
+                X86Opcode::MovdqaRR,
+                vec![X86ISelOperand::PReg(XMM3), X86ISelOperand::PReg(XMM2)],
+            ),
+        );
+        func.push_inst(
+            b0,
+            X86ISelInst::new(
+                X86Opcode::Paddd,
+                vec![
+                    X86ISelOperand::PReg(XMM3),
+                    X86ISelOperand::PReg(XMM2),
+                    X86ISelOperand::PReg(XMM8),
+                ],
+            ),
+        );
+        func.push_inst(
+            b0,
+            X86ISelInst::new(
+                X86Opcode::MovdquMR,
+                vec![
+                    X86ISelOperand::MemAddr {
+                        base: Box::new(X86ISelOperand::PReg(RAX)),
+                        disp: 0,
+                    },
+                    X86ISelOperand::PReg(XMM3),
+                ],
+            ),
+        );
+        func.push_inst(
+            b0,
+            X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(b1)]),
+        );
+        func.push_inst(b1, X86ISelInst::new(X86Opcode::Ret, vec![]));
+        func.blocks.get_mut(&b0).unwrap().successors = vec![b1];
+        func
+    }
+
+    /// ACCEPT (v1-shape): the `MovdqaRR` bridge before a tied `Paddd` whose
+    /// source is dead after the op is deleted, the op becomes self-tied on
+    /// the bridge SOURCE, downstream reads of the bridge destination are
+    /// renamed in lockstep, and the transformed stream still discharges TV-5.
+    #[test]
+    fn x86_xmm_bridge_collapse_paddd_accept() {
+        use trust_cg_ir::x86_64_regs::{XMM2, XMM8};
+        use trust_cg_verify::post_ra_dataflow;
+        use trust_cg_verify::post_regalloc_recheck::PostRegallocRecheckMode;
+
+        crate::env_lock::with_env_overrides_removed(&["TCG_NO_X86_XMM_BRIDGE_COLLAPSE"], || {
+            let mut func = xmm_bridge_paddd_fixture();
+            let alloc: HashMap<VReg, X86PReg> = HashMap::new();
+            let removed = coalesce_x86_redundant_movrr_copies(&mut func, &alloc);
+            assert_eq!(removed, 1, "the XMM bridge copy must be collapsed");
+
+            let insts = &func.blocks[&Block(0)].insts;
+            assert_eq!(insts.len(), 3, "bridge deleted; op + store + jmp remain");
+            assert_eq!(insts[0].opcode, X86Opcode::Paddd);
+            assert_eq!(
+                insts[0].operands,
+                vec![
+                    X86ISelOperand::PReg(XMM2),
+                    X86ISelOperand::PReg(XMM2),
+                    X86ISelOperand::PReg(XMM8),
+                ],
+                "the op must be self-tied on the bridge source (dst == ghost)"
+            );
+            assert_eq!(insts[1].opcode, X86Opcode::MovdquMR);
+            assert_eq!(
+                insts[1].operands[1],
+                X86ISelOperand::PReg(XMM2),
+                "the downstream read of the bridge destination must be renamed"
+            );
+
+            assert!(
+                post_ra_dataflow::evaluate(
+                    &func,
+                    &alloc,
+                    "x86_64",
+                    PostRegallocRecheckMode::Enforce
+                )
+                .is_none(),
+                "the collapsed stream must still discharge TV-5"
+            );
+        });
+    }
+
+    /// DECLINE (source redefined before a renamed read): a fresh load INTO
+    /// the bridge source between the tied op and a read of the bridge
+    /// destination makes the rename unsound — the source no longer carries
+    /// the op's result when the read executes.
+    #[test]
+    fn x86_xmm_bridge_collapse_pmulld_declines_on_src_redef() {
+        use trust_cg_ir::x86_64_regs::{RCX, XMM2, XMM3, XMM8};
+
+        crate::env_lock::with_env_overrides_removed(&["TCG_NO_X86_XMM_BRIDGE_COLLAPSE"], || {
+            let entry = Block(0);
+            let mut func = minimal_func("xmm_bridge_src_redef");
+            //   movdqa %xmm2, %xmm3        (bridge: d=XMM3 <- s=XMM2)
+            //   pmulld [XMM3, ghost=XMM2, XMM8]
+            //   movdqu %xmm2, [%rax]       (a NEW load into s: full redef)
+            //   movdqu [%rcx], %xmm3       (read of d AFTER the s redef)
+            func.push_inst(
+                entry,
+                X86ISelInst::new(
+                    X86Opcode::MovdqaRR,
+                    vec![X86ISelOperand::PReg(XMM3), X86ISelOperand::PReg(XMM2)],
+                ),
+            );
+            func.push_inst(
+                entry,
+                X86ISelInst::new(
+                    X86Opcode::Pmulld,
+                    vec![
+                        X86ISelOperand::PReg(XMM3),
+                        X86ISelOperand::PReg(XMM2),
+                        X86ISelOperand::PReg(XMM8),
+                    ],
+                ),
+            );
+            func.push_inst(
+                entry,
+                X86ISelInst::new(
+                    X86Opcode::MovdquRM,
+                    vec![
+                        X86ISelOperand::PReg(XMM2),
+                        X86ISelOperand::MemAddr {
+                            base: Box::new(X86ISelOperand::PReg(RAX)),
+                            disp: 0,
+                        },
+                    ],
+                ),
+            );
+            func.push_inst(
+                entry,
+                X86ISelInst::new(
+                    X86Opcode::MovdquMR,
+                    vec![
+                        X86ISelOperand::MemAddr {
+                            base: Box::new(X86ISelOperand::PReg(RCX)),
+                            disp: 0,
+                        },
+                        X86ISelOperand::PReg(XMM3),
+                    ],
+                ),
+            );
+
+            let alloc: HashMap<VReg, X86PReg> = HashMap::new();
+            let removed = coalesce_x86_redundant_movrr_copies(&mut func, &alloc);
+            assert_eq!(removed, 0, "src redef before a read of dst must decline");
+
+            let insts = &func.blocks[&entry].insts;
+            assert_eq!(insts.len(), 4, "stream must be untouched");
+            assert_eq!(insts[0].opcode, X86Opcode::MovdqaRR);
+            assert_eq!(
+                insts[0].operands,
+                vec![X86ISelOperand::PReg(XMM3), X86ISelOperand::PReg(XMM2)]
+            );
+            assert_eq!(
+                insts[1].operands[0],
+                X86ISelOperand::PReg(XMM3),
+                "the op destination must be untouched"
+            );
+            assert_eq!(
+                insts[3].operands[1],
+                X86ISelOperand::PReg(XMM3),
+                "the read of the bridge destination must be untouched"
+            );
+        });
+    }
+
+    /// FIXPOINT (two bridges, p4-shape): the punpcklqdq bridge is declined in
+    /// sweep 1 because its SOURCE is redefined by the paddq bridge's copy
+    /// before a read of its destination. The paddq bridge collapses in sweep
+    /// 1, which deletes that copy — and only the sweep-2 rescan of the
+    /// rebuilt stream can see the punpcklqdq bridge become legal.
+    #[test]
+    fn x86_xmm_bridge_collapse_two_bridge_fixpoint() {
+        use trust_cg_ir::x86_64_regs::{XMM1, XMM2, XMM3, XMM8, XMM14};
+
+        crate::env_lock::with_env_overrides_removed(&["TCG_NO_X86_XMM_BRIDGE_COLLAPSE"], || {
+            let entry = Block(0);
+            let mut func = minimal_func("xmm_bridge_fixpoint");
+            //   movdqa %xmm2, %xmm3          (bridge A: d=XMM3 <- s=XMM2)
+            //   punpcklqdq [XMM3, ghost=XMM2, XMM8]
+            //   movdqa %xmm1, %xmm2          (bridge B: d=XMM2 <- s=XMM1;
+            //                                 REDEFINES bridge A's source)
+            //   paddq  [XMM2, ghost=XMM1, XMM14]
+            //   movdqu [%rax], %xmm3         (read of A's d, after A's s redef)
+            //   movdqu [%rax+16], %xmm2      (read of B's d)
+            func.push_inst(
+                entry,
+                X86ISelInst::new(
+                    X86Opcode::MovdqaRR,
+                    vec![X86ISelOperand::PReg(XMM3), X86ISelOperand::PReg(XMM2)],
+                ),
+            );
+            func.push_inst(
+                entry,
+                X86ISelInst::new(
+                    X86Opcode::Punpcklqdq,
+                    vec![
+                        X86ISelOperand::PReg(XMM3),
+                        X86ISelOperand::PReg(XMM2),
+                        X86ISelOperand::PReg(XMM8),
+                    ],
+                ),
+            );
+            func.push_inst(
+                entry,
+                X86ISelInst::new(
+                    X86Opcode::MovdqaRR,
+                    vec![X86ISelOperand::PReg(XMM2), X86ISelOperand::PReg(XMM1)],
+                ),
+            );
+            func.push_inst(
+                entry,
+                X86ISelInst::new(
+                    X86Opcode::Paddq,
+                    vec![
+                        X86ISelOperand::PReg(XMM2),
+                        X86ISelOperand::PReg(XMM1),
+                        X86ISelOperand::PReg(XMM14),
+                    ],
+                ),
+            );
+            func.push_inst(
+                entry,
+                X86ISelInst::new(
+                    X86Opcode::MovdquMR,
+                    vec![
+                        X86ISelOperand::MemAddr {
+                            base: Box::new(X86ISelOperand::PReg(RAX)),
+                            disp: 0,
+                        },
+                        X86ISelOperand::PReg(XMM3),
+                    ],
+                ),
+            );
+            func.push_inst(
+                entry,
+                X86ISelInst::new(
+                    X86Opcode::MovdquMR,
+                    vec![
+                        X86ISelOperand::MemAddr {
+                            base: Box::new(X86ISelOperand::PReg(RAX)),
+                            disp: 16,
+                        },
+                        X86ISelOperand::PReg(XMM2),
+                    ],
+                ),
+            );
+
+            let alloc: HashMap<VReg, X86PReg> = HashMap::new();
+            let removed = coalesce_x86_redundant_movrr_copies(&mut func, &alloc);
+            assert_eq!(removed, 2, "both bridges must collapse across two sweeps");
+
+            let insts = &func.blocks[&entry].insts;
+            assert_eq!(insts.len(), 4, "both bridge copies deleted");
+            assert_eq!(insts[0].opcode, X86Opcode::Punpcklqdq);
+            assert_eq!(
+                insts[0].operands,
+                vec![
+                    X86ISelOperand::PReg(XMM2),
+                    X86ISelOperand::PReg(XMM2),
+                    X86ISelOperand::PReg(XMM8),
+                ],
+                "sweep 2: the punpcklqdq must be self-tied on its bridge source"
+            );
+            assert_eq!(insts[1].opcode, X86Opcode::Paddq);
+            assert_eq!(
+                insts[1].operands,
+                vec![
+                    X86ISelOperand::PReg(XMM1),
+                    X86ISelOperand::PReg(XMM1),
+                    X86ISelOperand::PReg(XMM14),
+                ],
+                "sweep 1: the paddq must be self-tied on its bridge source"
+            );
+            assert_eq!(
+                insts[2].operands[1],
+                X86ISelOperand::PReg(XMM2),
+                "the read of punpcklqdq's old destination must be renamed"
+            );
+            assert_eq!(
+                insts[3].operands[1],
+                X86ISelOperand::PReg(XMM1),
+                "the read of paddq's old destination must be renamed"
+            );
+        });
+    }
+
+    /// DECLINE (live-out): the bridge source is live into a successor block
+    /// and never fully redefined in the copy block, so its value must
+    /// survive the op — the collapse would overwrite it.
+    #[test]
+    fn x86_xmm_bridge_collapse_declines_live_out_source() {
+        use trust_cg_ir::x86_64_regs::{XMM2, XMM3, XMM8};
+
+        crate::env_lock::with_env_overrides_removed(&["TCG_NO_X86_XMM_BRIDGE_COLLAPSE"], || {
+            let (b0, b1) = (Block(0), Block(1));
+            let mut func = minimal_func("xmm_bridge_live_out");
+            func.ensure_block(b1);
+            // b0:  movdqa %xmm2, %xmm3
+            //      paddd  [XMM3, ghost=XMM2, XMM8]
+            //      jmp b1
+            // b1:  movdqu [%rax], %xmm2      (s read in the successor)
+            func.push_inst(
+                b0,
+                X86ISelInst::new(
+                    X86Opcode::MovdqaRR,
+                    vec![X86ISelOperand::PReg(XMM3), X86ISelOperand::PReg(XMM2)],
+                ),
+            );
+            func.push_inst(
+                b0,
+                X86ISelInst::new(
+                    X86Opcode::Paddd,
+                    vec![
+                        X86ISelOperand::PReg(XMM3),
+                        X86ISelOperand::PReg(XMM2),
+                        X86ISelOperand::PReg(XMM8),
+                    ],
+                ),
+            );
+            func.push_inst(
+                b0,
+                X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(b1)]),
+            );
+            func.push_inst(
+                b1,
+                X86ISelInst::new(
+                    X86Opcode::MovdquMR,
+                    vec![
+                        X86ISelOperand::MemAddr {
+                            base: Box::new(X86ISelOperand::PReg(RAX)),
+                            disp: 0,
+                        },
+                        X86ISelOperand::PReg(XMM2),
+                    ],
+                ),
+            );
+            func.blocks.get_mut(&b0).unwrap().successors = vec![b1];
+
+            let alloc: HashMap<VReg, X86PReg> = HashMap::new();
+            let removed = coalesce_x86_redundant_movrr_copies(&mut func, &alloc);
+            assert_eq!(removed, 0, "a live-out source must decline the collapse");
+            assert_eq!(func.blocks[&b0].insts.len(), 3, "stream must be untouched");
+            assert_eq!(func.blocks[&b0].insts[0].opcode, X86Opcode::MovdqaRR);
+        });
+    }
+
+    /// DECLINE (partial def is a read barrier): `MovssRR` into the bridge
+    /// source merges the untouched upper lanes — it READS the old value, so
+    /// it can neither kill the source nor be scanned past. (`Pinsrd`/
+    /// `Pinsrq` are the other partial-def opcodes; both are likewise
+    /// excluded from `x86_opcode_full_xmm_def`.)
+    #[test]
+    fn x86_xmm_bridge_collapse_partial_def_barrier_declines() {
+        use trust_cg_ir::x86_64_regs::{XMM2, XMM3, XMM8, XMM14};
+
+        crate::env_lock::with_env_overrides_removed(&["TCG_NO_X86_XMM_BRIDGE_COLLAPSE"], || {
+            let entry = Block(0);
+            let mut func = minimal_func("xmm_bridge_partial_def");
+            //   movdqa %xmm2, %xmm3
+            //   paddd  [XMM3, ghost=XMM2, XMM8]
+            //   movss  %xmm14, %xmm2       (PARTIAL def of s: lane-0 merge)
+            func.push_inst(
+                entry,
+                X86ISelInst::new(
+                    X86Opcode::MovdqaRR,
+                    vec![X86ISelOperand::PReg(XMM3), X86ISelOperand::PReg(XMM2)],
+                ),
+            );
+            func.push_inst(
+                entry,
+                X86ISelInst::new(
+                    X86Opcode::Paddd,
+                    vec![
+                        X86ISelOperand::PReg(XMM3),
+                        X86ISelOperand::PReg(XMM2),
+                        X86ISelOperand::PReg(XMM8),
+                    ],
+                ),
+            );
+            func.push_inst(
+                entry,
+                X86ISelInst::new(
+                    X86Opcode::MovssRR,
+                    vec![X86ISelOperand::PReg(XMM2), X86ISelOperand::PReg(XMM14)],
+                ),
+            );
+
+            let alloc: HashMap<VReg, X86PReg> = HashMap::new();
+            let removed = coalesce_x86_redundant_movrr_copies(&mut func, &alloc);
+            assert_eq!(removed, 0, "a partial def of the source must decline");
+            assert_eq!(
+                func.blocks[&entry].insts.len(),
+                3,
+                "stream must be untouched"
+            );
+            assert_eq!(func.blocks[&entry].insts[0].opcode, X86Opcode::MovdqaRR);
+        });
+    }
+
+    /// DECLINE (implicit XMM behavior in the window): `Pblendvb` reads XMM0
+    /// without naming it, so no rename over a window containing it can be
+    /// trusted. The identical stream WITHOUT the `Pblendvb` collapses,
+    /// pinning the decline to the implicit-XMM instruction itself.
+    #[test]
+    fn x86_xmm_bridge_collapse_pblendvb_window_declines() {
+        use trust_cg_ir::x86_64_regs::{XMM2, XMM3, XMM8, XMM14, XMM15};
+
+        crate::env_lock::with_env_overrides_removed(&["TCG_NO_X86_XMM_BRIDGE_COLLAPSE"], || {
+            let build = |with_pblendvb: bool| {
+                let entry = Block(0);
+                let mut func = minimal_func("xmm_bridge_pblendvb");
+                func.push_inst(
+                    entry,
+                    X86ISelInst::new(
+                        X86Opcode::MovdqaRR,
+                        vec![X86ISelOperand::PReg(XMM3), X86ISelOperand::PReg(XMM2)],
+                    ),
+                );
+                func.push_inst(
+                    entry,
+                    X86ISelInst::new(
+                        X86Opcode::Paddd,
+                        vec![
+                            X86ISelOperand::PReg(XMM3),
+                            X86ISelOperand::PReg(XMM2),
+                            X86ISelOperand::PReg(XMM8),
+                        ],
+                    ),
+                );
+                if with_pblendvb {
+                    func.push_inst(
+                        entry,
+                        X86ISelInst::new(
+                            X86Opcode::Pblendvb,
+                            vec![X86ISelOperand::PReg(XMM14), X86ISelOperand::PReg(XMM15)],
+                        ),
+                    );
+                }
+                func.push_inst(
+                    entry,
+                    X86ISelInst::new(
+                        X86Opcode::MovdquMR,
+                        vec![
+                            X86ISelOperand::MemAddr {
+                                base: Box::new(X86ISelOperand::PReg(RAX)),
+                                disp: 0,
+                            },
+                            X86ISelOperand::PReg(XMM3),
+                        ],
+                    ),
+                );
+                func
+            };
+            let alloc: HashMap<VReg, X86PReg> = HashMap::new();
+
+            let mut with_pblendvb = build(true);
+            let removed = coalesce_x86_redundant_movrr_copies(&mut with_pblendvb, &alloc);
+            assert_eq!(removed, 0, "an implicit-XMM window must decline");
+            assert_eq!(
+                with_pblendvb.blocks[&Block(0)].insts[0].opcode,
+                X86Opcode::MovdqaRR,
+                "the bridge must survive"
+            );
+
+            let mut without_pblendvb = build(false);
+            let removed = coalesce_x86_redundant_movrr_copies(&mut without_pblendvb, &alloc);
+            assert_eq!(
+                removed, 1,
+                "the identical stream without Pblendvb must collapse"
+            );
+        });
+    }
+
+    /// Kill switch: `TCG_NO_X86_XMM_BRIDGE_COLLAPSE` disables ONLY the XMM
+    /// arm — the bridge copy survives untouched — and the default (unset)
+    /// collapses the same stream.
+    #[test]
+    fn x86_xmm_bridge_collapse_kill_switch() {
+        use trust_cg_ir::x86_64_regs::XMM3;
+
+        crate::env_lock::with_env_overrides(&[("TCG_NO_X86_XMM_BRIDGE_COLLAPSE", "1")], || {
+            let mut func = xmm_bridge_paddd_fixture();
+            let alloc: HashMap<VReg, X86PReg> = HashMap::new();
+            let removed = coalesce_x86_redundant_movrr_copies(&mut func, &alloc);
+            assert_eq!(removed, 0, "the kill switch must disable the XMM arm");
+            let insts = &func.blocks[&Block(0)].insts;
+            assert_eq!(insts.len(), 4, "stream must be untouched");
+            assert_eq!(insts[0].opcode, X86Opcode::MovdqaRR);
+            assert_eq!(insts[1].operands[0], X86ISelOperand::PReg(XMM3));
+        });
+        crate::env_lock::with_env_overrides_removed(&["TCG_NO_X86_XMM_BRIDGE_COLLAPSE"], || {
+            let mut func = xmm_bridge_paddd_fixture();
+            let alloc: HashMap<VReg, X86PReg> = HashMap::new();
+            let removed = coalesce_x86_redundant_movrr_copies(&mut func, &alloc);
+            assert_eq!(removed, 1, "default-on: the same stream must collapse");
+        });
     }
 
     /// PINNED (mirror drift): the coalescer's implicit-register model

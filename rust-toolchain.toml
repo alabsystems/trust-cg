@@ -1,3 +1,7 @@
+# The ordinary developer and public-release lane is deterministic and usable,
+# but makes no Trust-verification claim. Trust verification remains an explicit
+# gate until scripts/check_trust_default_authority.py certifies one immutable
+# sysroot and strict, non-deauthorized policy for every compiled unit.
 [toolchain]
 channel = "1.97.1"
 profile = "minimal"

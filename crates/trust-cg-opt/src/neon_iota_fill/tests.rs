@@ -466,3 +466,93 @@ fn bails_on_small_const_bound() {
         "const bound below one full vector block",
     );
 }
+
+/// IDEMPOTENCE (the neon-bytesum / neon-fill bug class of 2026-08-27: a
+/// vectorizer that keeps the scalar loop as the remainder and then recognizes
+/// that remainder again on the next fixpoint iteration, nesting one zero-trip
+/// vector loop per iteration until the cap). After the first firing, further
+/// runs must change nothing.
+#[test]
+fn second_run_is_a_no_op() {
+    let mut func = build_iota(Cfg {
+        bound: BoundK::Const(1024),
+        addv: Add::Invariant,
+        variant: Variant::Good,
+    });
+    assert!(
+        NeonIotaFillPass::new().run(&mut func),
+        "first run must fire"
+    );
+    let (insts, blocks) = (func.insts.len(), func.blocks.len());
+    for again in 2..=4 {
+        assert!(
+            !NeonIotaFillPass::new().run(&mut func),
+            "run {again}: re-fired on its own output"
+        );
+        assert_eq!(func.insts.len(), insts, "run {again} added instructions");
+        assert_eq!(func.blocks.len(), blocks, "run {again} added blocks");
+    }
+}
+
+/// IDEMPOTENCE over every firing shape the builders offer (the primary
+/// `second_run_is_a_no_op` covers one; today's bug class hid in shapes
+/// the primary test did not exercise).
+#[test]
+fn second_run_is_a_no_op_for_every_firing_variant() {
+    let cases: Vec<(&str, Box<dyn Fn() -> MachFunction>)> = vec![
+        (
+            "const-bound",
+            Box::new(|| {
+                build_iota(Cfg {
+                    bound: BoundK::Const(1024),
+                    addv: Add::Invariant,
+                    variant: Variant::Good,
+                })
+            }),
+        ),
+        (
+            "runtime-bound",
+            Box::new(|| {
+                build_iota(Cfg {
+                    bound: BoundK::Runtime,
+                    addv: Add::Invariant,
+                    variant: Variant::Good,
+                })
+            }),
+        ),
+        (
+            "strro-lsl-store",
+            Box::new(|| {
+                build_iota(Cfg {
+                    bound: BoundK::Const(1024),
+                    addv: Add::Invariant,
+                    variant: Variant::StoreRoLsl,
+                })
+            }),
+        ),
+    ];
+    for (label, build) in cases {
+        let mut func = build();
+        assert!(
+            NeonIotaFillPass::new().run(&mut func),
+            "{label}: first run must fire"
+        );
+        let (insts, blocks) = (func.insts.len(), func.blocks.len());
+        for again in 2..=4 {
+            assert!(
+                !NeonIotaFillPass::new().run(&mut func),
+                "{label}: run {again} re-fired on its own output"
+            );
+            assert_eq!(
+                func.insts.len(),
+                insts,
+                "{label}: run {again} added instructions"
+            );
+            assert_eq!(
+                func.blocks.len(),
+                blocks,
+                "{label}: run {again} added blocks"
+            );
+        }
+    }
+}

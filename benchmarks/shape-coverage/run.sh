@@ -25,12 +25,49 @@ DYLIB="${1:-$HERE/../../crates/rustc-codegen-trust-cg/target/release/librustc_co
 RUSTC="$(rustup which --toolchain nightly-2026-04-20 rustc 2>/dev/null || echo rustc)"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 BASE="--edition=2021 --crate-type bin -Cpanic=abort -Coverflow-checks=off -Ccodegen-units=1"
-pass=0; fail=0; unsup=0
+
+# Exact fail-closed coverage floor at the final s72 corpus. A new decline is a
+# lost differential regression and fails. If one of these known gaps starts
+# compiling, the stale allowance also fails until it is consciously removed.
+is_expected_decline() {
+  case "$1 O$2" in
+    "s13_zero_trip O2"|"s13_zero_trip O3"|\
+    "s27_dyn_box_drop O0"|"s27_dyn_box_drop O1"|\
+    "s27_dyn_box_drop O2"|"s27_dyn_box_drop O3"|\
+    "s31_vec_sort_dedup O0"|"s31_vec_sort_dedup O1"|\
+    "s31_vec_sort_dedup O2"|"s31_vec_sort_dedup O3") return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+if [[ "${1:-}" == "--selftest" ]]; then
+  expected=0
+  for row in \
+    "s13_zero_trip 2" "s13_zero_trip 3" \
+    "s27_dyn_box_drop 0" "s27_dyn_box_drop 1" \
+    "s27_dyn_box_drop 2" "s27_dyn_box_drop 3" \
+    "s31_vec_sort_dedup 0" "s31_vec_sort_dedup 1" \
+    "s31_vec_sort_dedup 2" "s31_vec_sort_dedup 3"; do
+    # shellcheck disable=SC2086 # each fixture is deliberately two words
+    is_expected_decline $row || exit 1
+    expected=$((expected+1))
+  done
+  ! is_expected_decline s13_zero_trip 1 || exit 1
+  ! is_expected_decline s72_mut_ref_return 0 || exit 1
+  echo "shape-coverage decline-ratchet selftest: $expected expected rows, 2 rejection arms"
+  exit 0
+fi
+
+pass=0; fail=0; unsup=0; expected_unsup=0
 for src in "$HERE"/progs/*.rs; do
   n="$(basename "$src" .rs)"
   for opt in 0 1 2 3; do
-    if ! $RUSTC $BASE -Copt-level=$opt -o "$TMP/l" "$src" 2>/dev/null; then
-      echo "SKIP  $n O$opt (llvm oracle failed to build)"; continue; fi
+    if ! $RUSTC $BASE -Copt-level=$opt -o "$TMP/l" "$src" 2>"$TMP/llvm.err"; then
+      echo "FAIL  $n O$opt: LLVM oracle failed to build"
+      tail -5 "$TMP/llvm.err"
+      fail=$((fail+1))
+      continue
+    fi
     "$TMP/l" >/dev/null 2>&1; want=$?
     if ! env TCG_NO_PROOF_CERTS=1 TCG_REFINE_SOLVER=0 $RUSTC $BASE -Copt-level=$opt \
          -Zcodegen-backend="$DYLIB" -o "$TMP/t" "$src" 2>"$TMP/err"; then
@@ -39,7 +76,14 @@ for src in "$HERE"/progs/*.rs; do
       # it separately so coverage stays visible without faking a failure.
       if grep -qE "\[TCG-[A-Z-]+[0-9]*\]" "$TMP/err"; then
         code="$(grep -oE "\[TCG-[A-Z-]+[0-9]*\]" "$TMP/err" | head -1)"
-        echo "UNSUP $n O$opt: declined ($code)"; unsup=$((unsup+1))
+        if is_expected_decline "$n" "$opt"; then
+          echo "UNSUP $n O$opt: expected decline ($code)"
+          expected_unsup=$((expected_unsup+1))
+        else
+          echo "FAIL  $n O$opt: NEW fail-closed decline ($code)"
+          fail=$((fail+1))
+        fi
+        unsup=$((unsup+1))
       else
         echo "FAIL  $n O$opt: trust-cg failed to compile with no fail-closed diagnostic"
         fail=$((fail+1))
@@ -55,5 +99,9 @@ for src in "$HERE"/progs/*.rs; do
     fi
   done
 done
-echo "shape-coverage: $pass passed, $fail WRONG-ANSWER, $unsup declined-fail-closed"
+if [[ "$expected_unsup" -ne 10 ]]; then
+  echo "FAIL  decline ratchet: observed $expected_unsup/10 expected rows; update the exact allowlist consciously"
+  fail=$((fail+1))
+fi
+echo "shape-coverage: $pass passed, $fail failure(s), $unsup declined-fail-closed"
 [ "$fail" -eq 0 ]

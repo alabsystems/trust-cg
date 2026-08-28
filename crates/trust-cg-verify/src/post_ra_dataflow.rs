@@ -1646,6 +1646,27 @@ pub(crate) fn classify_x86_post_ra_inst(
             }
         }
 
+        // --- Memory-destination RMW ALU: source register + address registers
+        // read, NO register defs (the destination is the memory slot), RFLAGS
+        // written. AddMR* defines the full ADD mask (CmpRR shape); XorMR*
+        // defines the logic mask with AF UNDEFINED (TestRR shape) — modeling
+        // XOR's AF as defined would let a downstream AF-consumer pass
+        // validation falsely. ---
+        XorMR | AddMR | XorMRSib | AddMRSib => {
+            match inst.opcode {
+                AddMR | AddMRSib => {
+                    acc.flags_def_mask = FLAGS_ALL;
+                }
+                XorMR | XorMRSib => {
+                    add_definite_flag_effect(&mut acc, FLAGS_LOGIC_DEFINED, FLAG_AF);
+                }
+                _ => unreachable!(),
+            }
+            for op in &inst.operands {
+                acc.read_reg_or_mem(op, alloc);
+            }
+        }
+
         // --- Stack push/pop (implicit RSP update). ---
         Push => {
             acc.read_preg(RSP);

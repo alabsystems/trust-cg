@@ -118,6 +118,14 @@ fn write_temp_source(stem: &str, contents: &str) -> PathBuf {
 
 #[test]
 fn m1_hello_loop_compiles_and_runs_until_killed() {
+    // This M0 smoke test drives `rustc --target aarch64-apple-darwin` against a
+    // freshly built `.dylib` (see the module comment); on any other host it can
+    // only fail for environmental reasons, so skip EXPLICITLY rather than
+    // report a spurious failure in every Linux suite run.
+    if !cfg!(target_os = "macos") {
+        eprintln!("hello_loop: SKIPPED — this M0 smoke test targets aarch64-apple-darwin hosts");
+        return;
+    }
     // The smallest possible Rust program. This is literally the WS4 M0
     // target: when this compiles end-to-end and runs, we are done with
     // M0.

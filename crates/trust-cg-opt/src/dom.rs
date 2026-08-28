@@ -25,7 +25,7 @@
 //!
 //! Reference: LLVM `llvm/include/llvm/Support/GenericDomTree.h`
 
-use std::collections::{HashMap, HashSet};
+use crate::fast_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 /// Cumulative DomTree::compute cost (TCG_TIME_DOM=1).
 pub static DOM_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -43,8 +43,6 @@ pub struct DomTree {
     idom: HashMap<BlockId, BlockId>,
     /// Children in the dominator tree (block -> dominated children).
     children: HashMap<BlockId, Vec<BlockId>>,
-    /// Dominance frontiers: DF(b) = set of blocks where b's dominance ends.
-    dom_frontier: HashMap<BlockId, HashSet<BlockId>>,
     /// Reverse postorder numbering (block -> RPO index). Lower = earlier.
     rpo_number: HashMap<BlockId, u32>,
     /// Reverse postorder sequence of blocks.
@@ -89,14 +87,28 @@ impl DomTree {
 
         // Step 1: Compute reverse postorder via DFS.
         let rpo_order = compute_rpo(func, entry);
-        let mut rpo_number: HashMap<BlockId, u32> = HashMap::new();
+
+        // DENSE working state for the fixpoint. `BlockId.0` indexes
+        // `func.blocks` everywhere in this backend, so both maps below are
+        // arrays, not hash tables. This matters because the Cooper/Harvey/
+        // Kennedy inner loop (`intersect`) probes BOTH per step, and
+        // `DomTree::compute` is rebuilt once per rewrite by the loop-rotation
+        // driver — 300 times on the `loops` scaling shape at n=120. The
+        // hash-map versions are still materialized once at the end, so every
+        // field of the built tree, and every consumer, is unchanged.
+        let block_count = func.blocks.len();
+        let mut rpo_num: Vec<u32> = vec![u32::MAX; block_count];
         for (i, &block) in rpo_order.iter().enumerate() {
-            rpo_number.insert(block, i as u32);
+            if let Some(slot) = rpo_num.get_mut(block.0 as usize) {
+                *slot = i as u32;
+            }
         }
 
         // Step 2: Initialize idom. Entry dominates itself.
-        let mut idom: HashMap<BlockId, BlockId> = HashMap::new();
-        idom.insert(entry, entry);
+        let mut idom_of: Vec<Option<BlockId>> = vec![None; block_count];
+        if let Some(slot) = idom_of.get_mut(entry.0 as usize) {
+            *slot = Some(entry);
+        }
 
         // Step 3: Iterate until fixpoint (Cooper/Harvey/Kennedy).
         let mut changed = true;
@@ -111,7 +123,7 @@ impl DomTree {
                 // Find first processed predecessor (one with idom already set).
                 let mut new_idom = None;
                 for &pred in preds {
-                    if idom.contains_key(&pred) {
+                    if idom_at(&idom_of, pred).is_some() {
                         new_idom = Some(pred);
                         break;
                     }
@@ -127,20 +139,34 @@ impl DomTree {
                     if pred == new_idom_val {
                         continue;
                     }
-                    if idom.contains_key(&pred) {
-                        new_idom_val = intersect(pred, new_idom_val, &idom, &rpo_number);
+                    if idom_at(&idom_of, pred).is_some() {
+                        new_idom_val = intersect(pred, new_idom_val, &idom_of, &rpo_num);
                     }
                 }
 
-                if idom.get(&block) != Some(&new_idom_val) {
-                    idom.insert(block, new_idom_val);
+                if idom_at(&idom_of, block) != Some(new_idom_val) {
+                    if let Some(slot) = idom_of.get_mut(block.0 as usize) {
+                        *slot = Some(new_idom_val);
+                    }
                     changed = true;
                 }
             }
         }
 
+        // Materialize the map forms the tree stores and its consumers read.
+        let mut idom: HashMap<BlockId, BlockId> = HashMap::default();
+        for &block in &rpo_order {
+            if let Some(d) = idom_at(&idom_of, block) {
+                idom.insert(block, d);
+            }
+        }
+        let mut rpo_number: HashMap<BlockId, u32> = HashMap::default();
+        for (i, &block) in rpo_order.iter().enumerate() {
+            rpo_number.insert(block, i as u32);
+        }
+
         // Step 4: Build children map from idom.
-        let mut children: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+        let mut children: HashMap<BlockId, Vec<BlockId>> = HashMap::default();
         for (&block, &dom) in &idom {
             if block != dom {
                 children.entry(dom).or_default().push(block);
@@ -150,9 +176,6 @@ impl DomTree {
         for kids in children.values_mut() {
             kids.sort_by_key(|b| rpo_number.get(b).copied().unwrap_or(u32::MAX));
         }
-
-        // Step 5: Compute dominance frontiers.
-        let dom_frontier = compute_dominance_frontiers(&idom, func, &rpo_order);
 
         // Step 6: Euler-tour stamps over the dominator tree.
         //
@@ -166,8 +189,8 @@ impl DomTree {
         // Iterative DFS: recursion would blow the stack on the 1202-block
         // functions this is meant to speed up.
         let (tin, tout) = {
-            let mut tin: HashMap<BlockId, u32> = HashMap::new();
-            let mut tout: HashMap<BlockId, u32> = HashMap::new();
+            let mut tin: HashMap<BlockId, u32> = HashMap::default();
+            let mut tout: HashMap<BlockId, u32> = HashMap::default();
             let mut timer: u32 = 0;
             // (block, next child index to visit)
             let mut stack: Vec<(BlockId, usize)> = Vec::new();
@@ -201,7 +224,6 @@ impl DomTree {
         Self {
             idom,
             children,
-            dom_frontier,
             rpo_number,
             rpo_order,
             tin,
@@ -251,9 +273,27 @@ impl DomTree {
         self.children.get(&block).map_or(&[], |v| v.as_slice())
     }
 
-    /// Returns the dominance frontier of `block`.
-    pub fn dominance_frontier(&self, block: BlockId) -> Option<&HashSet<BlockId>> {
-        self.dom_frontier.get(&block)
+    /// Returns the dominance frontier of `block`, computed ON DEMAND.
+    ///
+    /// This used to be computed EAGERLY in `compute` and stored. Nothing in the
+    /// compiler ever read it -- the only callers are this module's own tests --
+    /// and `DomTree::compute` is hot: the loop-rotation driver rebuilds it once
+    /// per rewrite, so on the `loops` scaling shape at n=120 the frontiers cost
+    /// 71ms across 300 builds, about 9% of the whole optimization phase, for a
+    /// result that was then dropped.
+    ///
+    /// Computing here needs `func` for the predecessor lists, which the tree
+    /// does not retain. It recomputes every frontier per call and returns an
+    /// owned set; that is fine for the test-only usage, and if a real consumer
+    /// ever appears it should cache the whole map rather than call this per
+    /// block.
+    #[must_use]
+    pub fn dominance_frontier(
+        &self,
+        func: &MachFunction,
+        block: BlockId,
+    ) -> Option<HashSet<BlockId>> {
+        compute_dominance_frontiers(&self.idom, func, &self.rpo_order).remove(&block)
     }
 
     /// Returns the reverse postorder of blocks.
@@ -267,6 +307,15 @@ impl DomTree {
     }
 }
 
+/// Immediate dominator of `block` in the dense fixpoint state, if assigned.
+///
+/// A block id outside the array reads as unassigned, which is the same answer
+/// the previous `HashMap::contains_key` gave for an absent key.
+#[inline]
+fn idom_at(idom_of: &[Option<BlockId>], block: BlockId) -> Option<BlockId> {
+    idom_of.get(block.0 as usize).copied().flatten()
+}
+
 /// Intersect operation from Cooper/Harvey/Kennedy.
 ///
 /// Walks two fingers up the idom tree until they meet. Uses RPO numbers
@@ -274,16 +323,21 @@ impl DomTree {
 fn intersect(
     mut b1: BlockId,
     mut b2: BlockId,
-    idom: &HashMap<BlockId, BlockId>,
-    rpo_number: &HashMap<BlockId, u32>,
+    idom_of: &[Option<BlockId>],
+    rpo_num: &[u32],
 ) -> BlockId {
+    // Same walk as before, over arrays instead of hash maps. The `expect`s
+    // preserve the previous `idom[&b]` contract EXACTLY: indexing a `HashMap`
+    // with an absent key panics, so an unassigned idom here was always a bug,
+    // never a silently-tolerated case. Callers only intersect predecessors they
+    // have already confirmed assigned, and the walk ascends toward the entry,
+    // which is assigned first.
+    let number = |b: BlockId| rpo_num.get(b.0 as usize).copied().unwrap_or(u32::MAX);
     while b1 != b2 {
-        let n1 = rpo_number.get(&b1).copied().unwrap_or(u32::MAX);
-        let n2 = rpo_number.get(&b2).copied().unwrap_or(u32::MAX);
-        if n1 > n2 {
-            b1 = idom[&b1];
+        if number(b1) > number(b2) {
+            b1 = idom_at(idom_of, b1).expect("intersect ascends only assigned idoms");
         } else {
-            b2 = idom[&b2];
+            b2 = idom_at(idom_of, b2).expect("intersect ascends only assigned idoms");
         }
     }
     b1
@@ -291,7 +345,7 @@ fn intersect(
 
 /// Compute reverse postorder via iterative DFS from entry.
 fn compute_rpo(func: &MachFunction, entry: BlockId) -> Vec<BlockId> {
-    let mut visited: HashSet<BlockId> = HashSet::new();
+    let mut visited: HashSet<BlockId> = HashSet::default();
     let mut postorder: Vec<BlockId> = Vec::new();
     let mut stack: Vec<(BlockId, usize)> = vec![(entry, 0)];
     visited.insert(entry);
@@ -326,7 +380,7 @@ fn compute_dominance_frontiers(
     func: &MachFunction,
     rpo_order: &[BlockId],
 ) -> HashMap<BlockId, HashSet<BlockId>> {
-    let mut df: HashMap<BlockId, HashSet<BlockId>> = HashMap::new();
+    let mut df: HashMap<BlockId, HashSet<BlockId>> = HashMap::default();
 
     for &block in rpo_order {
         let preds = &func.block(block).preds;
@@ -488,13 +542,13 @@ mod tests {
         let dom = DomTree::compute(&func);
 
         // DF(bb1) = {bb3} (bb1 -> bb3 is a join point)
-        let df1 = dom.dominance_frontier(BlockId(1)).unwrap();
+        let df1 = dom.dominance_frontier(&func, BlockId(1)).unwrap();
         assert!(df1.contains(&BlockId(3)));
         // DF(bb2) = {bb3}
-        let df2 = dom.dominance_frontier(BlockId(2)).unwrap();
+        let df2 = dom.dominance_frontier(&func, BlockId(2)).unwrap();
         assert!(df2.contains(&BlockId(3)));
         // DF(bb0) = {} (bb0 dominates everything)
-        let df0 = dom.dominance_frontier(BlockId(0));
+        let df0 = dom.dominance_frontier(&func, BlockId(0));
         assert!(df0.is_none() || df0.unwrap().is_empty());
     }
 
@@ -527,7 +581,7 @@ mod tests {
         let dom = DomTree::compute(&func);
 
         // DF(bb3) = {bb1} (back-edge target)
-        let df3 = dom.dominance_frontier(BlockId(3)).unwrap();
+        let df3 = dom.dominance_frontier(&func, BlockId(3)).unwrap();
         assert!(df3.contains(&BlockId(1)));
     }
 

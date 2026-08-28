@@ -291,6 +291,16 @@ enum X86SourceOp {
     /// responsibility, exactly like every recognizer's loop-equivalence — this
     /// per-instruction obligation certifies the general SAD semantic.
     PsadbwByteSad,
+    /// LOW-QWORD PACK (`PUNPCKLQDQ`): `dst = [a.lane0, b.lane0]`.
+    /// MACHINE = `encode_punpcklqdq` (the real low-lane interleave over the
+    /// emitted operands); SOURCE = `encode_trust_ir_pack_low_qwords` (the
+    /// `V2I64PackLanes` spec) applied to the same operands' low lanes.
+    /// Reconstructed provenance credits it non-degenerate (the PSADBW rule):
+    /// a wrong emitted opcode or swapped operand wiring reconstructs to a
+    /// different machine expression and REFUTES. Emitted by the saxpy-Q
+    /// vectorizer preheader as the `[K;2]` register-form broadcast
+    /// (`PUNPCKLQDQ x, x` with both sources the MOVQ-loaded scalar).
+    PackLowQwords,
 
     // --- MEMORY loads/stores (genuine effective-address reconstruction) ---
     /// Integer/FP memory LOAD (`MovRM8/16/32/(64)`, `MovssRM`/`MovsdRM`). The
@@ -355,6 +365,32 @@ enum X86SourceOp {
     /// predicate maps to a different difference and REFUTES. `ImulRM` is the
     /// register-memory signed multiply `dst = reg * load(ea)` (low half, wrapping).
     MemAlu {
+        op: trust_cg_lower::instructions::Opcode,
+    },
+
+    // --- MEMORY-destination RMW ALU (store(ea, load(ea) OP reg)) ---
+    /// Memory-destination read-modify-write ALU (`XorMR`/`AddMR` and their SIB
+    /// siblings): `[ea] = load(ea) OP src_reg`. Operand shape
+    /// `[MemAddr/SibMemAddr, src_reg]`, mirroring `MemStore`. The obligation is
+    /// the literal COMPOSITION of the `MemStore` and `MemAlu` shapes:
+    ///
+    /// * SOURCE  = `concat(ir_ea, trust_ir(OP, load(ir_ea), src))`,
+    /// * MACHINE = `concat(machine_ea, x86_alu(load(machine_ea), src))`,
+    ///
+    /// with `ir_ea` the trust_ir `encode_trust_ir_binop` EA composition and
+    /// `machine_ea` the INDEPENDENT x86 `encode_lea_*` encoder over the SAME
+    /// base/index/scale/disp, and the machine value half built by the REAL
+    /// machine ALU encoder (`encode_xor_rr`/`encode_add_rr`) keyed off the REAL
+    /// emitted opcode. Refutations: a wrong EA diverges in BOTH halves (the
+    /// deterministic [`SmtExpr::MemLoad`] model makes `load(ea)` a bijection of
+    /// `ea`); Add-for-Xor diverges in the value half; a dropped/wrong source
+    /// register diverges in the value half; degenerating to a plain store (no
+    /// load term) diverges in the value half. The access width is fixed at 64
+    /// by the opcodes (REX.W forms only). Flags are deliberately NOT part of
+    /// the value obligation — the identical posture to `MemAlu` (AddRM/ImulRM);
+    /// the flag contract is owned by `x86_writes_flags`/
+    /// `x86_defines_all_cc_flags` and the TV-5 post-RA flag-effect model.
+    MemRmw {
         op: trust_cg_lower::instructions::Opcode,
     },
 
@@ -704,6 +740,9 @@ fn x86_opcode_to_source_op(opcode: X86Opcode) -> Option<(X86SourceOp, X86AluArit
             X86AluArity::Binary,
         )),
 
+        // ---- LOW-QWORD PACK: the [K;2] register-form broadcast builder ----
+        O::Punpcklqdq => Some((X86SourceOp::PackLowQwords, X86AluArity::Binary)),
+
         // ---- MEMORY-source ALU: reg OP load(ea) ----
         O::AddRM => Some((
             X86SourceOp::MemAlu { op: Opcode::Iadd },
@@ -725,6 +764,18 @@ fn x86_opcode_to_source_op(opcode: X86Opcode) -> Option<(X86SourceOp, X86AluArit
         // shape differs, and `x86_reconstruct_effective_address` models both.
         O::ImulRM | O::ImulRMSib => Some((
             X86SourceOp::MemAlu { op: Opcode::Imul },
+            X86AluArity::Binary,
+        )),
+
+        // ---- MEMORY-destination RMW ALU: [ea] = load(ea) OP src ----
+        // The SIB siblings share the identical value semantics; only the EA
+        // shape differs, and `x86_reconstruct_effective_address` models both.
+        O::XorMR | O::XorMRSib => Some((
+            X86SourceOp::MemRmw { op: Opcode::Bxor },
+            X86AluArity::Binary,
+        )),
+        O::AddMR | O::AddMRSib => Some((
+            X86SourceOp::MemRmw { op: Opcode::Iadd },
             X86AluArity::Binary,
         )),
 
@@ -804,6 +855,12 @@ fn x86_emitted_op_class(inst: &X86ISelInst) -> Option<OpClass> {
     };
     match &source_op {
         X86SourceOp::Binary(op) | X86SourceOp::MemAlu { op } => int_binop_class(op),
+        // Memory-destination RMW ALU: the semantic class follows the ALU op
+        // exactly as MemAlu's does (AddMR* -> IntAdd; XorMR* -> Bitwise).
+        X86SourceOp::MemRmw { op } => match op {
+            trust_cg_lower::instructions::Opcode::Bxor => Some(OpClass::Bitwise),
+            _ => int_binop_class(op),
+        },
         X86SourceOp::Bitwise(_) | X86SourceOp::Not => Some(OpClass::Bitwise),
         X86SourceOp::Shift(_) => Some(OpClass::Shift),
         X86SourceOp::Neg => Some(OpClass::IntNeg),
@@ -836,7 +893,8 @@ fn x86_emitted_op_class(inst: &X86ISelInst) -> Option<OpClass> {
         X86SourceOp::ImulImm => Some(OpClass::IntMul),
         X86SourceOp::PackedIntBinary { .. }
         | X86SourceOp::PackedIntCmp { .. }
-        | X86SourceOp::PsadbwByteSad => Some(OpClass::VecInt),
+        | X86SourceOp::PsadbwByteSad
+        | X86SourceOp::PackLowQwords => Some(OpClass::VecInt),
         X86SourceOp::PackedV128Bitwise(_) => Some(OpClass::VecBitwise),
         X86SourceOp::PackedFpBinary { .. } => Some(OpClass::VecFp),
         X86SourceOp::InPlaceIncDec { is_inc } => Some(if *is_inc {
@@ -1049,6 +1107,9 @@ pub fn reconstruct_alu_obligation(inst: &X86ISelInst) -> Option<ProofObligation>
         X86SourceOp::PsadbwByteSad => {
             return reconstruct_x86_psadbw(inst, from_opcode);
         }
+        X86SourceOp::PackLowQwords => {
+            return reconstruct_x86_pack_low_qwords(inst, from_opcode);
+        }
         X86SourceOp::PackedFpBinary { op, lane_bits } => {
             return reconstruct_x86_packed_fp_binary(inst, op, *lane_bits, from_opcode);
         }
@@ -1086,6 +1147,15 @@ pub fn reconstruct_alu_obligation(inst: &X86ISelInst) -> Option<ProofObligation>
         }
         X86SourceOp::MemAlu { op } => {
             return reconstruct_x86_mem_alu(inst, op, from_opcode);
+        }
+        X86SourceOp::MemRmw { op } => {
+            // Mirror MemStore: a proof-origin instance (e.g. a hypothetical
+            // atomic-origin RMW) keeps its stronger origin proof; fail closed
+            // here so the verifier routes to `proof_origin_to_proof_query`.
+            if inst.proof_origin.is_some() {
+                return None;
+            }
+            return reconstruct_x86_mem_rmw(inst, op, from_opcode);
         }
         X86SourceOp::InPlaceIncDec { is_inc } => {
             return reconstruct_x86_inc_dec(inst, *is_inc, from_opcode);
@@ -1979,6 +2049,94 @@ fn reconstruct_x86_mem_alu(
     Some(ProofObligation {
         name: format!(
             "RECONSTRUCTED x86_64 {op:?}RM_{width} -> {:?} (reg OP load(real-EA), real-operand)",
+            inst.opcode
+        ),
+        trust_ir_expr,
+        aarch64_expr: machine_expr,
+        inputs,
+        preconditions: vec![],
+        fp_inputs: vec![],
+        category: Some(crate::lowering_proof::TransvalCheckKind::InstructionLowering),
+        machine_side_provenance: MachineSideProvenance::Reconstructed {
+            from_opcode,
+            arity: 2,
+        },
+    })
+}
+
+/// Reconstruct a memory-destination RMW ALU (`XorMR`/`AddMR` + SIB siblings):
+/// `[ea] = load(ea) OP src_reg`. Schema: `[MemAddr/SibMemAddr, src_reg]`. The
+/// obligation composes the `MemStore` shape (address half + stored-value half)
+/// with the `MemAlu` shape (the REAL machine ALU encoder over a load of the
+/// same EA):
+///
+/// * SOURCE  = `concat(ir_ea, trust_ir(OP, load(ir_ea, 64), src))`,
+/// * MACHINE = `concat(machine_ea, x86_alu(load(machine_ea, 64), src))`.
+///
+/// The deterministic [`SmtExpr::MemLoad`] model makes `load(ea)` a bijection of
+/// `ea`, so a wrong base/index/scale/disp REFUTES in both halves; the machine
+/// value half is keyed off the REAL emitted opcode (`encode_xor_rr` /
+/// `encode_add_rr`), so Add-for-Xor REFUTES; a dropped/wrong source register
+/// REFUTES in the value half; a plain store of `src` (no load term) REFUTES in
+/// the value half. Access width is 64, fixed by the opcodes (REX.W only).
+/// Flags are deliberately NOT part of the value obligation (same posture as
+/// `MemAlu`); the flag contract is owned by the effects model + TV-5.
+fn reconstruct_x86_mem_rmw(
+    inst: &X86ISelInst,
+    op: &trust_cg_lower::instructions::Opcode,
+    from_opcode: String,
+) -> Option<ProofObligation> {
+    use crate::trust_ir_semantics::{encode_trust_ir_binop, encode_trust_ir_bitwise_binop};
+    use crate::x86_64_semantics::{encode_add_rr, encode_xor_rr};
+    use trust_cg_lower::instructions::Opcode;
+
+    if inst.operands.len() != 2 {
+        return None;
+    }
+    // The source register: a 64-bit GPR (the only width these opcodes carry).
+    let src = &inst.operands[1];
+    let width = x86_operand_reg_width_bits(src)?;
+    if width != 64 {
+        return None;
+    }
+    let size = x86_width_to_operand_size(width);
+    let ty = x86_width_to_type(width)?;
+
+    let (ir_ea, machine_ea, mut inputs) = x86_reconstruct_effective_address(&inst.operands[0])?;
+
+    let sym_src = SmtExpr::var("recon_src", width);
+    inputs.push(("recon_src".to_string(), width));
+
+    // The slot's pre-value: load(ea) at the access width on EACH side's own EA
+    // encoder — this is what makes the RMW a read of the slot, not a plain
+    // store, and what refutes a wrong EA through the value half too.
+    let ir_mem = SmtExpr::mem_load(ir_ea.clone(), width, false, width);
+    let machine_mem = SmtExpr::mem_load(machine_ea.clone(), width, false, width);
+
+    // SOURCE value half: the INTENDED trust_ir op over (load(ir_ea), src).
+    let src_value = match op {
+        Opcode::Bxor => encode_trust_ir_bitwise_binop(op, ty, ir_mem, sym_src.clone()),
+        Opcode::Iadd => encode_trust_ir_binop(op, ty, ir_mem, sym_src.clone()),
+        // No other RMW op is enrolled; fail closed.
+        _ => return None,
+    };
+    // MACHINE value half: the REAL emitted opcode's ALU encoder over
+    // (load(machine_ea), src) — keyed off inst.opcode, NOT `op`, so a
+    // table-vs-emission mismatch (Add-for-Xor) REFUTES.
+    let machine_value = match inst.opcode {
+        X86Opcode::XorMR | X86Opcode::XorMRSib => encode_xor_rr(size, machine_mem, sym_src),
+        X86Opcode::AddMR | X86Opcode::AddMRSib => encode_add_rr(size, machine_mem, sym_src),
+        _ => return None,
+    };
+
+    // concat(ea, value): the address half refutes a wrong EA; the value half
+    // ties the RMW computation to the slot.
+    let trust_ir_expr = ir_ea.concat(src_value);
+    let machine_expr = machine_ea.concat(machine_value);
+
+    Some(ProofObligation {
+        name: format!(
+            "RECONSTRUCTED x86_64 MemRmw_{op:?}_{width} -> {:?} (store(real-EA, load(real-EA) OP src), real-operand)",
             inst.opcode
         ),
         trust_ir_expr,
@@ -3142,6 +3300,46 @@ fn reconstruct_x86_packed_int_binary(
 /// Reconstructed provenance is what credits this obligation non-degenerate even
 /// though a correct lowering reconstructs to `sad == sad` (same rule as the
 /// lane-wise packed family and the bit-count reductions).
+/// Reconstruct the LOW-QWORD PACK (`PUNPCKLQDQ`): `dst = [a.lane0, b.lane0]`.
+/// Schema: `[dst_xmm, a_xmm, b_xmm]`, all 128-bit. MACHINE = `encode_punpcklqdq`
+/// (the real low-lane interleave); SOURCE = `encode_trust_ir_pack_low_qwords`
+/// (the `V2I64PackLanes` spec) applied to the SAME operands' low lanes.
+/// Reconstructed provenance credits this non-degenerate (the PSADBW rule): a
+/// wrong emitted opcode (e.g. the high-lane pairing) or swapped
+/// non-commutative wiring (`[b.lane0, a.lane0]`) reconstructs to a different
+/// machine expression and REFUTES.
+fn reconstruct_x86_pack_low_qwords(
+    inst: &X86ISelInst,
+    from_opcode: String,
+) -> Option<ProofObligation> {
+    use crate::trust_ir_semantics::encode_trust_ir_pack_low_qwords;
+    use crate::x86_64_semantics::encode_punpcklqdq;
+
+    if !x86_two_xmm128_operands(inst) {
+        return None;
+    }
+    let a = x86_v128_operand("recon_a");
+    let b = x86_v128_operand("recon_b");
+
+    let machine_expr = match inst.opcode {
+        X86Opcode::Punpcklqdq => encode_punpcklqdq(a.clone(), b.clone()),
+        _ => return None,
+    };
+    let x = crate::smt::lane_extract(&a, crate::smt::VectorArrangement::D2, 0);
+    let y = crate::smt::lane_extract(&b, crate::smt::VectorArrangement::D2, 0);
+    let trust_ir_expr = encode_trust_ir_pack_low_qwords(x, y);
+
+    Some(x86_packed_obligation(
+        format!(
+            "RECONSTRUCTED x86_64 low-qword pack -> {:?} (v128 lane pack)",
+            inst.opcode
+        ),
+        trust_ir_expr,
+        machine_expr,
+        from_opcode,
+    ))
+}
+
 fn reconstruct_x86_psadbw(inst: &X86ISelInst, from_opcode: String) -> Option<ProofObligation> {
     use crate::trust_ir_semantics::encode_trust_ir_byte_sad;
     use crate::x86_64_semantics::encode_psadbw;
@@ -3479,6 +3677,7 @@ pub fn representative_reconstructable_inst(opcode: X86Opcode) -> Option<X86ISelI
         | X86SourceOp::PackedIntCmp { .. }
         | X86SourceOp::PackedV128Bitwise(_)
         | X86SourceOp::PsadbwByteSad
+        | X86SourceOp::PackLowQwords
         | X86SourceOp::PackedFpBinary { .. } => {
             let xv = |id: u32| X86ISelOperand::VReg(VReg::new(id, RegClass::Fpr128));
             vec![xv(0), xv(1), xv(2)]
@@ -3645,6 +3844,36 @@ pub fn representative_reconstructable_inst(opcode: X86Opcode) -> Option<X86ISelI
                 },
             ]
         }
+        // ---- MEMORY-destination RMW ALU: [mem, src_reg]. The SIB opcodes must
+        //      carry a SibMemAddr representative (the pipeline's SIB-opcode
+        //      integrity guard rejects a MemAddr-shaped SIB inst — the same
+        //      reason as the ImulRMSib special case above); the base-only
+        //      opcodes carry a MemAddr. The source register is always Gpr64
+        //      (REX.W forms only). ----
+        X86SourceOp::MemRmw { .. } => {
+            if matches!(opcode, X86Opcode::XorMRSib | X86Opcode::AddMRSib) {
+                return Some(X86ISelInst::new(
+                    opcode,
+                    vec![
+                        X86ISelOperand::SibMemAddr {
+                            base: Box::new(r64(0)),
+                            index: Box::new(r64(1)),
+                            scale: 1,
+                            disp: 0,
+                        },
+                        r64(2),
+                    ],
+                ));
+            }
+            vec![
+                X86ISelOperand::MemAddr {
+                    base: Box::new(r64(0)),
+                    disp: 0,
+                },
+                r64(1),
+            ]
+        }
+
         // ---- IN-PLACE Inc/Dec: [dst] (read-modify-write of one register). ----
         X86SourceOp::InPlaceIncDec { .. } => vec![r64(0)],
 
@@ -3779,52 +4008,11 @@ pub fn reconstruction_discharges_valid(opcode: X86Opcode, config: &VerificationC
 /// walk stays on the calling thread exactly as before.
 const PREPASS_PAR_MIN_INSTS: usize = 16;
 
-/// Stack size for the pre-pass worker threads. MUST match the dedicated
-/// verifier-thread stack the callers already provide
-/// (`run_on_proof_verifier_stack`, 32 MiB): per-instruction discharge
-/// recurses over SMT expression trees, which overflows a default-size rayon
-/// worker stack on deep obligations.
-const PREPASS_STACK_SIZE: usize = 32 * 1024 * 1024;
-
-/// The process-wide rayon pool for the per-instruction verdict pre-pass.
-///
-/// ONE shared pool (not per-call): the per-FUNCTION cert lane in
-/// trust-cg-codegen already fans out across its own bounded pool, and every
-/// one of those workers runs a pre-pass — a per-call pool would multiply
-/// thread counts. `install` from multiple threads concurrently is supported
-/// (their jobs interleave in the shared queue), so total pre-pass threads
-/// stay bounded by this pool's size. Sized to the host's available
-/// parallelism, bounded by an EXPLICIT `TRUST_CG_MAX_PARALLELISM` (the same
-/// operator knob `trust_cg_codegen::resource_limits` honors; duplicated here
-/// by name because trust-cg-verify sits BELOW trust-cg-codegen in the crate
-/// graph). `None` when the host resolves to a single worker (fall back to
-/// the sequential walk) or the pool fails to build (never fail a compile
-/// over a thread-pool error — the serial walk is always available).
-fn verifier_prepass_pool() -> Option<&'static rayon::ThreadPool> {
-    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
-    POOL.get_or_init(|| {
-        let available = std::thread::available_parallelism().map_or(1, usize::from);
-        let workers = match std::env::var("TRUST_CG_MAX_PARALLELISM")
-            .ok()
-            .as_deref()
-            .and_then(|value| value.trim().parse::<usize>().ok())
-            .filter(|value| *value > 0)
-        {
-            Some(explicit) => explicit.min(available).max(1),
-            None => available,
-        };
-        if workers < 2 {
-            return None;
-        }
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(workers)
-            .stack_size(PREPASS_STACK_SIZE)
-            .thread_name(|idx| format!("trust-cg-x86-prepass-{idx}"))
-            .build()
-            .ok()
-    })
-    .as_ref()
-}
+/// The pre-pass shares the process-wide large-stack pool used by whole-function
+/// verification (`crate::resource_limits`). That is essential when codegen
+/// verifies multiple functions concurrently: nested pre-passes interleave on
+/// the same workers instead of constructing a second full-width set of 32 MiB
+/// stacks. Pool construction failure retains the serial walk below.
 
 /// The pre-pass pool IF fanning out `item_count` instructions is worthwhile.
 ///
@@ -3842,7 +4030,7 @@ fn verifier_prepass_pool_for_items(item_count: usize) -> Option<&'static rayon::
     if crate::verdict_db::reconstructed_live_solver_enabled() {
         return None;
     }
-    verifier_prepass_pool()
+    crate::resource_limits::proof_verifier_parallel_pool()
 }
 
 // ---------------------------------------------------------------------------

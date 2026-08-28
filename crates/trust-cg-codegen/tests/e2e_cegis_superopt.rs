@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use trust_cg_codegen::pipeline::{
     CegisPassStats, OptLevel, Pipeline, PipelineConfig, build_add_test_function,
 };
+use trust_cg_ir::regs::X0;
 use trust_cg_ir::{
     AArch64Opcode, MachFunction, MachInst, MachOperand, RegClass, Signature, Type as IrType, VReg,
 };
@@ -104,6 +105,20 @@ fn append_inst(func: &mut MachFunction, opcode: AArch64Opcode, operands: Vec<Mac
 }
 
 #[cfg(feature = "verify")]
+fn append_i32_return(func: &mut MachFunction, value: VReg) {
+    let copy = MachInst::new(
+        AArch64Opcode::MovR,
+        vec![MachOperand::PReg(X0), MachOperand::VReg(value)],
+    );
+    let id = func.push_inst(copy);
+    func.append_inst(func.entry, id);
+
+    let ret = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
+    let id = func.push_inst(ret);
+    func.append_inst(func.entry, id);
+}
+
+#[cfg(feature = "verify")]
 fn build_layer_a_mul_zero_func(name: &str, class: RegClass, optimized: bool) -> MachFunction {
     let mut func = MachFunction::new(
         name.to_string(),
@@ -141,11 +156,7 @@ fn build_layer_a_mul_zero_func(name: &str, class: RegClass, optimized: bool) -> 
         );
     }
 
-    append_inst(
-        &mut func,
-        AArch64Opcode::Ret,
-        vec![MachOperand::VReg(v_dst)],
-    );
+    append_i32_return(&mut func, v_dst);
     func
 }
 
@@ -197,11 +208,7 @@ fn build_layer_b_movz_add_func(
         );
     }
 
-    append_inst(
-        &mut func,
-        AArch64Opcode::Ret,
-        vec![MachOperand::VReg(v_dst)],
-    );
+    append_i32_return(&mut func, v_dst);
     func
 }
 

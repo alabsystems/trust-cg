@@ -13245,13 +13245,19 @@ impl X86InstructionSelector {
         Self::require_args(inst, 1, "StructGep")?;
         Self::require_result(inst, "StructGep")?;
 
-        let Type::Struct(fields) = &struct_ty else {
-            return Err(X86ISelError::UnsupportedOpcode(format!(
-                "{:?}",
-                inst.opcode
-            )));
+        // `Array(t, n)` is the compact spelling of `Struct([t; n])`; both index
+        // through the same `Type::offset_of`.
+        let field_count = match &struct_ty {
+            Type::Struct(fields) => fields.len(),
+            Type::Array(_, count) => *count as usize,
+            _ => {
+                return Err(X86ISelError::UnsupportedOpcode(format!(
+                    "{:?}",
+                    inst.opcode
+                )));
+            }
         };
-        if field_index as usize >= fields.len() {
+        if field_index as usize >= field_count {
             return Err(X86ISelError::UnsupportedOpcode(format!(
                 "{:?}",
                 inst.opcode

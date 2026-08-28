@@ -1576,6 +1576,48 @@ impl AArch64Opcode {
         )
     }
 
+    /// True for the trap/guard pseudo-instructions that carry `IS_BRANCH` only
+    /// because they flow control by TRAPPING. They never take a branch-target
+    /// operand at any stage; their `Imm` operands are payloads — a bounds
+    /// limit, a shift bitwidth, an overflow op-tag.
+    ///
+    /// Consumers that ask "is this a branch?" as a stand-in for "does this
+    /// carry a branch target?" must exclude these. The symbolic-CFG-authority
+    /// check is the motivating case: it flags a branch that has already been
+    /// resolved to a displacement, using "has an `Imm` and no `Block`" as the
+    /// proxy. That proxy is sound for a real branch and a FALSE POSITIVE for
+    /// every opcode below, because a payload immediate is indistinguishable
+    /// from a code offset by shape alone.
+    ///
+    /// AArch64 is the only backend that marks these `IS_BRANCH` at all —
+    /// x86-64 (`x86_64_ops.rs`) and RISC-V (`riscv_ops.rs`) give the same
+    /// pseudos `IS_PSEUDO | HAS_SIDE_EFFECTS`, which is why neither of them
+    /// needs this predicate. The flags here are deliberate (see the `Trap*`
+    /// arm of `default_flags()`: "control-flowing side effects until proof opts
+    /// them"), so the divergence is resolved on the consumer side.
+    ///
+    /// This lists the pseudos to EXCLUDE rather than the branches to INCLUDE,
+    /// and that direction is load-bearing: a new trap pseudo missing from this
+    /// list produces a loud spurious rejection, while a new branch opcode
+    /// missing from an include-list would silently escape the gate. Keep it
+    /// exactly in sync with the `Trap*` arms of `default_flags()`.
+    pub const fn is_trap_pseudo(self) -> bool {
+        use AArch64Opcode::*;
+        matches!(
+            self,
+            TrapOverflow
+                | TrapOverflowExact
+                | TrapBoundsCheck
+                | TrapBoundsCheckExact
+                | TrapNull
+                | TrapNullIfZero
+                | TrapDivZero
+                | TrapDivZeroIfZero
+                | TrapShiftRange
+                | TrapShiftRangeIfOOB
+        )
+    }
+
     /// Returns true if this opcode produces a value (operand[0] is a def).
     ///
     /// Instructions that don't produce values: CMP, TST, STR, STP, branches,
@@ -2935,5 +2977,57 @@ mod tests {
                 col: 0
             })
         );
+    }
+
+    /// `is_trap_pseudo` exists to separate "flows control" from "carries a
+    /// branch target". Both halves are asserted here: every trap pseudo must
+    /// be a branch AND a trap pseudo (so a consumer that filters on
+    /// `is_branch() && !is_trap_pseudo()` still sees it as control flow),
+    /// and every REAL branch must be a branch and NOT a trap pseudo (so the
+    /// filter never punches a hole in a gate).
+    ///
+    /// If a new `Trap*` opcode is added to `flags()` without being added to
+    /// `is_trap_pseudo`, add it here too — this test is the reminder.
+    #[test]
+    fn trap_pseudos_are_branches_that_carry_no_branch_target() {
+        use AArch64Opcode::*;
+
+        const TRAP_PSEUDOS: &[AArch64Opcode] = &[
+            TrapOverflow,
+            TrapOverflowExact,
+            TrapBoundsCheck,
+            TrapBoundsCheckExact,
+            TrapNull,
+            TrapNullIfZero,
+            TrapDivZero,
+            TrapDivZeroIfZero,
+            TrapShiftRange,
+            TrapShiftRangeIfOOB,
+        ];
+        for op in TRAP_PSEUDOS {
+            assert!(
+                op.is_trap_pseudo(),
+                "{op:?} is a Trap* pseudo but is_trap_pseudo() says no"
+            );
+            assert!(
+                op.default_flags().is_branch(),
+                "{op:?} lost IS_BRANCH; is_trap_pseudo's whole purpose is to \
+                 exclude it from branch-target checks, so re-check both"
+            );
+        }
+
+        // The other side: real branches must NOT be excluded by the predicate,
+        // or the symbolic-CFG-authority gate stops seeing them.
+        const REAL_BRANCHES: &[AArch64Opcode] = &[B, BCond, Bcc, Cbz, Cbnz, Tbz, Tbnz, Br];
+        for op in REAL_BRANCHES {
+            assert!(
+                op.default_flags().is_branch(),
+                "{op:?} should still be a branch"
+            );
+            assert!(
+                !op.is_trap_pseudo(),
+                "{op:?} is a REAL branch — excluding it would blind the gate"
+            );
+        }
     }
 }

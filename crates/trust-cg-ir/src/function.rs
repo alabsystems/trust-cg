@@ -260,6 +260,24 @@ impl Type {
     ///
     /// Returns `None` if this is not a struct type or the index is out of range.
     pub fn offset_of(&self, field_index: usize) -> Option<u32> {
+        // An ARRAY is indexable by the same field index as the equivalent
+        // uniform struct: `Array(t, n)` and `Struct([t; n])` place element `k`
+        // at the same byte offset, because `Self::bytes()` models an array as
+        // `elem.bytes() * count` (stride == element size, no inter-element
+        // padding) and the struct walk below adds `align_to(offset, t.align())`
+        // per field, which is a no-op when every field is the same `t`.
+        //
+        // Returning `None` here is NOT harmless: both `select_struct_gep`
+        // implementations do `offset_of(..).unwrap_or(0)`, so a missing arm
+        // silently addresses element 0 for every index.
+        if let Self::Array(elem, count) = self {
+            if field_index >= *count as usize {
+                return None;
+            }
+            return u32::try_from(field_index)
+                .ok()
+                .and_then(|index| index.checked_mul(elem.bytes()));
+        }
         let Self::Struct(fields) = self else {
             return None;
         };
@@ -930,6 +948,51 @@ impl MachFunction {
 
 #[cfg(test)]
 mod tests {
+
+    /// The array spelling of a uniform aggregate MUST index identically to the
+    /// struct spelling -- `memory_slot_lane_ty` in the rustc bridge emits
+    /// `Array(lane, n)` where it used to emit `Tuple([lane; n])`, and every
+    /// `StructGep` resolves the element offset through `offset_of`.
+    ///
+    /// This is a REGRESSION test for a real wrong-code bug: `offset_of` returned
+    /// `None` for arrays while both `select_struct_gep` implementations do
+    /// `.unwrap_or(0)`, so every element resolved to offset 0 and an sret
+    /// aggregate return read the wrong lanes. It survived the 18-program
+    /// byte-identity corpus and was caught only by `shape-coverage`.
+    ///
+    /// `offset_of` is implemented TWICE -- here and in
+    /// `trust_cg_ir::function::Type` -- so both are pinned.
+    #[test]
+    fn array_indexes_identically_to_the_uniform_struct_spelling() {
+        for lane in [Type::I8, Type::I16, Type::I32, Type::I64, Type::I128] {
+            for n in [1usize, 2, 3, 12, 64] {
+                let array = Type::Array(Box::new(lane.clone()), n as u32);
+                let structure = Type::Struct(vec![lane.clone(); n]);
+                assert_eq!(
+                    array.bytes(),
+                    structure.bytes(),
+                    "size mismatch for [{lane:?}; {n}]"
+                );
+                assert_eq!(
+                    array.align(),
+                    structure.align(),
+                    "align mismatch for [{lane:?}; {n}]"
+                );
+                for k in 0..n {
+                    assert_eq!(
+                        array.offset_of(k),
+                        structure.offset_of(k),
+                        "offset mismatch at element {k} of [{lane:?}; {n}]"
+                    );
+                }
+                assert_eq!(
+                    array.offset_of(n),
+                    None,
+                    "out-of-range element must be None for [{lane:?}; {n}]"
+                );
+            }
+        }
+    }
     use super::*;
     use crate::inst::{AArch64Opcode, MachInst};
     use crate::operand::MachOperand;

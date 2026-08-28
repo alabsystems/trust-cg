@@ -254,9 +254,16 @@ pub enum WasmOpcode {
     // =====================================================================
     // Constants — STRUCTURAL (value materialization, not a binary value op)
     // =====================================================================
-    /// `i32.const` (0x41) / `i64.const` (0x42) — push an immediate.
+    /// `i32.const` (0x41) / `i64.const` (0x42) — push a signed-LEB128 immediate.
     I32Const,
     I64Const,
+    /// `f32.const` (0x43) / `f64.const` (0x44) — push a RAW IEEE-754 payload.
+    /// Unlike the integer constants these immediates are NOT LEB128: the spec
+    /// fixes them at 4 and 8 little-endian bytes of the value's bit pattern, so
+    /// the signed-LEB decoder that credits `i32.const`/`i64.const` does not
+    /// reach them (see `coverage_gate::wasm_deferred_value_op_reason`).
+    F32Const,
+    F64Const,
 
     // =====================================================================
     // Locals / globals — STRUCTURAL
@@ -467,6 +474,8 @@ impl WasmOpcode {
             // Constants
             I32Const => 0x41,
             I64Const => 0x42,
+            F32Const => 0x43,
+            F64Const => 0x44,
             // Locals / globals
             LocalGet => 0x20,
             LocalSet => 0x21,
@@ -688,6 +697,8 @@ mod tests {
             I64TruncSatF64U,
             I32Const,
             I64Const,
+            F32Const,
+            F64Const,
             LocalGet,
             LocalSet,
             LocalTee,
@@ -723,7 +734,7 @@ mod tests {
 
     #[test]
     fn opcode_count() {
-        assert_eq!(all_opcodes().len(), 141);
+        assert_eq!(all_opcodes().len(), 143);
     }
 
     #[test]

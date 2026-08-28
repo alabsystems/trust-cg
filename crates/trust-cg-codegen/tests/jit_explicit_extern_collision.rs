@@ -8,6 +8,7 @@ use trust_cg_codegen::jit::{JitCompiler, JitConfig};
 use trust_cg_ir::function::{MachFunction, Signature, Type};
 use trust_cg_ir::inst::{AArch64Opcode, MachInst};
 use trust_cg_ir::operand::MachOperand;
+use trust_cg_ir::regs::X0;
 
 extern "C" fn host_collision_target(x: i64) -> i64 {
     x + 1
@@ -25,7 +26,8 @@ fn build_same_name_external_call(symbol: &str) -> MachFunction {
     let bl_id = func.push_inst(bl);
     func.append_inst(entry, bl_id);
 
-    let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+    // Signature returns [I64] -> the ABI return-register alias set is [X0].
+    let ret = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
     let ret_id = func.push_inst(ret);
     func.append_inst(entry, ret_id);
 

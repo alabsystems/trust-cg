@@ -8,7 +8,7 @@ Copyright 2026 Andrew Yates | License: Apache-2.0
 WHY THIS EXISTS: `scripts/fuzz_campaign.sh` drives trust-ir-gen / csmith /
 yarpgen, but all of those feed the trust_ir and LLVM-import frontends. The rustc
 BRIDGE -- the primary user-facing path -- had no generative differential
-coverage at all: 18 beat-llvm programs plus 23 shape-coverage programs, all
+coverage at all: 18 beat-llvm programs plus 24 shape-coverage programs, all
 hand-written. Every one of the 14+ wrong-code bugs found on 2026-08-19/20 was
 caught by differential testing on a shape those 40 programs did not contain.
 

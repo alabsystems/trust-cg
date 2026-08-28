@@ -319,6 +319,22 @@ fn run_and_cmp_fuse(func: &mut MachFunction, mut provenance: Option<&mut Provena
         return false;
     }
 
+    // PREFILTER (exact): every rewrite consumes an `AndRR`/`AndRI` definition. Without one in the live block lists the pass cannot
+    // change anything, so skip the per-block scan and the read-count census. Over-approximating
+    // presence is safe; the check is a single opcode sweep.
+    if !(func
+        .block_order
+        .iter()
+        .flat_map(|b| func.block(*b).insts.iter())
+        .any(|&i| func.inst(i).opcode == AArch64Opcode::AndRR)
+        || func
+            .block_order
+            .iter()
+            .flat_map(|b| func.block(*b).insts.iter())
+            .any(|&i| func.inst(i).opcode == AArch64Opcode::AndRI))
+    {
+        return false;
+    }
     // Function-wide read counts: `t` must be single-use across the WHOLE
     // function, not merely this block.
     let read_counts = count_vreg_reads(func);

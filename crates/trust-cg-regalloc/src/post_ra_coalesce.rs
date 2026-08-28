@@ -239,10 +239,20 @@ pub fn post_ra_coalesce_with_config(
         // Reproduce the reference's block-start liveness snapshot: recompute
         // (from per-block summaries) iff a mutation occurred since the last
         // fixpoint.
+        // Sub-stage timers (TRUST_CG_TIME_PASSES, `stage=post-ra::*`); pure
+        // instrumentation. Measured 2026-08-27: live-out (the liveness cache's
+        // from-scratch re-solve after each coalesced block) is ~91% of this
+        // pass; an exact dependency-cone skip / region-restricted re-solve was
+        // tried and measured out (B/A 0.999 on the corpus — the affected
+        // region is effectively the whole function inside loops).
+        let tl = crate::ra_stage_start();
         let block_live_out: BTreeSet<PReg> = cache.live_out_at_block_start(func, block_idx);
+        crate::ra_stage_end(&func.name, false, "post-ra::live-out", tl);
 
         let copies_before = result.copies_removed;
+        let tc = crate::ra_stage_start();
         coalesce_block(func, &block_insts, &block_live_out, &mut result, cfg);
+        crate::ra_stage_end(&func.name, false, "post-ra::coalesce-block", tc);
         if result.copies_removed != copies_before {
             // The block's transfer function may have changed; its summary must
             // be rebuilt and the global fixpoint refreshed before the next

@@ -335,7 +335,11 @@ fn build_fibonacci_machir() -> MachFunction {
     func.append_inst(bb_done, id);
 
     // RET
-    let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+    // The AArch64 CFG-authority gate requires a `Ret` to carry EXACTLY the ABI
+    // return-register implicit-use alias set that production isel attaches via
+    // `AppleAArch64ABI::required_return_pregs`. This fixture's signature returns
+    // [I64], which classifies to X0, so the required set is exactly [X0].
+    let ret = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
     let id = func.push_inst(ret);
     func.append_inst(bb_done, id);
 
@@ -901,7 +905,11 @@ fn build_sum_1_to_n_machir() -> MachFunction {
     func.append_inst(bb_done, id);
 
     // RET
-    let inst = MachInst::new(AArch64Opcode::Ret, vec![]);
+    // The AArch64 CFG-authority gate requires a `Ret` to carry EXACTLY the ABI
+    // return-register implicit-use alias set that production isel attaches via
+    // `AppleAArch64ABI::required_return_pregs`. This fixture's signature returns
+    // [I64], which classifies to X0, so the required set is exactly [X0].
+    let inst = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
     let id = func.push_inst(inst);
     func.append_inst(bb_done, id);
 

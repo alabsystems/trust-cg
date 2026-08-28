@@ -38,12 +38,14 @@
 use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
-use trust_cg_ir::{InstFlags, InstId, MachFunction, MachOperand, PassId, ProvenanceMap, VReg};
+use trust_cg_ir::{
+    AArch64Opcode, InstFlags, InstId, MachFunction, MachOperand, PassId, ProvenanceMap, VReg,
+};
 
 use crate::cache::StableHasher;
 use crate::effects::{
     MemoryEffect, aarch64_for_each_def_position, aarch64_for_each_use_position,
-    aarch64_use_operand_positions, opcode_effect, single_inst_def,
+    aarch64_use_operand_positions, opcode_effect, reads_flags, single_inst_def, writes_flags,
 };
 use crate::pass_manager::{
     CertifiedPassCheckerRecord, CertifiedPassRunRecord, CertifiedPassRunStatus, MachinePass,
@@ -76,6 +78,11 @@ pub enum DceContract {
     /// Removing a pure unused value preserves all observable graph/certificate
     /// outputs under bound-propagation semantics.
     PureUnusedValueUnobservable,
+    /// Removing a def-less NZCV writer (CMP/TST) whose flags are overwritten by
+    /// the next NZCV writer in the same block before any reader, call, branch,
+    /// terminator, or opaque pseudo preserves every observable output: the only
+    /// state it writes is dead on every path.
+    DeadNzcvWriteUnobservable,
 }
 
 /// Result produced by the local certificate checker.
@@ -116,6 +123,32 @@ pub struct DceVisibilityFacts {
     pub certificate_output_visible: bool,
 }
 
+/// Where the flags written by a removed dead flag write die
+/// (`DceContract::DeadNzcvWriteUnobservable`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DeadFlagsExit {
+    /// Overwritten by this NZCV writer later in the same block.
+    NextWriter { inst_id: u32 },
+    /// The block ends (in a non-flag-reading terminator) and NZCV is dead on
+    /// entry to every listed successor: from each, every path reaches an NZCV
+    /// writer, or the function's exit, before any reader.
+    CfgDead { blocks: Vec<u32> },
+}
+
+/// NZCV facts recorded for a removed dead flag write
+/// (`DceContract::DeadNzcvWriteUnobservable`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DceFlagsFacts {
+    /// The opcode writes NZCV and defines no register (CMP/TST forms).
+    pub flags_only_writer: bool,
+    /// Instructions between the write and the end of the in-block scan, none
+    /// of which reads NZCV, is an opaque pseudo, or carries implicit operands
+    /// (calls are neutral: a reader after one still counts).
+    pub insts_between: u32,
+    /// How the flags die.
+    pub exit: DeadFlagsExit,
+}
+
 /// One checked DCE pass certificate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DceCertificate {
@@ -130,6 +163,9 @@ pub struct DceCertificate {
     pub use_def: DceUseDefFacts,
     pub side_effects: DceSideEffectFacts,
     pub visibility: DceVisibilityFacts,
+    /// Present exactly for `DeadNzcvWriteUnobservable` certificates.
+    #[serde(default)]
+    pub nzcv: Option<DceFlagsFacts>,
     pub contract: DceContract,
     pub domain: String,
     pub obligation_hash: String,
@@ -345,10 +381,13 @@ fn run_impl(
         //   (a) it defines a VReg not in the used set, AND
         //   (b) it has no side effects.
         let mut dead_insts: HashSet<InstId> = HashSet::new();
+        let mut dead_flag_writes: HashSet<InstId> = HashSet::new();
+        // NZCV liveness for this wave (removals change positions, so per wave).
+        let nzcv = NzcvLiveness::compute(func);
 
         for block_id in func.block_order.clone() {
             let block = func.block(block_id);
-            for &inst_id in &block.insts {
+            for (pos, &inst_id) in block.insts.iter().enumerate() {
                 let inst = func.inst(inst_id);
                 let def_vreg = get_def_vreg(inst);
                 let is_dead_value = match def_vreg {
@@ -370,8 +409,15 @@ fn run_impl(
                     continue;
                 }
 
-                // Never remove instructions with side effects.
-                if has_side_effects(inst) {
+                // Never remove instructions with side effects — except a
+                // flags-only writer whose NZCV result is dead in its block
+                // (`dead_flags_write`), whose only side effect is that write.
+                let dead_nzcv = if def_vreg.is_none() && is_flags_only_writer(inst.opcode) {
+                    nzcv.dead_flags_write(func, block_id.0 as usize, pos)
+                } else {
+                    None
+                };
+                if has_side_effects(inst) && dead_nzcv.is_none() {
                     continue;
                 }
 
@@ -381,7 +427,7 @@ fn run_impl(
                         if !used_vregs.contains(&vreg) {
                             if let Some(options) = certified_options {
                                 let cert =
-                                    make_dce_certificate(inst_id, inst, &used_vregs, options);
+                                    make_dce_certificate(inst_id, inst, &used_vregs, options, None);
                                 if cert.result != DceCertificateResult::Verified {
                                     push_unique_dce_failure(
                                         &mut failures,
@@ -399,12 +445,13 @@ fn run_impl(
                     }
                     // Instructions with no def (and no side effects) that are
                     // not branches/terminators are dead. But be conservative:
-                    // only Nop qualifies here.
+                    // only Nop qualifies here — plus a flags-only writer whose
+                    // NZCV result is provably dead within its block.
                     None => {
                         if inst.is_nop() {
                             if let Some(options) = certified_options {
                                 let cert =
-                                    make_dce_certificate(inst_id, inst, &used_vregs, options);
+                                    make_dce_certificate(inst_id, inst, &used_vregs, options, None);
                                 if cert.result != DceCertificateResult::Verified {
                                     push_unique_dce_failure(
                                         &mut failures,
@@ -417,6 +464,29 @@ fn run_impl(
                                 }
                                 certificates.push(cert);
                             }
+                            dead_insts.insert(inst_id);
+                        } else if let Some(nzcv) = dead_nzcv {
+                            if let Some(options) = certified_options {
+                                let cert = make_dce_certificate(
+                                    inst_id,
+                                    inst,
+                                    &used_vregs,
+                                    options,
+                                    Some(nzcv),
+                                );
+                                if cert.result != DceCertificateResult::Verified {
+                                    push_unique_dce_failure(
+                                        &mut failures,
+                                        &mut seen_failures,
+                                        inst_id,
+                                        inst,
+                                        "local dead-NZCV-write checker failed".to_string(),
+                                    );
+                                    continue;
+                                }
+                                certificates.push(cert);
+                            }
+                            dead_flag_writes.insert(inst_id);
                             dead_insts.insert(inst_id);
                         }
                     }
@@ -439,7 +509,11 @@ fn run_impl(
                 provenance.record_deletion(
                     inst_id,
                     PassId::new("dce"),
-                    "unused instruction has no side effects",
+                    if dead_flag_writes.contains(&inst_id) {
+                        "flags-only write overwritten before any NZCV reader"
+                    } else {
+                        "unused instruction has no side effects"
+                    },
                 );
             }
         }
@@ -514,6 +588,164 @@ fn get_def_vreg(inst: &trust_cg_ir::MachInst) -> Option<VReg> {
     single_inst_def(inst)
 }
 
+/// A def-less NZCV writer: its ONLY effect is the flags (CMP/TST forms; not
+/// ADDS/SUBS, which define a register, and not FCMP).
+fn is_flags_only_writer(opcode: AArch64Opcode) -> bool {
+    use AArch64Opcode::*;
+    matches!(
+        opcode,
+        CmpRR | CmpRI | CMPWrr | CMPXrr | CMPWri | CMPXri | Tst
+    )
+}
+
+/// `TCG_TRACE_DEADFLAGS=1`: why a cross-block flag-liveness scan answered
+/// "live" (diagnostic; one line per refusal).
+fn trace_dead_flags(msg: impl FnOnce() -> String) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("TCG_TRACE_DEADFLAGS").is_some()) {
+        eprintln!("TCG_DEADFLAGS live: {}", msg());
+    }
+}
+
+/// Conditional branches read NZCV without being in `effects::reads_flags`
+/// (they are branches, not value producers).
+fn branch_reads_flags(opcode: AArch64Opcode) -> bool {
+    matches!(opcode, AArch64Opcode::BCond | AArch64Opcode::Bcc)
+}
+
+/// What an instruction does to a live NZCV value, for the liveness below.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FlagEvent {
+    /// Reads NZCV (CSET/CSEL family, ADC/SBC, B.cond): the value is live.
+    Read,
+    /// Writes NZCV without reading it: the previous value dies here.
+    Kill,
+    /// Unknown effect (an opaque pseudo, implicit operands): fail towards live.
+    Opaque,
+}
+
+/// Block-level NZCV liveness for one DCE wave, computed once per function:
+/// per block the positions of its flag events, and whether NZCV is LIVE on
+/// entry (some path from the block's top reaches a reader before a writer).
+/// Calls are transparent: NZCV is not an argument under AAPCS64, so a callee
+/// cannot rely on it, but a reader after the call on the same path still
+/// counts. Cycles of transparent blocks are dead (least fixpoint from
+/// `false`), which is the same answer the verifier's visited-set walk gives.
+struct NzcvLiveness {
+    /// Per block (indexed by `BlockId`): `(position, event, inst id)`, in order.
+    events: Vec<Vec<(usize, FlagEvent, u32)>>,
+    /// Per block: NZCV live on entry.
+    live_in: Vec<bool>,
+}
+
+impl NzcvLiveness {
+    fn event_of(inst: &trust_cg_ir::MachInst) -> Option<FlagEvent> {
+        let op = inst.opcode;
+        if reads_flags(op) || branch_reads_flags(op) {
+            return Some(FlagEvent::Read);
+        }
+        if writes_flags(op) {
+            return Some(FlagEvent::Kill);
+        }
+        if !inst.is_call()
+            && ((inst.is_pseudo() && !inst.is_nop())
+                || !inst.implicit_defs.is_empty()
+                || !inst.implicit_uses.is_empty())
+        {
+            return Some(FlagEvent::Opaque);
+        }
+        None
+    }
+
+    fn compute(func: &MachFunction) -> Self {
+        let nblocks = func.blocks.len();
+        let mut events: Vec<Vec<(usize, FlagEvent, u32)>> = vec![Vec::new(); nblocks];
+        for (b, block) in func.blocks.iter().enumerate() {
+            for (pos, &inst_id) in block.insts.iter().enumerate() {
+                let Some(inst) = func.insts.get(inst_id.0 as usize) else {
+                    events[b].push((pos, FlagEvent::Opaque, inst_id.0));
+                    continue;
+                };
+                if let Some(ev) = Self::event_of(inst) {
+                    events[b].push((pos, ev, inst_id.0));
+                }
+            }
+        }
+        // Least fixpoint: live_in[b] = first event is Read/Opaque, or (no
+        // event) any successor live on entry.
+        let mut live_in = vec![false; nblocks];
+        loop {
+            let mut changed = false;
+            for (b, block) in func.blocks.iter().enumerate() {
+                let v = match events[b].first() {
+                    Some((_, FlagEvent::Read | FlagEvent::Opaque, _)) => true,
+                    Some((_, FlagEvent::Kill, _)) => false,
+                    None => block
+                        .succs
+                        .iter()
+                        .any(|s| live_in.get(s.0 as usize).copied().unwrap_or(true)),
+                };
+                if v && !live_in[b] {
+                    live_in[b] = true;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        Self { events, live_in }
+    }
+
+    /// If the NZCV written by the flags-only writer at `pos` of block `b` is
+    /// dead — the next flag event in the block is a writer, or the block ends
+    /// with NZCV dead on entry to every successor — return the certificate
+    /// facts; `None` when a reader or something opaque comes first.
+    fn dead_flags_write(&self, func: &MachFunction, b: usize, pos: usize) -> Option<DceFlagsFacts> {
+        let block = func.blocks.get(b)?;
+        let inst = func.inst(*block.insts.get(pos)?);
+        if !is_flags_only_writer(inst.opcode)
+            || !inst.implicit_defs.is_empty()
+            || !inst.implicit_uses.is_empty()
+        {
+            return None;
+        }
+        let evs = &self.events[b];
+        let next = evs.partition_point(|(p, _, _)| *p <= pos);
+        match evs.get(next) {
+            Some((p, FlagEvent::Kill, id)) => Some(DceFlagsFacts {
+                flags_only_writer: true,
+                insts_between: (*p - pos - 1) as u32,
+                exit: DeadFlagsExit::NextWriter { inst_id: *id },
+            }),
+            Some((_, FlagEvent::Read | FlagEvent::Opaque, _)) => None,
+            None => {
+                // The flags leave the block: dead iff dead on entry to every
+                // successor (a return has none — NZCV is caller-saved).
+                let live = block
+                    .succs
+                    .iter()
+                    .filter(|s| self.live_in.get(s.0 as usize).copied().unwrap_or(true))
+                    .map(|s| s.0)
+                    .collect::<Vec<_>>();
+                if !live.is_empty() {
+                    trace_dead_flags(|| {
+                        format!("block {b}: NZCV live on entry to successor(s) {live:?}")
+                    });
+                    return None;
+                }
+                Some(DceFlagsFacts {
+                    flags_only_writer: true,
+                    insts_between: (block.insts.len() - pos - 1) as u32,
+                    exit: DeadFlagsExit::CfgDead {
+                        blocks: block.succs.iter().map(|s| s.0).collect(),
+                    },
+                })
+            }
+        }
+    }
+}
+
 /// Returns true if this instruction has side effects that prevent removal.
 fn has_side_effects(inst: &trust_cg_ir::MachInst) -> bool {
     let flags = inst.flags;
@@ -580,6 +812,7 @@ fn make_dce_certificate(
     inst: &trust_cg_ir::MachInst,
     used_vregs: &HashSet<VReg>,
     options: &DceCertifiedOptions,
+    nzcv: Option<DceFlagsFacts>,
 ) -> DceCertificate {
     let source_opcode = format!("{:?}", inst.opcode);
     let source_operands = inst.operands.iter().map(format_operand).collect::<Vec<_>>();
@@ -595,6 +828,11 @@ fn make_dce_certificate(
     let source_location = inst
         .source_loc
         .map(|loc| format!("file:{}:{}:{}", loc.file, loc.line, loc.col));
+    let contract = if nzcv.is_some() {
+        DceContract::DeadNzcvWriteUnobservable
+    } else {
+        DceContract::PureUnusedValueUnobservable
+    };
     let obligation_hash = dce_obligation_hash(
         inst_id,
         &source_opcode,
@@ -603,18 +841,32 @@ fn make_dce_certificate(
         &use_def,
         &side_effects,
         &visibility,
+        nzcv.as_ref(),
     );
-    let result = if check_dce_obligation(inst, &use_def, &side_effects, &visibility) {
+    let result = if check_dce_obligation(inst, &use_def, &side_effects, &visibility, nzcv.as_ref())
+    {
         DceCertificateResult::Verified
     } else {
         DceCertificateResult::Failed
+    };
+    let (pass_instance_id, domain, checker) = match contract {
+        DceContract::PureUnusedValueUnobservable => (
+            "dce:bound-propagation:pure-unused:v1",
+            "bound-propagation;scalar-bv64;observable-outputs=graph+certificate",
+            "trust-cg-opt analytical bound-propagation DCE checker v1",
+        ),
+        DceContract::DeadNzcvWriteUnobservable => (
+            "dce:nzcv:dead-write:v1",
+            "block-local NZCV liveness;observable-outputs=graph+certificate+flags",
+            "trust-cg-opt block-local dead-NZCV-write checker v1",
+        ),
     };
 
     DceCertificate {
         format_version: 1,
         pass_name: "dce".to_string(),
         pass_version: 1,
-        pass_instance_id: "dce:bound-propagation:pure-unused:v1".to_string(),
+        pass_instance_id: pass_instance_id.to_string(),
         source_inst_id: inst_id.0,
         source_opcode,
         source_operands,
@@ -622,10 +874,11 @@ fn make_dce_certificate(
         use_def,
         side_effects,
         visibility,
-        contract: DceContract::PureUnusedValueUnobservable,
-        domain: "bound-propagation;scalar-bv64;observable-outputs=graph+certificate".to_string(),
+        nzcv,
+        contract,
+        domain: domain.to_string(),
         obligation_hash,
-        checker: "trust-cg-opt analytical bound-propagation DCE checker v1".to_string(),
+        checker: checker.to_string(),
         result,
     }
 }
@@ -679,6 +932,7 @@ fn dce_obligation_hash(
     use_def: &DceUseDefFacts,
     side_effects: &DceSideEffectFacts,
     visibility: &DceVisibilityFacts,
+    nzcv: Option<&DceFlagsFacts>,
 ) -> String {
     let mut h = StableHasher::new();
     h.write_str("trust-cg.dce.cert.v1");
@@ -705,6 +959,27 @@ fn dce_obligation_hash(
     h.write_u8(u8::from(side_effects.has_side_effect_barrier));
     h.write_u8(u8::from(visibility.graph_output_visible));
     h.write_u8(u8::from(visibility.certificate_output_visible));
+    match nzcv {
+        Some(f) => {
+            h.write_str("nzcv-dead-write");
+            h.write_u8(u8::from(f.flags_only_writer));
+            h.write_u32(f.insts_between);
+            match &f.exit {
+                DeadFlagsExit::NextWriter { inst_id } => {
+                    h.write_u8(1);
+                    h.write_u32(*inst_id);
+                }
+                DeadFlagsExit::CfgDead { blocks } => {
+                    h.write_u8(2);
+                    h.write_u32(blocks.len() as u32);
+                    for b in blocks {
+                        h.write_u32(*b);
+                    }
+                }
+            }
+        }
+        None => h.write_u8(0),
+    }
     format!("{:032x}", h.finish128())
 }
 
@@ -713,13 +988,37 @@ fn check_dce_obligation(
     use_def: &DceUseDefFacts,
     side_effects: &DceSideEffectFacts,
     visibility: &DceVisibilityFacts,
+    nzcv: Option<&DceFlagsFacts>,
 ) -> bool {
-    (use_def.def_vreg.is_some() || inst.is_nop())
-        && !use_def.def_is_used
+    let unobservable = !use_def.def_is_used
         && side_effects.is_pure
-        && !side_effects.has_side_effect_barrier
         && !visibility.graph_output_visible
-        && !visibility.certificate_output_visible
+        && !visibility.certificate_output_visible;
+    match nzcv {
+        // A dead flag write: no register def, the flags are its only side
+        // effect (the barrier bit is exactly HAS_SIDE_EFFECTS for NZCV), and
+        // the recorded next writer follows with nothing between that could
+        // read or carry the flags.
+        Some(f) => {
+            unobservable
+                && use_def.def_vreg.is_none()
+                && f.flags_only_writer
+                && is_flags_only_writer(inst.opcode)
+                && inst.implicit_defs.is_empty()
+                && inst.implicit_uses.is_empty()
+                && inst.flags.contains(InstFlags::HAS_SIDE_EFFECTS)
+                && !inst.flags.contains(InstFlags::READS_MEMORY)
+                && !inst.flags.contains(InstFlags::WRITES_MEMORY)
+                && !inst.flags.contains(InstFlags::IS_CALL)
+                && !inst.flags.contains(InstFlags::IS_BRANCH)
+                && !inst.flags.contains(InstFlags::IS_TERMINATOR)
+        }
+        None => {
+            (use_def.def_vreg.is_some() || inst.is_nop())
+                && unobservable
+                && !side_effects.has_side_effect_barrier
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1002,12 +1301,297 @@ mod tests {
 
     #[test]
     fn test_dce_preserves_cmp() {
-        // cmp v0, v1 — sets flags, has HAS_SIDE_EFFECTS
+        // cmp v0, v1 — sets flags (HAS_SIDE_EFFECTS); its CSET reader, kept
+        // live by a store, keeps it.
         let cmp = MachInst::new(AArch64Opcode::CmpRR, vec![vreg(0), vreg(1)]);
+        let cset = MachInst::new(AArch64Opcode::CSet, vec![vreg(4), imm(0)]);
+        let store = MachInst::new(AArch64Opcode::StrRI, vec![vreg(4), imm(8)]);
         let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
-        let mut func = make_func_with_insts(vec![cmp, ret]);
+        let mut func = make_func_with_insts(vec![cmp, cset, store, ret]);
 
         let mut dce = DeadCodeElimination;
+        assert!(!dce.run(&mut func));
+    }
+
+    /// NZCV is caller-saved and meaningless after RET: a CMP whose flags reach
+    /// the function's exit unread is a dead write and goes.
+    #[test]
+    fn test_dce_removes_cmp_whose_flags_die_at_return() {
+        let mut func = make_func_with_insts(vec![
+            MachInst::new(AArch64Opcode::CmpRR, vec![vreg(0), vreg(1)]),
+            MachInst::new(AArch64Opcode::Ret, vec![]),
+        ]);
+        let mut dce = DeadCodeElimination;
+        let run = dce.run_certified(&mut func);
+        assert!(run.changed && run.is_certified());
+        assert_eq!(func.block(func.entry).insts.len(), 1);
+        assert!(matches!(
+            run.certificates[0].nzcv.as_ref().unwrap().exit,
+            DeadFlagsExit::CfgDead { ref blocks } if blocks.is_empty()
+        ));
+    }
+
+    /// A CMP whose flags are overwritten by the next CMP before any reader is
+    /// a dead flag write: removed, with a `DeadNzcvWriteUnobservable`
+    /// certificate naming the overwriting instruction. The live CMP's CSET is
+    /// kept alive by a store of its result.
+    #[test]
+    fn test_dce_removes_cmp_overwritten_before_any_reader() {
+        let dead = MachInst::new(AArch64Opcode::CmpRR, vec![vreg(0), vreg(1)]);
+        let nop = MachInst::new(AArch64Opcode::Nop, vec![]);
+        let live = MachInst::new(AArch64Opcode::CmpRR, vec![vreg(2), vreg(3)]);
+        let cset = MachInst::new(AArch64Opcode::CSet, vec![vreg(4), imm(2)]);
+        let store = MachInst::new(AArch64Opcode::StrRI, vec![vreg(4), imm(8)]);
+        let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+        let mut func = make_func_with_insts(vec![dead, nop, live, cset, store, ret]);
+        let live_id = func.block(func.entry).insts[2];
+
+        let mut dce = DeadCodeElimination;
+        let run = dce.run_certified(&mut func);
+        assert!(run.changed);
+        assert!(run.is_certified(), "failures: {:?}", run.failures);
+        let opcodes: Vec<_> = func
+            .block(func.entry)
+            .insts
+            .iter()
+            .map(|id| func.inst(*id).opcode)
+            .collect();
+        assert_eq!(
+            opcodes,
+            vec![
+                AArch64Opcode::CmpRR,
+                AArch64Opcode::CSet,
+                AArch64Opcode::StrRI,
+                AArch64Opcode::Ret
+            ],
+            "the dead CMP and the Nop go, the live CMP stays"
+        );
+        let flag_certs: Vec<_> = run
+            .certificates
+            .iter()
+            .filter(|c| c.contract == DceContract::DeadNzcvWriteUnobservable)
+            .collect();
+        assert_eq!(flag_certs.len(), 1);
+        let cert = flag_certs[0];
+        assert_eq!(cert.source_opcode, "CmpRR");
+        assert_eq!(cert.result, DceCertificateResult::Verified);
+        assert_eq!(cert.pass_instance_id, "dce:nzcv:dead-write:v1");
+        let facts = cert.nzcv.as_ref().expect("nzcv facts");
+        assert!(facts.flags_only_writer);
+        assert_eq!(facts.exit, DeadFlagsExit::NextWriter { inst_id: live_id.0 });
+        assert_eq!(facts.insts_between, 1);
+    }
+
+    /// Flags carried out of the block by a non-reading terminator (CBZ) are
+    /// dead when every successor writes NZCV before reading it — including
+    /// through a loop back-edge — and live as soon as one successor reads
+    /// them first.
+    #[test]
+    fn test_dce_dead_flag_write_across_the_cfg() {
+        // entry: cmp v0,v1 ; cbz v2 -> exit   (fallthrough -> body)
+        // body:  cmp v2,v3 ; cset v4 ; str v4 ; cbz v2 -> body (loop)  (fallthrough -> exit)
+        // exit:  ret
+        let build = |exit_reads_first: bool| {
+            let mut func = MachFunction::new("t".to_string(), Signature::new(vec![], vec![]));
+            let entry = func.entry;
+            let body = func.create_block();
+            let exit = func.create_block();
+            let add = |func: &mut MachFunction, b, i: MachInst| {
+                let id = func.push_inst(i);
+                func.append_inst(b, id);
+                id
+            };
+            let dead = add(
+                &mut func,
+                entry,
+                MachInst::new(AArch64Opcode::CmpRR, vec![vreg(0), vreg(1)]),
+            );
+            add(
+                &mut func,
+                entry,
+                MachInst::new(AArch64Opcode::Cbz, vec![vreg(2), MachOperand::Block(exit)]),
+            );
+            add(
+                &mut func,
+                body,
+                MachInst::new(AArch64Opcode::CmpRR, vec![vreg(2), vreg(3)]),
+            );
+            add(
+                &mut func,
+                body,
+                MachInst::new(AArch64Opcode::CSet, vec![vreg(4), imm(0)]),
+            );
+            add(
+                &mut func,
+                body,
+                MachInst::new(AArch64Opcode::StrRI, vec![vreg(4), imm(8)]),
+            );
+            add(
+                &mut func,
+                body,
+                MachInst::new(AArch64Opcode::Cbz, vec![vreg(2), MachOperand::Block(body)]),
+            );
+            if exit_reads_first {
+                add(
+                    &mut func,
+                    exit,
+                    MachInst::new(AArch64Opcode::CSet, vec![vreg(5), imm(1)]),
+                );
+                add(
+                    &mut func,
+                    exit,
+                    MachInst::new(AArch64Opcode::StrRI, vec![vreg(5), imm(16)]),
+                );
+            }
+            add(&mut func, exit, MachInst::new(AArch64Opcode::Ret, vec![]));
+            func.add_edge(entry, exit);
+            func.add_edge(entry, body);
+            func.add_edge(body, body);
+            func.add_edge(body, exit);
+            (func, dead)
+        };
+
+        let (mut func, dead) = build(false);
+        let mut dce = DeadCodeElimination;
+        let run = dce.run_certified(&mut func);
+        assert!(run.is_certified(), "failures: {:?}", run.failures);
+        assert!(
+            !func.block(func.entry).insts.contains(&dead),
+            "the entry CMP is dead across the CFG"
+        );
+        let cert = run
+            .certificates
+            .iter()
+            .find(|c| c.contract == DceContract::DeadNzcvWriteUnobservable)
+            .expect("a dead-flag certificate");
+        match &cert.nzcv.as_ref().unwrap().exit {
+            DeadFlagsExit::CfgDead { blocks } => {
+                assert_eq!(blocks.len(), 2, "exit and body checked: {blocks:?}")
+            }
+            other => panic!("expected CfgDead, got {other:?}"),
+        }
+        assert_eq!(
+            func.block(trust_cg_ir::BlockId(1)).insts.len(),
+            4,
+            "the body's live CMP stays"
+        );
+
+        let (mut func, dead) = build(true);
+        let run = DeadCodeElimination.run_certified(&mut func);
+        assert!(
+            func.block(func.entry).insts.contains(&dead),
+            "a successor reads the flags first: kept"
+        );
+        assert!(
+            run.certificates
+                .iter()
+                .all(|c| c.contract != DceContract::DeadNzcvWriteUnobservable)
+        );
+    }
+
+    /// Every way the flags can be read keeps the CMP under test (the first
+    /// instruction): a live reader (CSET, CSEL, ADC — each kept live by a
+    /// store of its result), a conditional branch, a reader after a call, or
+    /// an unconditional branch to a block that reads before writing.
+    #[test]
+    fn test_dce_keeps_cmp_whose_flags_may_be_read() {
+        let cmp = || MachInst::new(AArch64Opcode::CmpRR, vec![vreg(0), vreg(1)]);
+        let ret = || MachInst::new(AArch64Opcode::Ret, vec![]);
+        let keep = || MachInst::new(AArch64Opcode::StrRI, vec![vreg(4), imm(8)]);
+        let block0 = MachOperand::Block(trust_cg_ir::BlockId(0));
+        let cases: Vec<(&str, Vec<MachInst>)> = vec![
+            (
+                "cset reader",
+                vec![
+                    cmp(),
+                    MachInst::new(AArch64Opcode::CSet, vec![vreg(4), imm(0)]),
+                    keep(),
+                    ret(),
+                ],
+            ),
+            (
+                "csel reader",
+                vec![
+                    cmp(),
+                    MachInst::new(AArch64Opcode::Csel, vec![vreg(4), vreg(0), vreg(1), imm(0)]),
+                    keep(),
+                    ret(),
+                ],
+            ),
+            (
+                "conditional branch reader",
+                vec![
+                    cmp(),
+                    MachInst::new(AArch64Opcode::BCond, vec![imm(0), block0.clone()]),
+                ],
+            ),
+            (
+                "reader after a call still counts",
+                vec![
+                    cmp(),
+                    MachInst::new(
+                        AArch64Opcode::Bl,
+                        vec![MachOperand::Symbol("f".to_string())],
+                    ),
+                    MachInst::new(AArch64Opcode::CSet, vec![vreg(4), imm(0)]),
+                    keep(),
+                    ret(),
+                ],
+            ),
+            (
+                "adc reads the carry",
+                vec![
+                    cmp(),
+                    MachInst::new(AArch64Opcode::Adc, vec![vreg(4), vreg(0), vreg(1)]),
+                    keep(),
+                    ret(),
+                ],
+            ),
+        ];
+        for (label, insts) in cases {
+            let mut func = make_func_with_insts(insts);
+            let under_test = func.block(func.entry).insts[0];
+            let run = DeadCodeElimination.run_certified(&mut func);
+            assert!(
+                func.block(func.entry).insts.contains(&under_test),
+                "{label}: the CMP under test was removed ({:?})",
+                run.certificates
+            );
+        }
+
+        // An unconditional branch into a block that READS the flags first
+        // keeps them live across the edge: entry = [cset(stored) ; cmp ; b entry].
+        let mut func = make_func_with_insts(vec![
+            MachInst::new(AArch64Opcode::CSet, vec![vreg(4), imm(0)]),
+            keep(),
+            cmp(),
+            MachInst::new(AArch64Opcode::B, vec![block0.clone()]),
+        ]);
+        let entry = func.entry;
+        func.add_edge(entry, entry);
+        let under_test = func.block(entry).insts[2];
+        DeadCodeElimination.run_certified(&mut func);
+        assert!(
+            func.block(entry).insts.contains(&under_test),
+            "loop edge into a reader: kept"
+        );
+    }
+
+    /// CMP; CMP#imm; TST; CSET(stored) — the first two flag writes are dead,
+    /// the TST is live; a second run changes nothing.
+    #[test]
+    fn test_dce_dead_flag_write_is_idempotent() {
+        let mut func = make_func_with_insts(vec![
+            MachInst::new(AArch64Opcode::CmpRR, vec![vreg(0), vreg(1)]),
+            MachInst::new(AArch64Opcode::CmpRI, vec![vreg(0), imm(7)]),
+            MachInst::new(AArch64Opcode::Tst, vec![vreg(0), vreg(1)]),
+            MachInst::new(AArch64Opcode::CSet, vec![vreg(4), imm(1)]),
+            MachInst::new(AArch64Opcode::StrRI, vec![vreg(4), imm(8)]),
+            MachInst::new(AArch64Opcode::Ret, vec![]),
+        ]);
+        let mut dce = DeadCodeElimination;
+        assert!(dce.run(&mut func));
+        assert_eq!(func.block(func.entry).insts.len(), 4);
         assert!(!dce.run(&mut func));
     }
 

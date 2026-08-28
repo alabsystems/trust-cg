@@ -109,6 +109,15 @@ fn append_inst(func: &mut MachFunction, opcode: AArch64Opcode, operands: Vec<Mac
     func.append_inst(func.entry, id);
 }
 
+/// Append a `RET` carrying the ABI return-register implicit-use alias set for a
+/// signature returning a single I64 (`X0`), matching what production ISel emits
+/// via `AppleAArch64ABI::required_return_pregs`.
+fn append_ret_x0(func: &mut MachFunction) {
+    let ret = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
+    let id = func.push_inst(ret);
+    func.append_inst(func.entry, id);
+}
+
 fn append_ldr_x(func: &mut MachFunction, dst: trust_cg_ir::regs::PReg, offset: i64) {
     append_inst(
         func,
@@ -182,7 +191,7 @@ fn build_sparse_pivot_row_update_4term() -> MachFunction {
         AArch64Opcode::MovR,
         vec![MachOperand::PReg(X0), MachOperand::PReg(X9)],
     );
-    append_inst(&mut func, AArch64Opcode::Ret, vec![]);
+    append_ret_x0(&mut func);
 
     func
 }
@@ -218,7 +227,7 @@ fn build_sparse_pivot_entry() -> MachFunction {
             MachOperand::Imm(16),
         ],
     );
-    append_inst(&mut func, AArch64Opcode::Ret, vec![]);
+    append_ret_x0(&mut func);
 
     func
 }

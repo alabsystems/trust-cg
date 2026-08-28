@@ -1680,3 +1680,17 @@ fn store_of_invariant_value_still_fires() {
     assert_eq!(run(&mut f), 1, "invariant-valued store still admitted");
     assert_eq!(count(&f, AArch64Opcode::StrRI), 5, "1 scalar + 4 lanes");
 }
+
+/// IDEMPOTENCE: the split reduction has no remaining splittable shape, so a
+/// second run must change nothing.
+#[test]
+fn second_run_is_a_no_op() {
+    let mut f = build_prod_i64();
+    assert_eq!(run(&mut f), 1, "first run must fire");
+    let (insts, blocks) = (f.insts.len(), f.blocks.len());
+    for again in 2..=4 {
+        assert_eq!(run(&mut f), 0, "run {again} re-fired on its own output");
+        assert_eq!(f.insts.len(), insts, "run {again} added instructions");
+        assert_eq!(f.blocks.len(), blocks, "run {again} added blocks");
+    }
+}

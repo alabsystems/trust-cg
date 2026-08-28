@@ -42,7 +42,6 @@
 
 use std::ffi::CString;
 use std::io::{self, Write};
-use std::mem::MaybeUninit;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::Ordering;
@@ -58,7 +57,7 @@ use trust_cg_sat_host::propagate::{
     JIT_SUCCESSFUL_RUNS, PRIMARY_JIT_MODE, PROPAGATE_CALL_COUNT, SHADOW_MODE,
     TRUST_CG_PROPAGATE_VERBOSE,
 };
-use trust_cg_sat_host::sys;
+use trust_cg_sat_host::{OwnedMicroSatSolver, sys};
 
 /// SAT-Comp exit code convention. Different from MicroSAT's internal
 /// `SAT=1` / `UNSAT=0`.
@@ -278,23 +277,12 @@ fn run(args: Args) -> Result<u8, CliError> {
     let jit_primary_before = JIT_PRIMARY_RETURNS.load(Ordering::SeqCst);
     let jit_successful_before = JIT_SUCCESSFUL_RUNS.load(Ordering::SeqCst);
 
-    // SAFETY justification covered at the call site below.
-    let mut solver: MaybeUninit<sys::solver> = MaybeUninit::uninit();
     let c_path = CString::new(args.cnf.to_string_lossy().into_owned())
         .map_err(|e| CliError(format!("CNF path has interior NUL: {e}")))?;
 
-    // SAFETY: `parse` itself calls `initCDCL`, which initialises every
-    // field of `*solver` it reads before returning. Passing an
-    // uninitialised `solver` matches how MicroSAT's own `main` builds
-    // it on the stack. The cast on `c_path.as_ptr()` is sound because
-    // MicroSAT's `parse` reads the filename via `fopen` and never
-    // writes through the pointer despite the non-const signature.
-    let parse_rc = unsafe {
-        sys::parse(
-            solver.as_mut_ptr(),
-            c_path.as_ptr() as *mut std::os::raw::c_char,
-        )
-    };
+    // SAFETY: the CLI checked that the input path exists. SAT-competition
+    // callers are responsible for supplying a well-formed DIMACS instance.
+    let (mut solver, parse_rc) = unsafe { OwnedMicroSatSolver::parse(c_path.as_c_str()) };
 
     let solve_rc = if parse_rc == sys::UNSAT {
         comment("parse short-circuited to UNSAT", &mut stdout)?;
@@ -304,7 +292,7 @@ fn run(args: Args) -> Result<u8, CliError> {
         // `initCDCL` and populated the solver state. Calling `solve`
         // on that state is exactly the upstream usage in microsat.c's
         // `main`.
-        unsafe { sys::solve(solver.as_mut_ptr()) }
+        unsafe { solver.solve() }
     };
 
     // Flush any buffered DRAT before we read the file or exit.

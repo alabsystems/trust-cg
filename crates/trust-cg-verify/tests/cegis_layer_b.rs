@@ -25,9 +25,11 @@ use trust_cg_ir::{
 use trust_cg_opt::{CacheBackend, InMemoryCache, MachinePass};
 use trust_cg_verify::{CegisSuperoptConfig, CegisSuperoptPass};
 
-#[path = "support/cegis_alethe_gap.rs"]
-mod cegis_alethe_gap;
-use cegis_alethe_gap::{ALETHE_EXPORT_GAP_SKIP_NOTICE, alethe_export_gap_blocks_layer_b};
+#[path = "support/cegis_checker_gap.rs"]
+mod cegis_checker_gap;
+use cegis_checker_gap::{
+    INDEPENDENT_CHECKER_GAP_SKIP_NOTICE, independent_checker_unavailable_blocks_layer_b,
+};
 
 fn make_config(cache: Option<Arc<dyn CacheBackend>>) -> CegisSuperoptConfig {
     CegisSuperoptConfig {
@@ -89,8 +91,8 @@ fn layer_b_rewrites_movz_add_pair() {
     let (mut func, v_src, _v_imm, v_dst, movz_id, add_id, _ret_id) = layer_b_func();
 
     let committed = pass.run(&mut func);
-    if !committed && alethe_export_gap_blocks_layer_b() {
-        eprintln!("{ALETHE_EXPORT_GAP_SKIP_NOTICE}");
+    if !committed && independent_checker_unavailable_blocks_layer_b() {
+        eprintln!("{INDEPENDENT_CHECKER_GAP_SKIP_NOTICE}");
         return;
     }
     assert!(committed, "Layer B should commit the Movz+AddRR fusion");
@@ -206,8 +208,8 @@ fn layer_b_cache_replay_on_second_run_applies_rewrite() {
     let mut pass1 = CegisSuperoptPass::new(cfg.clone());
     let (mut func1, v_src1, _, v_dst1, movz_id1, add_id1, _) = layer_b_func();
     let committed1 = pass1.run(&mut func1);
-    if !committed1 && alethe_export_gap_blocks_layer_b() {
-        eprintln!("{ALETHE_EXPORT_GAP_SKIP_NOTICE}");
+    if !committed1 && independent_checker_unavailable_blocks_layer_b() {
+        eprintln!("{INDEPENDENT_CHECKER_GAP_SKIP_NOTICE}");
         return;
     }
     assert!(committed1);

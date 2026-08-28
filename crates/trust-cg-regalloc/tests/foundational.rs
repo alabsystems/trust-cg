@@ -166,6 +166,7 @@ fn linear_scan_spills_when_pressure_exceeds_pregs() {
         enable_spill_code: true,
         enable_spill_slot_reuse: false,
         hints: BTreeMap::new(),
+        callee_saved_regs: Default::default(),
         coalesce_tuning: Default::default(),
     };
 
@@ -202,6 +203,7 @@ fn linear_scan_no_overlap_in_physical_assignments() {
         enable_spill_code: true,
         enable_spill_slot_reuse: false,
         hints: BTreeMap::new(),
+        callee_saved_regs: Default::default(),
         coalesce_tuning: Default::default(),
     };
 

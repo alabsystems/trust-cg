@@ -257,6 +257,14 @@ fn build_fuzz_module(seed: u64, n: usize) -> trust_ir::Module {
     mb.build()
 }
 
+/// Pin `module` to the wasm32 lane. Stamped AFTER any interpreter reference
+/// runs: `compile_module` fail-closes on target-free modules, while the
+/// trust-ir interpreter fail-closes the other way (reference execution wants
+/// the canonical 64-bit layout).
+fn stamp_wasm32(module: &mut trust_ir::Module) {
+    module.target_info = Some(wasm::wasm32_target_info());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,7 +275,8 @@ mod tests {
     #[test]
     fn relooper_compiles_random_reducible_cfgs() {
         for seed in 0..64u64 {
-            let module = build_fuzz_module(seed.wrapping_mul(0x100000001B3) ^ 0xABCD, 20);
+            let mut module = build_fuzz_module(seed.wrapping_mul(0x100000001B3) ^ 0xABCD, 20);
+            stamp_wasm32(&mut module);
             wasm::compile_module(&module)
                 .unwrap_or_else(|e| panic!("seed {seed}: compile_module failed: {e}"));
         }
@@ -288,7 +297,7 @@ fn main() {
         .unwrap_or(0xD1CE_5EED_1234_5678);
     const PER_FN: usize = 200;
 
-    let module = build_fuzz_module(base_seed, n_funcs);
+    let mut module = build_fuzz_module(base_seed, n_funcs);
     let names: Vec<String> = (0..n_funcs).map(|i| format!("f{i}")).collect();
 
     let interp = Interpreter::with_module(&module).with_options(InterpretOptions {
@@ -335,6 +344,7 @@ fn main() {
         json.push('}');
     }
     json.push_str("]}");
+    stamp_wasm32(&mut module);
 
     let bytes = wasm::compile_module(&module)
         .unwrap_or_else(|e| panic!("compile_module failed (relooper bug?): {e}"));

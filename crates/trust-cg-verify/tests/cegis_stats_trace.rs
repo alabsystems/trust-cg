@@ -30,10 +30,6 @@ use trust_cg_opt::{CacheBackend, CacheKey, InMemoryCache, MachinePass};
 use trust_cg_verify::cegis_pass::MachOperandBlob;
 use trust_cg_verify::{CegisCacheEntry, CegisSuperoptConfig, CegisSuperoptPass, RewriteLayer};
 
-#[path = "support/cegis_alethe_gap.rs"]
-mod cegis_alethe_gap;
-use cegis_alethe_gap::{ALETHE_EXPORT_GAP_SKIP_NOTICE, alethe_export_gap_blocks_layer_a};
-
 #[derive(Default)]
 struct RecordingCache {
     entries: Mutex<HashMap<u128, Vec<u8>>>,
@@ -158,10 +154,6 @@ fn layer_a_populates_required_stats_fields_issue_492() {
     let mut func = layer_a_func();
 
     let committed = pass.run(&mut func);
-    if !committed && alethe_export_gap_blocks_layer_a() {
-        eprintln!("{ALETHE_EXPORT_GAP_SKIP_NOTICE}");
-        return;
-    }
     assert!(committed, "Layer A rewrite must commit on cold run");
 
     let stats = pass.stats();
@@ -272,10 +264,6 @@ fn trace_emits_applied_event_on_committed_rewrite_issue_492() {
     let mut func = layer_a_func();
 
     let committed = pass.run(&mut func);
-    if !committed && alethe_export_gap_blocks_layer_a() {
-        eprintln!("{ALETHE_EXPORT_GAP_SKIP_NOTICE}");
-        return;
-    }
     assert!(committed, "test precondition: Layer A must commit");
 
     let events = trace.events();
@@ -400,10 +388,7 @@ fn trace_cache_hit_path_still_emits_event_issue_492() {
     let mut pass_cold = CegisSuperoptPass::new(cfg_cold);
     let mut func_cold = layer_a_func();
     let committed_cold = pass_cold.run(&mut func_cold);
-    if !committed_cold && alethe_export_gap_blocks_layer_a() {
-        eprintln!("{ALETHE_EXPORT_GAP_SKIP_NOTICE}");
-        return;
-    }
+    assert!(committed_cold, "test precondition: Layer A must commit");
     assert_eq!(pass_cold.stats().cache_misses, 1);
 
     // Hot run with a fresh trace.
@@ -439,10 +424,6 @@ fn cache_entry_records_and_replays_serialized_replacement_body_issue_492() {
     let mut pass_cold = CegisSuperoptPass::new(cfg_cold);
     let mut func_cold = layer_a_func();
     let committed_cold = pass_cold.run(&mut func_cold);
-    if !committed_cold && alethe_export_gap_blocks_layer_a() {
-        eprintln!("{ALETHE_EXPORT_GAP_SKIP_NOTICE}");
-        return;
-    }
     assert!(committed_cold);
 
     let mut entry = cache.last_entry();

@@ -1506,6 +1506,10 @@ fn apply(func: &mut MachFunction, rec: &FindRecognized) -> bool {
         let k = if n >= width { n - (width - 1) } else { 0 };
         materialize_const(func, pre, k, RegClass::Gpr64)
     } else {
+        // `FindRecognized` has exactly two construction sites and each sets
+        // exactly one of the pair: the strict path `bound: Some(_) /
+        // bound_const: None`, the forward-chain path the mirror image. So the
+        // `bound_const == None` arm we are in implies `bound` is `Some`.
         let bound_reg = rec.bound.expect("strict path carries a register bound");
         let nb64 = alloc(func, RegClass::Gpr64);
         emit_before(

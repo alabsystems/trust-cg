@@ -126,7 +126,7 @@ pub use machine_types::{
 // Re-export canonical types from trust-cg-ir via machine_types.
 pub use call_clobber::{
     CallCrossing, aarch64_callee_saved_regs, aarch64_caller_saved_regs,
-    compute_call_crossing_hints, find_call_crossings, insert_call_save_restore,
+    compute_call_crossing_hints, find_call_crossings_in, insert_call_save_restore,
 };
 pub use coalesce::{
     CoalesceMode, CoalesceResult, CoalesceStats, CoalesceTuning, CopyCoalescer, apply_coalescing,
@@ -154,7 +154,7 @@ pub use x86_adapter::{
     x86_to_preg,
 };
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 // ---------------------------------------------------------------------------
 // Phase-internal timing attribution (Task 3): `[trust-cg-time-regalloc]` lines.
@@ -205,9 +205,17 @@ fn abi_hint_greedy_disabled() -> bool {
     *DISABLED.get_or_init(|| std::env::var_os("TCG_NO_ABI_HINT_GREEDY").is_some())
 }
 
+/// `TCG_NO_CALL_CROSSING_HINTS` disables the callee-saved bias for
+/// call-crossing intervals (the paired-A/B kill switch for that wiring).
+fn call_crossing_hints_disabled() -> bool {
+    use std::sync::OnceLock;
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("TCG_NO_CALL_CROSSING_HINTS").is_some())
+}
+
 /// Start a stage timer. `None` (zero-cost) unless timing is enabled.
 #[inline]
-fn ra_stage_start() -> Option<std::time::Instant> {
+pub(crate) fn ra_stage_start() -> Option<std::time::Instant> {
     if regalloc_timing_enabled() {
         Some(std::time::Instant::now())
     } else {
@@ -215,18 +223,51 @@ fn ra_stage_start() -> Option<std::time::Instant> {
     }
 }
 
-/// Emit one `[trust-cg-time-regalloc]` line for a completed stage. No-op unless
-/// the matching `ra_stage_start` returned `Some` (i.e. timing enabled).
+/// Buffered sink for `[trust-cg-time-regalloc]` records — same reason as the
+/// pass and pipeline logs: regalloc stages sit inside the `regalloc` pipeline
+/// phase, so an unbuffered write per stage is charged to the phase being
+/// measured.
+struct RaTimeLog {
+    lines: Vec<String>,
+}
+
+impl Drop for RaTimeLog {
+    fn drop(&mut self) {
+        if self.lines.is_empty() {
+            return;
+        }
+        use std::io::Write;
+        let stderr = std::io::stderr();
+        let mut out = stderr.lock();
+        for line in &self.lines {
+            let _ = writeln!(out, "{line}");
+        }
+        let _ = out.flush();
+    }
+}
+
+thread_local! {
+    static RA_TIME_LOG: std::cell::RefCell<RaTimeLog> =
+        const { std::cell::RefCell::new(RaTimeLog { lines: Vec::new() }) };
+}
+
+/// Record one `[trust-cg-time-regalloc]` line for a completed stage. No-op
+/// unless the matching `ra_stage_start` returned `Some` (i.e. timing enabled).
 #[inline]
-fn ra_stage_end(func_name: &str, use_ay: bool, stage: &str, start: Option<std::time::Instant>) {
+pub(crate) fn ra_stage_end(
+    func_name: &str,
+    use_ay: bool,
+    stage: &str,
+    start: Option<std::time::Instant>,
+) {
     if let Some(start) = start {
-        eprintln!(
-            "[trust-cg-time-regalloc] func={} pass={} stage={} elapsed_us={}",
-            func_name,
+        // Clock first; formatting and buffering are instrumentation.
+        let elapsed_us = start.elapsed().as_micros();
+        let line = format!(
+            "[trust-cg-time-regalloc] func={func_name} pass={} stage={stage} elapsed_us={elapsed_us}",
             if use_ay { "ay" } else { "greedy" },
-            stage,
-            start.elapsed().as_micros(),
         );
+        RA_TIME_LOG.with(|log| log.borrow_mut().lines.push(line));
     }
 }
 
@@ -283,6 +324,16 @@ pub struct AllocConfig {
     /// tried first — see the greedy arm for why the two orderings cannot
     /// conflict even if that order were lost.
     pub hints: BTreeMap<VReg, Vec<PReg>>,
+    /// Callee-saved registers for the target ABI. When non-empty,
+    /// [`allocate_core`] biases CALL-CROSSING intervals toward these
+    /// registers (via [`compute_call_crossing_hints`]) so a value live across
+    /// a call stops paying save/restore or a spill at every call site. Empty
+    /// disables the bias and reproduces the historical behavior; the x86-64
+    /// and AArch64 production constructors populate it
+    /// (`jit_latency_aarch64` keeps it empty — the extra crossing scan is
+    /// against that profile's latency budget). `TCG_NO_CALL_CROSSING_HINTS`
+    /// is the runtime kill switch.
+    pub callee_saved_regs: BTreeSet<PReg>,
     /// Target tuning for the pre-RA copy coalescer (hardened-guard-copy
     /// normalization + kill-at-def / pass-through merges). The empty default
     /// reproduces the historical behavior; the AArch64 constructors opt in.
@@ -303,6 +354,7 @@ impl AllocConfig {
             enable_spill_code: true,
             enable_spill_slot_reuse: true,
             hints: BTreeMap::new(),
+            callee_saved_regs: aarch64_callee_saved_regs(),
             coalesce_tuning: coalesce::CoalesceTuning::aarch64(),
         }
     }
@@ -319,6 +371,7 @@ impl AllocConfig {
             enable_spill_code: true,
             enable_spill_slot_reuse: true,
             hints: BTreeMap::new(),
+            callee_saved_regs: aarch64_callee_saved_regs(),
             coalesce_tuning: coalesce::CoalesceTuning::aarch64(),
         }
     }
@@ -352,6 +405,7 @@ impl AllocConfig {
             enable_spill_code: true,
             enable_spill_slot_reuse: false,
             hints: BTreeMap::new(),
+            callee_saved_regs: BTreeSet::new(),
             coalesce_tuning: coalesce::CoalesceTuning::default(),
         }
     }
@@ -734,7 +788,6 @@ fn allocate_core(
     let t_live = ra_stage_start();
     let liveness = compute_live_intervals(func);
     ra_stage_end(&func.name, use_ay, "liveness", t_live);
-    let mut reserved_regs = implicit_def_reservations(func, &liveness.inst_numbering);
     let mut intervals_map = liveness.intervals;
     // Kept alongside `intervals_map`/`reserved_regs` and refreshed with them
     // after coalescing (below): every consumer of instruction positions must
@@ -793,13 +846,19 @@ fn allocate_core(
             // very reservation its own copy creates — silently defeating the
             // ABI copy hints in exactly the loops they were built for.
             let recomputed = compute_live_intervals(func);
-            reserved_regs = implicit_def_reservations(func, &recomputed.inst_numbering);
             intervals_map = recomputed.intervals;
             inst_numbering = recomputed.inst_numbering;
         }
         debug_dump_intervals("after coalescing", &intervals_map);
     }
     ra_stage_end(&func.name, use_ay, "coalesce", t_coalesce);
+    // The call-clobber reservations are computed ONCE here, from the numbering
+    // in force after coalescing (the recomputed one when coalescing rewrote
+    // the function, the original one otherwise). They used to be computed
+    // before the coalesce block and recomputed inside it, which threw the
+    // first result away on every function coalescing changed; nothing between
+    // the two points read them, so this is the same value either way.
+    let reserved_regs = implicit_def_reservations(func, &inst_numbering);
 
     let intervals: Vec<LiveInterval> = intervals_map.values().cloned().collect();
 
@@ -894,6 +953,32 @@ fn allocate_core(
     // split re-allocation. Triggers the post-split liveness refresh of
     // `intervals_map` (used by spill-slot reuse) after the match.
     let mut linear_scan_split_kept = false;
+
+    // Bias call-crossing intervals toward callee-saved registers, so a value
+    // live across a call stops paying save/restore (or a whole spill) at
+    // every call site. Appended AFTER the ABI argument hints and the copy
+    // hints in both arms, so existing preferences keep priority, and checked
+    // against full interference like any other candidate — a hint can never
+    // overlay a live value. Empty `callee_saved_regs` (or the kill switch)
+    // reproduces the historical behavior exactly.
+    let call_crossing_hints = if ay_tuple.is_some()
+        || call_crossing_hints_disabled()
+        || config.callee_saved_regs.is_empty()
+    {
+        BTreeMap::new()
+    } else {
+        // `intervals` is `intervals_map.values()` in ascending `VReg` order,
+        // which is ascending id order (`VReg` orders by `id` first and liveness
+        // yields one interval per id), i.e. exactly the order the former
+        // `BTreeMap<u32, LiveInterval>` — a clone of every interval — iterated.
+        let crossings = find_call_crossings_in(func, &intervals, &inst_numbering);
+        compute_call_crossing_hints(
+            &crossings,
+            &config.callee_saved_regs,
+            &config.allocatable_regs,
+        )
+    };
+
     let t_alloc = ra_stage_start();
     let (mut result, spilled) = match ay_tuple {
         Some(tuple) => tuple,
@@ -915,6 +1000,14 @@ fn allocate_core(
                 let (copy_hints, hint_exempt) = copy_register_hints(func, &inst_numbering);
                 for (vreg, pregs) in copy_hints {
                     hints.entry(vreg).or_default().extend(pregs);
+                }
+                for (vreg, pregs) in &call_crossing_hints {
+                    let entry = hints.entry(*vreg).or_default();
+                    for preg in pregs {
+                        if !entry.contains(preg) {
+                            entry.push(*preg);
+                        }
+                    }
                 }
                 scanner.set_hints(hints, hint_exempt);
                 let result = scanner.allocate()?;
@@ -1003,6 +1096,14 @@ fn allocate_core(
                     }
                     hint_exempt = exempt;
                 }
+                for (vreg, pregs) in &call_crossing_hints {
+                    let entry = hints.entry(*vreg).or_default();
+                    for preg in pregs {
+                        if !entry.contains(preg) {
+                            entry.push(*preg);
+                        }
+                    }
+                }
                 let mut allocator = GreedyAllocator::new_with_reserved(
                     intervals,
                     &config.allocatable_regs,
@@ -1069,7 +1170,7 @@ fn allocate_core(
             let mut rows: Vec<String> = spilled
                 .iter()
                 .map(|v| {
-                    let key = if let Some(iv) = intervals_map.get(&v.id) {
+                    if let Some(iv) = intervals_map.get(&v.id) {
                         format!(
                             "v{}[{}..{}] w={:.4} uses={} defs={}",
                             v.id,
@@ -1081,8 +1182,7 @@ fn allocate_core(
                         )
                     } else {
                         format!("v{}[?]", v.id)
-                    };
-                    key
+                    }
                 })
                 .collect();
             rows.sort();
@@ -2135,6 +2235,125 @@ pub(crate) fn implicit_def_reservations(
     func: &RegAllocFunction,
     inst_numbering: &BTreeMap<InstId, u32>,
 ) -> BTreeMap<PReg, Vec<u32>> {
+    // Dense-by-encoding accumulation, then ONE sorted map at the end. The
+    // reference form (`implicit_def_reservations_reference`, kept as the test
+    // oracle) did a `BTreeMap::entry` per caller-saved VIEW per call
+    // instruction — 136 lookups per call on AArch64 — which was ~70% of the
+    // validator's physreg check and a similar share of allocate_core's
+    // pre-numbering build. Identity: every `entry(..).or_default()` of the
+    // reference creates the key (even when it then pushes nothing, e.g. an
+    // empty call-argument span), and the per-key positions are pushed in the
+    // same traversal order; `created` reproduces the key set exactly and the
+    // final `BTreeMap` orders keys by `PReg` as before.
+    let mut slots: Vec<Vec<u32>> = Vec::new();
+    let mut created: Vec<bool> = Vec::new();
+    #[inline]
+    fn slot<'a>(
+        slots: &'a mut Vec<Vec<u32>>,
+        created: &mut Vec<bool>,
+        preg: PReg,
+    ) -> &'a mut Vec<u32> {
+        let i = preg.encoding() as usize;
+        if i >= slots.len() {
+            slots.resize_with(i + 1, Vec::new);
+            created.resize(i + 1, false);
+        }
+        created[i] = true;
+        &mut slots[i]
+    }
+    // `last_preg_def` per block: dense with an epoch stamp (bumped per block).
+    let mut last_def: Vec<u32> = Vec::new();
+    let mut last_def_epoch: Vec<u32> = Vec::new();
+    let mut epoch: u32 = 0;
+    let get_last =
+        |last_def: &Vec<u32>, last_def_epoch: &Vec<u32>, epoch: u32, reg: PReg| -> Option<u32> {
+            let i = reg.encoding() as usize;
+            (i < last_def.len() && last_def_epoch[i] == epoch).then(|| last_def[i])
+        };
+
+    for block_id in &func.block_order {
+        let Some(block) = func.blocks.get(block_id.0 as usize) else {
+            continue;
+        };
+        epoch += 1;
+
+        for inst_id in &block.insts {
+            let Some(&pos) = inst_numbering.get(inst_id) else {
+                continue;
+            };
+            let Some(inst) = func.insts.get(inst_id.0 as usize) else {
+                continue;
+            };
+
+            if inst.flags.is_call() {
+                for &arg_preg in &inst.implicit_uses {
+                    let def_pos = std::iter::once(arg_preg)
+                        .chain(crate::greedy::aliasing_pregs(arg_preg))
+                        .filter_map(|reg| get_last(&last_def, &last_def_epoch, epoch, reg))
+                        .max();
+                    if let Some(def_pos) = def_pos
+                        && def_pos < pos
+                    {
+                        let entry = slot(&mut slots, &mut created, arg_preg);
+                        for span_pos in (def_pos + 1)..pos {
+                            entry.push(span_pos);
+                        }
+                    }
+                }
+            }
+
+            let mut set_last = |preg: PReg| {
+                let i = preg.encoding() as usize;
+                if i >= last_def.len() {
+                    last_def.resize(i + 1, 0);
+                    last_def_epoch.resize(i + 1, 0);
+                }
+                last_def[i] = pos;
+                last_def_epoch[i] = epoch;
+            };
+            for preg in inst.defs.iter().filter_map(RegAllocOperand::as_preg) {
+                slot(&mut slots, &mut created, preg).push(pos);
+                set_last(preg);
+            }
+            for preg in inst.uses.iter().filter_map(RegAllocOperand::as_preg) {
+                slot(&mut slots, &mut created, preg).push(pos);
+            }
+            for &preg in &inst.implicit_defs {
+                slot(&mut slots, &mut created, preg).push(pos);
+                set_last(preg);
+            }
+            for &preg in &inst.implicit_uses {
+                slot(&mut slots, &mut created, preg).push(pos);
+            }
+        }
+    }
+
+    let mut reserved: BTreeMap<PReg, Vec<u32>> = BTreeMap::new();
+    for (i, points) in slots.into_iter().enumerate() {
+        if created[i] {
+            reserved.insert(PReg::new(i as u16), points);
+        }
+    }
+
+    // Unchanged tail: the span passes run on the finished map, then every
+    // key's positions are sorted and deduplicated (so push ORDER above is
+    // immaterial; only the key set and the position sets are).
+    reserve_implicit_use_spans(func, inst_numbering, &mut reserved);
+    reserve_incoming_argument_spans(func, inst_numbering, &mut reserved);
+
+    for positions in reserved.values_mut() {
+        positions.sort_unstable();
+        positions.dedup();
+    }
+
+    reserved
+}
+
+#[cfg(test)]
+pub(crate) fn implicit_def_reservations_reference(
+    func: &RegAllocFunction,
+    inst_numbering: &BTreeMap<InstId, u32>,
+) -> BTreeMap<PReg, Vec<u32>> {
     let mut reserved: BTreeMap<PReg, Vec<u32>> = BTreeMap::new();
 
     for block_id in &func.block_order {
@@ -2145,7 +2364,9 @@ pub(crate) fn implicit_def_reservations(
         // Track, within this block, the most recent position at which each
         // physical register was defined. Used to reserve a call's argument
         // registers across the WHOLE span from their setup move to the call
-        // (see the call-argument span reservation below).
+        // (see the call-argument span reservation below). All implicit-use
+        // spans, including calls and returns, are also modeled CFG-wide by the
+        // separate backward dataflow below.
         let mut last_preg_def: BTreeMap<PReg, u32> = BTreeMap::new();
 
         for inst_id in &block.insts {
@@ -2220,6 +2441,7 @@ pub(crate) fn implicit_def_reservations(
         }
     }
 
+    reserve_implicit_use_spans(func, inst_numbering, &mut reserved);
     reserve_incoming_argument_spans(func, inst_numbering, &mut reserved);
 
     for positions in reserved.values_mut() {
@@ -2228,6 +2450,136 @@ pub(crate) fn implicit_def_reservations(
     }
 
     reserved
+}
+
+/// Reserve every physical implicit use from each reaching definition through
+/// every sink that consumes it, including cross-block paths.
+///
+/// VReg liveness cannot represent a value after `Copy X0 <- v` has placed it in
+/// a fixed ABI register. Point-only reservations at the copy and `RET` therefore
+/// leave the interior free for an unrelated interval to be colored X0/W0 and
+/// clobber the result. The existing call setup repair handles the common
+/// same-block case; this CFG-aware model additionally handles a producer in a
+/// predecessor and applies to calls and non-call sinks alike.
+///
+/// For each alias class named by a sink's implicit uses, this is ordinary
+/// backward physical-register liveness: an explicit or implicit aliasing
+/// definition kills the successor value, then a same-instruction sink use
+/// generates the input value. The def-before-use reverse transfer is material
+/// for calls, whose arguments are read before their caller-saved implicit defs.
+/// Successor live-ins feed predecessor live-outs to a fixed point. We reserve
+/// every instruction point at which that physical value is live. Missing or
+/// ambiguous return authority is rejected independently by the translation
+/// validator; for any sink without a producer, reserving all the way to entry is
+/// the conservative allocator behavior.
+fn reserve_implicit_use_spans(
+    func: &RegAllocFunction,
+    inst_numbering: &BTreeMap<InstId, u32>,
+    reserved: &mut BTreeMap<PReg, Vec<u32>>,
+) {
+    let mut sink_pregs = Vec::new();
+    for block_id in &func.block_order {
+        let Some(block) = func.blocks.get(block_id.0 as usize) else {
+            continue;
+        };
+        for inst_id in &block.insts {
+            let Some(inst) = func.insts.get(inst_id.0 as usize) else {
+                continue;
+            };
+            for &preg in &inst.implicit_uses {
+                if !sink_pregs
+                    .iter()
+                    .any(|&existing| greedy::allocator_pregs_overlap(existing, preg))
+                {
+                    sink_pregs.push(preg);
+                }
+            }
+        }
+    }
+
+    for sink_preg in sink_pregs {
+        let mut live_in = vec![false; func.blocks.len()];
+        let mut live_out = vec![false; func.blocks.len()];
+
+        loop {
+            let mut changed = false;
+            for block_id in func.block_order.iter().rev() {
+                let block_index = block_id.0 as usize;
+                let Some(block) = func.blocks.get(block_index) else {
+                    continue;
+                };
+                let out = block
+                    .succs
+                    .iter()
+                    .any(|succ| live_in.get(succ.0 as usize).copied().unwrap_or(false));
+                let mut live = out;
+                for inst_id in block.insts.iter().rev() {
+                    let Some(inst) = func.insts.get(inst_id.0 as usize) else {
+                        continue;
+                    };
+                    if regalloc_inst_defines_preg_alias(inst, sink_preg) {
+                        live = false;
+                    }
+                    if inst
+                        .implicit_uses
+                        .iter()
+                        .any(|&use_preg| greedy::allocator_pregs_overlap(use_preg, sink_preg))
+                    {
+                        live = true;
+                    }
+                }
+                if live_out[block_index] != out {
+                    live_out[block_index] = out;
+                    changed = true;
+                }
+                if live_in[block_index] != live {
+                    live_in[block_index] = live;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        let points = reserved.entry(sink_preg).or_default();
+        for block_id in &func.block_order {
+            let block_index = block_id.0 as usize;
+            let Some(block) = func.blocks.get(block_index) else {
+                continue;
+            };
+            let mut live = live_out[block_index];
+            for inst_id in block.insts.iter().rev() {
+                let Some(inst) = func.insts.get(inst_id.0 as usize) else {
+                    continue;
+                };
+                let live_after = live;
+                if regalloc_inst_defines_preg_alias(inst, sink_preg) {
+                    live = false;
+                }
+                if inst
+                    .implicit_uses
+                    .iter()
+                    .any(|&use_preg| greedy::allocator_pregs_overlap(use_preg, sink_preg))
+                {
+                    live = true;
+                }
+                if (live || live_after)
+                    && let Some(&pos) = inst_numbering.get(inst_id)
+                {
+                    points.push(pos);
+                }
+            }
+        }
+    }
+}
+
+fn regalloc_inst_defines_preg_alias(inst: &RegAllocInst, preg: PReg) -> bool {
+    inst.defs
+        .iter()
+        .filter_map(RegAllocOperand::as_preg)
+        .chain(inst.implicit_defs.iter().copied())
+        .any(|defined| greedy::allocator_pregs_overlap(defined, preg))
 }
 
 /// Reserve each INCOMING-ARGUMENT (entry-block live-in) physical register over
@@ -2726,6 +3078,7 @@ mod tests {
             enable_spill_code: true,
             enable_spill_slot_reuse: false,
             hints: BTreeMap::new(),
+            callee_saved_regs: Default::default(),
             coalesce_tuning: Default::default(),
         }
     }
@@ -2743,6 +3096,7 @@ mod tests {
             enable_spill_code: true,
             enable_spill_slot_reuse: false,
             hints: BTreeMap::new(),
+            callee_saved_regs: Default::default(),
             coalesce_tuning: Default::default(),
         }
     }
@@ -2760,6 +3114,7 @@ mod tests {
             enable_spill_code: true,
             enable_spill_slot_reuse: false,
             hints: BTreeMap::new(),
+            callee_saved_regs: Default::default(),
             coalesce_tuning: Default::default(),
         }
     }
@@ -3317,6 +3672,7 @@ mod tests {
             enable_spill_code: true,
             enable_spill_slot_reuse: false,
             hints: BTreeMap::new(),
+            callee_saved_regs: Default::default(),
             coalesce_tuning: Default::default(),
         };
         let result = allocate(&mut func, &config).expect("allocation failed");
@@ -3525,6 +3881,7 @@ mod tests {
             enable_spill_code: true,
             enable_spill_slot_reuse: true,
             hints: BTreeMap::new(),
+            callee_saved_regs: Default::default(),
             coalesce_tuning: Default::default(),
         };
 
@@ -3827,6 +4184,260 @@ mod tests {
             assert!(
                 x0_points.contains(&pos),
                 "X0 span must cover pos {pos} (W-alias setup def matched); got {x0_points:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn return_register_is_reserved_across_same_block_alias_span() {
+        let x0 = PReg::new(0);
+        let w0 = PReg::new(32);
+        let result = VReg::new(0, RegClass::Gpr32);
+        let temporary = VReg::new(1, RegClass::Gpr32);
+        let func = RegAllocFunction {
+            name: "return_alias_span".into(),
+            insts: vec![
+                MachInst {
+                    opcode: phi_elim::PSEUDO_COPY,
+                    defs: vec![MachOperand::PReg(w0)],
+                    uses: vec![MachOperand::VReg(result)],
+                    implicit_defs: Vec::new(),
+                    implicit_uses: Vec::new(),
+                    flags: InstFlags::default(),
+                    tied_operands: Vec::new(),
+                },
+                MachInst {
+                    opcode: 2,
+                    defs: vec![MachOperand::VReg(temporary)],
+                    uses: vec![MachOperand::Imm(7)],
+                    implicit_defs: Vec::new(),
+                    implicit_uses: Vec::new(),
+                    flags: InstFlags::default(),
+                    tied_operands: Vec::new(),
+                },
+                MachInst {
+                    opcode: 3,
+                    defs: Vec::new(),
+                    uses: vec![MachOperand::VReg(temporary)],
+                    implicit_defs: Vec::new(),
+                    implicit_uses: Vec::new(),
+                    flags: InstFlags::default(),
+                    tied_operands: Vec::new(),
+                },
+                MachInst {
+                    opcode: 4,
+                    defs: Vec::new(),
+                    uses: Vec::new(),
+                    implicit_defs: Vec::new(),
+                    implicit_uses: vec![x0],
+                    flags: InstFlags::IS_RETURN.union(InstFlags::IS_TERMINATOR),
+                    tied_operands: Vec::new(),
+                },
+            ],
+            blocks: vec![MachBlock {
+                insts: vec![InstId(0), InstId(1), InstId(2), InstId(3)],
+                preds: Vec::new(),
+                succs: Vec::new(),
+                loop_depth: 0,
+            }],
+            block_order: vec![BlockId(0)],
+            entry_block: BlockId(0),
+            next_vreg: 2,
+            next_stack_slot: 0,
+            stack_slots: BTreeMap::new(),
+        };
+
+        let liveness = compute_live_intervals(&func);
+        let reserved = implicit_def_reservations(&func, &liveness.inst_numbering);
+        let points = reserved.get(&x0).expect("X0 return sink must be reserved");
+        for point in 0..=3 {
+            assert!(
+                points.contains(&point),
+                "W0 producer through X0 return sink must reserve point {point}: {points:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn return_register_liveness_flows_across_cfg_edges() {
+        let x0 = PReg::new(0);
+        let result = VReg::new(0, RegClass::Gpr64);
+        let temporary = VReg::new(1, RegClass::Gpr64);
+        let func = RegAllocFunction {
+            name: "return_cross_block_span".into(),
+            insts: vec![
+                MachInst {
+                    opcode: phi_elim::PSEUDO_COPY,
+                    defs: vec![MachOperand::PReg(x0)],
+                    uses: vec![MachOperand::VReg(result)],
+                    implicit_defs: Vec::new(),
+                    implicit_uses: Vec::new(),
+                    flags: InstFlags::default(),
+                    tied_operands: Vec::new(),
+                },
+                MachInst {
+                    opcode: 2,
+                    defs: Vec::new(),
+                    uses: vec![MachOperand::Block(BlockId(1))],
+                    implicit_defs: Vec::new(),
+                    implicit_uses: Vec::new(),
+                    flags: InstFlags::IS_BRANCH.union(InstFlags::IS_TERMINATOR),
+                    tied_operands: Vec::new(),
+                },
+                MachInst {
+                    opcode: 3,
+                    defs: vec![MachOperand::VReg(temporary)],
+                    uses: vec![MachOperand::Imm(9)],
+                    implicit_defs: Vec::new(),
+                    implicit_uses: Vec::new(),
+                    flags: InstFlags::default(),
+                    tied_operands: Vec::new(),
+                },
+                MachInst {
+                    opcode: 4,
+                    defs: Vec::new(),
+                    uses: vec![MachOperand::VReg(temporary)],
+                    implicit_defs: Vec::new(),
+                    implicit_uses: Vec::new(),
+                    flags: InstFlags::default(),
+                    tied_operands: Vec::new(),
+                },
+                MachInst {
+                    opcode: 5,
+                    defs: Vec::new(),
+                    uses: Vec::new(),
+                    implicit_defs: Vec::new(),
+                    implicit_uses: vec![x0],
+                    flags: InstFlags::IS_RETURN.union(InstFlags::IS_TERMINATOR),
+                    tied_operands: Vec::new(),
+                },
+            ],
+            blocks: vec![
+                MachBlock {
+                    insts: vec![InstId(0), InstId(1)],
+                    preds: Vec::new(),
+                    succs: vec![BlockId(1)],
+                    loop_depth: 0,
+                },
+                MachBlock {
+                    insts: vec![InstId(2), InstId(3), InstId(4)],
+                    preds: vec![BlockId(0)],
+                    succs: Vec::new(),
+                    loop_depth: 0,
+                },
+            ],
+            block_order: vec![BlockId(0), BlockId(1)],
+            entry_block: BlockId(0),
+            next_vreg: 2,
+            next_stack_slot: 0,
+            stack_slots: BTreeMap::new(),
+        };
+
+        let liveness = compute_live_intervals(&func);
+        let reserved = implicit_def_reservations(&func, &liveness.inst_numbering);
+        let points = reserved.get(&x0).expect("X0 return sink must be reserved");
+        for point in 0..=4 {
+            assert!(
+                points.contains(&point),
+                "cross-block return value must reserve point {point}: {points:?}"
+            );
+        }
+    }
+
+    /// A call reads its argument registers before its caller-saved implicit
+    /// defs clobber those same registers. In reverse liveness, the def must
+    /// therefore kill first and the use must then generate. This fixture also
+    /// puts the producer in a predecessor so the same-block call-span shortcut
+    /// cannot hide an incorrect transfer function.
+    #[test]
+    fn call_argument_liveness_flows_across_cfg_with_same_inst_clobber() {
+        let x0 = PReg::new(0);
+        let argument = VReg::new(0, RegClass::Gpr64);
+        let temporary = VReg::new(1, RegClass::Gpr64);
+        let func = RegAllocFunction {
+            name: "call_cross_block_use_before_clobber".into(),
+            insts: vec![
+                MachInst {
+                    opcode: phi_elim::PSEUDO_COPY,
+                    defs: vec![MachOperand::PReg(x0)],
+                    uses: vec![MachOperand::VReg(argument)],
+                    implicit_defs: Vec::new(),
+                    implicit_uses: Vec::new(),
+                    flags: InstFlags::default(),
+                    tied_operands: Vec::new(),
+                },
+                MachInst {
+                    opcode: 2,
+                    defs: Vec::new(),
+                    uses: vec![MachOperand::Block(BlockId(1))],
+                    implicit_defs: Vec::new(),
+                    implicit_uses: Vec::new(),
+                    flags: InstFlags::IS_BRANCH.union(InstFlags::IS_TERMINATOR),
+                    tied_operands: Vec::new(),
+                },
+                MachInst {
+                    opcode: 3,
+                    defs: vec![MachOperand::VReg(temporary)],
+                    uses: vec![MachOperand::Imm(11)],
+                    implicit_defs: Vec::new(),
+                    implicit_uses: Vec::new(),
+                    flags: InstFlags::default(),
+                    tied_operands: Vec::new(),
+                },
+                MachInst {
+                    opcode: 4,
+                    defs: Vec::new(),
+                    uses: vec![MachOperand::VReg(temporary)],
+                    implicit_defs: Vec::new(),
+                    implicit_uses: Vec::new(),
+                    flags: InstFlags::default(),
+                    tied_operands: Vec::new(),
+                },
+                MachInst {
+                    opcode: 5,
+                    defs: Vec::new(),
+                    uses: Vec::new(),
+                    implicit_defs: vec![x0],
+                    implicit_uses: vec![x0],
+                    flags: InstFlags::IS_CALL,
+                    tied_operands: Vec::new(),
+                },
+            ],
+            blocks: vec![
+                MachBlock {
+                    insts: vec![InstId(0), InstId(1)],
+                    preds: Vec::new(),
+                    succs: vec![BlockId(1)],
+                    loop_depth: 0,
+                },
+                MachBlock {
+                    insts: vec![InstId(2), InstId(3), InstId(4)],
+                    preds: vec![BlockId(0)],
+                    succs: Vec::new(),
+                    loop_depth: 0,
+                },
+            ],
+            block_order: vec![BlockId(0), BlockId(1)],
+            entry_block: BlockId(0),
+            next_vreg: 2,
+            next_stack_slot: 0,
+            stack_slots: BTreeMap::new(),
+        };
+
+        let liveness = compute_live_intervals(&func);
+        let reserved = implicit_def_reservations(&func, &liveness.inst_numbering);
+        let points = reserved
+            .get(&x0)
+            .expect("X0 call argument must be reserved");
+        for point in 0..=4 {
+            assert!(
+                points.contains(&point),
+                "cross-block call argument must reserve point {point}: {points:?}"
+            );
+            assert_eq!(
+                points.iter().filter(|&&reserved| reserved == point).count(),
+                1,
+                "same-block and CFG-aware call repairs must deduplicate point {point}: {points:?}"
             );
         }
     }
@@ -4334,6 +4945,7 @@ mod tests {
                 enable_spill_code: true,
                 enable_spill_slot_reuse: false,
                 hints: BTreeMap::new(),
+                callee_saved_regs: Default::default(),
                 coalesce_tuning: Default::default(),
             }
         }

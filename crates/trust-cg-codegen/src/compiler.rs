@@ -41,13 +41,14 @@ use crate::compile_artifact_cache_profile::{
     CompileArtifactCacheTelemetry, CompileArtifactProofPolicy, LocalFilesystemCompileArtifactCache,
 };
 use crate::dialect_pipeline::{DialectPipelineError, lower_dialects_if_needed};
+use crate::jit_contract::{HostJitSelectedCodegenProfile, HostJitSelectedCodegenProfileError};
 use crate::jit_diagnostics::sha256_hex;
 use crate::pipeline::{
     ObjectGlobal, OptLevel, PGO_COUNTER_ARRAY_SYMBOL, PGO_NSITES_SYMBOL, Pipeline, PipelineConfig,
     PipelineError, ProofOptimizationCertificateCitation, guard_kernel_gate_enabled,
 };
 use crate::target::{CallingConvention, Target, TargetOperatingSystem, TargetSpec};
-use crate::x86_64::X86MachineCodeEvidence;
+use crate::x86_64::{X86MachineCodeEvidence, X86TargetFeatures};
 
 // ---------------------------------------------------------------------------
 // Error types
@@ -177,6 +178,45 @@ pub enum CompileError {
     /// JIT compilation failed while producing executable memory.
     #[error("JIT compilation failed: {0}")]
     Jit(#[from] crate::jit::JitError),
+
+    /// No per-function machine-code evidence was available from which to
+    /// derive the selected host-JIT codegen profile.
+    #[error("x86 host-JIT selected-codegen profile has no per-function machine-code evidence")]
+    HostJitSelectedCodegenFeaturesMissing,
+
+    /// A function's actual machine-code target features differed from the
+    /// target features captured from the pipeline that compiled it.
+    #[error(
+        "x86 host-JIT function `{function_name}` selected codegen features `{actual}` but the captured pipeline selected `{expected}`"
+    )]
+    HostJitSelectedCodegenFeaturesPipelineMismatch {
+        /// Function carrying the mismatched evidence.
+        function_name: String,
+        /// Captured pipeline target features.
+        expected: String,
+        /// Function's actual machine-code target features.
+        actual: String,
+    },
+
+    /// Functions in one executable buffer reported different actual
+    /// machine-code target-feature sets.
+    #[error(
+        "x86 host-JIT selected-codegen features are nonuniform: `{reference_function}` selected `{reference_features}`, but `{function_name}` selected `{actual_features}`"
+    )]
+    HostJitSelectedCodegenFeaturesNonUniform {
+        /// First function establishing the selected profile.
+        reference_function: String,
+        /// First function's selected features.
+        reference_features: String,
+        /// Later function carrying different evidence.
+        function_name: String,
+        /// Later function's selected features.
+        actual_features: String,
+    },
+
+    /// The uniform actual selection could not form a self-consistent profile.
+    #[error("x86 host-JIT selected-codegen profile error: {0}")]
+    HostJitSelectedCodegenProfile(#[from] HostJitSelectedCodegenProfileError),
 
     /// Caller attempted to JIT-compile code for an ISA that does not match
     /// the current host process.
@@ -1847,6 +1887,10 @@ pub struct JitCompilationResult {
     /// Per-function code-quality and phase-timing metrics. See #364.
     /// Always populated (one entry per compiled function).
     pub per_function_metrics: Vec<FunctionQualityMetrics>,
+    /// Actual x86 host-JIT target-feature profile derived from every
+    /// function's final machine-code evidence. Non-x86 JIT paths report
+    /// `None`.
+    pub host_jit_selected_codegen_profile: Option<HostJitSelectedCodegenProfile>,
     /// JIT-5 validation provenance: the resolved mode, the published-image
     /// hash the certificates bind to, and per-function coverage/cache
     /// provenance. `None` only for legacy result constructions that predate
@@ -1870,8 +1914,45 @@ impl std::fmt::Debug for JitCompilationResult {
                 "per_function_metrics_count",
                 &self.per_function_metrics.len(),
             )
+            .field(
+                "host_jit_selected_codegen_profile_sha256",
+                &self
+                    .host_jit_selected_codegen_profile
+                    .as_ref()
+                    .map(HostJitSelectedCodegenProfile::profile_sha256),
+            )
             .finish()
     }
+}
+
+fn validate_x86_host_jit_selected_codegen_features<'a>(
+    expected_pipeline_features: X86TargetFeatures,
+    evidence: impl IntoIterator<Item = (&'a str, X86TargetFeatures)>,
+) -> Result<X86TargetFeatures, CompileError> {
+    let mut evidence = evidence.into_iter();
+    let Some((reference_function, reference_features)) = evidence.next() else {
+        return Err(CompileError::HostJitSelectedCodegenFeaturesMissing);
+    };
+    if reference_features != expected_pipeline_features {
+        return Err(
+            CompileError::HostJitSelectedCodegenFeaturesPipelineMismatch {
+                function_name: reference_function.to_owned(),
+                expected: expected_pipeline_features.metadata_feature_list(),
+                actual: reference_features.metadata_feature_list(),
+            },
+        );
+    }
+    for (function_name, actual_features) in evidence {
+        if actual_features != reference_features {
+            return Err(CompileError::HostJitSelectedCodegenFeaturesNonUniform {
+                reference_function: reference_function.to_owned(),
+                reference_features: reference_features.metadata_feature_list(),
+                function_name: function_name.to_owned(),
+                actual_features: actual_features.metadata_feature_list(),
+            });
+        }
+    }
+    Ok(reference_features)
 }
 
 // ---------------------------------------------------------------------------
@@ -3497,17 +3578,17 @@ fn generate_proof_certificates(
 ) -> Vec<ProofCertificate> {
     use trust_cg_verify::function_verifier::InstructionVerificationResult;
 
+    // `TCG_TIME_WALK=1`: split this function's certificate phase into the
+    // walk (including its waits on in-flight sweeps), the dataflow-integrity
+    // check and the certificate build.
+    let timing = std::env::var_os("TCG_TIME_WALK").is_some();
+    let t0 = timing.then(Instant::now);
     let report =
         crate::jit_cert::run_on_proof_verifier_stack("trust-cg-aarch64-proof-verifier", || {
             shared_aarch64_function_verifier().verify_with_lir_source(func, lir_source)
         });
-
-    // TV-3 (aarch64, WARN-ONLY): block-level lowering-integrity telemetry. The
-    // three checks are host-independent, but the aarch64 differential corpus
-    // cannot execute on the x86 validation host and the stamps only reach here
-    // through the post-pass MachFunction, so the §2.4 warn->enforce flip is the
-    // Apple-Silicon lane's (roadmap §3). `evaluate` in WARN mode counts +
-    // reports but never changes a verdict, so cert output is unaffected.
+    let t_walk = t0.map(|t| t.elapsed());
+    let t1 = timing.then(Instant::now);
     if let Some(lir) = lir_source {
         let mode = trust_cg_verify::dataflow_integrity::dataflow_integrity_mode(
             trust_cg_verify::dataflow_integrity::AARCH64_DATAFLOW_INTEGRITY_DEFAULT,
@@ -3515,6 +3596,8 @@ fn generate_proof_certificates(
         let _ = trust_cg_verify::dataflow_integrity::evaluate(func, lir, "aarch64", mode);
     }
 
+    let t_dfi = t1.map(|t| t.elapsed());
+    let t2 = timing.then(Instant::now);
     let mut certs = Vec::new();
 
     append_emitted_opcode_inventory_certificate(&mut certs, &report);
@@ -3592,6 +3675,16 @@ fn generate_proof_certificates(
         }
     }
 
+    if let (Some(w), Some(d), Some(t)) = (t_walk, t_dfi, t2) {
+        eprintln!(
+            "TCG_TIME_CERTS fn={} walk={:.2}ms dataflow_integrity={:.2}ms certs_build={:.2}ms n={}",
+            func.name,
+            w.as_secs_f64() * 1000.0,
+            d.as_secs_f64() * 1000.0,
+            t.elapsed().as_secs_f64() * 1000.0,
+            certs.len()
+        );
+    }
     certs
 }
 
@@ -3773,6 +3866,23 @@ fn shared_x86_64_function_verifier() -> &'static trust_cg_verify::X86FunctionVer
 #[cfg(feature = "verify")]
 fn shared_aarch64_function_verifier()
 -> &'static trust_cg_verify::function_verifier::FunctionVerifier {
+    static INIT_TRACE: std::sync::Once = std::sync::Once::new();
+    INIT_TRACE.call_once(|| {
+        if std::env::var_os("TCG_TIME_SWEEP").is_some() {
+            let t0 = std::time::Instant::now();
+            let _ = shared_aarch64_function_verifier_inner();
+            eprintln!(
+                "TCG_VERIFIER_INIT first_call={:.1}ms",
+                t0.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+    });
+    shared_aarch64_function_verifier_inner()
+}
+
+#[cfg(feature = "verify")]
+fn shared_aarch64_function_verifier_inner()
+-> &'static trust_cg_verify::function_verifier::FunctionVerifier {
     static VERIFIER: std::sync::OnceLock<trust_cg_verify::function_verifier::FunctionVerifier> =
         std::sync::OnceLock::new();
     VERIFIER.get_or_init(trust_cg_verify::function_verifier::FunctionVerifier::new)
@@ -3802,6 +3912,269 @@ fn shared_aarch64_function_verifier()
 #[cfg(feature = "verify")]
 pub fn warm_x86_64_proof_verifier() {
     let _ = shared_x86_64_function_verifier();
+}
+
+/// Worker count for the flat-tape sweep pre-warm: the host's parallelism,
+/// capped by an explicit `TRUST_CG_MAX_PARALLELISM`, NOT capped by the item count (one obligation is many chunks, see `lowering_proof::fan_out_chunks`),
+/// and `None` when there is nothing to sweep. Deliberately independent of the deep-walk
+/// verifier pool's limit (see the pre-warm comment in `compile`).
+#[cfg(feature = "verify")]
+fn sweep_prewarm_width(item_count: usize) -> Option<usize> {
+    if item_count == 0 {
+        return None;
+    }
+    let available = std::thread::available_parallelism().map_or(1, usize::from);
+    let cap = std::env::var("TRUST_CG_MAX_PARALLELISM")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .map_or(available, |explicit| explicit.min(available).max(1));
+    // NOT `cap.min(item_count)`: one obligation is no longer one task. Its
+    // 100k-sample sweep splits into chunks across whatever pool it runs on
+    // (`lowering_proof::fan_out_chunks`), so even a single-kind round fills
+    // the pool — and a single-kind round was exactly the third CGU of every
+    // corpus compile, previously swept inline on one thread.
+    (cap >= 2).then_some(cap)
+}
+
+/// The ONE process-wide sweep pool: host-wide (bounded by
+/// `TRUST_CG_MAX_PARALLELISM`), default stacks — see the pre-warm site for why
+/// it is not the 32 MiB-stack verifier pool. Built once, on first use, by
+/// whichever caller comes first (the init-time speculative sweep, normally);
+/// every per-CGU pre-warm round then reuses it instead of spawning and joining
+/// 20 threads per round (3-4 rounds per compile on the corpus). `None` on a
+/// single-core host or when the operator pins parallelism to 1.
+#[cfg(feature = "verify")]
+static SWEEP_POOL: std::sync::OnceLock<
+    std::sync::Mutex<Option<std::sync::Arc<rayon::ThreadPool>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(feature = "verify")]
+fn sweep_pool() -> Option<std::sync::Arc<rayon::ThreadPool>> {
+    let slot = SWEEP_POOL.get_or_init(|| {
+        let pool = sweep_prewarm_width(1).and_then(|width| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(width)
+                .thread_name(|idx| format!("trust-cg-sweep-{idx}"))
+                .build()
+                .ok()
+                .map(std::sync::Arc::new)
+        });
+        // Every sweep in the process — the certificate walk's included — fans
+        // its sample chunks out to this pool from now on.
+        trust_cg_verify::lowering_proof::set_sweep_helper_pool(pool.clone());
+        std::sync::Mutex::new(pool)
+    });
+    slot.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// Let the sweep pool's workers go once no more sweeps can run (the bridge
+/// calls this at the end of `join_codegen`). The pool is dropped on a
+/// detached thread, so its 20 workers are torn down while rustc links rather
+/// than inside `exit` — measured on the corpus as 5-10ms of the after-join
+/// segment with the pool alive (an 8-worker pool recovered it but cost the
+/// sweeps up to 12ms). A sweep still holding the `Arc` (the speculative one,
+/// if it is somehow still running) keeps the pool alive until it finishes;
+/// the drop then happens on that thread. Any later `sweep_pool()` call gets
+/// `None` and sweeps inline, exactly as on a single-core host.
+#[cfg(feature = "verify")]
+pub fn release_sweep_pool() {
+    let Some(slot) = SWEEP_POOL.get() else { return };
+    let pool = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    trust_cg_verify::lowering_proof::set_sweep_helper_pool(None);
+    if let Some(pool) = pool {
+        let _ = std::thread::Builder::new()
+            .name("trust-cg-sweep-release".to_owned())
+            .spawn(move || drop(pool));
+    }
+}
+
+/// One unit of ASYNCHRONOUS sweep pre-warm work: owned, so the owners can
+/// outlive the compile phase that spawned them.
+#[cfg(feature = "verify")]
+enum AsyncSweepItem {
+    Registry(&'static trust_cg_verify::ProofObligation),
+    Reconstructed(
+        (
+            trust_cg_verify::ProofObligation,
+            trust_cg_verify::ProofObligation,
+        ),
+    ),
+}
+
+/// The asynchronous twin of `sweep_with_bounded_owners`: `threads / 2`
+/// owner jobs are spawned onto `pool`, each pulling items from one counter
+/// until it is exhausted, and NOBODY waits — the caller proceeds to the
+/// certificate walk, which blocks per memo cell exactly where it must.
+/// Owners hold no cell while pulling and never enter a rayon wait inside
+/// one, so the deadlock argument of `fan_out_chunks` is unchanged.
+#[cfg(feature = "verify")]
+fn spawn_bounded_owner_sweeps(
+    pool: &rayon::ThreadPool,
+    items: Vec<AsyncSweepItem>,
+    verifier: &'static trust_cg_verify::function_verifier::FunctionVerifier,
+) {
+    let owners = (pool.current_num_threads() / 2)
+        .clamp(1, 10)
+        .min(items.len().max(1));
+    let items = std::sync::Arc::new(items);
+    let next = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    for _ in 0..owners {
+        let (items, next) = (std::sync::Arc::clone(&items), std::sync::Arc::clone(&next));
+        pool.spawn(move || {
+            loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(item) = items.get(i) else { return };
+                match item {
+                    AsyncSweepItem::Registry(ob) => verifier.discharge_registry_obligation_now(ob),
+                    AsyncSweepItem::Reconstructed((inst, canon)) => {
+                        verifier.discharge_reconstructed_obligation_now(inst, canon)
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Discharge `items` on `pool` with at most `threads / 2` (capped at 10)
+/// concurrent OWNERS, so the rest of the pool is free to run the owners'
+/// sample chunks — when this is the only sweep on the pool; while the
+/// init-time speculative sweep and the first CGU's pre-warm overlap, both
+/// sets of owners share it and owners run more of their own chunks.
+///
+/// A plain `par_iter` makes every worker an owner. A kind's chunk helpers
+/// (`fan_out_chunks`) then sit in its owner's deque BEHIND the par_iter's
+/// remaining range jobs, and rayon thieves take the oldest job first — so a
+/// big kind's chunks are stolen only once every other kind has been taken.
+/// Measured on v3_popcount's 803-op NEON tape: 24 of 24 chunks ran on the
+/// owner, 23ms, with 19 workers busy elsewhere. Owners pull items from one
+/// counter, so small kinds still stream through them; big kinds get the
+/// idle half.
+#[cfg(feature = "verify")]
+fn sweep_with_bounded_owners<T: Sync>(
+    pool: &rayon::ThreadPool,
+    items: &[T],
+    discharge: impl Fn(&T) + Sync,
+) {
+    let owners = (pool.current_num_threads() / 2)
+        .clamp(1, 10)
+        .min(items.len().max(1));
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    pool.install(|| {
+        (0..owners).into_par_iter().for_each(|_| {
+            loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(item) = items.get(i) else { return };
+                discharge(item);
+            }
+        })
+    });
+}
+
+/// The registry obligation KINDS every aarch64 program's certificate lane
+/// sweeps, whatever the program: the entry CGU (`rustc_entry_main`), the
+/// allocator shim, and every function's prologue/epilogue, frame layout and
+/// relocations. Measured as the memo MISSES of `fn main() {}` under
+/// `TCG_TIME_SWEEP=1` (13 registry kinds; the other two misses are
+/// RECONSTRUCTED obligations built from real instructions, which have no
+/// registry name), and confirmed a subset of every corpus program's misses.
+///
+/// `speculative_sweep_aarch64_invariant_kinds` sweeps these at backend `init`,
+/// while rustc still has its whole front end ahead of it — the same CPU the
+/// first CGU's pre-warm would spend on them later, spent while the box would
+/// otherwise idle. A stale entry costs one wasted sweep; a MISSING entry costs
+/// nothing but the speed-up. Regenerate: compile `fn main() {}` with
+/// `TCG_TIME_SWEEP=1` and take the non-RECONSTRUCTED `TCG_TIME_SWEEP` names;
+/// `scripts/check_invariant_sweep_kinds.sh` diffs the two.
+#[cfg(feature = "verify")]
+pub const AARCH64_INVARIANT_SWEEP_KINDS: &[&str] = &[
+    "ConstMat: MOVZ #imm16, LSL #0 == zext(imm16)",
+    "FrameLayout: callee-save pair slots don't overlap",
+    "FrameLayout: callee-save restore is identity",
+    "FrameLayout: SP alignment preserved (SP % 16 == 0 after SUB)",
+    "Iadd_I8 -> ADD (8-bit)",
+    "Isub_I8 -> SUB (8-bit)",
+    "LDP_QF_ABV_I32_offset0: two adjacent Load_I32 == LDP [Xn, #0]",
+    "MachO AArch64: ARM64_RELOC_BRANCH26 BL == S+A (PC-relative call)",
+    "MachO AArch64: ARM64_RELOC_GOT_LOAD_PAGEOFF12 ADRP+LDR == G+A (GOT slot address)",
+    "MachO AArch64: ARM64_RELOC_PAGE21 ADRP == page(S+A) (PC-relative page)",
+    "MachO AArch64: ARM64_RELOC_PAGEOFF12 ADRP+ADD == S+A (full address)",
+    "Roundtrip_I8: store then load",
+    "Uextend_I8_to_I32 -> UXTB (AND #0xFF)",
+];
+
+/// Sweep [`AARCH64_INVARIANT_SWEEP_KINDS`] on the sweep pool, filling the same
+/// process-wide memo cells the first CGU's pre-warm would otherwise compute on
+/// the critical path. Builds the shared verifier (the proof database) first,
+/// so this subsumes `warm_aarch64_proof_verifier`. Meant for a detached
+/// thread at backend `init`; blocks until the sweeps are done. Gated like the
+/// warm: `shared_aarch64_function_verifier` only exists under `verify`.
+#[cfg(feature = "verify")]
+pub fn speculative_sweep_aarch64_invariant_kinds() {
+    // Same rule as the pre-warm it front-runs: with the live solver route
+    // requested, registry discharges may enter the solver, which must never be
+    // invoked from multiple threads — so no speculative fan-out either.
+    if recon_live_solver_route_requested() {
+        return;
+    }
+    let t0 = Instant::now();
+    let verifier = shared_aarch64_function_verifier();
+    let t_db = t0.elapsed();
+    let obligations = verifier.registry_obligations_named(AARCH64_INVARIANT_SWEEP_KINDS);
+    if let Some(pool) = sweep_pool() {
+        sweep_with_bounded_owners(&pool, &obligations, |ob| {
+            verifier.discharge_registry_obligation_now(ob)
+        });
+    }
+    if std::env::var_os("TCG_TIME_SWEEP").is_some() {
+        eprintln!(
+            "TCG_SPECULATIVE_SWEEP kinds={} db={:.1}ms total={:.1}ms",
+            obligations.len(),
+            t_db.as_secs_f64() * 1000.0,
+            t0.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+}
+
+#[cfg(all(test, feature = "verify"))]
+mod invariant_sweep_kinds_tests {
+    use super::*;
+
+    /// Every listed kind names exactly one registry obligation (a typo or a
+    /// renamed obligation would otherwise turn into a silent no-op), and the
+    /// list has no duplicates.
+    #[test]
+    fn every_invariant_kind_resolves_to_one_registry_obligation() {
+        let verifier = shared_aarch64_function_verifier();
+        let mut seen = std::collections::HashSet::new();
+        for name in AARCH64_INVARIANT_SWEEP_KINDS {
+            assert!(seen.insert(*name), "duplicate invariant kind `{name}`");
+            let hits = verifier.registry_obligations_named(&[name]);
+            assert_eq!(
+                hits.len(),
+                1,
+                "invariant kind `{name}` resolves to {} registry obligations",
+                hits.len()
+            );
+        }
+        let all = verifier.registry_obligations_named(AARCH64_INVARIANT_SWEEP_KINDS);
+        assert_eq!(all.len(), AARCH64_INVARIANT_SWEEP_KINDS.len());
+    }
+}
+
+/// AArch64 twin of [`warm_x86_64_proof_verifier`]: build the shared verifier's
+/// proof database off the critical path. See the bridge's `codegen_crate`.
+/// Gated identically to the x86 twin — `shared_aarch64_function_verifier` only
+/// exists under `verify`, and an ungated wrapper would break the default-feature
+/// build the moment anything called it.
+#[cfg(feature = "verify")]
+pub fn warm_aarch64_proof_verifier() {
+    let _ = shared_aarch64_function_verifier();
 }
 
 /// JIT-5 config fingerprint for the x86-64 certificate cache key.
@@ -5020,10 +5393,158 @@ impl Compiler {
         // Proof certificates are generated before cache lookup/store so a
         // proof-policy cache partition cannot promote object bytes whose public
         // proof surface contains failed, unverified, or unknown entries.
+        //
+        // The certificate lane is the single largest phase of a proofs-ON
+        // compile and, until this entry existed, the ONLY untraced one: an
+        // empty `fn main() {}` reported `total=98.4ms` against itemised phases
+        // summing to 4.3ms, so 94ms had nowhere to land and every attribution
+        // attempt was guesswork. The x86 path in `compile_x86_64_module` has
+        // carried an `x86_proof_certs` entry for a while; this is its AArch64
+        // twin, which the object path never got.
+        // KIND-PARALLEL PRE-WARM of the fixed-registry sweeps.
+        //
+        // The proofs-ON compile gap is a FIXED per-process cost: ~15-30 distinct
+        // registry obligations are each swept ONCE (100k samples) on first touch,
+        // then memoised. The per-function cert lane below cannot parallelise
+        // that — a corpus program has 8-9 functions, every one of which needs
+        // the SAME kinds, so its workers queue on the same memo cells
+        // (measured: 0.98-1.35x concurrency). The parallelism has to run across
+        // obligation KINDS instead: enumerate every distinct registry obligation
+        // the module will discharge, sweep them concurrently on a pool whose
+        // workers carry the verifier stack, and let the serial walk hit warm
+        // cells. Measured on h3_box_leak: 29 kinds, 138ms serial, largest single
+        // kind 12ms — so the critical path drops to ~one kind.
+        //
+        // Verdict-identical by construction: `discharge_registry_obligation`
+        // ends in the content-keyed memo, each cell is computed once by
+        // whichever thread reaches it first, and the walk reads the cell. The
+        // selection is the walk's OWN (`registry_proof_for_query`), not a copy,
+        // so it cannot drift. Reconstruction-arm obligations (cheap ALU sweeps)
+        // are left to the walk. Width never affects output.
+        #[cfg(feature = "verify")]
+        if std::env::var_os("TCG_TIME_SWEEP").is_some() {
+            eprintln!(
+                "TCG_PREWARM_GATE fns={} emit_proofs={} parallel={} recon_route={}",
+                prepared_funcs.len(),
+                self.config.emit_proofs,
+                self.config.parallel,
+                recon_live_solver_route_requested()
+            );
+        }
+        // NOT gated on `config.parallel`. That flag governs the FUNCTION-level
+        // regalloc+encode fanout, which is memory-bounded and which the bridge's
+        // legacy path pins to `false` for every CGU but the first. A kind-parallel
+        // sweep pre-warm is the opposite shape — read-only CPU over the shared
+        // verifier — and it is worth the MOST on exactly the single-function CGU
+        // (measured: a `main` CGU with fns=1 paid 41ms of first-touch sweeps that
+        // the gated version skipped). Width is bounded by
+        // `verification_worker_count_for_items`, which honours
+        // `TRUST_CG_MAX_PARALLELISM` and returns None when there is nothing to
+        // spread, and by the solver-serialisation rule below.
+        #[cfg(feature = "verify")]
+        if (self.config.emit_proofs || self.requires_verified_proof_promotion())
+            && !recon_live_solver_route_requested()
+        {
+            let prewarm_start = Instant::now();
+            let verifier = shared_aarch64_function_verifier();
+            let funcs: Vec<&trust_cg_ir::MachFunction> = prepared_funcs.iter().collect();
+            let (obligations, recon) = verifier.registry_obligations_for_functions(&funcs);
+            let t_enum = prewarm_start.elapsed();
+            let total = obligations.len() + recon.len();
+            if std::env::var_os("TCG_TIME_SWEEP").is_some() {
+                eprintln!(
+                    "TCG_PREWARM fns={} registry={} reconstructed={} width={:?}",
+                    funcs.len(),
+                    obligations.len(),
+                    recon.len(),
+                    sweep_prewarm_width(total)
+                );
+            }
+            // NOT on the shared 32 MiB-stack verifier pool, deliberately. That
+            // pool is sized for the per-function certificate WALK, whose
+            // `try_eval` recursion genuinely needs the large stack, and it is
+            // therefore kept narrow (2 workers by default; 1 in the bridge) to
+            // bound total stack memory. The sweeps here are a different shape:
+            // every corpus obligation compiles to a FLAT tape (29/29 on
+            // h3_box_leak — the recursive fallback never runs), the only
+            // recursion is the one-time `FlatProg::compile` tree walk, and the
+            // deepest obligation in the entire registry nests 68 levels (`BSR_I64`),
+            // which a default 2 MiB worker stack absorbs with orders of magnitude
+            // to spare. So this pool is WIDE (host parallelism, bounded by the
+            // operator's TRUST_CG_MAX_PARALLELISM) and default-stack: the memory
+            // argument that narrows the walk pool does not apply to it, and
+            // narrowing it would serialize ~20-30 independent kinds behind one
+            // or two workers — measured as +30..+64ms on the corpus.
+            // Width comes from the HOST (bounded by the operator's
+            // TRUST_CG_MAX_PARALLELISM), not from
+            // `verification_worker_count_for_items`: that now derives from the
+            // walk pool's limit, which is 1 inside the bridge — so asking it here
+            // returned None and silently disabled the pre-warm entirely.
+            // The pool sizes itself (`sweep_pool`); this is only the go/no-go.
+            if sweep_prewarm_width(total).is_some() {
+                let t_run0 = Instant::now();
+                if let Some(pool) = sweep_pool() {
+                    // Asynchronous: the owners start on the pool and the WALK
+                    // starts now, blocking only on the cells it reaches while
+                    // they are in flight — so the sweeps overlap the walk
+                    // instead of preceding it. A kind the walk reaches before
+                    // any owner claimed it is swept by the walk, fanned out to
+                    // the same pool (`set_sweep_helper_pool`).
+                    let items: Vec<AsyncSweepItem> = obligations
+                        .iter()
+                        .map(|ob| AsyncSweepItem::Registry(ob))
+                        .chain(recon.iter().cloned().map(AsyncSweepItem::Reconstructed))
+                        .collect();
+                    spawn_bounded_owner_sweeps(&pool, items, verifier);
+                }
+                if std::env::var_os("TCG_TIME_SWEEP").is_some() {
+                    eprintln!(
+                        "TCG_PREWARM_SPLIT enumerate={:.1}ms run={:.1}ms",
+                        t_enum.as_secs_f64() * 1000.0,
+                        t_run0.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+            }
+            if tracing {
+                trace_entries.push(TraceEntry {
+                    phase: "proof_prewarm".to_string(),
+                    duration: prewarm_start.elapsed(),
+                    detail: Some(format!(
+                        "{} registry + {} reconstructed obligations",
+                        obligations.len(),
+                        recon.len()
+                    )),
+                });
+            }
+        }
+        #[cfg(feature = "verify")]
+        let proof_certs_start = Instant::now();
+        // CT-7 pool width for the cert lane — the SAME policy `compile_x86_64`
+        // has used since CT-7 and which this path never got. `use_parallel` /
+        // `parallel_worker_count` come from `worker_count_for_items`, whose
+        // 16-items-per-worker floor is calibrated for the memory-hungry
+        // regalloc+encode fanout; applying it here left every CGU under 32
+        // functions generating certificates SERIALLY, and the certificate lane
+        // is the dominant proofs-ON compile cost. Per-function verification is
+        // pure read-only CPU over the shared `&'static` verifier, but its deep
+        // SMT walk needs a 32 MiB stack. The shared verifier resource policy
+        // therefore uses a small process-wide pool (or the explicit operator
+        // limit) rather than the memory-heavy regalloc heuristic. Width never
+        // affects output — the lane collects into a function-ordered vector.
+        //
+        // The solver-serialization condition is carried over verbatim: the
+        // opt-in reconstructed-obligation route discharges OUTSIDE the memo
+        // lock, so when it is armed the lane stays serial rather than invoking
+        // a solver from several threads.
+        #[cfg(feature = "verify")]
+        let cert_worker_count = if self.config.parallel && !recon_live_solver_route_requested() {
+            crate::resource_limits::verification_worker_count_for_items(prepared_funcs.len())
+        } else {
+            None
+        };
         #[cfg(feature = "verify")]
         let mut proofs = if self.config.emit_proofs || self.requires_verified_proof_promotion() {
-            let all_certs: Vec<ProofCertificate> = if use_parallel {
-                let worker_count = parallel_worker_count.unwrap_or(1);
+            let all_certs: Vec<ProofCertificate> = if let Some(worker_count) = cert_worker_count {
                 let pool =
                     crate::resource_limits::build_rayon_pool(worker_count).map_err(|err| {
                         CompileError::Pipeline(PipelineError::ISel(format!(
@@ -5054,6 +5575,18 @@ impl Compiler {
         } else {
             None
         };
+        #[cfg(feature = "verify")]
+        if tracing {
+            trace_entries.push(TraceEntry {
+                phase: "proof_certs".to_string(),
+                duration: proof_certs_start.elapsed(),
+                detail: Some(format!(
+                    "{} certs over {} fns",
+                    proofs.as_deref().map(<[_]>::len).unwrap_or(0),
+                    prepared_funcs.len()
+                )),
+            });
+        }
         #[cfg(not(feature = "verify"))]
         let proofs: Option<Vec<ProofCertificate>> = None;
 
@@ -5535,12 +6068,12 @@ impl Compiler {
             // rustc bridge) parallelizes.
             //
             // CT-7: the cert lane's pool width comes from
-            // `verification_worker_count_for_items` (default: the host's
-            // available parallelism), NOT the conservative
-            // `worker_count_for_items` regalloc+encode cap — per-function
-            // verification is pure read-only CPU over the shared `&'static`
-            // verifier and is the dominant proofs-on compile cost. Width
-            // never affects output (function-ordered collect).
+            // `verification_worker_count_for_items` (the shared large-stack
+            // verifier policy), NOT the regalloc+encode cap. All functions and
+            // their nested instruction pre-passes submit to one process-wide
+            // 32 MiB-stack pool, so the safe default is small while an explicit
+            // operator limit remains available. Width never affects output
+            // (function-ordered collect).
             let cert_worker_count = if use_parallel && !recon_live_solver_route_requested() {
                 crate::resource_limits::verification_worker_count_for_items(
                     optimized_isel_funcs.len(),
@@ -6273,6 +6806,7 @@ impl Compiler {
         } else {
             X86PipelineConfig::host_jit()
         };
+        let selected_pipeline_target_features = jit_base_config.target_features;
         let pipeline = X86Pipeline::new(X86PipelineConfig {
             opt_level: x86_opt_level,
             output_format: X86OutputFormat::RawBytes,
@@ -6296,6 +6830,7 @@ impl Compiler {
                 output_format: X86OutputFormat::RawBytes,
                 emit_frame: true,
                 call_abi,
+                target_features: selected_pipeline_target_features,
                 ..X86PipelineConfig::host_jit()
             }))
         } else {
@@ -6538,6 +7073,29 @@ impl Compiler {
             });
         }
 
+        // Derive one artifact-level profile from the ACTUAL target-feature
+        // evidence returned by every function's final machine-code pipeline.
+        // This gate runs before certification and publication, so neither a
+        // pipeline/evidence mismatch nor a nonuniform multi-function artifact
+        // can reach executable memory.
+        let selected_target_features = validate_x86_host_jit_selected_codegen_features(
+            selected_pipeline_target_features,
+            optimized_isel_funcs
+                .iter()
+                .zip(&encoded)
+                .map(|(function, encoded)| {
+                    (
+                        function.name.as_str(),
+                        encoded.machine_code_evidence.target_features,
+                    )
+                }),
+        )?;
+        let selected_codegen_profile =
+            HostJitSelectedCodegenProfile::from_validated_x86_target_features(
+                compiler_target_triple(self.target_spec),
+                selected_target_features,
+            )?;
+
         let function_code_size: usize = encoded.iter().map(|func| func.published_len).sum();
 
         let mut veneers: HashMap<String, u64> = HashMap::new();
@@ -6657,6 +7215,9 @@ impl Compiler {
             windows_unwind_functions,
         )
         .map_err(CompileError::Jit)?;
+        buffer
+            .attach_host_jit_selected_codegen_profile(selected_codegen_profile.clone())
+            .map_err(CompileError::Jit)?;
         if tracing {
             trace_entries.push(TraceEntry {
                 phase: "x86_jit_publish".to_string(),
@@ -6720,6 +7281,7 @@ impl Compiler {
             proofs,
             proof_optimization_certificates: Vec::new(),
             per_function_metrics,
+            host_jit_selected_codegen_profile: Some(selected_codegen_profile),
             validation,
         })
     }
@@ -7248,6 +7810,7 @@ impl Compiler {
             proofs,
             proof_optimization_certificates,
             per_function_metrics,
+            host_jit_selected_codegen_profile: None,
             validation,
         })
     }
@@ -7335,6 +7898,81 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn selected_codegen_evidence_accepts_uniform_actual_pipeline_features() {
+        let selected = X86TargetFeatures::generic_x86_64()
+            .with_feature(crate::x86_64::X86TargetFeature::Popcnt)
+            .with_feature(crate::x86_64::X86TargetFeature::Sse41);
+
+        assert_eq!(
+            validate_x86_host_jit_selected_codegen_features(
+                selected,
+                [("first", selected), ("second", selected)],
+            )
+            .expect("uniform actual evidence must be admitted"),
+            selected
+        );
+    }
+
+    #[test]
+    fn selected_codegen_evidence_rejects_pipeline_mismatch() {
+        let pipeline = X86TargetFeatures::generic_x86_64()
+            .with_feature(crate::x86_64::X86TargetFeature::Popcnt);
+        let actual = pipeline.with_feature(crate::x86_64::X86TargetFeature::Sse41);
+
+        let error =
+            validate_x86_host_jit_selected_codegen_features(pipeline, [("mismatched", actual)])
+                .expect_err("actual evidence must equal the captured pipeline selection");
+        assert!(matches!(
+            error,
+            CompileError::HostJitSelectedCodegenFeaturesPipelineMismatch {
+                function_name,
+                expected,
+                actual,
+            } if function_name == "mismatched"
+                && expected == "popcnt"
+                && actual == "popcnt,sse4.1"
+        ));
+    }
+
+    #[test]
+    fn selected_codegen_evidence_rejects_nonuniform_functions() {
+        let selected = X86TargetFeatures::generic_x86_64()
+            .with_feature(crate::x86_64::X86TargetFeature::Popcnt);
+        let divergent = selected.with_feature(crate::x86_64::X86TargetFeature::Sse41);
+
+        let error = validate_x86_host_jit_selected_codegen_features(
+            selected,
+            [("reference", selected), ("divergent", divergent)],
+        )
+        .expect_err("all functions in one executable buffer must agree");
+        assert!(matches!(
+            error,
+            CompileError::HostJitSelectedCodegenFeaturesNonUniform {
+                reference_function,
+                reference_features,
+                function_name,
+                actual_features,
+            } if reference_function == "reference"
+                && reference_features == "popcnt"
+                && function_name == "divergent"
+                && actual_features == "popcnt,sse4.1"
+        ));
+    }
+
+    #[test]
+    fn selected_codegen_evidence_rejects_empty_function_set() {
+        let error = validate_x86_host_jit_selected_codegen_features(
+            X86TargetFeatures::generic_x86_64(),
+            std::iter::empty::<(&str, X86TargetFeatures)>(),
+        )
+        .expect_err("a profile cannot be derived without function evidence");
+        assert!(matches!(
+            error,
+            CompileError::HostJitSelectedCodegenFeaturesMissing
+        ));
+    }
 
     #[test]
     fn production_x86_dataflow_gate_cannot_be_disabled_by_environment() {
@@ -10861,6 +11499,96 @@ mod tests {
         );
         assert_eq!(serial.metrics.function_count, 6);
         assert_eq!(parallel_a.metrics.function_count, 6);
+        assert_eq!(
+            serial.metrics.instruction_count,
+            parallel_a.metrics.instruction_count
+        );
+        assert_eq!(
+            serial.metrics.code_size_bytes,
+            parallel_a.metrics.code_size_bytes
+        );
+    }
+
+    /// The AArch64 twin of
+    /// `test_x86_parallel_and_serial_multi_function_byte_identical`.
+    ///
+    /// The x86 dispatcher has had a width-invariance gate since CT-5. The
+    /// AArch64 object path did NOT, and it also never picked up CT-7's
+    /// cert-lane pool policy — it inherited `worker_count_for_items`, whose
+    /// 16-items-per-worker floor kept every CGU under 32 functions generating
+    /// certificates serially. Now that this lane fans out for real, it needs
+    /// the same gate: a scheduling-dependent object or proof bundle would be
+    /// exactly the BENCH-8 nondeterminism class.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn test_aarch64_parallel_and_serial_multi_function_byte_identical() {
+        use trust_ir::Ty;
+        use trust_ir_build::ModuleBuilder;
+
+        let build_module = || {
+            let mut mb = ModuleBuilder::new("aarch64_parallel_determinism");
+            for (idx, name) in [
+                "add_fn",
+                "mul_sub_fn",
+                "add_double_fn",
+                "poly_fn",
+                "chain_fn",
+                "mix_fn",
+            ]
+            .iter()
+            .enumerate()
+            {
+                let ty = mb.add_func_type(vec![Ty::I64, Ty::I64], vec![Ty::I64]);
+                let mut fb = mb.function(*name, ty);
+                let entry = fb.create_block();
+                let a = fb.add_block_param(entry, Ty::I64);
+                let b = fb.add_block_param(entry, Ty::I64);
+                fb.switch_to_block(entry);
+                let k = fb.iconst(Ty::I64, (idx as i128) + 3);
+                let sum = fb.add(Ty::I64, a, b);
+                let prod = fb.mul(Ty::I64, sum, k);
+                let result = fb.sub(Ty::I64, prod, a);
+                fb.ret(vec![result]);
+                fb.build();
+            }
+            mb.build()
+        };
+
+        let compile_with = |parallel: bool| {
+            Compiler::new(CompilerConfig {
+                parallel,
+                emit_proofs: true,
+                ..CompilerConfig::default()
+            })
+            .compile(&build_module())
+            .expect("aarch64 multi-function module should compile")
+        };
+
+        let serial = compile_with(false);
+        let parallel_a = compile_with(true);
+        let parallel_b = compile_with(true);
+
+        assert_eq!(
+            serial.object_code, parallel_a.object_code,
+            "aarch64 parallel compilation must be BYTE-IDENTICAL to serial"
+        );
+        assert_eq!(
+            parallel_a.object_code, parallel_b.object_code,
+            "aarch64 parallel compilation must be deterministic across repeated runs"
+        );
+        assert_eq!(
+            serial.proofs, parallel_a.proofs,
+            "aarch64 parallel proof bundle must be identical to serial (ordered cert lane)"
+        );
+        assert_eq!(
+            parallel_a.proofs, parallel_b.proofs,
+            "aarch64 parallel proof bundle must be deterministic across repeated runs"
+        );
+        assert!(
+            serial.proofs.as_ref().is_some_and(|p| !p.is_empty()),
+            "emit_proofs should produce a non-empty proof bundle"
+        );
+        assert_eq!(serial.metrics.function_count, 6);
         assert_eq!(
             serial.metrics.instruction_count,
             parallel_a.metrics.instruction_count

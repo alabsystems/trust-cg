@@ -2637,7 +2637,7 @@ mod tests {
         let add_id = func.push_inst(add);
         func.append_inst(entry, add_id);
 
-        let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+        let ret = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
         let ret_id = func.push_inst(ret);
         func.append_inst(entry, ret_id);
 
@@ -2698,7 +2698,7 @@ mod tests {
         let add_id = func.push_inst(add);
         func.append_inst(entry, add_id);
 
-        let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+        let ret = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
         let ret_id = func.push_inst(ret);
         func.append_inst(entry, ret_id);
 

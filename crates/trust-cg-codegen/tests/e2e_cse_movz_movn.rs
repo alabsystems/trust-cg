@@ -166,7 +166,9 @@ fn build_pos2_plus_neg3_function() -> MachFunction {
     let add_id = func.push_inst(add);
     func.append_inst(entry, add_id);
 
-    let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+    // Signature returns [I64]: the CFG-authority gate requires the Ret to carry
+    // exactly the ABI return-register alias set, as production isel does.
+    let ret = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
     let ret_id = func.push_inst(ret);
     func.append_inst(entry, ret_id);
 

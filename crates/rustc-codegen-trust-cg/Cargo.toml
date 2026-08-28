@@ -50,14 +50,14 @@ trust-cg-lower = { path = "../trust-cg-lower" }
 # (`ssa_loop_complete::check_function_fail_closed`) lives in trust-cg-verify.
 # `default-features = false` keeps the SMT/ay subprocess toolchain out of the
 # bridge's dependency graph — the checker imports only `trust_ir` + `std`, so
-# this pulls in trust-cg-opt + rayon + sha2 + rmp-serde but no solver binary.
+# this pulls in trust-cg-opt + rayon + sha2 but no solver binary.
 trust-cg-verify = { path = "../trust-cg-verify", default-features = false }
 # Direct dependency (not `workspace = true`): this crate is its own workspace (see the
 # empty `[workspace]` below), so it cannot inherit `trust-ir` from the main
 # Trust Codegen workspace. The git source + features mirror the root workspace's
 # `workspace.dependencies.trust-ir` so feature unification with the
 # trust-cg-codegen/trust-cg-lower path deps stays consistent.
-trust-ir = { git = "https://github.com/alabsystems/trust-ir.git", rev = "604ff42f8779920c903701bdbf030f17941ac927", features = ["serde", "parser", "binary", "dialect-verif-example", "clean-expr"] }
+trust-ir = { git = "https://github.com/alabsystems/trust-ir.git", rev = "036e1ea8a3994b0eeb826c88e6116cf076560aea", features = ["serde", "parser", "binary", "dialect-verif-example", "clean-expr"] }
 
 [package.metadata.rust-analyzer]
 # Tell rust-analyzer to enable `rustc_private` so it indexes our

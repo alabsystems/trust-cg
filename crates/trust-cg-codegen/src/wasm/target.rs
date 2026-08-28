@@ -29,6 +29,32 @@ pub fn is_wasm32_target(triple: &str) -> bool {
     arch == "wasm32"
 }
 
+/// The canonical target triple of the wasm backend's closed-module lane.
+pub const WASM32_TRIPLE: &str = "wasm32-unknown-unknown";
+
+/// The canonical [`trust_ir::TargetInfo`] a module must carry to enter the
+/// wasm32 lane: 32-bit pointers, little-endian, pinned to [`WASM32_TRIPLE`].
+///
+/// [`crate::wasm::compile_module`] refuses target-free modules and modules
+/// pinned to any other pointer-width/endianness shape (the layout engine would
+/// size pointers at 8 bytes while the lowering addresses memory through i32).
+/// Callers building modules for this backend stamp
+/// `module.target_info = Some(wasm32_target_info())` before compiling.
+///
+/// `struct_passing` is [`trust_ir::StructPassingPolicy::Unclassified`] — the
+/// honest declaration for producers that perform no aggregate classification.
+/// The wasm lane needs none: by-value aggregates in signatures are refused at
+/// type mapping, so no classification claim is ever consumed.
+pub fn wasm32_target_info() -> trust_ir::TargetInfo {
+    trust_ir::TargetInfo {
+        triple: WASM32_TRIPLE.to_string(),
+        pointer_size: 4,
+        endianness: trust_ir::Endianness::Little,
+        abi: None,
+        struct_passing: trust_ir::StructPassingPolicy::Unclassified,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -49,5 +75,19 @@ mod tests {
         // wasm64 is not handled by this backend yet.
         assert!(!is_wasm32_target("wasm64-unknown-unknown"));
         assert!(!is_wasm32_target(""));
+    }
+
+    #[test]
+    fn canonical_wasm32_target_info_is_the_wasm32_shape() {
+        let ti = wasm32_target_info();
+        assert_eq!(ti.triple, WASM32_TRIPLE);
+        assert!(is_wasm32_target(&ti.triple));
+        assert_eq!(ti.pointer_size, 4);
+        assert_eq!(ti.endianness, trust_ir::Endianness::Little);
+        assert_eq!(ti.abi, None);
+        assert_eq!(
+            ti.struct_passing,
+            trust_ir::StructPassingPolicy::Unclassified
+        );
     }
 }

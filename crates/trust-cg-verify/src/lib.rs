@@ -128,6 +128,7 @@ pub mod call_lowering_proofs;
 pub mod canary_cert;
 pub mod carrier_hygiene;
 pub mod cegis;
+pub mod cegis_cache_codec;
 pub mod cegis_cache_io;
 pub mod cegis_pass;
 pub mod cegis_pass_x86;
@@ -196,6 +197,7 @@ pub mod proof_gate;
 pub mod provenance_xcheck;
 pub mod reduction_split_proofs;
 pub mod regalloc_proofs;
+pub mod resource_limits;
 pub mod rewrite_admission;
 pub mod rewrite_candidate_extractor;
 pub mod riscv_function_verifier;
@@ -218,12 +220,16 @@ pub mod vectorization_proofs;
 pub mod verdict_db;
 pub mod verification_runner;
 pub mod verify;
+pub mod wasm_abi_proofs;
+pub mod wasm_cfg_proofs;
+pub mod wasm_encoding_proofs;
 #[cfg(test)]
 mod wasm_formal;
 pub mod wasm_function_verifier;
 pub mod wasm_lowering_proofs;
 pub mod wasm_memory_proofs;
 pub mod wasm_semantics;
+pub mod wasm_value_domain;
 pub mod x86_64_eflags;
 pub mod x86_64_eflags_proofs;
 pub mod x86_64_function_verifier;
@@ -238,6 +244,7 @@ pub use ay_bridge::{
     verify_with_ay, verify_with_ay_cli, verify_with_cli, z3_available,
 };
 pub use cegis::{CegisLoop, CegisResult, ConcreteInput};
+pub use cegis_cache_codec::CacheCodecError;
 pub use cegis_cache_io::{
     CEGIS_CACHE_DIR_NAME, CEGIS_CACHE_ENV, STALE_LOCK_AGE, SharedCegisCache, WRITE_LOCK_POLL,
     WRITE_LOCK_WAIT, default_cache_root as cegis_shared_cache_root,

@@ -32,7 +32,7 @@ fn main() {
                     (n, p.category.name().to_string(), p.obligation.name.clone())
                 })
                 .collect();
-            rows.sort_by(|a, b| b.0.cmp(&a.0));
+            rows.sort_by_key(|row| std::cmp::Reverse(row.0));
             let total: usize = rows.iter().map(|r| r.0).sum();
             let x86: usize = rows
                 .iter()

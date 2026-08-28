@@ -1366,7 +1366,11 @@ impl OptimizationPipeline {
                 // mis-modeled trip count can only refuse to fire. Kill switch:
                 // `TCG_NO_PARTIAL_UNROLL`; bisect key `partial_unroll`.
                 if !is_disabled("partial_unroll") {
-                    pm = pm.with_pass(Box::new(crate::loop_unroll::PartialUnroll::new()));
+                    pm = pm.with_pass(Box::new(crate::loop_unroll::PartialUnroll::new(
+                        (!is_disabled("profileuse"))
+                            .then(|| self.pgo.profile_hotness())
+                            .flatten(),
+                    )));
                 }
                 if !is_disabled("sched") {
                     pm = pm.with_pass(Box::new(PressureAwareScheduler));
@@ -1976,7 +1980,11 @@ impl OptimizationPipeline {
                 // PARTIAL (factor) unroll — see the O2 comment. Kill switch:
                 // `TCG_NO_PARTIAL_UNROLL`; bisect key `partial_unroll`.
                 if !is_disabled("partial_unroll") {
-                    pm = pm.with_pass(Box::new(crate::loop_unroll::PartialUnroll::new()));
+                    pm = pm.with_pass(Box::new(crate::loop_unroll::PartialUnroll::new(
+                        (!is_disabled("profileuse"))
+                            .then(|| self.pgo.profile_hotness())
+                            .flatten(),
+                    )));
                 }
                 if !is_disabled("sched") {
                     pm = pm.with_pass(Box::new(PressureAwareScheduler));

@@ -1377,6 +1377,7 @@ mod tests {
             enable_spill_code: true,
             enable_spill_slot_reuse: true,
             hints: BTreeMap::new(),
+            callee_saved_regs: Default::default(),
             coalesce_tuning: Default::default(),
         };
         let _ = crate::allocate(&mut f, &config);

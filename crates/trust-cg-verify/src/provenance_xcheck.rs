@@ -233,7 +233,10 @@ pub fn classify_lir_opcode(opcode: &LirOpcode) -> OpClass {
         | O::V2F64Fadd
         | O::V2F64Fsub
         | O::V2F64Fmul
-        | O::V2F64Fdiv => OpClass::VecFp,
+        | O::V2F64Fdiv
+        | O::V4F32Fmuladd
+        | O::V2F64Fmuladd
+        | O::V2F64ExtractLane { .. } => OpClass::VecFp,
         O::Select { .. } => OpClass::Select,
         O::Icmp { .. } => OpClass::IntCmp,
         O::CheckedSadd

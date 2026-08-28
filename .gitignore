@@ -86,3 +86,18 @@ publish/.out/
 # Session scratch work area (untracked temp files; never commit)
 # Fuzzer repro directories are source-controlled regression fixtures.
 /scratchpad/
+
+# Raw eval RUN OUTPUT (scripts/run_llvm_test_suite.sh,
+# scripts/run_panic_fuzz_evidence.sh, the per-test logs). Nothing under here has
+# ever been tracked, and the ratchet's own instruction is to COPY a result out
+# to a reviewed baseline (`cp evals/results/tests/<date>.json <baseline>`) —
+# which is what gets committed. The raw tree is scratch.
+#
+# Not cosmetic: hooks/pre-push refuses on `git status --porcelain`, which counts
+# UNTRACKED files, so a developer who ran either script could never push main
+# again until they deleted the output by hand. Measured — that is exactly what
+# this clone was in.
+/evals/results/
+
+# Verification build output (channel=trust default lane)
+target-verify/

@@ -17,13 +17,40 @@ use trust_cg_lower::{X86ISelFunction, X86ISelInst, X86ISelOperand};
 use crate::effects::{x86_inst_effect, x86_reads_flags, x86_writes_flags};
 use crate::x86_pass_manager::X86MachinePass;
 
+/// Admission callback for the memory-destination RMW fusion (`rmw_fuse`):
+/// `true` iff the candidate FUSED opcode (`XorMR`/`AddMR`/`XorMRSib`/
+/// `AddMRSib`) is proof-covered on this build. Injected by the constructor
+/// (trust-cg-opt must not depend on trust-cg-verify — same callback-injection
+/// pattern as `X86IfConvert`/`X86StrengthReduce`); the fail-closed default
+/// ([`X86Peephole::default`]) admits NOTHING, so the fusion never fires
+/// unless a caller explicitly wires the proof-backed admission.
+pub type MemRmwAdmit = fn(X86Opcode) -> bool;
+
 /// Bounded algebraic-identity peepholes for x86-64 ISel-output functions.
-pub struct X86Peephole;
+pub struct X86Peephole {
+    /// Proof admission for the RMW fusion. See [`MemRmwAdmit`].
+    admit_mem_rmw: MemRmwAdmit,
+}
 
 impl X86Peephole {
+    /// Create the pass with the given RMW-fusion admission callback.
+    pub fn new(admit_mem_rmw: MemRmwAdmit) -> Self {
+        Self { admit_mem_rmw }
+    }
+
     /// Run x86 peepholes directly on an ISel function.
     pub fn run_on_function(&mut self, func: &mut X86ISelFunction) -> bool {
-        run_impl(func)
+        run_impl(func, self.admit_mem_rmw)
+    }
+}
+
+impl Default for X86Peephole {
+    /// The CLOSED admission: every peephole except the RMW fusion runs
+    /// unchanged; the RMW fusion never fires (fail-closed on the proof).
+    fn default() -> Self {
+        Self {
+            admit_mem_rmw: |_| false,
+        }
     }
 }
 
@@ -33,13 +60,15 @@ impl X86MachinePass for X86Peephole {
     }
 
     fn run(&mut self, func: &mut X86ISelFunction) -> bool {
-        run_impl(func)
+        run_impl(func, self.admit_mem_rmw)
     }
 }
 
 enum PeepholeEdit {
     Remove,
     Replace(X86ISelInst),
+    /// Replace one instruction with two (spliced in order at its position).
+    ReplaceTwo(X86ISelInst, X86ISelInst),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,7 +78,7 @@ pub(crate) enum FlagOverwrite {
     Full,
 }
 
-fn run_impl(func: &mut X86ISelFunction) -> bool {
+fn run_impl(func: &mut X86ISelFunction, admit_mem_rmw: MemRmwAdmit) -> bool {
     let mut changed = false;
 
     // Function-scope pass: fold uniquely-defined `MovRI` constants into the
@@ -143,6 +172,80 @@ fn run_impl(func: &mut X86ISelFunction) -> bool {
         }
     }
 
+    // Multi-instruction pass: memory-destination RMW fusion (Stage 2 of the
+    // b1 RMW arc, DEFAULT-ON; `TCG_NO_X86_RMW_FUSE` opts out). Folds a
+    // load / commutative-ALU / same-address store triple into the single
+    // memory-destination ALU (`XorMR*`/`AddMR*`). ADMISSION-GATED on the
+    // injected proof callback (fail-closed `|_| false` default): a fused
+    // opcode is only ever created when the caller certifies its
+    // reconstruction obligation discharges Valid. Runs after imul_fuse so
+    // the two RM/MR families never race for one load, and after the
+    // addr-chain fold so SIB shapes are final. See `rmw_fuse_run_on_block`
+    // for the hand-proof.
+    if rmw_fuse_enabled() {
+        for block_id in func.block_order.clone() {
+            if rmw_fuse_run_on_block(func, block_id, admit_mem_rmw) {
+                changed = true;
+            }
+        }
+    }
+
+    // Multi-instruction pass: latch-advance collapse (DEFAULT-ON;
+    // `TCG_NO_X86_LATCH_COLLAPSE` opts out). The frontend's counted-loop latch
+    // `AddRI n,c,k ; MovRR c,n ; Cmp{RI,RR} n,… ; Jcc` advances through a
+    // fresh vreg `n`, which regalloc must place in a SECOND register and the
+    // AddRI->LEA bridge then spells as `lea k(c),n ; mov n,c ; cmp n,…` — two
+    // instructions and one register more than LLVM's `add k,c ; cmp c,…`.
+    // When `n` has no other def or use, advancing IN PLACE is
+    // value-identical: the compare reads the same advanced value through `c`,
+    // and the flag schedule is unchanged (AddRI wrote flags at the same
+    // position before; the compare overwrites them before the Jcc either
+    // way). Measured (hand-asm ablation, 2026-08-28): p1 latch -10.3%,
+    // exact-parity with LLVM together with the commute pass below.
+    if latch_advance_collapse_enabled() {
+        let (uses, defs) = function_use_def_counts(func);
+        for block_id in func.block_order.clone() {
+            if latch_advance_collapse_run_on_block(func, block_id, &uses, &defs) {
+                changed = true;
+            }
+        }
+    }
+
+    // Multi-instruction pass: LEA displacement fold (DEFAULT-ON;
+    // `TCG_NO_X86_LEA_DISP_FOLD` opts out). `LeaSib t,[b+i*s+d] ; AddRI x,t,k`
+    // with `t` living only in this window folds to `LeaSib x,[b+i*s+(d+k)]` —
+    // the p2_collatz `lea (%rcx,%rcx,2) ; add $1` chain becomes LLVM's single
+    // `lea 1(%rcx,%rcx,2)`. Legal when the AddRI's flags are provably dead
+    // (LEA writes none) and the folded displacement stays in i32.
+    if lea_disp_fold_enabled() {
+        let (uses, defs) = function_use_def_counts(func);
+        for block_id in func.block_order.clone() {
+            if lea_disp_fold_run_on_block(func, block_id, &uses, &defs) {
+                changed = true;
+            }
+        }
+    }
+
+    // Single-instruction pass: commutative dying-source-first normalization
+    // (OPT-IN `TCG_X86_COMMUTE_DST` — REFUTED as a default, see
+    // `commute_dying_source_enabled`). For a commutative
+    // 3-operand ALU op `Op d, s1, s2`, two-address fixup ties d to s1 —
+    // copying s1. When s1 outlives the op but s2 DIES here, that copy is a
+    // real extra instruction (the xorshift `x ^= t` bodies pay 3 of them per
+    // round); swapping to `Op d, s2, s1` lets the tie copy the dying value,
+    // which regalloc coalesces away. Wrapping add/mul and the bitwise ops are
+    // fully commutative including their flag results, so the swap is
+    // semantics- and proof-neutral (reconstruction re-checks the operand
+    // wiring). Precedent: the saxpyq ImulRR operand swap (3ea43e17).
+    if commute_dying_source_enabled() {
+        let (uses, defs) = function_use_def_counts(func);
+        for block_id in func.block_order.clone() {
+            if commute_dying_source_run_on_block(func, block_id, &uses, &defs) {
+                changed = true;
+            }
+        }
+    }
+
     // SIB-base LEA fold (OPT-IN `TCG_X86_SIB_BASE_FOLD`): fold each stack-slot
     // base-`Lea` into its already-formed indexed SIB memory operand, killing the
     // redundant per-access `leaq -N(%rbp)`. See `sib_base_lea_fold`. NOTE: this
@@ -206,6 +309,19 @@ fn run_impl(func: &mut X86ISelFunction) -> bool {
                     block.insts[index] = inst;
                     changed = true;
                     index += 1;
+                }
+                Some(PeepholeEdit::ReplaceTwo(mut a, mut b)) => {
+                    let origin = block.insts[index].proof_origin;
+                    if a.proof_origin.is_none() {
+                        a.proof_origin = origin;
+                    }
+                    if b.proof_origin.is_none() {
+                        b.proof_origin = origin;
+                    }
+                    block.insts[index] = a;
+                    block.insts.insert(index + 1, b);
+                    changed = true;
+                    index += 2;
                 }
                 None => index += 1,
             }
@@ -882,6 +998,261 @@ fn operand_mentions_vreg(op: &X86ISelOperand, vreg: VReg) -> bool {
 /// the second. We approximate this conservatively by treating every operand
 /// of a non-producing instruction as a use, and every non-first operand of
 /// a value-producing instruction as a use.
+/// Kill switch for the latch-advance collapse (any value disables).
+fn latch_advance_collapse_enabled() -> bool {
+    std::env::var_os("TCG_NO_X86_LATCH_COLLAPSE").is_none()
+}
+
+/// The commutative dying-source-first swap is 🛑 REFUTED AS A DEFAULT and
+/// OPT-IN only (`TCG_X86_COMMUTE_DST=1`). Per-switch isolation A/B
+/// (2026-08-28, 4-program lanes): with the swap ON p1_xorshift sits at
+/// ~1.48x and p6/b1 regress ~6-9%; with it OFF p1 returns to ~1.20x.
+/// Root cause: for a LOOP-CARRIED chain `x' = x ^ t`, tying the
+/// destination to `x` (the original order) lets regalloc coalesce the
+/// backedge — x' simply becomes x's register, zero copies — while tying
+/// to the dying temp forces a real x'-to-x copy every iteration. The
+/// single-def/single-use "dying" model cannot see that the destination is
+/// the carried successor of s1; a future version would need to exempt
+/// operands whose def-use web forms a carried chain with the destination.
+fn commute_dying_source_enabled() -> bool {
+    std::env::var_os("TCG_X86_COMMUTE_DST").is_some()
+}
+
+/// FUNCTION-WIDE use and def counts under [`vreg_uses_in_block`]'s exact
+/// def/use convention (operand 0 of a value-producing opcode is the def; its
+/// only reads are addressing base/index regs; every other operand is a use).
+fn function_use_def_counts(
+    func: &X86ISelFunction,
+) -> (
+    std::collections::HashMap<VReg, u32>,
+    std::collections::HashMap<VReg, u32>,
+) {
+    use crate::effects::x86_produces_value;
+    let mut uses = std::collections::HashMap::new();
+    let mut defs = std::collections::HashMap::new();
+    for block in func.blocks.values() {
+        for inst in &block.insts {
+            let produces = x86_produces_value(inst.opcode);
+            for (idx, op) in inst.operands.iter().enumerate() {
+                if produces && idx == 0 {
+                    if let X86ISelOperand::VReg(d) = op {
+                        *defs.entry(*d).or_insert(0) += 1;
+                    }
+                    count_addressing_uses(op, &mut uses);
+                    continue;
+                }
+                count_operand_uses(op, &mut uses);
+            }
+        }
+    }
+    (uses, defs)
+}
+
+/// Latch-advance collapse: `AddRI n,c,k ; MovRR c,n ; Cmp{RI,RR} n,… ; Jcc`
+/// -> `AddRI c,c,k ; Cmp{RI,RR} c,… ; Jcc` when `n` is single-def and its
+/// ONLY uses are the write-back and the compare. Value-exact: the compare
+/// reads the identical advanced value; `c` holds it from the AddRI onward
+/// (nothing sits between the four matched instructions); the AddRI's flag
+/// write happens at the same position as before and is overwritten by the
+/// compare either way. Windows are matched against counts frozen at pass
+/// entry — a vreg consumed by one rewrite cannot satisfy another window's
+/// side conditions (its counts would have excluded the first match), so
+/// applying all matches in one sweep is sound.
+fn latch_advance_collapse_run_on_block(
+    func: &mut X86ISelFunction,
+    block_id: trust_cg_lower::instructions::Block,
+    uses: &std::collections::HashMap<VReg, u32>,
+    defs: &std::collections::HashMap<VReg, u32>,
+) -> bool {
+    let Some(block) = func.blocks.get_mut(&block_id) else {
+        return false;
+    };
+    let insts = &mut block.insts;
+    let mut changed = false;
+    let mut i = 0;
+    while i + 3 < insts.len() {
+        let matched = (|| -> Option<(VReg, VReg)> {
+            let [
+                X86ISelOperand::VReg(n),
+                X86ISelOperand::VReg(c),
+                X86ISelOperand::Imm(_),
+            ] = insts[i].operands.as_slice()
+            else {
+                return None;
+            };
+            if insts[i].opcode != X86Opcode::AddRI || n == c || n.class != c.class {
+                return None;
+            }
+            let (n, c) = (*n, *c);
+            if insts[i + 1].opcode != X86Opcode::MovRR {
+                return None;
+            }
+            let [X86ISelOperand::VReg(wc), X86ISelOperand::VReg(wn)] =
+                insts[i + 1].operands.as_slice()
+            else {
+                return None;
+            };
+            if *wc != c || *wn != n {
+                return None;
+            }
+            let cmp_reads_n = match (insts[i + 2].opcode, insts[i + 2].operands.as_slice()) {
+                (X86Opcode::CmpRI, [X86ISelOperand::VReg(a), X86ISelOperand::Imm(_)]) => *a == n,
+                (X86Opcode::CmpRR, [X86ISelOperand::VReg(a), X86ISelOperand::VReg(b)]) => {
+                    *a == n && *b != n && *b != c
+                }
+                _ => false,
+            };
+            if !cmp_reads_n || insts[i + 3].opcode != X86Opcode::Jcc {
+                return None;
+            }
+            // `n` exists ONLY inside this window: one def (the AddRI), two
+            // uses (the write-back and the compare).
+            if defs.get(&n).copied().unwrap_or(0) != 1 || uses.get(&n).copied().unwrap_or(0) != 2 {
+                return None;
+            }
+            Some((n, c))
+        })();
+        if let Some((_n, c)) = matched {
+            insts[i].operands[0] = X86ISelOperand::VReg(c);
+            if let X86ISelOperand::VReg(a) = &mut insts[i + 2].operands[0] {
+                *a = c;
+            }
+            insts.remove(i + 1);
+            changed = true;
+            i += 3; // past the rewritten AddRI/Cmp/Jcc
+        } else {
+            i += 1;
+        }
+    }
+    changed
+}
+
+/// Kill switch for the LEA displacement fold (any value disables).
+fn lea_disp_fold_enabled() -> bool {
+    std::env::var_os("TCG_NO_X86_LEA_DISP_FOLD").is_none()
+}
+
+/// `LeaSib t,[b+i*s+d] ; AddRI x,t,k` -> `LeaSib x,[b+i*s+(d+k)]` when `t`
+/// is single-def and this AddRI is its only use, the AddRI's flag write is
+/// provably dead (LEA writes no flags, so the fold must not lose a consumed
+/// flag result), and `d+k` fits i32. The two instructions need not be
+/// adjacent as long as nothing between them redefines `b`/`i` (we require
+/// adjacency anyway — the ISel emits the pair back-to-back and adjacency
+/// keeps the redefinition argument trivial).
+fn lea_disp_fold_run_on_block(
+    func: &mut X86ISelFunction,
+    block_id: trust_cg_lower::instructions::Block,
+    uses: &std::collections::HashMap<VReg, u32>,
+    defs: &std::collections::HashMap<VReg, u32>,
+) -> bool {
+    let Some(block) = func.blocks.get_mut(&block_id) else {
+        return false;
+    };
+    let insts = &mut block.insts;
+    let mut changed = false;
+    let mut i = 0;
+    while i + 1 < insts.len() {
+        let matched = (|| -> Option<(VReg, i32)> {
+            if insts[i].opcode != X86Opcode::LeaSib {
+                return None;
+            }
+            let [
+                X86ISelOperand::VReg(t),
+                X86ISelOperand::SibMemAddr { disp, .. },
+            ] = insts[i].operands.as_slice()
+            else {
+                return None;
+            };
+            let (t, d) = (*t, *disp);
+            if insts[i + 1].opcode != X86Opcode::AddRI {
+                return None;
+            }
+            let [
+                X86ISelOperand::VReg(x),
+                X86ISelOperand::VReg(src),
+                X86ISelOperand::Imm(k),
+            ] = insts[i + 1].operands.as_slice()
+            else {
+                return None;
+            };
+            if *src != t || *x == t || x.class != t.class {
+                return None;
+            }
+            // `t` lives only here: one def (the LeaSib), one use (this AddRI).
+            if defs.get(&t).copied().unwrap_or(0) != 1 || uses.get(&t).copied().unwrap_or(0) != 1 {
+                return None;
+            }
+            // The AddRI's flag write must be dead — the fold removes it.
+            if !flags_written_here_are_dead(insts, i + 1) {
+                return None;
+            }
+            let folded = (d as i64).checked_add(*k)?;
+            let folded = i32::try_from(folded).ok()?;
+            Some((*x, folded))
+        })();
+        if let Some((x, folded)) = matched {
+            insts[i].operands[0] = X86ISelOperand::VReg(x);
+            if let X86ISelOperand::SibMemAddr { disp, .. } = &mut insts[i].operands[1] {
+                *disp = folded;
+            }
+            insts.remove(i + 1);
+            changed = true;
+        }
+        i += 1;
+    }
+    changed
+}
+
+/// Commutative dying-source-first normalization: for `Op d, s1, s2` with a
+/// commutative wrapping/bitwise `Op`, when `s1` outlives the op (more than
+/// one use or def) but `s2` is single-def and this is its only use, swap to
+/// `Op d, s2, s1` so the two-address tie copies the DYING value. Result and
+/// flags are identical for either operand order on AddRR/ImulRR/AndRR/OrRR/
+/// XorRR (all flag outputs are functions of the unordered operand pair).
+fn commute_dying_source_run_on_block(
+    func: &mut X86ISelFunction,
+    block_id: trust_cg_lower::instructions::Block,
+    uses: &std::collections::HashMap<VReg, u32>,
+    defs: &std::collections::HashMap<VReg, u32>,
+) -> bool {
+    let Some(block) = func.blocks.get_mut(&block_id) else {
+        return false;
+    };
+    let mut changed = false;
+    for inst in &mut block.insts {
+        if !matches!(
+            inst.opcode,
+            X86Opcode::AddRR
+                | X86Opcode::ImulRR
+                | X86Opcode::AndRR
+                | X86Opcode::OrRR
+                | X86Opcode::XorRR
+        ) {
+            continue;
+        }
+        let [
+            X86ISelOperand::VReg(d),
+            X86ISelOperand::VReg(s1),
+            X86ISelOperand::VReg(s2),
+        ] = inst.operands.as_slice()
+        else {
+            continue;
+        };
+        let (d, s1, s2) = (*d, *s1, *s2);
+        if d == s1 || d == s2 || s1 == s2 || s1.class != s2.class {
+            continue;
+        }
+        let dying = |v: VReg| {
+            defs.get(&v).copied().unwrap_or(0) == 1 && uses.get(&v).copied().unwrap_or(0) == 1
+        };
+        if !dying(s1) && dying(s2) {
+            inst.operands.swap(1, 2);
+            changed = true;
+        }
+    }
+    changed
+}
+
 fn vreg_uses_in_block(insts: &[X86ISelInst]) -> std::collections::HashMap<VReg, u32> {
     use crate::effects::x86_produces_value;
     let mut counts = std::collections::HashMap::new();
@@ -2036,6 +2407,534 @@ fn imul_fuse_run_on_block(
     true
 }
 
+// ---------------------------------------------------------------------------
+// Memory-destination RMW fusion (b1 RMW arc Stage 2; DEFAULT-ON,
+// `TCG_NO_X86_RMW_FUSE` opts out; ADMISSION-GATED on the injected proof
+// callback)
+//
+//   i: MovRMSib t, [sib]         (or full-width MovRM t, [mem] -> base form)
+//   j: OpRR d, t, s | OpRR d, s, t | tied OpRR d, t   (Op in {Xor, Add};
+//                                    tied form: the register operand is d's
+//                                    own pre-value, i.e. s := d)
+//   k: MovMRSib [sib'], d        (or MovMR) with sib' STRUCTURALLY IDENTICAL
+//                                 to sib
+//     =>  delete i and j; replace k with:  OpMRSib [sib], s  (or OpMR)
+// ---------------------------------------------------------------------------
+//
+// HAND-PROOF (semantic equivalence): the fused `OpMRSib [ea], s` at k
+// computes `mem[ea] := load64(ea) Op s` and writes Op's flags there. The
+// unfused triple computed `t := load64(ea)` at i, `d := t Op s` at j (writing
+// Op's flags at j), and `mem[ea] := d` at k. Equality needs exactly:
+//   (1) `load64(ea)` yields the same value at i and k — the windows (i,j) and
+//       (j,k) admit NO memory-writing instruction, no call, and no other
+//       memory op at all (W1/W2), and the EA registers have no defs in either
+//       window (E); the two memory operands are STRUCTURALLY IDENTICAL VReg
+//       terms, so same registers + same values = same address. Structural EA
+//       identity IS the entire alias argument — no may-alias reasoning exists
+//       or is needed.
+//   (2) `s` has the same value at j and k — no def of s in the windows (W).
+//       (Tied form: s is d itself, whose only def in [i, k] WAS j — deleted.)
+//   (3) the values of `t` and `d` are consumed ONLY inside the triple — `t`
+//       locally dead after j and `d` locally dead after k (D, the shared
+//       per-def window machinery; the fused form defines no register).
+//   (4) RFLAGS: Op's flag-write MOVES from j down to k. This is the NOVEL
+//       hazard relative to imul_fuse (which moved the flag-neutral load while
+//       its flag-writing anchor stayed put): the window (j,k) must contain no
+//       flag-READER (it would observe Op's flags in the unfused stream and
+//       stale flags in the fused one) and no flag-WRITER (its flags would
+//       survive at block exit in the unfused stream but be overwritten by the
+//       moved Op-write in the fused one). With W2 empty of both, the exit
+//       flag VALUES are identical: same Op over the same operand values, and
+//       nothing between j and k touches or observes RFLAGS. No flags-deadness
+//       analysis is needed at all.
+//   (5) Fault equivalence: same EA (1), no control flow / pseudos in the
+//       windows — the fused RMW faults iff the load/store pair did.
+//
+// SIDE CONDITIONS (all fail-closed, extending imul_fuse's A/B/W/E/D):
+//   A. Anchor j: `XorRR`/`AddRR` with default flags, no proof_origin,
+//      all-Gpr64 VReg operands; forms `[d, t, s]` / `[d, s, t]` (commutative)
+//      or tied `[d, t]` (s := d). `s != t` (the value would be needed twice
+//      but the load is deleted); `t != d` (fail-closed; the deadness scan
+//      cannot separate the two uses of one id).
+//   B. Load i: the NEAREST prior def of `t`, a `MovRMSib` (-> SIB RMW form)
+//      or full-width `MovRM` (-> base form) with default flags and no
+//      proof_origin; every EA component a Gpr64 VReg (PReg EA refused) —
+//      shared acceptance with `imul_fuse_load_kind`.
+//   C. Store k: same-family store (`MovMRSib` for `MovRMSib`, `MovMR` for
+//      `MovRM`) with default flags, no proof_origin; value operand is exactly
+//      `d`; memory operand STRUCTURALLY EQUAL to the load's (same base/index
+//      VReg id+class, same scale, same disp).
+//   W1. Window (i,j): pure register ALU only (`imul_fuse_window_ok`), no
+//      mention of `t`, no def of the EA regs or of `s`.
+//   W2. Window (j,k): W1 PLUS no flag-reader AND no flag-writer
+//      (`x86_reads_flags` / `x86_writes_flags`), and no mention of `d`
+//      (a use would consume the deleted ALU result; a def would change the
+//      stored value).
+//   E. The EA regs exclude `t` (the load overwrites it) and `d` (the ALU
+//      writes it between load and store — structural identity would not be
+//      value identity).
+//   D. `t` locally dead after j; `d` locally dead after k — both via the
+//      shared hardened `imul_fuse_t_dead_after` (full-unconditional-overwrite
+//      + tied/conditional-write refusal).
+//   P. ADMISSION: the fused opcode is created ONLY if the injected callback
+//      admits it (proof-backed `reconstruction_discharges_valid` in
+//      production; `|_| false` when absent). Architecture-enforced
+//      fail-closed: no admission, no emission.
+// ---------------------------------------------------------------------------
+
+/// DEFAULT-ON (same record as imul_fuse); `TCG_NO_X86_RMW_FUSE` is the
+/// forensic opt-out. Read through the lock-guarded process-env shim so the
+/// kill-switch test can override it without racing parallel test threads.
+fn rmw_fuse_enabled() -> bool {
+    crate::env_lock::var_os("TCG_NO_X86_RMW_FUSE").is_none()
+}
+
+/// The load kinds the RMW fusion accepts, mapped to the REQUIRED same-family
+/// store opcode. Shares `imul_fuse_load_kind`'s hardened acceptance (64-bit
+/// forms only, default flags, no proof_origin, VReg-only EA components — a
+/// PReg base/index would make the E redef scan vacuously pass over an address
+/// the pass cannot track; refused outright).
+fn rmw_fuse_load_kind(inst: &X86ISelInst) -> Option<(VReg, X86ISelOperand, X86Opcode)> {
+    // Own acceptance, WIDER than `imul_fuse_load_kind` in exactly one way:
+    // a `StackSlot` EA base is admitted (b1's hot `t[j] ^= s` arm indexes a
+    // STACK array, so its SIB base is a slot, not a vreg). This is sound
+    // under the same E-condition machinery: `imul_fuse_ea_reg_ids` returns
+    // only the VReg components, and a stack slot cannot be redefined at all,
+    // so the redef scan over the ids it DOES return is complete. A `PReg`
+    // base/index stays refused (untrackable — the original
+    // adversarial-review FAIL_CLOSED_GAP).
+    if inst.proof_origin.is_some() || inst.flags != inst.opcode.default_flags() {
+        return None;
+    }
+    let base_ok = |b: &X86ISelOperand| {
+        matches!(b, X86ISelOperand::VReg(v) if v.class == RegClass::Gpr64)
+            || matches!(b, X86ISelOperand::StackSlot(_))
+    };
+    match inst.opcode {
+        X86Opcode::MovRMSib => match inst.operands.as_slice() {
+            [
+                X86ISelOperand::VReg(t),
+                sib @ X86ISelOperand::SibMemAddr { base, index, .. },
+            ] if t.class == RegClass::Gpr64
+                && base_ok(base.as_ref())
+                && matches!(index.as_ref(), X86ISelOperand::VReg(i) if i.class == RegClass::Gpr64) =>
+            {
+                Some((*t, sib.clone(), X86Opcode::MovMRSib))
+            }
+            _ => None,
+        },
+        X86Opcode::MovRM => match inst.operands.as_slice() {
+            [
+                X86ISelOperand::VReg(t),
+                mem @ X86ISelOperand::MemAddr { base, .. },
+            ] if t.class == RegClass::Gpr64 && base_ok(base.as_ref()) => {
+                Some((*t, mem.clone(), X86Opcode::MovMR))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Def sites of FUNCTION-WIDE single-def vregs: id -> (opcode, operands).
+/// A single-def vreg holds one value for the whole execution after its def.
+/// Canonical spelling is therefore position-independent only while the
+/// canonical root is not redefined between the two memory operations; the
+/// caller enforces that temporal condition with [`rmw_fuse_ea_reg_ids`].
+fn rmw_fuse_single_def_sites(
+    func: &X86ISelFunction,
+) -> std::collections::HashMap<u32, (X86Opcode, Vec<X86ISelOperand>)> {
+    use crate::effects::x86_produces_value;
+    let mut sites: std::collections::HashMap<u32, Option<(X86Opcode, Vec<X86ISelOperand>)>> =
+        std::collections::HashMap::new();
+    for block in func.blocks.values() {
+        for inst in &block.insts {
+            if !x86_produces_value(inst.opcode) {
+                continue;
+            }
+            if let Some(X86ISelOperand::VReg(d)) = inst.operands.first() {
+                match sites.entry(d.id) {
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(Some((inst.opcode, inst.operands.clone())));
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut e) => {
+                        e.insert(None); // multi-def: disqualified
+                    }
+                }
+            }
+        }
+    }
+    sites
+        .into_iter()
+        .filter_map(|(id, v)| v.map(|v| (id, v)))
+        .collect()
+}
+
+/// Canonicalize a SIB (index, scale) pair through single-def `MovRR` copy
+/// chains and single-def `ImulRRI x{2,4,8}` scale folds, returning the root
+/// id and the effective hardware scale. Fail-closed at every step: a
+/// multi-def link, a non-copy/non-scale def, or a scale outside {1,2,4,8}
+/// stops the walk at the current vreg.
+fn rmw_fuse_canon_index(
+    sites: &std::collections::HashMap<u32, (X86Opcode, Vec<X86ISelOperand>)>,
+    mut v: VReg,
+    mut scale: u8,
+) -> (u32, u8) {
+    for _ in 0..16 {
+        let Some((op, operands)) = sites.get(&v.id) else {
+            return (v.id, scale);
+        };
+        match (op, operands.as_slice()) {
+            (X86Opcode::MovRR, [X86ISelOperand::VReg(_), X86ISelOperand::VReg(src)])
+                if src.class == RegClass::Gpr64 =>
+            {
+                v = *src;
+            }
+            (
+                X86Opcode::ImulRRI,
+                [
+                    X86ISelOperand::VReg(_),
+                    X86ISelOperand::VReg(src),
+                    X86ISelOperand::Imm(k),
+                ],
+            ) if src.class == RegClass::Gpr64 && matches!(*k, 2 | 4 | 8) => {
+                let ns = (scale as i64) * *k;
+                if !matches!(ns, 1 | 2 | 4 | 8) {
+                    return (v.id, scale);
+                }
+                scale = ns as u8;
+                v = *src;
+            }
+            _ => return (v.id, scale),
+        }
+    }
+    (v.id, scale)
+}
+
+/// Every register whose value can affect an EA accepted by
+/// [`rmw_fuse_same_ea`]. In addition to the syntactically mentioned base and
+/// index, include the canonical index root. The latter is load-bearing: a
+/// copy alias can retain the root's old value across a tied/conditional root
+/// write, while a later store using the root observes its new value. Scanning
+/// only the syntactic alias would then equate two different addresses.
+fn rmw_fuse_ea_reg_ids(
+    sites: &std::collections::HashMap<u32, (X86Opcode, Vec<X86ISelOperand>)>,
+    mem: &X86ISelOperand,
+) -> Vec<u32> {
+    let mut ids = imul_fuse_ea_reg_ids(mem);
+    if let X86ISelOperand::SibMemAddr { index, scale, .. } = mem {
+        if let X86ISelOperand::VReg(index) = index.as_ref() {
+            ids.push(rmw_fuse_canon_index(sites, *index, *scale).0);
+        }
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+/// Condition C's EA equivalence: same base operand (structural — VReg id or
+/// StackSlot index), same displacement, and (index, scale) pairs that
+/// canonicalize to the same (root, effective scale). The b1 shapes this
+/// admits: a store index that is a pure copy-chain alias of the load index,
+/// and a store using `index = j*8, scale 1` against a load's
+/// `index = j, scale 8`.
+fn rmw_fuse_same_ea(
+    sites: &std::collections::HashMap<u32, (X86Opcode, Vec<X86ISelOperand>)>,
+    load_mem: &X86ISelOperand,
+    store_mem: &X86ISelOperand,
+) -> bool {
+    if load_mem == store_mem {
+        return true;
+    }
+    match (load_mem, store_mem) {
+        (
+            X86ISelOperand::SibMemAddr {
+                base: lb,
+                index: li,
+                scale: ls,
+                disp: ld,
+            },
+            X86ISelOperand::SibMemAddr {
+                base: sb,
+                index: si,
+                scale: ss,
+                disp: sd,
+            },
+        ) if lb == sb && ld == sd => {
+            let (X86ISelOperand::VReg(li), X86ISelOperand::VReg(si)) = (li.as_ref(), si.as_ref())
+            else {
+                return false;
+            };
+            rmw_fuse_canon_index(sites, *li, *ls) == rmw_fuse_canon_index(sites, *si, *ss)
+        }
+        _ => false,
+    }
+}
+
+/// The fused memory-destination opcode for (ALU anchor, store form), or None
+/// for any pair outside the two proven commutative families.
+fn rmw_fuse_fused_opcode(alu: X86Opcode, store: X86Opcode) -> Option<X86Opcode> {
+    match (alu, store) {
+        (X86Opcode::XorRR, X86Opcode::MovMRSib) => Some(X86Opcode::XorMRSib),
+        (X86Opcode::XorRR, X86Opcode::MovMR) => Some(X86Opcode::XorMR),
+        (X86Opcode::AddRR, X86Opcode::MovMRSib) => Some(X86Opcode::AddMRSib),
+        (X86Opcode::AddRR, X86Opcode::MovMR) => Some(X86Opcode::AddMR),
+        _ => None,
+    }
+}
+
+/// Window purity for condition W2: W1's pure-register-ALU rule PLUS no
+/// flag-reader and no flag-writer — the ALU's flag-write moves from j down to
+/// k across this window (hand-proof item 4). `imul_fuse_window_ok` alone
+/// admits Setcc/Cmovcc (EMPTY default flags) and every flag-writing ALU.
+fn rmw_fuse_w2_ok(inst: &X86ISelInst) -> bool {
+    imul_fuse_window_ok(inst) && !x86_reads_flags(inst.opcode) && !x86_writes_flags(inst.opcode)
+}
+
+/// Run the RMW fusion on one block. Returns whether anything changed.
+///
+/// `admit` is the fail-closed proof admission (condition P): the fused opcode
+/// is never constructed unless `admit(fused_opcode)`.
+fn rmw_fuse_run_on_block(
+    func: &mut X86ISelFunction,
+    block_id: trust_cg_lower::instructions::Block,
+    admit: MemRmwAdmit,
+) -> bool {
+    let sites = rmw_fuse_single_def_sites(func);
+    let (fn_uses, fn_defs) = function_use_def_counts(func);
+    let Some(block) = func.blocks.get(&block_id) else {
+        return false;
+    };
+    let insts = &block.insts;
+
+    struct Fusion {
+        load_idx: usize,
+        alu_idx: usize,
+        store_idx: usize,
+        replacement: X86ISelInst,
+    }
+    let mut fusions: Vec<Fusion> = Vec::new();
+    let mut consumed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+    for j in 0..insts.len() {
+        let anchor = &insts[j];
+        if !matches!(anchor.opcode, X86Opcode::XorRR | X86Opcode::AddRR)
+            || anchor.proof_origin.is_some()
+            || anchor.flags != anchor.opcode.default_flags()
+        {
+            continue;
+        }
+        let g64 = |r: &VReg| r.class == RegClass::Gpr64;
+        // Decode the anchor form into (d, [(t_candidate, s_for_that_t)]).
+        // Tied `[d, t]`: d := d Op t, so the fused register source is d's own
+        // pre-value (s := d).
+        let (d, forms): (VReg, Vec<(VReg, VReg)>) = match anchor.operands.as_slice() {
+            [X86ISelOperand::VReg(d), X86ISelOperand::VReg(t)] if g64(d) && g64(t) && t != d => {
+                (*d, vec![(*t, *d)])
+            }
+            [
+                X86ISelOperand::VReg(d),
+                X86ISelOperand::VReg(s1),
+                X86ISelOperand::VReg(s2),
+            ] if g64(d) && g64(s1) && g64(s2) => (*d, vec![(*s1, *s2), (*s2, *s1)]),
+            _ => continue,
+        };
+
+        // Try each source as the load result `t` (commutative).
+        'forms: for &(t, s) in &forms {
+            // Condition A: s != t (the loaded value would be needed twice but
+            // the load is deleted); t != d (fail-closed — one id playing both
+            // roles defeats the two deadness scans).
+            if s.id == t.id || t.id == d.id {
+                continue;
+            }
+            // Find t's nearest def above j (condition B).
+            let Some(i) = (0..j)
+                .rev()
+                .find(|&x| local_fold_defines_vreg(&insts[x], t))
+            else {
+                continue;
+            };
+            if consumed.contains(&i) || consumed.contains(&j) {
+                continue;
+            }
+            let Some((lt, mem, store_opcode)) = rmw_fuse_load_kind(&insts[i]) else {
+                continue;
+            };
+            if lt != t {
+                continue;
+            }
+            // Condition P: the proof admission gate. No admission, no fusion —
+            // the opcode is never constructed, so it can never be emitted.
+            let Some(fused_opcode) = rmw_fuse_fused_opcode(anchor.opcode, store_opcode) else {
+                continue;
+            };
+            if !admit(fused_opcode) {
+                continue;
+            }
+            // Condition E: EA regs exclude t (overwritten by the load) and d
+            // (overwritten by the ALU) — structural EA identity must be VALUE
+            // identity at both the load's and the store's position.
+            // Include canonical roots as well as the registers spelled in the
+            // load. Otherwise `alias <- root; load [alias]; root += 1; store
+            // [root]` is falsely considered one EA: the alias still holds the
+            // old root while the store observes the new one.
+            let ea_ids = rmw_fuse_ea_reg_ids(&sites, &mem);
+            if ea_ids.iter().any(|&id| id == t.id || id == d.id) {
+                continue;
+            }
+            // Condition W1 over (i,j): pure register ALU, no mention of t, no
+            // def of the EA regs or of s.
+            for w in &insts[i + 1..j] {
+                if !imul_fuse_window_ok(w) {
+                    continue 'forms;
+                }
+                let mut w_mentions = std::collections::HashSet::new();
+                for op in &w.operands {
+                    collect_operand_mentions_flat(op, &mut w_mentions);
+                }
+                if w_mentions.iter().any(|m| m.id == t.id) {
+                    continue 'forms;
+                }
+                if ea_ids
+                    .iter()
+                    .chain(std::iter::once(&s.id))
+                    .any(|&id| local_fold_defines_vreg(w, VReg::new(id, RegClass::Gpr64)))
+                {
+                    continue 'forms;
+                }
+            }
+            // Find the store k (condition C), walking forward under W2. The
+            // first instruction that is neither the matching store nor a
+            // W2-clean window member aborts the candidate — in particular ANY
+            // other memory op (imul_fuse_window_ok excludes it) and ANY
+            // flag-reader or flag-writer (rmw_fuse_w2_ok).
+            let mut store_idx = None;
+            for (k, w) in insts.iter().enumerate().skip(j + 1) {
+                let is_matching_store = w.opcode == store_opcode
+                    && w.proof_origin.is_none()
+                    && w.flags == store_opcode.default_flags()
+                    && matches!(
+                        w.operands.as_slice(),
+                        // EA equivalence (condition C): structural identity,
+                        // OR the same address under single-def copy-chain /
+                        // scale-fold canonicalization (`rmw_fuse_same_ea`).
+                        // The FUSED instruction keeps the LOAD's operand
+                        // spelling either way. Value operand exactly d.
+                        [m, X86ISelOperand::VReg(v)]
+                            if rmw_fuse_same_ea(&sites, &mem, m) && *v == d
+                    );
+                if is_matching_store {
+                    store_idx = Some(k);
+                    break;
+                }
+                // W2 window member: W1 conditions PLUS the flag fence, PLUS
+                // no mention of d (a use would consume the deleted ALU
+                // result; a def would change the stored value).
+                if !rmw_fuse_w2_ok(w) {
+                    break;
+                }
+                let mut w_mentions = std::collections::HashSet::new();
+                for op in &w.operands {
+                    collect_operand_mentions_flat(op, &mut w_mentions);
+                }
+                if w_mentions.iter().any(|m| m.id == t.id || m.id == d.id) {
+                    break;
+                }
+                if ea_ids
+                    .iter()
+                    .chain(std::iter::once(&s.id))
+                    .any(|&id| local_fold_defines_vreg(w, VReg::new(id, RegClass::Gpr64)))
+                {
+                    break;
+                }
+            }
+            let Some(k) = store_idx else {
+                continue;
+            };
+            if consumed.contains(&k) {
+                continue;
+            }
+            // Condition D: t locally dead after j; d locally dead after k.
+            // Condition D. The block-local redef rule OR the function-wide
+            // single-def/single-use fallback: the matched load is t's ONLY
+            // def and the matched anchor its ONLY use (respectively ALU/
+            // store for d), so deleting the pair leaves the vreg with zero
+            // defs and zero uses — vacuously dead. This is the b1 hot-block
+            // reality: t and d are simply never touched again before the
+            // block ends, which the redef rule cannot see. (The tied form
+            // keeps the strict rule for d: there s == d, and d's pre-value
+            // is READ by the fused instruction.)
+            let whole_fn_dead = |x: VReg| {
+                fn_defs.get(&x).copied().unwrap_or(0) == 1
+                    && fn_uses.get(&x).copied().unwrap_or(0) == 1
+            };
+            if !(imul_fuse_t_dead_after(insts, j, t) || whole_fn_dead(t)) {
+                continue;
+            }
+            if !(imul_fuse_t_dead_after(insts, k, d) || (s != d && whole_fn_dead(d))) {
+                continue;
+            }
+            // Build the replacement: `OpMR[Sib] [mem], s` with the opcode's
+            // default flags (`X86ISelInst::new` applies them).
+            let replacement =
+                X86ISelInst::new(fused_opcode, vec![mem.clone(), X86ISelOperand::VReg(s)]);
+            consumed.insert(i);
+            consumed.insert(j);
+            consumed.insert(k);
+            fusions.push(Fusion {
+                load_idx: i,
+                alu_idx: j,
+                store_idx: k,
+                replacement,
+            });
+            break;
+        }
+    }
+
+    if fusions.is_empty() {
+        return false;
+    }
+
+    if crate::env_lock::var_os("TCG_X86_RMW_FUSE_LOG").is_some() {
+        eprintln!(
+            "x86-rmw-fuse: fused {} rmw triple(s) in `{}` block #{:?}",
+            fusions.len(),
+            func.name,
+            block_id.0,
+        );
+    }
+
+    // Rebuild the block: delete each load and ALU, splice each replacement at
+    // the store's position.
+    let mut delete: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut replace: std::collections::HashMap<usize, X86ISelInst> =
+        std::collections::HashMap::new();
+    for f in fusions {
+        delete.insert(f.load_idx);
+        delete.insert(f.alu_idx);
+        replace.insert(f.store_idx, f.replacement);
+    }
+    let block = func.blocks.get_mut(&block_id).expect("block existed above");
+    let old = std::mem::take(&mut block.insts);
+    let mut rebuilt = Vec::with_capacity(old.len());
+    for (idx, inst) in old.into_iter().enumerate() {
+        if delete.contains(&idx) {
+            continue;
+        }
+        if let Some(mut rep) = replace.remove(&idx) {
+            // Preserve the store's proof_origin (None by condition C, but
+            // keep the plumbing honest).
+            rep.proof_origin = inst.proof_origin;
+            rebuilt.push(rep);
+            continue;
+        }
+        rebuilt.push(inst);
+    }
+    block.insts = rebuilt;
+    true
+}
+
 fn simplify_inst_gated(
     insts: &[X86ISelInst],
     index: usize,
@@ -2144,6 +3043,38 @@ fn simplify_inst_gated(
                 -1 if dst == src => Some(PeepholeEdit::Replace(neg_vreg(dst))),
                 0 => Some(PeepholeEdit::Replace(xorrr_zero(dst))),
                 1 => Some(movrr_or_remove(dst, src)),
+                // Small-constant strength reduction (critical-cycle scope,
+                // re-scoped from the 2026-08 suite-level null: on p5's
+                // loop-carried recurrence the 3-cycle IMUL is the cycle's
+                // longest link and a 1-cycle LEA measured -8%; off the
+                // cycle it is ~free either way, so firing unconditionally
+                // costs nothing). d = s*{3,5,9} is one LEA [s + s*{2,4,8}];
+                // d = s*7 is SHL d,s,3 ; SUB d,d,s using d itself as the
+                // temporary (requires d != s). The flags guard above
+                // already proved the IMUL's flag results are dead, and
+                // every replacement opcode is inside the proof perimeter.
+                // Kill switch: `TCG_NO_X86_CONSTMUL_LEA`.
+                3 | 5 | 9 if constmul_lea_enabled() && dst != src => Some(PeepholeEdit::Replace(
+                    lea_sib_scaled(dst, src, (imm - 1) as u8),
+                )),
+                7 if constmul_lea_enabled() && dst != src => Some(PeepholeEdit::ReplaceTwo(
+                    X86ISelInst::new(
+                        X86Opcode::ShlRI,
+                        vec![
+                            X86ISelOperand::VReg(dst),
+                            X86ISelOperand::VReg(src),
+                            X86ISelOperand::Imm(3),
+                        ],
+                    ),
+                    X86ISelInst::new(
+                        X86Opcode::SubRR,
+                        vec![
+                            X86ISelOperand::VReg(dst),
+                            X86ISelOperand::VReg(dst),
+                            X86ISelOperand::VReg(src),
+                        ],
+                    ),
+                )),
                 _ => None,
             }
         }
@@ -2291,6 +3222,30 @@ fn test_rr(src: VReg) -> X86ISelInst {
     X86ISelInst::new(
         X86Opcode::TestRR,
         vec![X86ISelOperand::VReg(src), X86ISelOperand::VReg(src)],
+    )
+}
+
+/// Kill switch for the small-constant IMUL -> LEA/SHL-SUB strength
+/// reduction (any value disables).
+fn constmul_lea_enabled() -> bool {
+    std::env::var_os("TCG_NO_X86_CONSTMUL_LEA").is_none()
+}
+
+/// `dst = src + src*scale` — the single-LEA form of `src * (scale+1)` for
+/// scale in {2, 4, 8}.
+fn lea_sib_scaled(dst: VReg, src: VReg, scale: u8) -> X86ISelInst {
+    debug_assert!(matches!(scale, 2 | 4 | 8));
+    X86ISelInst::new(
+        X86Opcode::LeaSib,
+        vec![
+            X86ISelOperand::VReg(dst),
+            X86ISelOperand::SibMemAddr {
+                base: Box::new(X86ISelOperand::VReg(src)),
+                index: Box::new(X86ISelOperand::VReg(src)),
+                scale,
+                disp: 0,
+            },
+        ],
     )
 }
 
@@ -2955,6 +3910,9 @@ fn sib_addr_fold_run_on_block(
     // Rewrite every memory op in place, then delete the scale-def + add of each
     // fired edit in descending index order so earlier indices stay valid.
     let mut to_delete: Vec<usize> = Vec::new();
+    // `sib_addr_fold_run_on_block` opens with
+    // `let Some(block) = func.blocks.get(&block_id) else { return false }`;
+    // the anchor scan between there and here only reads `func`.
     let block = func.blocks.get_mut(&block_id).expect("block existed above");
     for edit in &edits {
         for r in &edit.mem_rewrites {
@@ -4061,7 +5019,10 @@ struct LocalChainAddr {
     base: VReg,
     base_captured_at: usize,
     index: Option<(VReg, usize)>,
-    disp: i64,
+    /// Narrowed to the SIB displacement width at construction: the chain is
+    /// accumulated in `i64` and refused outright if it does not fit, so no
+    /// consumer has to re-check (or assert) the range.
+    disp: i32,
     links_consumed: usize,
 }
 
@@ -4178,7 +5139,7 @@ fn resolve_local_addr_chain(
         let _ = iv;
     }
 
-    i32::try_from(disp).ok()?;
+    let disp = i32::try_from(disp).ok()?;
     Some(LocalChainAddr {
         base: v,
         base_captured_at: pos,
@@ -4275,7 +5236,7 @@ fn addr_chain_fold_run_on_block(
         if chain.links_consumed == 0 {
             continue;
         }
-        let disp = i32::try_from(chain.disp).expect("checked in resolve");
+        let disp = chain.disp;
         let (new_opcode, new_addr) = match chain.index {
             Some((iv, _)) => (
                 match (is_load, width32) {
@@ -4345,6 +5306,9 @@ fn addr_chain_fold_run_on_block(
         );
     }
 
+    // `addr_chain_fold_run_on_block` opens with
+    // `let Some(block) = func.blocks.get(&block_id) else { return false }`;
+    // the rewrite-collection scan between there and here only reads `func`.
     let block = func.blocks.get_mut(&block_id).expect("block existed above");
     for r in rewrites {
         let mem = &mut block.insts[r.mem_idx];
@@ -4538,6 +5502,9 @@ fn sib_base_lea_fold_run_on_block(
         );
     }
 
+    // `sib_base_lea_fold_run_on_block` opens with
+    // `let Some(block) = func.blocks.get(&block_id) else { return false }`;
+    // the rewrite-collection scan between there and here only reads `func`.
     let block = func.blocks.get_mut(&block_id).expect("block existed above");
     for r in rewrites {
         for op in block.insts[r.mem_idx].operands.iter_mut() {
@@ -5033,7 +6000,7 @@ mod tests {
             X86ISelInst::new(X86Opcode::MovRR, vec![vreg(0), vreg(0)]),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut pm = X86PassManager::new().with_pass(Box::new(X86Peephole));
+        let mut pm = X86PassManager::new().with_pass(Box::new(X86Peephole::default()));
 
         assert!(pm.run_once(&mut func));
 
@@ -5046,7 +6013,7 @@ mod tests {
             X86ISelInst::new(X86Opcode::MovRR32, vec![vreg32(0), vreg32(0)]),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(peephole.run_on_function(&mut func));
 
@@ -5065,7 +6032,7 @@ mod tests {
                 X86ISelInst::new(opcode, vec![reg(0), reg(0)]),
                 X86ISelInst::new(X86Opcode::Ret, vec![]),
             ]);
-            let mut peephole = X86Peephole;
+            let mut peephole = X86Peephole::default();
 
             assert!(
                 peephole.run_on_function(&mut func),
@@ -5091,7 +6058,7 @@ mod tests {
             ),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(peephole.run_on_function(&mut func));
 
@@ -5116,7 +6083,7 @@ mod tests {
             .with_proof_origin(X86ProofOrigin::AtomicLoad),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(peephole.run_on_function(&mut func));
 
@@ -5137,7 +6104,7 @@ mod tests {
             ),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(peephole.run_on_function(&mut func));
 
@@ -5160,7 +6127,7 @@ mod tests {
             ),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(peephole.run_on_function(&mut func));
 
@@ -5188,7 +6155,7 @@ mod tests {
             ),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(peephole.run_on_function(&mut func));
 
@@ -5235,7 +6202,7 @@ mod tests {
             ),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(!peephole.run_on_function(&mut func));
 
@@ -5274,7 +6241,7 @@ mod tests {
             ),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(!peephole.run_on_function(&mut func));
 
@@ -5310,7 +6277,7 @@ mod tests {
             ),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(peephole.run_on_function(&mut func));
 
@@ -5342,7 +6309,7 @@ mod tests {
             ),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(!peephole.run_on_function(&mut func));
 
@@ -5359,7 +6326,7 @@ mod tests {
             X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(4), X86ISelOperand::Imm(0)]),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(peephole.run_on_function(&mut func));
 
@@ -5387,7 +6354,7 @@ mod tests {
             X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(2), X86ISelOperand::Imm(0)]),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(peephole.run_on_function(&mut func));
 
@@ -5418,7 +6385,7 @@ mod tests {
             ),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(!peephole.run_on_function(&mut func));
 
@@ -5436,7 +6403,7 @@ mod tests {
             X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(5), X86ISelOperand::Imm(1)]),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(!peephole.run_on_function(&mut func));
 
@@ -5485,7 +6452,7 @@ mod tests {
             X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(8), X86ISelOperand::Imm(0)]),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(peephole.run_on_function(&mut func));
 
@@ -5517,7 +6484,7 @@ mod tests {
             X86ISelInst::new(X86Opcode::CmpRI, vec![vreg32(2), X86ISelOperand::Imm(0)]),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(peephole.run_on_function(&mut func));
 
@@ -5536,7 +6503,7 @@ mod tests {
             X86ISelInst::new(X86Opcode::CmpRI, vec![vreg32(4), X86ISelOperand::Imm(0)]),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(peephole.run_on_function(&mut func));
 
@@ -5587,7 +6554,7 @@ mod tests {
             X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(1), X86ISelOperand::Imm(0)]),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(!peephole.run_on_function(&mut read_func));
         assert!(!peephole.run_on_function(&mut branch_func));
@@ -5635,7 +6602,7 @@ mod tests {
             ),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(!peephole.run_on_function(&mut func));
 
@@ -5671,7 +6638,7 @@ mod tests {
             X86ISelInst::new(X86Opcode::CmpRI, vec![vreg32(4), X86ISelOperand::Imm(0)]),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(peephole.run_on_function(&mut func));
 
@@ -5724,7 +6691,7 @@ mod tests {
             X86ISelInst::new(X86Opcode::SubRI, vec![vreg(1), X86ISelOperand::Imm(1)]),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(!peephole.run_on_function(&mut add_read_func));
         assert!(!peephole.run_on_function(&mut sub_read_func));
@@ -5783,7 +6750,7 @@ mod tests {
             X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(10), X86ISelOperand::Imm(0)]),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(peephole.run_on_function(&mut func));
 
@@ -5850,7 +6817,7 @@ mod tests {
             X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(6), X86ISelOperand::Imm(0)]),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(peephole.run_on_function(&mut func));
 
@@ -5884,7 +6851,7 @@ mod tests {
             X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(1), X86ISelOperand::Imm(0)]),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(peephole.run_on_function(&mut func));
 
@@ -5915,7 +6882,7 @@ mod tests {
             ),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(!peephole.run_on_function(&mut sub_func));
         assert!(!peephole.run_on_function(&mut xor_func));
@@ -5946,7 +6913,7 @@ mod tests {
             X86ISelInst::new(X86Opcode::CmpRI, vec![vreg32(2), X86ISelOperand::Imm(0)]),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(peephole.run_on_function(&mut func));
 
@@ -5977,7 +6944,7 @@ mod tests {
             ),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(!peephole.run_on_function(&mut func));
 
@@ -6005,7 +6972,7 @@ mod tests {
             X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(0), X86ISelOperand::Imm(1)]),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(!peephole.run_on_function(&mut func));
 
@@ -6033,7 +7000,7 @@ mod tests {
             X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(2), X86ISelOperand::Imm(0)]),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(peephole.run_on_function(&mut func));
 
@@ -6059,7 +7026,7 @@ mod tests {
             X86ISelInst::new(X86Opcode::CmpRI, vec![vreg32(1), X86ISelOperand::Imm(0)]),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(peephole.run_on_function(&mut func));
 
@@ -6090,7 +7057,7 @@ mod tests {
             ),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(!peephole.run_on_function(&mut func));
 
@@ -6123,7 +7090,7 @@ mod tests {
             X86ISelInst::new(X86Opcode::CmpRI, vec![vreg32(4), X86ISelOperand::Imm(0)]),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(peephole.run_on_function(&mut func));
 
@@ -6153,7 +7120,7 @@ mod tests {
             X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(2), X86ISelOperand::Imm(0)]),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(peephole.run_on_function(&mut func));
 
@@ -6184,7 +7151,7 @@ mod tests {
             X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(6), X86ISelOperand::Imm(0)]),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(peephole.run_on_function(&mut func));
 
@@ -6227,7 +7194,7 @@ mod tests {
             ),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(!peephole.run_on_function(&mut read_func));
         assert!(!peephole.run_on_function(&mut live_out_func));
@@ -6255,7 +7222,7 @@ mod tests {
             X86ISelInst::new(X86Opcode::CmpRI, vec![vreg32(4), X86ISelOperand::Imm(0)]),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(peephole.run_on_function(&mut func));
 
@@ -6290,7 +7257,7 @@ mod tests {
             X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(4), X86ISelOperand::Imm(0)]),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(peephole.run_on_function(&mut func));
 
@@ -6335,7 +7302,7 @@ mod tests {
             ),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(!peephole.run_on_function(&mut read_func));
         assert!(!peephole.run_on_function(&mut live_out_func));
@@ -6370,7 +7337,7 @@ mod tests {
             ),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(!peephole.run_on_function(&mut read_func));
         assert!(!peephole.run_on_function(&mut live_out_func));
@@ -6395,7 +7362,7 @@ mod tests {
             X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(2), X86ISelOperand::Imm(0)]),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(peephole.run_on_function(&mut func));
 
@@ -6418,7 +7385,7 @@ mod tests {
             ),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(!peephole.run_on_function(&mut func));
 
@@ -6442,7 +7409,7 @@ mod tests {
             ),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(!peephole.run_on_function(&mut func));
 
@@ -6472,7 +7439,7 @@ mod tests {
                 ),
                 X86ISelInst::new(X86Opcode::Ret, vec![]),
             ]);
-            let mut peephole = X86Peephole;
+            let mut peephole = X86Peephole::default();
 
             assert!(
                 !peephole.run_on_function(&mut func),
@@ -6504,7 +7471,7 @@ mod tests {
             ),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(peephole.run_on_function(&mut func));
 
@@ -6547,7 +7514,7 @@ mod tests {
             ),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(!peephole.run_on_function(&mut branch_func));
         assert!(!peephole.run_on_function(&mut return_func));
@@ -6585,7 +7552,7 @@ mod tests {
             X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(3), X86ISelOperand::Imm(1)]),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(!peephole.run_on_function(&mut func));
 
@@ -6623,7 +7590,7 @@ mod tests {
             X86ISelInst::new(X86Opcode::Movzx, vec![vreg32(10), vreg32(10)]),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(peephole.run_on_function(&mut func));
 
@@ -6661,7 +7628,7 @@ mod tests {
             X86ISelInst::new(X86Opcode::Movzx, vec![vreg32(10), vreg32(10)]),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(peephole.run_on_function(&mut func));
 
@@ -6690,7 +7657,7 @@ mod tests {
             X86ISelInst::new(X86Opcode::Movzx, vec![vreg32(10), vreg32(10)]),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
         assert!(peephole.run_on_function(&mut func));
 
         let insts = entry_insts(&func);
@@ -6712,7 +7679,7 @@ mod tests {
             X86ISelInst::new(X86Opcode::Movzx, vec![vreg32(11), vreg32(11)]),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(!peephole.run_on_function(&mut func));
         assert_eq!(
@@ -6743,7 +7710,7 @@ mod tests {
             X86ISelInst::new(X86Opcode::Movzx, vec![vreg32(10), vreg32(10)]),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(!peephole.run_on_function(&mut func));
         assert_eq!(
@@ -6774,7 +7741,7 @@ mod tests {
             X86ISelInst::new(X86Opcode::Movzx, vec![vreg32(10), vreg32(10)]),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(!peephole.run_on_function(&mut func));
         assert_eq!(
@@ -6805,7 +7772,7 @@ mod tests {
             X86ISelInst::new(X86Opcode::Movzx, vec![vreg32(10), vreg32(10)]),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(peephole.run_on_function(&mut func));
         // The rewrite hoists xor above AddRR, keeping CmpRR in place.
@@ -6836,7 +7803,7 @@ mod tests {
             X86ISelInst::new(X86Opcode::Movzx, vec![vreg32(10), vreg32(10)]),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(!peephole.run_on_function(&mut func));
         assert_eq!(
@@ -6867,7 +7834,7 @@ mod tests {
             ),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(!peephole.run_on_function(&mut func));
         assert_eq!(
@@ -6903,7 +7870,7 @@ mod tests {
             X86ISelInst::new(X86Opcode::Movzx, vec![vreg32(10), vreg32(10)]),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(!peephole.run_on_function(&mut func));
         assert_eq!(
@@ -6957,7 +7924,7 @@ mod tests {
             ),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
         peephole.run_on_function(&mut func);
         let opcodes = entry_opcodes(&func);
         // setcc-hoist conservatively declines because %D is used twice.
@@ -6981,7 +7948,7 @@ mod tests {
             X86ISelInst::new(X86Opcode::Movzx, vec![vreg32(20), vreg32(20)]),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
         assert!(peephole.run_on_function(&mut func));
         assert_eq!(
             entry_opcodes(&func),
@@ -7021,7 +7988,7 @@ mod tests {
             ),
             X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(Block(2))]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
         assert!(peephole.run_on_function(&mut func));
         // The boolean materialization (Setcc/Movzx/zero-test) is gone; only the
         // comparison and a direct conditional jump on its flags remain.
@@ -7064,7 +8031,7 @@ mod tests {
             ),
             X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(Block(2))]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(peephole.run_on_function(&mut func));
 
@@ -7105,7 +8072,7 @@ mod tests {
             ),
             X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(Block(2))]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(peephole.run_on_function(&mut func));
 
@@ -7147,7 +8114,7 @@ mod tests {
             ),
             X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(Block(2))]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(peephole.run_on_function(&mut func));
 
@@ -7196,7 +8163,7 @@ mod tests {
             ),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
         peephole.run_on_function(&mut func);
 
         let opcodes = entry_opcodes(&func);
@@ -7223,7 +8190,7 @@ mod tests {
             ),
             X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(Block(2))]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
         peephole.run_on_function(&mut func);
 
         let opcodes = entry_opcodes(&func);
@@ -7252,7 +8219,7 @@ mod tests {
             ),
             X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(Block(2))]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
         peephole.run_on_function(&mut func);
 
         assert!(!entry_opcodes(&func).contains(&X86Opcode::BtRI));
@@ -7273,7 +8240,7 @@ mod tests {
             ),
             X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(Block(2))]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
         peephole.run_on_function(&mut func);
 
         assert!(!entry_opcodes(&func).contains(&X86Opcode::BtRI));
@@ -7295,7 +8262,7 @@ mod tests {
             ),
             X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(Block(2))]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
         peephole.run_on_function(&mut func);
 
         assert!(!entry_opcodes(&func).contains(&X86Opcode::BtRI));
@@ -7315,7 +8282,7 @@ mod tests {
             ),
             X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(Block(2))]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
         peephole.run_on_function(&mut func);
 
         assert!(!entry_opcodes(&func).contains(&X86Opcode::BtRI));
@@ -7341,7 +8308,7 @@ mod tests {
             ),
             X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(Block(2))]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
         peephole.run_on_function(&mut func);
 
         assert!(!entry_opcodes(&func).contains(&X86Opcode::BtRI));
@@ -7361,7 +8328,7 @@ mod tests {
             ),
             X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(Block(2))]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
         peephole.run_on_function(&mut func);
 
         assert!(!entry_opcodes(&func).contains(&X86Opcode::BtRI));
@@ -7388,7 +8355,7 @@ mod tests {
             ),
             X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(Block(2))]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
         peephole.run_on_function(&mut func);
 
         assert!(!entry_opcodes(&func).contains(&X86Opcode::BtRI));
@@ -7417,7 +8384,7 @@ mod tests {
             ),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(peephole.run_on_function(&mut func));
 
@@ -7482,7 +8449,7 @@ mod tests {
         );
         func.push_inst(other, X86ISelInst::new(X86Opcode::Ret, vec![]));
 
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
         peephole.run_on_function(&mut func);
 
         let entry_block = &func.blocks[&entry];
@@ -7515,7 +8482,7 @@ mod tests {
             ),
             X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(Block(2))]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
         peephole.run_on_function(&mut func);
 
         assert!(!entry_opcodes(&func).contains(&X86Opcode::BtRI));
@@ -7539,7 +8506,7 @@ mod tests {
             X86ISelInst::new(X86Opcode::Movzx, vec![vreg32(11), vreg32(11)]),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
 
         assert!(peephole.run_on_function(&mut func));
 
@@ -7598,7 +8565,7 @@ mod tests {
     fn cmp_branch_fusion_fires_on_full_b1_condbr_shape_jcc_ne() {
         // Branch-when-true (Jcc NE on the bool) collapses to Jcc <cc>.
         let mut func = icmp_condbr_shape(X86CondCode::B, X86CondCode::NE);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
         assert!(peephole.run_on_function(&mut func));
 
         assert_eq!(
@@ -7621,7 +8588,7 @@ mod tests {
     fn cmp_branch_fusion_inverts_cc_on_jcc_e() {
         // Branch-when-false (Jcc E on the bool) collapses to Jcc <cc.invert()>.
         let mut func = icmp_condbr_shape(X86CondCode::B, X86CondCode::E);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
         assert!(peephole.run_on_function(&mut func));
 
         let insts = entry_insts(&func);
@@ -7655,7 +8622,7 @@ mod tests {
             ),
             X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(Block(2))]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
         assert!(peephole.run_on_function(&mut func));
 
         assert_eq!(
@@ -7683,7 +8650,7 @@ mod tests {
                 vec![vreg(7), vreg(6), X86ISelOperand::Imm(1)],
             ),
         );
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
         peephole.run_on_function(&mut func);
         // CmpRR/Setcc must survive (no fusion).
         let opcodes = entry_opcodes(&func);
@@ -7711,7 +8678,7 @@ mod tests {
             ),
             X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(Block(2))]),
         ]);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
         peephole.run_on_function(&mut func);
         assert!(entry_opcodes(&func).contains(&X86Opcode::Setcc));
     }
@@ -7729,7 +8696,7 @@ mod tests {
                 .unwrap();
             block.insts[jcc_idx].proof_origin = Some(X86ProofOrigin::AtomicLoad);
         }
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
         assert!(peephole.run_on_function(&mut func));
         let insts = entry_insts(&func);
         let new_jcc = insts.iter().find(|i| i.opcode == X86Opcode::Jcc).unwrap();
@@ -8171,7 +9138,7 @@ mod tests {
             X86ISelInst::new(X86Opcode::AddRR, vec![vreg(7), vreg(8), vreg(5)]),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        assert!(run_impl(&mut func));
+        assert!(run_impl(&mut func, |_| false));
         let opcodes = entry_opcodes(&func);
         assert!(
             opcodes.contains(&X86Opcode::MovRMSib),
@@ -8272,7 +9239,7 @@ mod tests {
     fn sib_fold_end_to_end_via_run_impl() {
         // The full peephole entrypoint fires the fold at its scheduled slot.
         let mut func = foldable_store_window(X86Opcode::ImulRRI, 8);
-        let mut peephole = X86Peephole;
+        let mut peephole = X86Peephole::default();
         assert!(peephole.run_on_function(&mut func));
         assert!(entry_opcodes(&func).contains(&X86Opcode::MovMRSib));
         assert!(!entry_opcodes(&func).contains(&X86Opcode::ImulRRI));
@@ -9034,6 +10001,558 @@ mod tests {
         assert!(!imul_fuse_run_on_block(&mut func, Block(0)));
     }
 
+    // -----------------------------------------------------------------------
+    // Memory-destination RMW fusion (TCG_NO_X86_RMW_FUSE) — called directly,
+    // bypassing the env gate; the admission callback is |_| true except where
+    // the admission gate itself is under test.
+    // -----------------------------------------------------------------------
+
+    /// The b1 arm-1 accept shape: load / ALU / same-address store, with the
+    /// postlude that makes `t`(5) and `d`(6) locally dead (killing redefs
+    /// with downstream readers, mirroring the imul_fuse tests).
+    fn rmw_triple(
+        load_mem: X86ISelOperand,
+        alu: X86ISelInst,
+        store_mem: X86ISelOperand,
+    ) -> Vec<X86ISelInst> {
+        let load_op = match load_mem {
+            X86ISelOperand::SibMemAddr { .. } => X86Opcode::MovRMSib,
+            _ => X86Opcode::MovRM,
+        };
+        let store_op = match store_mem {
+            X86ISelOperand::SibMemAddr { .. } => X86Opcode::MovMRSib,
+            _ => X86Opcode::MovMR,
+        };
+        vec![
+            X86ISelInst::new(load_op, vec![vreg(5), load_mem]),
+            alu,
+            X86ISelInst::new(store_op, vec![store_mem, vreg(6)]),
+            X86ISelInst::new(X86Opcode::MovRI, vec![vreg(5), X86ISelOperand::Imm(0)]),
+            X86ISelInst::new(X86Opcode::MovRI, vec![vreg(6), X86ISelOperand::Imm(0)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(8), vreg(6)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(9), vreg(5)]),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]
+    }
+
+    #[test]
+    fn rmw_fuse_block_tail_without_redefs_fuses() {
+        // The REAL b1 hot block: nothing touches t or d again before the
+        // block ends — no redefs for the block-local rule to find. The
+        // function-wide single-def/single-use fallback must admit it.
+        let sib_i = |id: u32| X86ISelOperand::SibMemAddr {
+            base: Box::new(X86ISelOperand::StackSlot(0)),
+            index: Box::new(vreg(id)),
+            scale: 8,
+            disp: 0,
+        };
+        let mut func = make_func(vec![
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(45), vreg(44)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(51), vreg(45)]),
+            X86ISelInst::new(X86Opcode::MovRMSib, vec![vreg(63), sib_i(44)]),
+            X86ISelInst::new(X86Opcode::XorRR, vec![vreg(64), vreg(63), vreg(46)]),
+            X86ISelInst::new(X86Opcode::MovMRSib, vec![sib_i(51), vreg(64)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(65), vreg(38)]),
+            X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(Block(0))]),
+        ]);
+        assert!(rmw_fuse_run_on_block(&mut func, Block(0), |_| true));
+        let ops = entry_opcodes(&func);
+        assert!(
+            ops.contains(&X86Opcode::XorMRSib),
+            "the untouched-tail b1 shape must fuse: {ops:?}"
+        );
+        assert!(!ops.contains(&X86Opcode::XorRR));
+    }
+
+    #[test]
+    fn rmw_fuse_copy_chain_alias_store_index_fuses() {
+        // b1 arm 1's REAL pre-peephole shape: the store indexes through a
+        // pure copy chain of the load's index (v51 <- v45 <- v44).
+        let sib_i = |id: u32| X86ISelOperand::SibMemAddr {
+            base: Box::new(X86ISelOperand::StackSlot(0)),
+            index: Box::new(vreg(id)),
+            scale: 8,
+            disp: 0,
+        };
+        let mut func = make_func(vec![
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(45), vreg(44)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(51), vreg(45)]),
+            X86ISelInst::new(X86Opcode::MovRMSib, vec![vreg(5), sib_i(44)]),
+            X86ISelInst::new(X86Opcode::XorRR, vec![vreg(6), vreg(5), vreg(4)]),
+            X86ISelInst::new(X86Opcode::MovMRSib, vec![sib_i(51), vreg(6)]),
+            X86ISelInst::new(X86Opcode::MovRI, vec![vreg(5), X86ISelOperand::Imm(0)]),
+            X86ISelInst::new(X86Opcode::MovRI, vec![vreg(6), X86ISelOperand::Imm(0)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(8), vreg(6)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(9), vreg(5)]),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        assert!(rmw_fuse_run_on_block(&mut func, Block(0), |_| true));
+        let ops = entry_opcodes(&func);
+        assert!(
+            ops.contains(&X86Opcode::XorMRSib),
+            "copy-chain-alias store EA must fuse: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn rmw_fuse_scale_folded_store_index_fuses() {
+        // b1 arm 2's shape: load at [slot + j*8], store at [slot + (j*8)*1]
+        // with the *8 as a single-def ImulRRI.
+        let mut func = make_func(vec![
+            X86ISelInst::new(
+                X86Opcode::ImulRRI,
+                vec![vreg(93), vreg(44), X86ISelOperand::Imm(8)],
+            ),
+            X86ISelInst::new(
+                X86Opcode::MovRMSib,
+                vec![
+                    vreg(5),
+                    X86ISelOperand::SibMemAddr {
+                        base: Box::new(X86ISelOperand::StackSlot(0)),
+                        index: Box::new(vreg(44)),
+                        scale: 8,
+                        disp: 0,
+                    },
+                ],
+            ),
+            X86ISelInst::new(X86Opcode::AddRR, vec![vreg(6), vreg(5), vreg(4)]),
+            X86ISelInst::new(
+                X86Opcode::MovMRSib,
+                vec![
+                    X86ISelOperand::SibMemAddr {
+                        base: Box::new(X86ISelOperand::StackSlot(0)),
+                        index: Box::new(vreg(93)),
+                        scale: 1,
+                        disp: 0,
+                    },
+                    vreg(6),
+                ],
+            ),
+            X86ISelInst::new(X86Opcode::MovRI, vec![vreg(5), X86ISelOperand::Imm(0)]),
+            X86ISelInst::new(X86Opcode::MovRI, vec![vreg(6), X86ISelOperand::Imm(0)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(8), vreg(6)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(9), vreg(5)]),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        assert!(rmw_fuse_run_on_block(&mut func, Block(0), |_| true));
+        assert!(
+            entry_opcodes(&func).contains(&X86Opcode::AddMRSib),
+            "scale-folded store EA must fuse: {:?}",
+            entry_opcodes(&func)
+        );
+    }
+
+    #[test]
+    fn rmw_fuse_refuses_multi_def_alias_index() {
+        // The store's index alias has a SECOND def: canonicalization must
+        // fail closed and the triple must stay unfused.
+        let sib_i = |id: u32| X86ISelOperand::SibMemAddr {
+            base: Box::new(X86ISelOperand::StackSlot(0)),
+            index: Box::new(vreg(id)),
+            scale: 8,
+            disp: 0,
+        };
+        let mut func = make_func(vec![
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(51), vreg(44)]),
+            X86ISelInst::new(X86Opcode::MovRMSib, vec![vreg(5), sib_i(44)]),
+            X86ISelInst::new(X86Opcode::XorRR, vec![vreg(6), vreg(5), vreg(4)]),
+            X86ISelInst::new(X86Opcode::MovMRSib, vec![sib_i(51), vreg(6)]),
+            // Second def of the alias AFTER the store: multi-def, refused.
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(51), vreg(4)]),
+            X86ISelInst::new(X86Opcode::MovRI, vec![vreg(5), X86ISelOperand::Imm(0)]),
+            X86ISelInst::new(X86Opcode::MovRI, vec![vreg(6), X86ISelOperand::Imm(0)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(8), vreg(6)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(9), vreg(5)]),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        assert!(!rmw_fuse_run_on_block(&mut func, Block(0), |_| true));
+    }
+
+    #[test]
+    fn rmw_fuse_refuses_alias_when_canonical_root_changes_in_window() {
+        // v51 captures the OLD value of v44 for the load. The tied AddRI then
+        // changes v44 before the store. Position-independent copy-chain
+        // canonicalization alone says both indices have root v44, but the
+        // addresses differ in time and fusing would write the wrong slot.
+        let sib_i = |id: u32| X86ISelOperand::SibMemAddr {
+            base: Box::new(X86ISelOperand::StackSlot(0)),
+            index: Box::new(vreg(id)),
+            scale: 8,
+            disp: 0,
+        };
+        let mut func = make_func(vec![
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(51), vreg(44)]),
+            X86ISelInst::new(X86Opcode::MovRMSib, vec![vreg(5), sib_i(51)]),
+            X86ISelInst::new(X86Opcode::AddRI, vec![vreg(44), X86ISelOperand::Imm(1)]),
+            X86ISelInst::new(X86Opcode::XorRR, vec![vreg(6), vreg(5), vreg(4)]),
+            X86ISelInst::new(X86Opcode::MovMRSib, vec![sib_i(44), vreg(6)]),
+            X86ISelInst::new(X86Opcode::MovRI, vec![vreg(5), X86ISelOperand::Imm(0)]),
+            X86ISelInst::new(X86Opcode::MovRI, vec![vreg(6), X86ISelOperand::Imm(0)]),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        assert!(
+            !rmw_fuse_run_on_block(&mut func, Block(0), |_| true),
+            "an intervening write to the canonical EA root must fail closed"
+        );
+    }
+
+    #[test]
+    fn rmw_fuse_stackslot_base_sib_fuses() {
+        // b1's REAL hot arm: the table is a STACK array, so the SIB base is
+        // a StackSlot. The slot cannot be redefined; the E-scan covers the
+        // VReg index.
+        let slot_sib = || X86ISelOperand::SibMemAddr {
+            base: Box::new(X86ISelOperand::StackSlot(3)),
+            index: Box::new(vreg(2)),
+            scale: 8,
+            disp: -160,
+        };
+        let mut func = make_func(rmw_triple(
+            slot_sib(),
+            X86ISelInst::new(X86Opcode::XorRR, vec![vreg(6), vreg(5), vreg(4)]),
+            slot_sib(),
+        ));
+        assert!(rmw_fuse_run_on_block(&mut func, Block(0), |_| true));
+        let ops = entry_opcodes(&func);
+        assert!(
+            ops.contains(&X86Opcode::XorMRSib),
+            "stack-slot-based triple must fuse: {ops:?}"
+        );
+        assert!(!ops.contains(&X86Opcode::MovRMSib));
+    }
+
+    #[test]
+    fn rmw_fuse_xor_three_op_b1_shape() {
+        // MovRMSib t(5),[1+2*8-160]; XorRR d(6),t(5),s(4); MovMRSib [same],d
+        //   ->  XorMRSib [1+2*8-160], s(4); load and ALU deleted.
+        let mut func = make_func(rmw_triple(
+            sib_op(1, 2, 8, -160),
+            X86ISelInst::new(X86Opcode::XorRR, vec![vreg(6), vreg(5), vreg(4)]),
+            sib_op(1, 2, 8, -160),
+        ));
+        assert!(rmw_fuse_run_on_block(&mut func, Block(0), |_| true));
+        assert_eq!(
+            entry_opcodes(&func),
+            vec![
+                X86Opcode::XorMRSib,
+                X86Opcode::MovRI,
+                X86Opcode::MovRI,
+                X86Opcode::MovRR,
+                X86Opcode::MovRR,
+                X86Opcode::Ret
+            ]
+        );
+        let insts = entry_insts(&func);
+        assert_eq!(insts[0].operands, vec![sib_op(1, 2, 8, -160), vreg(4)]);
+        assert_eq!(insts[0].flags, X86Opcode::XorMRSib.default_flags());
+        assert_eq!(insts[0].proof_origin, None);
+    }
+
+    #[test]
+    fn rmw_fuse_xor_commuted_operands() {
+        // Commuted anchor `XorRR d, s, t` fuses identically.
+        let mut func = make_func(rmw_triple(
+            sib_op(1, 2, 8, -160),
+            X86ISelInst::new(X86Opcode::XorRR, vec![vreg(6), vreg(4), vreg(5)]),
+            sib_op(1, 2, 8, -160),
+        ));
+        assert!(rmw_fuse_run_on_block(&mut func, Block(0), |_| true));
+        let insts = entry_insts(&func);
+        assert_eq!(insts[0].opcode, X86Opcode::XorMRSib);
+        assert_eq!(insts[0].operands, vec![sib_op(1, 2, 8, -160), vreg(4)]);
+    }
+
+    #[test]
+    fn rmw_fuse_add_tied_form() {
+        // Tied `AddRR d, t`: d := d + t, so the fused register source is d's
+        // own pre-value.
+        let mut func = make_func(rmw_triple(
+            sib_op(1, 2, 8, 0),
+            X86ISelInst::new(X86Opcode::AddRR, vec![vreg(6), vreg(5)]),
+            sib_op(1, 2, 8, 0),
+        ));
+        assert!(rmw_fuse_run_on_block(&mut func, Block(0), |_| true));
+        let insts = entry_insts(&func);
+        assert_eq!(insts[0].opcode, X86Opcode::AddMRSib);
+        assert_eq!(insts[0].operands, vec![sib_op(1, 2, 8, 0), vreg(6)]);
+    }
+
+    #[test]
+    fn rmw_fuse_add_base_disp_form() {
+        // Full-width MovRM/MovMR pair fuses to the base+disp AddMR.
+        let mut func = make_func(rmw_triple(
+            mem(1, 16),
+            X86ISelInst::new(X86Opcode::AddRR, vec![vreg(6), vreg(5), vreg(4)]),
+            mem(1, 16),
+        ));
+        assert!(rmw_fuse_run_on_block(&mut func, Block(0), |_| true));
+        let insts = entry_insts(&func);
+        assert_eq!(insts[0].opcode, X86Opcode::AddMR);
+        assert_eq!(insts[0].operands, vec![mem(1, 16), vreg(4)]);
+    }
+
+    #[test]
+    fn rmw_fuse_refuses_store_in_load_alu_window() {
+        // A store between load and ALU may alias the loaded address.
+        let mut insts = rmw_triple(
+            sib_op(1, 2, 8, 0),
+            X86ISelInst::new(X86Opcode::XorRR, vec![vreg(6), vreg(5), vreg(4)]),
+            sib_op(1, 2, 8, 0),
+        );
+        insts.insert(
+            1,
+            X86ISelInst::new(X86Opcode::MovMR, vec![mem(3, 0), vreg(4)]),
+        );
+        let mut func = make_func(insts);
+        assert!(!rmw_fuse_run_on_block(&mut func, Block(0), |_| true));
+    }
+
+    #[test]
+    fn rmw_fuse_refuses_store_in_alu_store_window() {
+        // A store between ALU and the anchor store may alias the RMW address.
+        let mut insts = rmw_triple(
+            sib_op(1, 2, 8, 0),
+            X86ISelInst::new(X86Opcode::XorRR, vec![vreg(6), vreg(5), vreg(4)]),
+            sib_op(1, 2, 8, 0),
+        );
+        insts.insert(
+            2,
+            X86ISelInst::new(X86Opcode::MovMR, vec![mem(3, 0), vreg(4)]),
+        );
+        let mut func = make_func(insts);
+        assert!(!rmw_fuse_run_on_block(&mut func, Block(0), |_| true));
+    }
+
+    #[test]
+    fn rmw_fuse_refuses_flag_reader_in_alu_store_window() {
+        // The ALU's flag-write moves from j down to k: a window Setcc/Cmovcc
+        // would observe the ALU flags in the unfused stream and stale flags
+        // in the fused one (the NOVEL W2 hazard; `imul_fuse_window_ok` alone
+        // admits both — EMPTY default flags).
+        for reader in [
+            X86ISelInst::new(
+                X86Opcode::Setcc,
+                vec![vreg(11), X86ISelOperand::CondCode(X86CondCode::E)],
+            ),
+            X86ISelInst::new(
+                X86Opcode::Cmovcc,
+                vec![
+                    vreg(11),
+                    vreg(12),
+                    X86ISelOperand::CondCode(X86CondCode::AE),
+                ],
+            ),
+        ] {
+            let mut insts = rmw_triple(
+                sib_op(1, 2, 8, 0),
+                X86ISelInst::new(X86Opcode::XorRR, vec![vreg(6), vreg(5), vreg(4)]),
+                sib_op(1, 2, 8, 0),
+            );
+            insts.insert(2, reader);
+            let mut func = make_func(insts);
+            assert!(!rmw_fuse_run_on_block(&mut func, Block(0), |_| true));
+        }
+    }
+
+    #[test]
+    fn rmw_fuse_refuses_flag_writer_in_alu_store_window() {
+        // A window flag-writer's flags survive at exit in the unfused stream
+        // but would be overwritten by the moved ALU-write in the fused one.
+        let mut insts = rmw_triple(
+            sib_op(1, 2, 8, 0),
+            X86ISelInst::new(X86Opcode::XorRR, vec![vreg(6), vreg(5), vreg(4)]),
+            sib_op(1, 2, 8, 0),
+        );
+        insts.insert(
+            2,
+            X86ISelInst::new(X86Opcode::AddRR, vec![vreg(11), vreg(12), vreg(13)]),
+        );
+        let mut func = make_func(insts);
+        assert!(!rmw_fuse_run_on_block(&mut func, Block(0), |_| true));
+    }
+
+    #[test]
+    fn rmw_fuse_refuses_ea_reg_redef_in_window() {
+        // The SIB base is redefined between ALU and store: the store's
+        // structurally-identical EA no longer VALUE-matches the load's.
+        // (MovRI writes no flags, so this isolates the E condition from W2's
+        // flag fence.)
+        let mut insts = rmw_triple(
+            sib_op(1, 2, 8, 0),
+            X86ISelInst::new(X86Opcode::XorRR, vec![vreg(6), vreg(5), vreg(4)]),
+            sib_op(1, 2, 8, 0),
+        );
+        insts.insert(
+            2,
+            X86ISelInst::new(X86Opcode::MovRI, vec![vreg(1), X86ISelOperand::Imm(9)]),
+        );
+        let mut func = make_func(insts);
+        assert!(!rmw_fuse_run_on_block(&mut func, Block(0), |_| true));
+    }
+
+    #[test]
+    fn rmw_fuse_refuses_t_use_in_window() {
+        // A window instruction reads t: deleting the load would hand it the
+        // stale pre-load value.
+        let mut insts = rmw_triple(
+            sib_op(1, 2, 8, 0),
+            X86ISelInst::new(X86Opcode::XorRR, vec![vreg(6), vreg(5), vreg(4)]),
+            sib_op(1, 2, 8, 0),
+        );
+        insts.insert(
+            1,
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(7), vreg(5)]),
+        );
+        let mut func = make_func(insts);
+        assert!(!rmw_fuse_run_on_block(&mut func, Block(0), |_| true));
+    }
+
+    #[test]
+    fn rmw_fuse_refuses_live_d_after_store() {
+        // d is read after the store: the fused form defines no register, so
+        // the ALU result would vanish. Refuse (condition D).
+        let mut func = make_func(vec![
+            X86ISelInst::new(X86Opcode::MovRMSib, vec![vreg(5), sib_op(1, 2, 8, 0)]),
+            X86ISelInst::new(X86Opcode::XorRR, vec![vreg(6), vreg(5), vreg(4)]),
+            X86ISelInst::new(X86Opcode::MovMRSib, vec![sib_op(1, 2, 8, 0), vreg(6)]),
+            X86ISelInst::new(X86Opcode::MovRI, vec![vreg(5), X86ISelOperand::Imm(0)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(8), vreg(6)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(9), vreg(5)]),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        assert!(!rmw_fuse_run_on_block(&mut func, Block(0), |_| true));
+    }
+
+    #[test]
+    fn rmw_fuse_refuses_mismatched_store_ea() {
+        // Structural EA identity is the entire alias argument: any component
+        // mismatch (scale, disp, index, base) refuses.
+        for store_sib in [
+            sib_op(1, 2, 4, 0),
+            sib_op(1, 2, 8, 8),
+            sib_op(1, 3, 8, 0),
+            sib_op(3, 2, 8, 0),
+        ] {
+            let mut func = make_func(rmw_triple(
+                sib_op(1, 2, 8, 0),
+                X86ISelInst::new(X86Opcode::XorRR, vec![vreg(6), vreg(5), vreg(4)]),
+                store_sib,
+            ));
+            assert!(!rmw_fuse_run_on_block(&mut func, Block(0), |_| true));
+        }
+    }
+
+    #[test]
+    fn rmw_fuse_refuses_preg_ea_component() {
+        // A PReg EA base is an address the pass cannot track: fail closed.
+        let preg_sib = || X86ISelOperand::SibMemAddr {
+            base: Box::new(X86ISelOperand::PReg(trust_cg_ir::x86_64_regs::RDI)),
+            index: Box::new(vreg(2)),
+            scale: 8,
+            disp: 0,
+        };
+        let mut func = make_func(rmw_triple(
+            preg_sib(),
+            X86ISelInst::new(X86Opcode::XorRR, vec![vreg(6), vreg(5), vreg(4)]),
+            preg_sib(),
+        ));
+        assert!(!rmw_fuse_run_on_block(&mut func, Block(0), |_| true));
+    }
+
+    #[test]
+    fn rmw_fuse_refuses_proof_origin() {
+        // A proof-carrying anchor or store must never be rewritten.
+        for tagged in [1_usize, 2] {
+            let mut insts = rmw_triple(
+                sib_op(1, 2, 8, 0),
+                X86ISelInst::new(X86Opcode::XorRR, vec![vreg(6), vreg(5), vreg(4)]),
+                sib_op(1, 2, 8, 0),
+            );
+            insts[tagged] = insts[tagged]
+                .clone()
+                .with_proof_origin(X86ProofOrigin::AtomicLoad);
+            let mut func = make_func(insts);
+            assert!(!rmw_fuse_run_on_block(&mut func, Block(0), |_| true));
+        }
+    }
+
+    #[test]
+    fn rmw_fuse_refuses_s_equals_t() {
+        // Both ALU sources are the load result: the value is needed twice
+        // but the load is deleted. Refuse.
+        let mut func = make_func(rmw_triple(
+            sib_op(1, 2, 8, 0),
+            X86ISelInst::new(X86Opcode::XorRR, vec![vreg(6), vreg(5), vreg(5)]),
+            sib_op(1, 2, 8, 0),
+        ));
+        assert!(!rmw_fuse_run_on_block(&mut func, Block(0), |_| true));
+    }
+
+    #[test]
+    fn rmw_fuse_admission_gate_is_fail_closed() {
+        // The proof admission callback is consulted with the EXACT fused
+        // opcode; a closed or wrong-opcode admission never fires.
+        let shape = || {
+            make_func(rmw_triple(
+                sib_op(1, 2, 8, 0),
+                X86ISelInst::new(X86Opcode::XorRR, vec![vreg(6), vreg(5), vreg(4)]),
+                sib_op(1, 2, 8, 0),
+            ))
+        };
+        let mut closed = shape();
+        assert!(!rmw_fuse_run_on_block(&mut closed, Block(0), |_| false));
+        let mut wrong_opcode = shape();
+        assert!(!rmw_fuse_run_on_block(&mut wrong_opcode, Block(0), |op| op == X86Opcode::AddMRSib));
+        let mut exact = shape();
+        assert!(rmw_fuse_run_on_block(&mut exact, Block(0), |op| op == X86Opcode::XorMRSib));
+        assert_eq!(entry_insts(&exact)[0].opcode, X86Opcode::XorMRSib);
+    }
+
+    #[test]
+    fn rmw_fuse_default_pass_admission_is_closed() {
+        // `X86Peephole::default()` carries the closed `|_| false` admission:
+        // the full pass never creates an RMW opcode without an injected proof
+        // gate (env gate untouched — the fusion declines on admission alone).
+        let mut func = make_func(rmw_triple(
+            sib_op(1, 2, 8, 0),
+            X86ISelInst::new(X86Opcode::XorRR, vec![vreg(6), vreg(5), vreg(4)]),
+            sib_op(1, 2, 8, 0),
+        ));
+        let mut peephole = X86Peephole::default();
+        peephole.run_on_function(&mut func);
+        assert!(
+            !entry_opcodes(&func)
+                .iter()
+                .any(|op| matches!(op, X86Opcode::XorMRSib | X86Opcode::XorMR)),
+            "closed default admission must never create an RMW opcode"
+        );
+    }
+
+    #[test]
+    fn rmw_fuse_kill_switch_and_default_on() {
+        // Full-pass runs under the lock-guarded env shim: default-ON fuses
+        // (with an open admission), TCG_NO_X86_RMW_FUSE=1 disables.
+        let shape = || {
+            make_func(rmw_triple(
+                sib_op(1, 2, 8, 0),
+                X86ISelInst::new(X86Opcode::XorRR, vec![vreg(6), vreg(5), vreg(4)]),
+                sib_op(1, 2, 8, 0),
+            ))
+        };
+        crate::env_lock::with_env_overrides_removed(&["TCG_NO_X86_RMW_FUSE"], || {
+            assert!(rmw_fuse_enabled());
+            let mut func = shape();
+            X86Peephole::new(|_| true).run_on_function(&mut func);
+            assert!(entry_opcodes(&func).contains(&X86Opcode::XorMRSib));
+        });
+        crate::env_lock::with_env_overrides(&[("TCG_NO_X86_RMW_FUSE", "1")], || {
+            assert!(!rmw_fuse_enabled());
+            let mut func = shape();
+            X86Peephole::new(|_| true).run_on_function(&mut func);
+            assert!(!entry_opcodes(&func).contains(&X86Opcode::XorMRSib));
+        });
+    }
+
     #[test]
     fn zeroidiom_gate_declines_unread_zero_and_allows_read_zero() {
         // Unread MovRI-0 must stay MovRI (DCE-removable) under the gate;
@@ -9072,5 +10591,301 @@ mod tests {
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
         assert!(!addr_chain_fold_run_on_block(&mut func, Block(0)));
+    }
+
+    // ---- latch-advance collapse + commutative dying-source swap ----
+
+    fn imm(v: i64) -> X86ISelOperand {
+        X86ISelOperand::Imm(v)
+    }
+
+    #[test]
+    fn latch_collapse_rewrites_the_counted_loop_latch() {
+        // AddRI n,c,1 ; MovRR c,n ; CmpRI n,100 ; Jcc  ->  in-place advance.
+        let mut func = make_func(vec![
+            X86ISelInst::new(X86Opcode::AddRI, vec![vreg(5), vreg(1), imm(1)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(1), vreg(5)]),
+            X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(5), imm(100)]),
+            X86ISelInst::new(
+                X86Opcode::Jcc,
+                vec![
+                    X86ISelOperand::CondCode(X86CondCode::B),
+                    X86ISelOperand::Block(Block(0)),
+                ],
+            ),
+        ]);
+        let (uses, defs) = function_use_def_counts(&func);
+        assert!(latch_advance_collapse_run_on_block(
+            &mut func,
+            Block(0),
+            &uses,
+            &defs
+        ));
+        let insts = entry_insts(&func);
+        assert_eq!(insts.len(), 3, "the MovRR write-back is gone");
+        assert_eq!(insts[0].opcode, X86Opcode::AddRI);
+        assert_eq!(insts[0].operands[0], vreg(1), "in-place advance");
+        assert_eq!(insts[1].opcode, X86Opcode::CmpRI);
+        assert_eq!(insts[1].operands[0], vreg(1), "compare reads c");
+    }
+
+    #[test]
+    fn latch_collapse_declines_when_the_fresh_vreg_escapes() {
+        // An extra read of n after the window keeps the original shape.
+        let mut func = make_func(vec![
+            X86ISelInst::new(X86Opcode::AddRI, vec![vreg(5), vreg(1), imm(1)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(1), vreg(5)]),
+            X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(5), imm(100)]),
+            X86ISelInst::new(
+                X86Opcode::Jcc,
+                vec![
+                    X86ISelOperand::CondCode(X86CondCode::B),
+                    X86ISelOperand::Block(Block(0)),
+                ],
+            ),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(9), vreg(5)]),
+        ]);
+        let (uses, defs) = function_use_def_counts(&func);
+        assert!(!latch_advance_collapse_run_on_block(
+            &mut func,
+            Block(0),
+            &uses,
+            &defs
+        ));
+        assert_eq!(entry_insts(&func).len(), 5);
+    }
+
+    #[test]
+    fn latch_collapse_declines_a_bound_equal_to_the_counter() {
+        // CmpRR n, c would read c's OLD value pre-collapse; decline.
+        let mut func = make_func(vec![
+            X86ISelInst::new(X86Opcode::AddRI, vec![vreg(5), vreg(1), imm(1)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(1), vreg(5)]),
+            X86ISelInst::new(X86Opcode::CmpRR, vec![vreg(5), vreg(1)]),
+            X86ISelInst::new(
+                X86Opcode::Jcc,
+                vec![
+                    X86ISelOperand::CondCode(X86CondCode::B),
+                    X86ISelOperand::Block(Block(0)),
+                ],
+            ),
+        ]);
+        let (uses, defs) = function_use_def_counts(&func);
+        assert!(!latch_advance_collapse_run_on_block(
+            &mut func,
+            Block(0),
+            &uses,
+            &defs
+        ));
+    }
+
+    #[test]
+    fn commute_swaps_the_dying_source_first() {
+        // x (vreg 1) is read twice; t (vreg 5) dies at the xor: swap so the
+        // two-address tie copies the dying t.
+        let mut func = make_func(vec![
+            X86ISelInst::new(X86Opcode::ShlRI, vec![vreg(5), vreg(1), imm(13)]),
+            X86ISelInst::new(X86Opcode::XorRR, vec![vreg(6), vreg(1), vreg(5)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(9), vreg(1)]),
+        ]);
+        let (uses, defs) = function_use_def_counts(&func);
+        assert!(commute_dying_source_run_on_block(
+            &mut func,
+            Block(0),
+            &uses,
+            &defs
+        ));
+        let insts = entry_insts(&func);
+        assert_eq!(insts[1].operands[1], vreg(5), "dying t first (tied)");
+        assert_eq!(insts[1].operands[2], vreg(1), "live x second");
+    }
+
+    #[test]
+    fn commute_leaves_an_already_dying_first_source() {
+        // Both sources dying, or s1 dying: no churn.
+        let mut func = make_func(vec![
+            X86ISelInst::new(X86Opcode::ShlRI, vec![vreg(5), vreg(1), imm(13)]),
+            X86ISelInst::new(X86Opcode::ShlRI, vec![vreg(6), vreg(1), imm(7)]),
+            X86ISelInst::new(X86Opcode::XorRR, vec![vreg(7), vreg(5), vreg(6)]),
+        ]);
+        let (uses, defs) = function_use_def_counts(&func);
+        assert!(!commute_dying_source_run_on_block(
+            &mut func,
+            Block(0),
+            &uses,
+            &defs
+        ));
+    }
+
+    #[test]
+    fn constmul_three_becomes_one_lea() {
+        let mut func = make_func(vec![
+            X86ISelInst::new(X86Opcode::ImulRRI, vec![vreg(2), vreg(1), imm(3)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(9), vreg(2)]),
+            // A full flag overwrite proves the IMUL's flags dead.
+            X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(9), imm(0)]),
+        ]);
+        let mut pass = X86Peephole::default();
+        assert!(pass.run(&mut func));
+        let ops = entry_opcodes(&func);
+        assert!(ops.contains(&X86Opcode::LeaSib), "3x -> one LEA: {ops:?}");
+        assert!(!ops.contains(&X86Opcode::ImulRRI));
+    }
+
+    #[test]
+    fn constmul_seven_becomes_shl_sub() {
+        let mut func = make_func(vec![
+            X86ISelInst::new(X86Opcode::ImulRRI, vec![vreg(2), vreg(1), imm(7)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(9), vreg(2)]),
+            X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(9), imm(0)]),
+        ]);
+        let mut pass = X86Peephole::default();
+        assert!(pass.run(&mut func));
+        let insts = entry_insts(&func);
+        let shl = insts
+            .iter()
+            .position(|i| i.opcode == X86Opcode::ShlRI)
+            .expect("SHL d,s,3");
+        assert_eq!(insts[shl].operands[0], vreg(2));
+        assert_eq!(insts[shl].operands[1], vreg(1));
+        assert_eq!(insts[shl + 1].opcode, X86Opcode::SubRR, "then SUB d,d,s");
+        assert_eq!(insts[shl + 1].operands[1], vreg(2));
+        assert_eq!(insts[shl + 1].operands[2], vreg(1));
+        assert!(!entry_opcodes(&func).contains(&X86Opcode::ImulRRI));
+    }
+
+    #[test]
+    fn constmul_declines_when_imul_flags_are_read() {
+        // A Jcc consuming the IMUL's flags: the rewrite would change them.
+        let mut func = make_func(vec![
+            X86ISelInst::new(X86Opcode::ImulRRI, vec![vreg(2), vreg(1), imm(3)]),
+            X86ISelInst::new(
+                X86Opcode::Jcc,
+                vec![
+                    X86ISelOperand::CondCode(X86CondCode::O),
+                    X86ISelOperand::Block(Block(0)),
+                ],
+            ),
+        ]);
+        let mut pass = X86Peephole::default();
+        pass.run(&mut func);
+        assert!(
+            entry_opcodes(&func).contains(&X86Opcode::ImulRRI),
+            "flag-consumed IMUL must survive"
+        );
+    }
+
+    #[test]
+    fn constmul_declines_tied_seven() {
+        // d == s: d-as-temp would destroy the source; keep the IMUL.
+        let mut func = make_func(vec![
+            X86ISelInst::new(X86Opcode::ImulRRI, vec![vreg(1), vreg(1), imm(7)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(9), vreg(1)]),
+        ]);
+        let mut pass = X86Peephole::default();
+        pass.run(&mut func);
+        assert!(entry_opcodes(&func).contains(&X86Opcode::ImulRRI));
+    }
+
+    #[test]
+    fn lea_disp_fold_merges_the_add_one() {
+        // lea (c,c,2),t ; add t,1 -> x  ==>  lea 1(c,c,2),x
+        let mut func = make_func(vec![
+            X86ISelInst::new(
+                X86Opcode::LeaSib,
+                vec![
+                    vreg(5),
+                    X86ISelOperand::SibMemAddr {
+                        base: Box::new(vreg(1)),
+                        index: Box::new(vreg(1)),
+                        scale: 2,
+                        disp: 0,
+                    },
+                ],
+            ),
+            X86ISelInst::new(X86Opcode::AddRI, vec![vreg(6), vreg(5), imm(1)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(9), vreg(6)]),
+            X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(9), imm(0)]),
+        ]);
+        let (uses, defs) = function_use_def_counts(&func);
+        assert!(lea_disp_fold_run_on_block(
+            &mut func,
+            Block(0),
+            &uses,
+            &defs
+        ));
+        let insts = entry_insts(&func);
+        assert_eq!(insts[0].opcode, X86Opcode::LeaSib);
+        assert_eq!(insts[0].operands[0], vreg(6), "LEA now defines x");
+        assert!(
+            matches!(
+                &insts[0].operands[1],
+                X86ISelOperand::SibMemAddr { disp: 1, .. }
+            ),
+            "displacement folded"
+        );
+        assert_ne!(insts[1].opcode, X86Opcode::AddRI, "the AddRI is gone");
+    }
+
+    #[test]
+    fn lea_disp_fold_declines_a_multi_use_lea() {
+        // t read again later: keep both instructions.
+        let mut func = make_func(vec![
+            X86ISelInst::new(
+                X86Opcode::LeaSib,
+                vec![
+                    vreg(5),
+                    X86ISelOperand::SibMemAddr {
+                        base: Box::new(vreg(1)),
+                        index: Box::new(vreg(1)),
+                        scale: 2,
+                        disp: 0,
+                    },
+                ],
+            ),
+            X86ISelInst::new(X86Opcode::AddRI, vec![vreg(6), vreg(5), imm(1)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(9), vreg(5)]),
+            X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(9), imm(0)]),
+        ]);
+        let (uses, defs) = function_use_def_counts(&func);
+        assert!(!lea_disp_fold_run_on_block(
+            &mut func,
+            Block(0),
+            &uses,
+            &defs
+        ));
+    }
+
+    #[test]
+    fn lea_disp_fold_declines_when_add_flags_are_read() {
+        let mut func = make_func(vec![
+            X86ISelInst::new(
+                X86Opcode::LeaSib,
+                vec![
+                    vreg(5),
+                    X86ISelOperand::SibMemAddr {
+                        base: Box::new(vreg(1)),
+                        index: Box::new(vreg(1)),
+                        scale: 2,
+                        disp: 0,
+                    },
+                ],
+            ),
+            X86ISelInst::new(X86Opcode::AddRI, vec![vreg(6), vreg(5), imm(1)]),
+            X86ISelInst::new(
+                X86Opcode::Jcc,
+                vec![
+                    X86ISelOperand::CondCode(X86CondCode::O),
+                    X86ISelOperand::Block(Block(0)),
+                ],
+            ),
+        ]);
+        let (uses, defs) = function_use_def_counts(&func);
+        assert!(!lea_disp_fold_run_on_block(
+            &mut func,
+            Block(0),
+            &uses,
+            &defs
+        ));
     }
 }

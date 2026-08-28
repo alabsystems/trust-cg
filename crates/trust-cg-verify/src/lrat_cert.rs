@@ -125,8 +125,86 @@ fn file_sha256(path: &Path) -> Option<String> {
 /// this digest, and the replay itself must use
 /// [`recheck_cert_with_expected_checker`] so a replacement during the check is
 /// detected rather than inheriting the old binary's authority.
+///
+/// Memoized in-process by file metadata (path, size, mtime, and on unix
+/// dev/ino/ctime) — the same in-process pattern as
+/// `ay_bridge::solver_identity_hash`, and with the same posture: nothing
+/// persistent, so a forged metadata tuple in a later process buys nothing.
+/// Any ordinary rewrite of the checker changes mtime/ctime (or the inode) and
+/// misses the memo, so the before/after replay gates keep detecting
+/// checker replacement. `TCG_PARANOID_FILE_HASH=1` restores a full re-read on
+/// every call.
 pub fn checker_binary_sha256(path: &Path) -> Option<String> {
-    file_sha256(path)
+    if std::env::var_os("TCG_PARANOID_FILE_HASH").is_some() {
+        return file_sha256(path);
+    }
+    let key = FileStatKey::for_path(path)?;
+    {
+        let memo = file_sha_memo().lock().unwrap();
+        if let Some(hash) = memo.get(&key) {
+            return Some(hash.clone());
+        }
+    }
+    let hash = file_sha256(path)?;
+    // Only memoize when the metadata is unchanged across the read: a file
+    // swapped mid-hash must not be remembered under the old key.
+    if FileStatKey::for_path(path).as_ref() == Some(&key) {
+        file_sha_memo().lock().unwrap().insert(key, hash.clone());
+    }
+    Some(hash)
+}
+
+/// Stat identity used to key the in-process hash memo.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct FileStatKey {
+    path: std::path::PathBuf,
+    size: u64,
+    mtime_ns: i128,
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+    #[cfg(unix)]
+    ctime: (i64, i64),
+}
+
+impl FileStatKey {
+    fn for_path(path: &Path) -> Option<Self> {
+        let meta = std::fs::metadata(path).ok()?;
+        let mtime_ns = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as i128)
+            .unwrap_or(-1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Some(Self {
+                path: path.to_owned(),
+                size: meta.len(),
+                mtime_ns,
+                dev: meta.dev(),
+                ino: meta.ino(),
+                ctime: (meta.ctime(), meta.ctime_nsec()),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Some(Self {
+                path: path.to_owned(),
+                size: meta.len(),
+                mtime_ns,
+            })
+        }
+    }
+}
+
+type FileShaMemo = std::sync::Mutex<std::collections::HashMap<FileStatKey, String>>;
+
+fn file_sha_memo() -> &'static FileShaMemo {
+    static MEMO: std::sync::OnceLock<FileShaMemo> = std::sync::OnceLock::new();
+    MEMO.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
 /// The outcome of an independent `drat-trim` re-check.

@@ -70,7 +70,7 @@ use trust_cg_ir::{
 };
 
 use crate::pass_manager::MachinePass;
-use crate::reaching_const::{ReachingCtx, unique_reaching_const, unique_reaching_const_with};
+use crate::reaching_const::{ReachingCtx, unique_reaching_const_with};
 
 /// Multiply-by-small-constant -> shift/add-sub strength reduction pass.
 pub struct MulShiftReduce;
@@ -163,6 +163,22 @@ fn run_mul_shift_reduce(
     func: &mut MachFunction,
     mut provenance: Option<&mut ProvenanceMap>,
 ) -> bool {
+    // PREFILTER (exact): the rewrite sites are `MulRR` / `Madd` by a constant. Without one in the live block lists the pass cannot
+    // change anything, so skip the per-block scan. Over-approximating
+    // presence is safe; the check is a single opcode sweep.
+    if !(func
+        .block_order
+        .iter()
+        .flat_map(|b| func.block(*b).insts.iter())
+        .any(|&i| func.inst(i).opcode == AArch64Opcode::MulRR)
+        || func
+            .block_order
+            .iter()
+            .flat_map(|b| func.block(*b).insts.iter())
+            .any(|&i| func.inst(i).opcode == AArch64Opcode::Madd))
+    {
+        return false;
+    }
     let mut changed = false;
     // `unique_reaching_const` rebuilds three whole-function indexes on every
     // call, so resolving one constant per candidate is quadratic in the block
@@ -198,7 +214,11 @@ fn run_mul_shift_reduce(
     // opcode is not a move-wide either before (Mul/Madd) or after (Add/Lsl).
     // `unique_reaching_const` therefore returns the same verdict for every query
     // whether it runs before or after the earlier blocks were rewritten.
-    let ctx = ReachingCtx::new(func);
+    // The reaching-defs context is built only if a candidate survives the
+    // structural prefilter in `plan_for` (most no-change runs never need it);
+    // the move-wide census that feeds the prefilter is one linear scan.
+    let ctx: std::cell::OnceCell<ReachingCtx> = std::cell::OnceCell::new();
+    let mw = MoveWideCensus::build(func);
 
     // Phase A (immutable, whole function): recognize every rewritable multiply
     // against the UNMUTATED function, building a fully-validated Plan for each.
@@ -207,7 +227,7 @@ fn run_mul_shift_reduce(
         let block_insts = func.block(block_id).insts.clone();
         let mut plans: Vec<(InstId, Plan)> = Vec::new();
         for &inst_id in &block_insts {
-            if let Some(plan) = analyze(func, Some(&ctx), inst_id) {
+            if let Some(plan) = analyze(func, &ctx, &mw, inst_id) {
                 plans.push((inst_id, plan));
             }
         }
@@ -242,7 +262,70 @@ fn run_mul_shift_reduce(
 
 /// Recognize a `MulRR` / `Madd` by a small compile-time constant and build a
 /// validated [`Plan`]. Returns `None` (BAIL) on every unproven precondition.
-fn analyze(func: &MachFunction, ctx: Option<&ReachingCtx>, inst_id: InstId) -> Option<Plan> {
+/// One linear scan's census of the move-wide defs (`Movz`/`Movn`/`Movk`)
+/// of every vreg id, for `plan_for`'s structural prefilter.
+enum MoveWide {
+    /// Exactly one move-wide def: its base value when it is a `Movz`/`Movn`
+    /// (`fold_chain`'s base cases, class-masked exactly as there), `None` for
+    /// a `Movk` (a chain whose base is not known without the query).
+    Single(Option<u64>),
+    /// More than one move-wide def of this id.
+    Many,
+}
+
+struct MoveWideCensus {
+    by_id: crate::fast_hash::FxHashMap<u32, MoveWide>,
+}
+
+impl MoveWideCensus {
+    fn build(func: &MachFunction) -> Self {
+        use crate::reaching_const::{movn_value, movz_value};
+        let mut by_id: crate::fast_hash::FxHashMap<u32, MoveWide> = Default::default();
+        for &block_id in &func.block_order {
+            for &inst_id in &func.block(block_id).insts {
+                let inst = func.inst(inst_id);
+                let base = match inst.opcode {
+                    AArch64Opcode::Movz => movz_value(inst).map(|(dst, value)| {
+                        let v = if dst.class == RegClass::Gpr32 {
+                            value & 0xFFFF_FFFF
+                        } else {
+                            value
+                        };
+                        (dst.id, Some(v))
+                    }),
+                    AArch64Opcode::Movn => {
+                        movn_value(inst).map(|(dst, value)| (dst.id, Some(value)))
+                    }
+                    AArch64Opcode::Movk => inst
+                        .operands
+                        .first()
+                        .and_then(|o| o.as_vreg())
+                        .map(|d| (d.id, None)),
+                    _ => None,
+                };
+                let Some((id, base)) = base else {
+                    continue;
+                };
+                by_id
+                    .entry(id)
+                    .and_modify(|e| *e = MoveWide::Many)
+                    .or_insert(MoveWide::Single(base));
+            }
+        }
+        Self { by_id }
+    }
+
+    fn get(&self, id: u32) -> Option<&MoveWide> {
+        self.by_id.get(&id)
+    }
+}
+
+fn analyze(
+    func: &MachFunction,
+    ctx: &std::cell::OnceCell<ReachingCtx>,
+    mw: &MoveWideCensus,
+    inst_id: InstId,
+) -> Option<Plan> {
     let inst = func.inst(inst_id);
     match inst.opcode {
         AArch64Opcode::MulRR => {
@@ -255,8 +338,8 @@ fn analyze(func: &MachFunction, ctx: Option<&ReachingCtx>, inst_id: InstId) -> O
             let op1 = inst.operands[1].as_vreg()?;
             let op2 = inst.operands[2].as_vreg()?;
             // Prefer op2 as the constant (isel's `x * C` order), then op1.
-            plan_for(func, ctx, inst_id, dst, op1, op2, None)
-                .or_else(|| plan_for(func, ctx, inst_id, dst, op2, op1, None))
+            plan_for(func, ctx, mw, inst_id, dst, op1, op2, None)
+                .or_else(|| plan_for(func, ctx, mw, inst_id, dst, op2, op1, None))
         }
         AArch64Opcode::Madd => {
             // Madd [dst, Xn, Xm, Xa] : dst = Xa + Xn*Xm. Xn*Xm commutes; Xa is
@@ -268,8 +351,8 @@ fn analyze(func: &MachFunction, ctx: Option<&ReachingCtx>, inst_id: InstId) -> O
             let xn = inst.operands[1].as_vreg()?;
             let xm = inst.operands[2].as_vreg()?;
             let xa = inst.operands[3].as_vreg()?;
-            plan_for(func, ctx, inst_id, dst, xn, xm, Some(xa))
-                .or_else(|| plan_for(func, ctx, inst_id, dst, xm, xn, Some(xa)))
+            plan_for(func, ctx, mw, inst_id, dst, xn, xm, Some(xa))
+                .or_else(|| plan_for(func, ctx, mw, inst_id, dst, xm, xn, Some(xa)))
         }
         _ => None,
     }
@@ -279,7 +362,8 @@ fn analyze(func: &MachFunction, ctx: Option<&ReachingCtx>, inst_id: InstId) -> O
 /// the multiplicand; `cst` is the candidate constant-multiplier operand.
 fn plan_for(
     func: &MachFunction,
-    ctx: Option<&ReachingCtx>,
+    ctx: &std::cell::OnceCell<ReachingCtx>,
+    mw: &MoveWideCensus,
     inst_id: InstId,
     dst: VReg,
     x: VReg,
@@ -305,10 +389,40 @@ fn plan_for(
     }
 
     // Resolve the multiplier to a proven unique compile-time constant, or bail.
-    let raw = match ctx {
-        Some(ctx) => unique_reaching_const_with(func, ctx, inst_id, cst)?,
-        None => unique_reaching_const(func, inst_id, cst)?,
-    };
+    // Structural prefilter, before any reaching-defs query. The query can
+    // only succeed when the unique reaching def of `cst` is a move-wide
+    // instruction (`fold_chain`'s Movz/Movn/Movk arms; anything else is
+    // `None`): no move-wide def of that id anywhere -> None, exactly as the
+    // query would answer. One move-wide def with a known base (Movz/Movn,
+    // not a Movk chain) -> if the query succeeds it yields that very base,
+    // so a base that does not decompose is the same `None` the full path
+    // returns after the query; a base that does decompose falls through to
+    // the query, which alone decides whether that def actually reaches.
+    match mw.get(cst.id) {
+        None => return None,
+        Some(MoveWide::Single(Some(base))) => {
+            let mut val = *base;
+            if cst.class.size_bits() <= 32 {
+                val &= 0xFFFF_FFFF;
+            }
+            let raw = val as i64;
+            let c: i128 = if width == 32 {
+                i128::from(raw as i32)
+            } else {
+                i128::from(raw)
+            };
+            if decompose(c, width).is_none() {
+                return None;
+            }
+        }
+        Some(MoveWide::Single(None)) | Some(MoveWide::Many) => {}
+    }
+    let raw = unique_reaching_const_with(
+        func,
+        ctx.get_or_init(|| ReachingCtx::new(func)),
+        inst_id,
+        cst,
+    )?;
     // Sign-extend from the operation width: a 32-bit `-3` arrives as the
     // zero-extended `0xFFFF_FFFD`; interpret it as `-3` so the compact 2-term
     // `1 - 4` decomposition is found. `x * c ≡ x * (c mod 2^W) (mod 2^W)`, so

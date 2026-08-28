@@ -272,6 +272,9 @@ fn decode_check_corpus_replay() {
                 check(X86Opcode::MovMR32, &X86InstOperands::rm(d, base, disp));
                 check(X86Opcode::MovMR8, &X86InstOperands::rm(d, base, disp));
                 check(X86Opcode::TestRM, &X86InstOperands::rm(d, base, disp));
+                // Memory-destination RMW ALU, base+disp forms.
+                check(X86Opcode::XorMR, &X86InstOperands::rm(d, base, disp));
+                check(X86Opcode::AddMR, &X86InstOperands::rm(d, base, disp));
             }
         }
     }
@@ -292,6 +295,15 @@ fn decode_check_corpus_replay() {
                         );
                         check(
                             X86Opcode::LeaSib,
+                            &X86InstOperands::rm_sib(d, base, index, scale, disp),
+                        );
+                        // Memory-destination RMW ALU, SIB forms.
+                        check(
+                            X86Opcode::XorMRSib,
+                            &X86InstOperands::rm_sib(d, base, index, scale, disp),
+                        );
+                        check(
+                            X86Opcode::AddMRSib,
                             &X86InstOperands::rm_sib(d, base, index, scale, disp),
                         );
                     }

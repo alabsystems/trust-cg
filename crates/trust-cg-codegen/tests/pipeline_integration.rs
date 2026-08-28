@@ -273,7 +273,7 @@ fn test_encode_simple_sub() {
     let sub_id = func.push_inst(sub);
     func.append_inst(entry, sub_id);
 
-    let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+    let ret = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
     let ret_id = func.push_inst(ret);
     func.append_inst(entry, ret_id);
 
@@ -304,7 +304,7 @@ fn test_encode_mov_imm() {
     let mov_id = func.push_inst(mov);
     func.append_inst(entry, mov_id);
 
-    let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+    let ret = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
     let ret_id = func.push_inst(ret);
     func.append_inst(entry, ret_id);
 
@@ -365,7 +365,7 @@ fn test_pipeline_add_imm() {
     let add_id = func.push_inst(add);
     func.append_inst(entry, add_id);
 
-    let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+    let ret = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
     let ret_id = func.push_inst(ret);
     func.append_inst(entry, ret_id);
 
@@ -737,7 +737,7 @@ fn test_full_pipeline_produces_valid_object() {
     func.append_inst(entry, mov_ret_id);
 
     // RET
-    let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+    let ret = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
     let ret_id = func.push_inst(ret);
     func.append_inst(entry, ret_id);
 
@@ -815,7 +815,7 @@ fn test_prepare_ir_function_eliminates_vregs_before_encode() {
     let mov_ret_id = func.push_inst(mov_ret);
     func.append_inst(entry, mov_ret_id);
 
-    let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+    let ret = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
     let ret_id = func.push_inst(ret);
     func.append_inst(entry, ret_id);
 

@@ -30,12 +30,14 @@ Usage:
   check_perf_ratchet.py                     # validate newest benchmarks/beat-llvm/results/*.json
   check_perf_ratchet.py <results.json>      # validate a specific results file
   check_perf_ratchet.py --append <results.json>   # validate, append, and render the local LEDGER.md view
+  check_perf_ratchet.py --render                  # re-render LEDGER.md from the ledger (no append)
   check_perf_ratchet.py --check-ledger      # re-validate every committed ledger row
 
 Exit: 0 OK (or regression check skipped — loudly); 1 REJECT/regression/MISMATCH;
       2 tooling error (missing files, unparseable JSON).
 """
 import json
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -106,8 +108,20 @@ def condense(results, source_name):
     p = results["provenance"]
     a = results["aggregates"]
     gates = load_json(GATES)
-    gate_verdicts = {name: bool(evaluate(g["predicate"], results))
-                     for name, g in gates["gates"].items()}
+    # A gate whose INPUT is absent from the results is UNMEASURED, not failed.
+    # `evaluate` returns False for `.x != null and ...` when `.x` is missing,
+    # and `bool()` then stamped that as a fail — so G2_M1_compile_cold_vs_O2
+    # read "fail" on every row for as long as nobody passed `--cold`, and the
+    # one time it was measured (1.654x vs <= 2.00x) it passed. Stamp None here;
+    # the badge renderer already draws None as "—".
+    gate_verdicts = {}
+    for name, g in gates["gates"].items():
+        fields = set(re.findall(r"\.aggregates\.([A-Za-z0-9_]+)", g["predicate"]))
+        if fields and all(field in a and a[field] is None for field in fields):
+            gate_verdicts[name] = None
+        else:
+            gate_verdicts[name] = bool(evaluate(g["predicate"], results))
+    noise = compile_noise(results)
     return {
         "source_results": source_name,
         "timestamp_utc": p["timestamp_utc"],
@@ -138,7 +152,66 @@ def condense(results, source_name):
         "size_geomean_vs_llvm_o3": a.get("size_geomean_vs_llvm_o3"),
         "rss_geomean_vs_llvm_o3": a.get("rss_geomean_vs_llvm_o3"),
         "gates": gate_verdicts,
+        # BENCH-11: the row's own compile noise, so a gate decided within it is
+        # labelled as such rather than read as a fact (see `compile_noise`).
+        "compile_noise_spread_geomean": noise["spread_geomean"],
+        "compile_geomean_uncertainty_pct": noise["uncertainty_pct"],
+        "compile_gate_margins": compile_gate_margins(a, noise["uncertainty_pct"]),
     }
+
+
+# The two compile gates whose value the noise estimate qualifies. gates.json
+# stays the authority for the VERDICT; this only says how far from the line the
+# value sits relative to the row's own measurement noise.
+COMPILE_GATE_THRESHOLDS = {
+    "G2_M1_compile_warm_vs_O2": ("compile_warm_geomean_vs_llvm_o2", 1.00),
+    "G2_endstate_compile_warm_vs_O3": ("compile_warm_geomean_vs_llvm_o3", 1.00),
+}
+
+
+def compile_noise(results):
+    """Within-row compile-time noise, from data the row already carries.
+
+    Every program's warm bridge lane is N (default 3) timed compiles; the
+    per-program ratio is a median of those. The max/min spread of the N times
+    is a per-program noise indicator; its geomean over the corpus is stamped as
+    `compile_noise_spread_geomean`. A crude uncertainty for the corpus geomean
+    of medians follows: each median is uncertain by about half the spread, and
+    the geomean of P independent programs shrinks that by sqrt(P):
+        uncertainty_pct ~= ((spread_geomean - 1) / 2) / sqrt(P) * 100
+    Measured on this box (identical dylibs, n=25 interleaved) the within-run
+    resolution is ~1%, which is what this formula gives for spread ~1.09 over
+    18 programs. Between-run drift is LARGER (~3%) and is not captured here —
+    compare rows, not one row, for anything under that."""
+    import math
+    programs = results.get("programs") or {}
+    items = programs.items() if isinstance(programs, dict) else [(x.get("name") or x.get("stem"), x) for x in programs]
+    spreads = []
+    for _, row in items:
+        times = (((row or {}).get("compile") or {}).get("bridge_warm") or {}).get("times_s") or []
+        times = [t for t in times if t]
+        if len(times) >= 2:
+            spreads.append(max(times) / min(times))
+    if not spreads:
+        return {"spread_geomean": None, "uncertainty_pct": None}
+    spread_geomean = math.exp(sum(math.log(x) for x in spreads) / len(spreads))
+    uncertainty_pct = ((spread_geomean - 1) / 2) / math.sqrt(len(spreads)) * 100
+    return {"spread_geomean": round(spread_geomean, 3), "uncertainty_pct": round(uncertainty_pct, 2)}
+
+
+def compile_gate_margins(aggregates, uncertainty_pct):
+    """For each compile gate: how far the row's value is from the threshold, in
+    percent, and whether that distance is inside the row's own uncertainty."""
+    out = {}
+    for gate, (metric, threshold) in COMPILE_GATE_THRESHOLDS.items():
+        value = aggregates.get(metric)
+        if value is None:
+            out[gate] = None
+            continue
+        margin_pct = round((value - threshold) / threshold * 100, 2)
+        within = None if uncertainty_pct is None else abs(margin_pct) <= uncertainty_pct
+        out[gate] = {"margin_pct": margin_pct, "within_noise": within}
+    return out
 
 
 def read_ledger():
@@ -246,6 +319,8 @@ def _badge_block(ledger):
     scal = r.get("scalar_runtime_geomean_vs_llvm_o3")
     cw2 = r.get("compile_warm_geomean_vs_llvm_o2")
     cw3 = r.get("compile_warm_geomean_vs_llvm_o3")
+    unc = r.get("compile_geomean_uncertainty_pct")
+    margins = r.get("compile_gate_margins") or {}
     cov = r.get("coverage_pct")
     # plain-language runtime standing vs LLVM -O3 (honest, data-driven — never rounded to a win)
     if rt is None:
@@ -263,7 +338,9 @@ def _badge_block(ledger):
                         "tracking-only, never headline") + ")",
         f"- **runtime vs LLVM -O3:** {standing}"
         + (f"; scalar {scal}x" if scal is not None else ""),
-        f"- **compile (warm) vs LLVM -O2:** {cw2}x  ·  **vs -O3:** {cw3}x",
+        f"- **compile (warm) vs LLVM -O2:** {cw2}x  ·  **vs -O3:** {cw3}x"
+        + (f"  ·  ±{unc}% within-row noise (BENCH-11; between-run drift is larger, ~3% on this box)"
+           if unc is not None else ""),
         f"- **coverage:** {cov}% ({r.get('match_count')}/{r.get('total_programs')} MATCH, "
         f"{r.get('mismatch_count')} MISMATCH); **distance to strictly-better (GATE-SB):** "
         "geomean < 1.00x AND every benchmark <= 1.50x at coverage >= 80%",
@@ -274,6 +351,11 @@ def _badge_block(ledger):
     for key, label, target in GATE_BADGE:
         v = gates.get(key)
         mark = "PASS" if v else ("fail" if v is not None else "—")
+        m = margins.get(key)
+        if isinstance(m, dict):
+            sign = "+" if m["margin_pct"] >= 0 else ""
+            mark += f" ({sign}{m['margin_pct']}% from the line"
+            mark += ", WITHIN this row's noise)" if m.get("within_noise") else ")"
         lines.append(f"| {label} | {target} | {mark} |")
     lines += [
         "",
@@ -330,6 +412,52 @@ def newest_results():
     return max(files, key=lambda p: p.stat().st_mtime)
 
 
+
+def restamp_unmeasured(dry_run):
+    """Flip a stamped `false` to `null` on rows where the gate's input was never
+    produced.
+
+    Before the verdict fix above, `bool(evaluate(...))` stamped an ABSENT input
+    as a failed gate. The rows already in the ledger carry that frozen `false`,
+    and `render_md` draws the badge from the row's stamp — so the fix alone
+    leaves the committed table wrong. This is the narrowest correction that is
+    sound from row data alone: a gate whose every predicate input is `None` ON
+    THE ROW is unmeasured, and only that stamp changes. Nothing is recomputed
+    from partial data — a gate whose input IS present keeps its stamp exactly.
+    """
+    gates = load_json(GATES)["gates"]
+    fields = {name: set(re.findall(r"\.aggregates\.([A-Za-z0-9_]+)", g["predicate"]))
+              for name, g in gates.items()}
+    ledger = [json.loads(line) for line in LEDGER.read_text(encoding="utf-8").splitlines() if line.strip()]
+    changes = []
+    for i, row in enumerate(ledger):
+        for name, fs in fields.items():
+            stamped = row.get("gates", {}).get(name)
+            # "Unmeasured" means the row CONDENSES this input as a column and it is
+            # None — the harness ran but never produced it. A field that is not a
+            # row column at all (G1b's vectorizable_worst, G1a's scalar geomean on
+            # pre-category rows) was measured from the results JSON and simply not
+            # condensed; its stamp is real and must stand.
+            if stamped is not None and fs and all(f in row and row[f] is None for f in fs):
+                changes.append((i, row.get("git_sha", "?")[:9], name, stamped))
+                if not dry_run:
+                    row["gates"][name] = None
+    for i, sha, name, old in changes:
+        print(f"perf-ratchet: restamp row {i} {sha} {name}: {json.dumps(old)} -> null (input never produced)")
+    if not changes:
+        print("perf-ratchet: restamp: no unmeasured-as-failed stamps found")
+        return 0
+    if dry_run:
+        print(f"perf-ratchet: restamp DRY RUN — {len(changes)} stamp(s) would change, nothing written")
+        return 0
+    with LEDGER.open("w", encoding="utf-8") as f:
+        for row in ledger:
+            f.write(json.dumps(row, sort_keys=True) + "\n")
+    LEDGER_MD.write_text(render_md(ledger) + "\n")
+    print(f"perf-ratchet: restamped {len(changes)} stamp(s); rewrote {LEDGER.relative_to(REPO)} and {LEDGER_MD.relative_to(REPO)}")
+    return 0
+
+
 def main():
     # Before anything renders: the badge is the ONE source of truth every
     # workstream reads, so a badge that silently omits a staged gate is worse
@@ -337,7 +465,14 @@ def main():
     _assert_badge_matches_contract()
 
     args = sys.argv[1:]
+    if "--render" in args:
+        ledger = read_ledger()
+        LEDGER_MD.write_text(render_md(ledger) + "\n")
+        print(f"perf-ratchet: rendered {LEDGER_MD.relative_to(REPO)} ({len(ledger)} rows)")
+        return 0
     append = "--append" in args
+    if "--restamp-unmeasured" in args:
+        return restamp_unmeasured(dry_run="--dry-run" in args)
     check_ledger = "--check-ledger" in args
     args = [a for a in args if not a.startswith("--")]
 

@@ -829,3 +829,23 @@ fn chain_bails_on_runtime_register_bound() {
         "a runtime (non-constant) register bound must BAIL on the chain path"
     );
 }
+
+/// IDEMPOTENCE (the neon-bytesum / neon-fill bug class of 2026-08-27: a
+/// vectorizer that keeps the scalar loop as the remainder and then recognizes
+/// that remainder again on the next fixpoint iteration, nesting one zero-trip
+/// vector loop per iteration until the cap). After the first firing, further
+/// runs must change nothing.
+#[test]
+fn second_run_is_a_no_op() {
+    let mut func = build_find(Corrupt::None);
+    assert!(NeonFindPass::new().run(&mut func), "first run must fire");
+    let (insts, blocks) = (func.insts.len(), func.blocks.len());
+    for again in 2..=4 {
+        assert!(
+            !NeonFindPass::new().run(&mut func),
+            "run {again}: re-fired on its own output"
+        );
+        assert_eq!(func.insts.len(), insts, "run {again} added instructions");
+        assert_eq!(func.blocks.len(), blocks, "run {again} added blocks");
+    }
+}

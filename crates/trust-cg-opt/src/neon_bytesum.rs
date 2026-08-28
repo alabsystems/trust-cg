@@ -436,7 +436,7 @@ impl Recognized {
     fn recognize(
         func: &MachFunction,
         dom: &DomTree,
-        def: &HashMap<u32, InstId>,
+        def: &DefIndex,
         _loops: &LoopAnalysis,
         header: BlockId,
         latch: BlockId,
@@ -847,6 +847,20 @@ impl Recognized {
             bail!("base not loop-invariant");
         };
 
+        // IDEMPOTENCE: `apply` keeps the scalar loop as the remainder of the
+        // vector loop it builds, advancing the SAME iv and folding the vector
+        // partial sum into the SAME acc in the vector loop's exit block, which
+        // becomes the scalar loop's new preheader. Without this guard the
+        // remainder loop is recognized again on the next fixpoint iteration
+        // (same iv/acc/bound), and every iteration nests one more vector loop
+        // that runs zero iterations at runtime (+44 instructions each on
+        // p7_sieve; the fixpoint never converged and hit the iteration cap).
+        // A preheader that folds a NEON lane-extracted sum into `acc` is
+        // exactly `apply`'s exit block, so the loop is a remainder we built.
+        if preheader_folds_vector_partial_sum(func, &def, preheader, acc) {
+            bail!("remainder loop of an already-vectorized loop");
+        }
+
         if dump {
             eprintln!(
                 "[neon-bytesum] RECOGNIZED@{} iv={:?} acc={:?} bound={} base={:?} kind={:?} u32={}",
@@ -865,6 +879,64 @@ impl Recognized {
             acc_is_u32,
         })
     }
+}
+
+/// Whether `preheader` ends a vector loop built by [`apply`] for the loop
+/// accumulating into `acc`: it contains `AddRR acc, acc, s` where `s`
+/// derives — through the single-def `MovR`/`Copy`/`Uxtw`/`AddRR` chain that
+/// `apply` emits — from a `NeonUmovGen` lane extraction. A scalar reduction
+/// loop's own preheader never folds a NEON lane into its accumulator, so this
+/// recognizes precisely the remainder loops this pass leaves behind.
+fn preheader_folds_vector_partial_sum(
+    func: &MachFunction,
+    def: &DefIndex,
+    preheader: BlockId,
+    acc: VReg,
+) -> bool {
+    let block = func.block(preheader);
+    let in_preheader = |id: InstId| block.insts.contains(&id);
+    // Does `v` (defined in the preheader) derive from a NEON lane extraction?
+    fn from_neon_lane(
+        func: &MachFunction,
+        def: &DefIndex,
+        in_preheader: &dyn Fn(InstId) -> bool,
+        v: VReg,
+        depth: u32,
+    ) -> bool {
+        if depth > 8 {
+            return false;
+        }
+        let Some(&d) = def.get(&v.id) else {
+            return false;
+        };
+        if !in_preheader(d) {
+            return false;
+        }
+        let inst = func.inst(d);
+        match inst.opcode {
+            AArch64Opcode::NeonUmovGen => true,
+            AArch64Opcode::MovR | AArch64Opcode::Copy | AArch64Opcode::Uxtw
+                if inst.operands.len() == 2 =>
+            {
+                vreg_of(&inst.operands[1])
+                    .is_some_and(|s| from_neon_lane(func, def, in_preheader, s, depth + 1))
+            }
+            AArch64Opcode::AddRR if inst.operands.len() == 3 => inst.operands[1..]
+                .iter()
+                .filter_map(vreg_of)
+                .any(|s| from_neon_lane(func, def, in_preheader, s, depth + 1)),
+            _ => false,
+        }
+    }
+    block.insts.iter().any(|&id| {
+        let inst = func.inst(id);
+        inst.opcode == AArch64Opcode::AddRR
+            && inst.operands.len() == 3
+            && vreg_of(&inst.operands[0]) == Some(acc)
+            && vreg_of(&inst.operands[1]) == Some(acc)
+            && vreg_of(&inst.operands[2])
+                .is_some_and(|s| from_neon_lane(func, def, &in_preheader, s, 0))
+    })
 }
 
 /// SOUNDNESS GATE for the straight-reduction path: prove the loop body is a
@@ -901,7 +973,7 @@ impl Recognized {
 /// in-body 2-succ block that is not an `iv <u N` guard must BAIL.
 fn recognize_forward_chain(
     func: &MachFunction,
-    def: &HashMap<u32, InstId>,
+    def: &DefIndex,
     header: BlockId,
     latch: BlockId,
     body: &HashSet<BlockId>,
@@ -983,7 +1055,7 @@ fn recognize_forward_chain(
 /// `Cbz`/`Cbnz`, a wrong condition code, or a mismatched CSet/CmpRI boolean.
 fn recognize_chain_guard(
     func: &MachFunction,
-    def: &HashMap<u32, InstId>,
+    def: &DefIndex,
     blk: BlockId,
     body: &HashSet<BlockId>,
 ) -> Option<(VReg, i64, BlockId)> {
@@ -1052,7 +1124,7 @@ fn recognize_chain_guard(
 
 /// `v` is the boolean a `CSet` produced (the CSet-materialized guard's
 /// condition value).
-fn is_cset_result(func: &MachFunction, def: &HashMap<u32, InstId>, v: VReg) -> bool {
+fn is_cset_result(func: &MachFunction, def: &DefIndex, v: VReg) -> bool {
     def.get(&v.id)
         .is_some_and(|&d| func.inst(d).opcode == AArch64Opcode::CSet)
 }
@@ -1061,7 +1133,7 @@ fn is_cset_result(func: &MachFunction, def: &HashMap<u32, InstId>, v: VReg) -> b
 /// latch writeback `acc = MovR(acc_next)`.
 fn reduction_result(
     func: &MachFunction,
-    def: &HashMap<u32, InstId>,
+    def: &DefIndex,
     latch: BlockId,
     acc: VReg,
 ) -> Option<VReg> {
@@ -1103,7 +1175,7 @@ enum ArmKind {
 /// non-byte / signed load, or `acc` read off the conditional path all BAIL.
 fn recognize_predcount(
     func: &MachFunction,
-    def: &HashMap<u32, InstId>,
+    def: &DefIndex,
     latch: BlockId,
     body: &HashSet<BlockId>,
     loop_insts: &HashSet<InstId>,
@@ -1144,7 +1216,7 @@ fn recognize_predcount(
 #[allow(clippy::too_many_arguments)]
 fn try_predcount_diamond(
     func: &MachFunction,
-    def: &HashMap<u32, InstId>,
+    def: &DefIndex,
     latch: BlockId,
     body: &HashSet<BlockId>,
     loop_insts: &HashSet<InstId>,
@@ -1268,7 +1340,7 @@ fn try_predcount_diamond(
 /// `AddRI(acc, 1)` (the `+1` arm). Returns which, plus the acc-reading inst.
 fn classify_predcount_arm(
     func: &MachFunction,
-    def: &HashMap<u32, InstId>,
+    def: &DefIndex,
     arm: BlockId,
     merge: VReg,
     acc: VReg,
@@ -1345,7 +1417,7 @@ fn predcount_branch_zero_arm(
 
 /// `v` is (a copy of) `iv - 1`: `SubRI(iv, 1)` or `SubRR(iv, one)` (one a
 /// materialized constant `1`), resolved through `MovR`/`Copy`.
-fn is_iv_minus_one(func: &MachFunction, def: &HashMap<u32, InstId>, v: VReg, iv: VReg) -> bool {
+fn is_iv_minus_one(func: &MachFunction, def: &DefIndex, v: VReg, iv: VReg) -> bool {
     let v = strip_copies(func, def, v);
     let Some(&d) = def.get(&v.id) else {
         return false;
@@ -1371,7 +1443,7 @@ fn is_iv_minus_one(func: &MachFunction, def: &HashMap<u32, InstId>, v: VReg, iv:
 /// `byte_load_base` / `pred_load_base`).
 fn is_byte_load_val(
     func: &MachFunction,
-    def: &HashMap<u32, InstId>,
+    def: &DefIndex,
     loop_insts: &HashSet<InstId>,
     v: VReg,
 ) -> bool {
@@ -1404,7 +1476,7 @@ fn is_byte_load_val(
 /// Returns the base pointer.
 fn pred_load_base(
     func: &MachFunction,
-    def: &HashMap<u32, InstId>,
+    def: &DefIndex,
     loop_insts: &HashSet<InstId>,
     iv: VReg,
     v: VReg,
@@ -1477,7 +1549,7 @@ fn pred_load_base(
 /// if the initial value is not a resolvable constant.
 fn loop_init_value(
     func: &MachFunction,
-    def: &HashMap<u32, InstId>,
+    def: &DefIndex,
     preheader: BlockId,
     iv: VReg,
 ) -> Option<i64> {
@@ -1518,7 +1590,7 @@ fn loop_init_value(
 #[allow(clippy::too_many_arguments)]
 fn recognize_stencil(
     func: &MachFunction,
-    def: &HashMap<u32, InstId>,
+    def: &DefIndex,
     preheader: BlockId,
     latch: BlockId,
     body: &HashSet<BlockId>,
@@ -1570,7 +1642,7 @@ fn recognize_stencil(
 #[allow(clippy::too_many_arguments)]
 fn try_stencil_diamond(
     func: &MachFunction,
-    def: &HashMap<u32, InstId>,
+    def: &DefIndex,
     latch: BlockId,
     body: &HashSet<BlockId>,
     loop_insts: &HashSet<InstId>,
@@ -1746,7 +1818,7 @@ fn is_internal_diamond_head(func: &MachFunction, blk: BlockId, body: &HashSet<Bl
 
 /// `a` equals `b` up through `MovR`/`Copy` chains (a general sibling of
 /// `same_as_iv`).
-fn same_reg(func: &MachFunction, def: &HashMap<u32, InstId>, a: VReg, b: VReg) -> bool {
+fn same_reg(func: &MachFunction, def: &DefIndex, a: VReg, b: VReg) -> bool {
     strip_copies(func, def, a) == strip_copies(func, def, b)
 }
 
@@ -1770,7 +1842,7 @@ struct NibTerm {
 /// amount 4 and mask 15 are pinned EXACTLY (any other split BAILS).
 fn decode_nibble(
     func: &MachFunction,
-    def: &HashMap<u32, InstId>,
+    def: &DefIndex,
     loop_insts: &HashSet<InstId>,
     nibble: VReg,
 ) -> Option<(bool, VReg)> {
@@ -1797,7 +1869,7 @@ fn decode_nibble(
 /// closed on any deviation.
 fn decode_nib_term(
     func: &MachFunction,
-    def: &HashMap<u32, InstId>,
+    def: &DefIndex,
     loop_insts: &HashSet<InstId>,
     t: VReg,
 ) -> Option<NibTerm> {
@@ -1838,12 +1910,7 @@ fn decode_nib_term(
 /// The constant `sel` selects in `arm` (a `MovR`/`Copy` from a materialized
 /// constant). Returns `None` if `arm` does not define `sel` exactly once from a
 /// constant.
-fn arm_select_const(
-    func: &MachFunction,
-    def: &HashMap<u32, InstId>,
-    arm: BlockId,
-    sel: VReg,
-) -> Option<i64> {
+fn arm_select_const(func: &MachFunction, def: &DefIndex, arm: BlockId, sel: VReg) -> Option<i64> {
     let mut cval = None;
     for &id in &func.block(arm).insts {
         let inst = func.inst(id);
@@ -1945,7 +2012,7 @@ fn decode_select_head(
 /// wrong/opposite constants, reversed polarity, extra defs, arm off the diamond).
 fn recognize_select_diamond(
     func: &MachFunction,
-    def: &HashMap<u32, InstId>,
+    def: &DefIndex,
     sel: VReg,
     nibble: VReg,
     body: &HashSet<BlockId>,
@@ -2030,7 +2097,7 @@ fn recognize_select_diamond(
 #[derive(Clone, Copy)]
 struct HexNibbleLoop<'a> {
     func: &'a MachFunction,
-    def: &'a HashMap<u32, InstId>,
+    def: &'a DefIndex,
     header: BlockId,
     latch: BlockId,
     body: &'a HashSet<BlockId>,
@@ -2276,7 +2343,7 @@ fn allowed_loop_op(op: AArch64Opcode) -> bool {
 /// widened byte load `a[i] as u64` (`pop = false`); return `(pop, base)`.
 fn recognize_bytesum_term(
     func: &MachFunction,
-    def: &HashMap<u32, InstId>,
+    def: &DefIndex,
     loop_insts: &HashSet<InstId>,
     iv: VReg,
     term: VReg,
@@ -2343,7 +2410,7 @@ fn cmpri_feeds_cset(func: &MachFunction, blk: BlockId, id: InstId) -> bool {
 ///   contributions dot-sum into the `.4S` partials, each `<= N < 2^31` (no wrap).
 fn recognize_maskcmp_term(
     func: &MachFunction,
-    def: &HashMap<u32, InstId>,
+    def: &DefIndex,
     loop_insts: &HashSet<InstId>,
     iv: VReg,
     term: VReg,
@@ -2428,7 +2495,7 @@ fn recognize_maskcmp_term(
 
 /// `v == byte & 0xFFFFFFFF` (`AndRR` with a materialized `0xFFFFFFFF`, or
 /// `AndRI(_, 0xFFFFFFFF)`) -> the pre-mask value. The mask is a no-op on a byte.
-fn strip_u32_mask(func: &MachFunction, def: &HashMap<u32, InstId>, v: VReg) -> Option<VReg> {
+fn strip_u32_mask(func: &MachFunction, def: &DefIndex, v: VReg) -> Option<VReg> {
     let inst = func.inst(*def.get(&v.id)?);
     match inst.opcode {
         AArch64Opcode::AndRI if imm_of(&inst.operands[2]) == Some(MASK32) => {
@@ -2455,7 +2522,7 @@ fn strip_u32_mask(func: &MachFunction, def: &HashMap<u32, InstId>, v: VReg) -> O
 /// `Uxtb`/`Uxtw`. Requires `index == iv` and returns the base.
 fn byte_load_base(
     func: &MachFunction,
-    def: &HashMap<u32, InstId>,
+    def: &DefIndex,
     loop_insts: &HashSet<InstId>,
     iv: VReg,
     v: VReg,
@@ -2494,7 +2561,7 @@ fn byte_load_base(
 /// `Madd(iv-like, 1, base)`.
 fn ldrb_addr_base(
     func: &MachFunction,
-    def: &HashMap<u32, InstId>,
+    def: &DefIndex,
     loop_insts: &HashSet<InstId>,
     iv: VReg,
     addr: VReg,
@@ -2534,12 +2601,12 @@ fn ldrb_addr_base(
 }
 
 /// `v` equals `iv` up through `MovR`/`Copy` chains.
-fn same_as_iv(func: &MachFunction, def: &HashMap<u32, InstId>, v: VReg, iv: VReg) -> bool {
+fn same_as_iv(func: &MachFunction, def: &DefIndex, v: VReg, iv: VReg) -> bool {
     strip_copies(func, def, v) == strip_copies(func, def, iv)
 }
 
 /// Follow `MovR`/`Copy` chains to the underlying value.
-fn strip_copies(func: &MachFunction, def: &HashMap<u32, InstId>, mut v: VReg) -> VReg {
+fn strip_copies(func: &MachFunction, def: &DefIndex, mut v: VReg) -> VReg {
     for _ in 0..16 {
         // A vreg with several live defs has no single reaching definition: the
         // def map is LAST-WINS over the emitted layout, so it names whichever
@@ -2553,7 +2620,7 @@ fn strip_copies(func: &MachFunction, def: &HashMap<u32, InstId>, mut v: VReg) ->
         // mac_row_unroll, strided_store_unroll, neon_iota_fill and neon_bytesum.
         // `swap_range_guard::single_def` and `neon_find`'s bound check were the
         // in-tree precedents for doing it right.
-        if crate::effects::live_def_count(func, v.id) != 1 {
+        if def.live_def_count(v.id) != 1 {
             return v;
         }
         let Some(&d) = def.get(&v.id) else {
@@ -2587,7 +2654,7 @@ fn count_live_defs(func: &MachFunction, v: VReg) -> usize {
 /// may materialize `p = root + iv` there. `None` (fail-closed) otherwise.
 fn resolve_invariant_base(
     func: &MachFunction,
-    def: &HashMap<u32, InstId>,
+    def: &DefIndex,
     loop_insts: &HashSet<InstId>,
     dom: &DomTree,
     preheader: BlockId,
@@ -2629,11 +2696,7 @@ fn resolve_invariant_base(
 /// Match the 64-bit SWAR population count and return its INPUT (`t0`, the
 /// `x & 0xFFFFFFFF` value). Sibling of `neon_array::detect_ctpop_swar_i32` with
 /// 64-bit masks, an extra `>>32` fold level, and a `& 0x7f` final mask.
-fn detect_ctpop_swar_i64(
-    func: &MachFunction,
-    def: &HashMap<u32, InstId>,
-    root: VReg,
-) -> Option<VReg> {
+fn detect_ctpop_swar_i64(func: &MachFunction, def: &DefIndex, root: VReg) -> Option<VReg> {
     // root = t16 & 0x7f
     let (t16, m) = swar_and_imm(func, def, root)?;
     if m != 0x7f {
@@ -2668,15 +2731,11 @@ fn detect_ctpop_swar_i64(
     Some(t0)
 }
 
-fn swar_inst<'a>(
-    func: &'a MachFunction,
-    def: &HashMap<u32, InstId>,
-    v: VReg,
-) -> Option<&'a MachInst> {
+fn swar_inst<'a>(func: &'a MachFunction, def: &DefIndex, v: VReg) -> Option<&'a MachInst> {
     Some(func.inst(*def.get(&v.id)?))
 }
 
-fn swar_and_imm(func: &MachFunction, def: &HashMap<u32, InstId>, v: VReg) -> Option<(VReg, i64)> {
+fn swar_and_imm(func: &MachFunction, def: &DefIndex, v: VReg) -> Option<(VReg, i64)> {
     let inst = swar_inst(func, def, v)?;
     if inst.opcode == AArch64Opcode::AndRI && inst.operands.len() == 3 {
         Some((vreg_of(&inst.operands[1])?, imm_of(&inst.operands[2])?))
@@ -2685,7 +2744,7 @@ fn swar_and_imm(func: &MachFunction, def: &HashMap<u32, InstId>, v: VReg) -> Opt
     }
 }
 
-fn swar_add_rr(func: &MachFunction, def: &HashMap<u32, InstId>, v: VReg) -> Option<(VReg, VReg)> {
+fn swar_add_rr(func: &MachFunction, def: &DefIndex, v: VReg) -> Option<(VReg, VReg)> {
     let inst = swar_inst(func, def, v)?;
     if inst.opcode == AArch64Opcode::AddRR && inst.operands.len() == 3 {
         Some((vreg_of(&inst.operands[1])?, vreg_of(&inst.operands[2])?))
@@ -2694,7 +2753,7 @@ fn swar_add_rr(func: &MachFunction, def: &HashMap<u32, InstId>, v: VReg) -> Opti
     }
 }
 
-fn swar_sub_rr(func: &MachFunction, def: &HashMap<u32, InstId>, v: VReg) -> Option<(VReg, VReg)> {
+fn swar_sub_rr(func: &MachFunction, def: &DefIndex, v: VReg) -> Option<(VReg, VReg)> {
     let inst = swar_inst(func, def, v)?;
     if inst.opcode == AArch64Opcode::SubRR && inst.operands.len() == 3 {
         Some((vreg_of(&inst.operands[1])?, vreg_of(&inst.operands[2])?))
@@ -2703,7 +2762,7 @@ fn swar_sub_rr(func: &MachFunction, def: &HashMap<u32, InstId>, v: VReg) -> Opti
     }
 }
 
-fn swar_lsr_imm(func: &MachFunction, def: &HashMap<u32, InstId>, v: VReg) -> Option<(VReg, i64)> {
+fn swar_lsr_imm(func: &MachFunction, def: &DefIndex, v: VReg) -> Option<(VReg, i64)> {
     let inst = swar_inst(func, def, v)?;
     if inst.opcode == AArch64Opcode::LsrRI && inst.operands.len() == 3 {
         Some((vreg_of(&inst.operands[1])?, imm_of(&inst.operands[2])?))
@@ -2713,12 +2772,7 @@ fn swar_lsr_imm(func: &MachFunction, def: &HashMap<u32, InstId>, v: VReg) -> Opt
 }
 
 /// `v = a + (a >> shift)` -> `a`.
-fn swar_add_self_lsr(
-    func: &MachFunction,
-    def: &HashMap<u32, InstId>,
-    v: VReg,
-    shift: i64,
-) -> Option<VReg> {
+fn swar_add_self_lsr(func: &MachFunction, def: &DefIndex, v: VReg, shift: i64) -> Option<VReg> {
     let (a, b) = swar_add_rr(func, def, v)?;
     if let Some((s, sh)) = swar_lsr_imm(func, def, b)
         && sh == shift
@@ -2736,7 +2790,7 @@ fn swar_add_self_lsr(
 }
 
 /// `(x & 0x33..33) + ((x >> 2) & 0x33..33)` given the two addends -> `x`.
-fn swar_pairs(func: &MachFunction, def: &HashMap<u32, InstId>, a: VReg, b: VReg) -> Option<VReg> {
+fn swar_pairs(func: &MachFunction, def: &DefIndex, a: VReg, b: VReg) -> Option<VReg> {
     let try_order = |lo: VReg, hi: VReg| -> Option<VReg> {
         let (x, m_lo) = swar_and_imm(func, def, lo)?;
         if m_lo != M33 {
@@ -3350,7 +3404,7 @@ fn copy_like(inst: &MachInst) -> Option<(VReg, VReg)> {
 /// 16-bit `Movz` constant, or a `Movz(lo16)`+`Movk(hi16, lsl 16)` pair (e.g.
 /// `0xFFFFFFFF`), through copies. The `Movk` writes its dst IN PLACE (tied), so
 /// its low 16 bits come from a preceding `Movz` on the SAME vreg in the block.
-fn const_value(func: &MachFunction, def: &HashMap<u32, InstId>, val: VReg) -> Option<i64> {
+fn const_value(func: &MachFunction, def: &DefIndex, val: VReg) -> Option<i64> {
     let v = strip_copies(func, def, val);
     let id = *def.get(&v.id)?;
     let inst = func.inst(id);
@@ -3438,10 +3492,61 @@ pub(crate) static BYTESUM_NANOS: std::sync::atomic::AtomicU64 =
 pub(crate) static BYTESUM_CALLS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-fn build_def_map(func: &MachFunction) -> HashMap<u32, InstId> {
+/// The pass's per-run view of the function's defs: the reaching-def map
+/// (exactly `effects::build_reaching_def_map`, reached through `Deref`) plus
+/// `effects::live_def_count` for every vreg id, computed once. Every
+/// `strip_copies` step used to rescan the whole function for that count —
+/// 15-25 whole-function walks per deep-walked loop — and the recognition
+/// sweep never mutates the function (every `apply` runs after it), so the
+/// counts read here are the counts those scans would have found.
+pub(crate) struct DefIndex {
+    def: HashMap<u32, InstId>,
+    /// Instructions defining each vreg id (an instruction defining the same id
+    /// in two classes counts once, as `live_def_count` counts instructions).
+    live_defs: HashMap<u32, u32>,
+}
+
+impl std::ops::Deref for DefIndex {
+    type Target = HashMap<u32, InstId>;
+    fn deref(&self) -> &Self::Target {
+        &self.def
+    }
+}
+
+impl DefIndex {
+    fn build(func: &MachFunction) -> Self {
+        let def = build_def_map_inner(func);
+        let mut live_defs: HashMap<u32, u32> = HashMap::new();
+        for &b in &func.block_order {
+            for &id in &func.block(b).insts {
+                let mut seen: [Option<u32>; 8] = [None; 8];
+                let mut n = 0usize;
+                crate::effects::for_each_inst_def(func.inst(id), |v| {
+                    if seen[..n].contains(&Some(v.id)) {
+                        return;
+                    }
+                    if n < seen.len() {
+                        seen[n] = Some(v.id);
+                        n += 1;
+                    }
+                    *live_defs.entry(v.id).or_insert(0) += 1;
+                });
+            }
+        }
+        DefIndex { def, live_defs }
+    }
+
+    /// `effects::live_def_count(func, id)` for the function this index was
+    /// built from.
+    fn live_def_count(&self, id: u32) -> usize {
+        self.live_defs.get(&id).copied().unwrap_or(0) as usize
+    }
+}
+
+fn build_def_map(func: &MachFunction) -> DefIndex {
     if crate::neon_array::boi_timing_enabled() {
         let t = std::time::Instant::now();
-        let r = build_def_map_inner(func);
+        let r = DefIndex::build(func);
         BYTESUM_NANOS.fetch_add(
             t.elapsed().as_nanos() as u64,
             std::sync::atomic::Ordering::Relaxed,
@@ -3449,7 +3554,7 @@ fn build_def_map(func: &MachFunction) -> HashMap<u32, InstId> {
         BYTESUM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return r;
     }
-    build_def_map_inner(func)
+    DefIndex::build(func)
 }
 
 fn build_def_map_inner(func: &MachFunction) -> HashMap<u32, InstId> {

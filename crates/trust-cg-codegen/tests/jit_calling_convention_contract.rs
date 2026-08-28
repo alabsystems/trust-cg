@@ -31,7 +31,9 @@ mod aarch64 {
         );
         let id = f.push_inst(add);
         f.append_inst(e, id);
-        let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+        // Signature returns [I64] -> AAPCS64 return-register set is exactly {X0}
+        // (matches `AppleAArch64ABI::required_return_pregs(&[Type::I64])`).
+        let ret = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
         let id = f.push_inst(ret);
         f.append_inst(e, id);
         f

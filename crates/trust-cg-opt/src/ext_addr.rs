@@ -90,7 +90,9 @@ use trust_cg_ir::{
 };
 
 use crate::dom::DomTree;
-use crate::effects::{aarch64_def_operand_positions, aarch64_use_operand_positions};
+use crate::effects::{
+    aarch64_for_each_def_position, aarch64_for_each_use_position, aarch64_use_operand_positions,
+};
 use crate::loops::LoopAnalysis;
 use crate::pass_manager::{AnalysisCache, MachinePass};
 
@@ -632,7 +634,14 @@ fn run_ext_addr_fold(func: &mut MachFunction, mut provenance: Option<&mut Proven
     // identity. Fold it away (a Sxtb/Sxth is NOT redundant — it changes the
     // sign extension — so it is deliberately left alone by THIS phase, and
     // width-folded into the signed load by the third phase below).
-    if fold_redundant_narrow_zext(func, provenance.as_deref_mut()) {
+    // Phases 2/2b/3 recomputed the def/use counts phase 1 already holds; they
+    // are pure functions of the function, so while no phase has mutated it
+    // (`!changed`) phase 1's maps are handed down instead.
+    if fold_redundant_narrow_zext(
+        func,
+        provenance.as_deref_mut(),
+        (!changed).then_some((&def_counts, &use_counts)),
+    ) {
         changed = true;
     }
 
@@ -642,7 +651,11 @@ fn run_ext_addr_fold(func: &mut MachFunction, mut provenance: Option<&mut Proven
     // rewritten to the load result and the extend is deleted. Kill switch:
     // `TCG_NO_EXT_ADDR_ZEXT_IDENTITY`.
     if std::env::var_os("TCG_NO_EXT_ADDR_ZEXT_IDENTITY").is_none()
-        && fold_identity_narrow_zext(func, provenance.as_deref_mut())
+        && fold_identity_narrow_zext(
+            func,
+            provenance.as_deref_mut(),
+            (!changed).then_some(&def_counts),
+        )
     {
         changed = true;
     }
@@ -651,7 +664,11 @@ fn run_ext_addr_fold(func: &mut MachFunction, mut provenance: Option<&mut Proven
     // width-folded into the signed load opcode (`LdrbRI`+`Sxtb` => `LdrsbRI`,
     // `LdrhRI`+`Sxth` => `LdrshRI`). Kill switch: `TCG_NO_EXT_ADDR_NARROW_SEXT`.
     if std::env::var_os("TCG_NO_EXT_ADDR_NARROW_SEXT").is_none()
-        && fold_narrow_load_sext(func, provenance)
+        && fold_narrow_load_sext(
+            func,
+            provenance,
+            (!changed).then_some((&def_counts, &use_counts)),
+        )
     {
         changed = true;
     }
@@ -1098,9 +1115,18 @@ fn try_cross_block_store_plan(
 fn fold_redundant_narrow_zext(
     func: &mut MachFunction,
     mut provenance: Option<&mut ProvenanceMap>,
+    shared_counts: Option<(&HashMap<VReg, u32>, &HashMap<VReg, u32>)>,
 ) -> bool {
-    let def_counts = count_vreg_defs(func);
-    let use_counts = count_vreg_uses(func);
+    // `shared_counts` are the caller's (def, use) counts, valid because nothing
+    // has mutated the function since they were built; otherwise recount.
+    let owned;
+    let (def_counts, use_counts): (&HashMap<VReg, u32>, &HashMap<VReg, u32>) = match shared_counts {
+        Some((defs, uses)) => (defs, uses),
+        None => {
+            owned = (count_vreg_defs(func), count_vreg_uses(func));
+            (&owned.0, &owned.1)
+        }
+    };
 
     // Map each single-def narrow-load result vreg to (defining load inst, the
     // set of extend widths it makes redundant).
@@ -1224,9 +1250,16 @@ fn fold_redundant_narrow_zext(
 fn fold_narrow_load_sext(
     func: &mut MachFunction,
     mut provenance: Option<&mut ProvenanceMap>,
+    shared_counts: Option<(&HashMap<VReg, u32>, &HashMap<VReg, u32>)>,
 ) -> bool {
-    let def_counts = count_vreg_defs(func);
-    let use_counts = count_vreg_uses(func);
+    let owned;
+    let (def_counts, use_counts): (&HashMap<VReg, u32>, &HashMap<VReg, u32>) = match shared_counts {
+        Some((defs, uses)) => (defs, uses),
+        None => {
+            owned = (count_vreg_defs(func), count_vreg_uses(func));
+            (&owned.0, &owned.1)
+        }
+    };
 
     // Map each single-def narrow-RI-load result vreg to (load inst, signed
     // opcode, access width in bytes).
@@ -1361,8 +1394,16 @@ fn fold_narrow_load_sext(
 fn fold_identity_narrow_zext(
     func: &mut MachFunction,
     provenance: Option<&mut ProvenanceMap>,
+    shared_def_counts: Option<&HashMap<VReg, u32>>,
 ) -> bool {
-    let def_counts = count_vreg_defs(func);
+    let owned;
+    let def_counts: &HashMap<VReg, u32> = match shared_def_counts {
+        Some(defs) => defs,
+        None => {
+            owned = count_vreg_defs(func);
+            &owned
+        }
+    };
 
     // Map each single-def narrow-load result vreg to (load inst, bits cleared
     // above): 8 for byte loads (makes Uxtb — and Uxth — redundant), 16 for
@@ -1502,9 +1543,13 @@ fn defines_in_range(
 ) -> bool {
     block_insts[from..to].iter().any(|&inst_id| {
         let inst = func.inst(inst_id);
-        aarch64_def_operand_positions(inst.opcode, inst.operands.len())
-            .into_iter()
-            .any(|idx| inst.operands.get(idx).and_then(|op| op.as_vreg()) == Some(vreg))
+        let mut found = false;
+        aarch64_for_each_def_position(inst.opcode, inst.operands.len(), |idx| {
+            if !found && inst.operands.get(idx).and_then(|op| op.as_vreg()) == Some(vreg) {
+                found = true;
+            }
+        });
+        found
     })
 }
 
@@ -1514,11 +1559,11 @@ fn count_vreg_uses(func: &MachFunction) -> HashMap<VReg, u32> {
         let block = func.block(*block_id);
         for &inst_id in &block.insts {
             let inst = func.inst(inst_id);
-            for idx in aarch64_use_operand_positions(inst.opcode, inst.operands.len()) {
+            aarch64_for_each_use_position(inst.opcode, inst.operands.len(), |idx| {
                 if let Some(MachOperand::VReg(vreg)) = inst.operands.get(idx) {
                     *counts.entry(*vreg).or_insert(0) += 1;
                 }
-            }
+            });
         }
     }
     counts
@@ -1530,11 +1575,11 @@ fn count_vreg_defs(func: &MachFunction) -> HashMap<VReg, u32> {
         let block = func.block(*block_id);
         for &inst_id in &block.insts {
             let inst = func.inst(inst_id);
-            for idx in aarch64_def_operand_positions(inst.opcode, inst.operands.len()) {
+            aarch64_for_each_def_position(inst.opcode, inst.operands.len(), |idx| {
                 if let Some(vreg) = inst.operands.get(idx).and_then(|op| op.as_vreg()) {
                     *counts.entry(vreg).or_insert(0) += 1;
                 }
-            }
+            });
         }
     }
     counts

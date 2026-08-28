@@ -31,8 +31,8 @@
 //!    from `per_query_ms`. The total wall clock spent in this pass is
 //!    capped by `budget_sec`.
 //! 4. On successful equivalence proofs, record rewrites in
-//!    [`CegisCacheEntry`], serialize via `rmp-serde`, and store under the
-//!    function hash.
+//!    [`CegisCacheEntry`], serialize via [`crate::cegis_cache_codec`], and
+//!    store under the function hash.
 //!
 //! The first payload layer recognizes one hand-seeded single-instruction
 //! rewrite: `MulRR x, (Movz #0)` within a block can become `Movz #0` when the
@@ -53,6 +53,7 @@ use trust_cg_ir::{
 use trust_cg_opt::{CacheBackend, CacheKey, MachinePass, StableHasher};
 
 use crate::cegis::{CegisLoop, CegisResult};
+use crate::cegis_cache_codec::CacheCodecError;
 use crate::failed_proof_reducer::FailedProofCounterexampleCorpus;
 use crate::rewrite_admission::{SourceRegionIdentity, TargetAbiLayoutIdentity};
 use crate::smt::SmtExpr;
@@ -394,7 +395,7 @@ impl MachOperandBlob {
     }
 }
 
-/// `rmp-serde` friendly projection of a replacement [`MachInst`].
+/// Cache-format projection of a replacement [`MachInst`].
 ///
 /// The cache format stores opcode + operands only. On replay the first rebuilt
 /// replacement instruction inherits `proof` and `source_loc` from the first
@@ -462,9 +463,17 @@ pub struct ProvenRewrite {
 
 /// Serializable cache entry stored under the per-function cache key.
 ///
-/// Encoded as MessagePack via `rmp-serde`. Format version is bumped whenever
-/// fields are added; older cache entries are discarded by the consumer when
-/// version changes (equivalent to a cache miss).
+/// Encoded by [`crate::cegis_cache_codec`], which owns the byte layout and the
+/// fail-closed reader. Format version is bumped whenever fields OR the layout
+/// change; older cache entries are rejected by the decoder (equivalent to a
+/// cache miss).
+///
+/// The `Serialize`/`Deserialize` derives on this type and its components are
+/// **not** the cache format any more. They are retained for two reasons: the
+/// acceptance differential in `tests/cegis_cache_codec.rs` compares this
+/// codec against the previous `rmp-serde` encoding, which needs them; and
+/// harnesses roundtrip these types through JSON. Do not route the cache
+/// through them.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CegisCacheEntry {
     /// Format version. Bump when fields change.
@@ -497,11 +506,19 @@ impl CegisCacheEntry {
     /// - v5: Layer C added constant-mask materialization fusion for bit-reverse
     ///   idioms (#854). Empty v4 entries must be invalidated so newly-covered
     ///   functions are re-enumerated instead of replaying a stale no-op.
+    /// - v6: the payload format changed from MessagePack (`rmp-serde`) to the
+    ///   in-tree [`crate::cegis_cache_codec`]. No field changed. This is a pure
+    ///   wire-format break: `rmp-serde` was the last third-party normal
+    ///   dependency edge keeping `rmp-serde`/`rmp` — and one of the edges
+    ///   keeping `serde` — in the shipping closure, so every proof over a unit
+    ///   that reaches this cache was conditional on code Trust does not own.
+    ///   v5 blobs do not carry the v6 magic and are rejected structurally,
+    ///   before any field is parsed.
     ///
     /// Older entries are silently rejected as a miss; this is semantics-
     /// preserving because the pass simply re-runs enumeration on the next
     /// invocation.
-    pub const VERSION: u32 = 5;
+    pub const VERSION: u32 = 6;
 
     /// Fresh empty entry with the current version.
     pub fn empty() -> Self {
@@ -511,19 +528,24 @@ impl CegisCacheEntry {
         }
     }
 
-    /// Encode to MessagePack bytes.
-    pub fn encode(&self) -> Result<Vec<u8>, rmp_serde::encode::Error> {
-        rmp_serde::to_vec(self)
+    /// Encode to cache bytes.
+    ///
+    /// Fails only if a sequence exceeds the `u32` wire length prefix, which a
+    /// well-formed entry cannot reach. The one caller that writes to a backend
+    /// drops the put on an error rather than failing the compilation.
+    pub fn encode(&self) -> Result<Vec<u8>, CacheCodecError> {
+        crate::cegis_cache_codec::encode_entry(self)
     }
 
-    /// Decode from MessagePack bytes. Returns `None` if the version mismatches
-    /// (treated as a cache miss by callers).
+    /// Decode from cache bytes. Returns `None` for anything the caller must
+    /// treat as a miss: wrong magic, wrong [`Self::VERSION`], an unknown tag, a
+    /// short read, a non-UTF-8 opcode or symbol, or trailing bytes.
+    ///
+    /// This is the fail-closed side of a read that carries proof authority — a
+    /// hit replays recorded rewrites **without** re-running CEGIS — so every
+    /// ambiguity resolves to a miss. See [`crate::cegis_cache_codec`].
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        let entry: Self = rmp_serde::from_slice(bytes).ok()?;
-        if entry.version != Self::VERSION {
-            return None;
-        }
-        Some(entry)
+        crate::cegis_cache_codec::decode_entry(bytes)
     }
 }
 
@@ -894,7 +916,12 @@ impl CegisSuperoptPass {
                                 self.stats.rejected += 1;
                                 entry.rejected += 1;
                             }
-                            Ok(CegisResult::Error(_)) => {
+                            Ok(CegisResult::Error(message)) => {
+                                if std::env::var_os("TCG_SOLVE_TRACE").is_some() {
+                                    eprintln!(
+                                        "TCG_SOLVE_TRACE cegis_error layer=A message={message}"
+                                    );
+                                }
                                 self.stats.verifier_errors += 1;
                                 self.stats.rejected += 1;
                                 entry.rejected += 1;
@@ -1146,7 +1173,12 @@ impl CegisSuperoptPass {
                                 self.stats.rejected += 1;
                                 entry.rejected += 1;
                             }
-                            Ok(CegisResult::Error(_)) => {
+                            Ok(CegisResult::Error(message)) => {
+                                if std::env::var_os("TCG_SOLVE_TRACE").is_some() {
+                                    eprintln!(
+                                        "TCG_SOLVE_TRACE cegis_error layer=B message={message}"
+                                    );
+                                }
                                 self.stats.verifier_errors += 1;
                                 self.stats.rejected += 1;
                                 entry.rejected += 1;
@@ -1460,7 +1492,10 @@ impl CegisSuperoptPass {
                         self.stats.rejected += 1;
                         entry.rejected += 1;
                     }
-                    Ok(CegisResult::Error(_)) => {
+                    Ok(CegisResult::Error(message)) => {
+                        if std::env::var_os("TCG_SOLVE_TRACE").is_some() {
+                            eprintln!("TCG_SOLVE_TRACE cegis_error layer=C message={message}");
+                        }
                         self.stats.verifier_errors += 1;
                         self.stats.rejected += 1;
                         entry.rejected += 1;
@@ -2279,7 +2314,12 @@ mod tests {
         // v1-v3 entries predate the serialized replacement-body format.
         // v4 predates the #854 Layer C matcher; stale empty entries must not
         // suppress newly-covered bit-reverse mask candidates.
-        for old_version in [1u32, 2u32, 3u32, 4u32] {
+        // v5 predates the `cegis_cache_codec` wire format. Note this loop can
+        // only exercise the *version field* gate, because the current encoder
+        // is the only one available here; a genuine v5 MessagePack blob is
+        // rejected on the magic instead, and that is covered by
+        // `tests/cegis_cache_codec.rs::a_real_v5_messagepack_blob_is_a_miss`.
+        for old_version in [1u32, 2u32, 3u32, 4u32, 5u32] {
             let entry = CegisCacheEntry {
                 version: old_version,
                 ..Default::default()
@@ -2287,7 +2327,7 @@ mod tests {
             let bytes = entry.encode().expect("encode");
             assert!(
                 CegisCacheEntry::decode(&bytes).is_none(),
-                "v{} cache entries must be rejected after VERSION=4 bump",
+                "v{} cache entries must be rejected at the current VERSION",
                 old_version,
             );
         }

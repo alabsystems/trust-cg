@@ -75,6 +75,22 @@ struct ProducerDef {
 }
 
 fn run_lsr_and_ubfx(func: &mut MachFunction, mut provenance: Option<&mut ProvenanceMap>) -> bool {
+    // PREFILTER (exact): the only rewrite is an `AndRI` fed by an `LsrRI`. Without one in the live block lists the pass cannot
+    // change anything, so skip the per-block scan and the read-count census. Over-approximating
+    // presence is safe; the check is a single opcode sweep.
+    if !(func
+        .block_order
+        .iter()
+        .flat_map(|b| func.block(*b).insts.iter())
+        .any(|&i| func.inst(i).opcode == AArch64Opcode::LsrRI)
+        && func
+            .block_order
+            .iter()
+            .flat_map(|b| func.block(*b).insts.iter())
+            .any(|&i| func.inst(i).opcode == AArch64Opcode::AndRI))
+    {
+        return false;
+    }
     let read_counts = count_vreg_reads(func);
     let mut changed = false;
 

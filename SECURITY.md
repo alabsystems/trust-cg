@@ -1,6 +1,6 @@
 # Security policy
 
-trust-cg v0.1.0 is alpha research software and is not approved for production,
+trust-cg is alpha research software and is not approved for production,
 safety-critical, or security-critical use. Correctness and robustness bugs are
 still security-relevant to the project, especially when they can cause silent
 wrong code, bypass a fail-closed gate, forge or misbind evidence, or execute

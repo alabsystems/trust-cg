@@ -43,16 +43,13 @@ trust-cg-opt = { workspace = true }
 trust-cg-process-env = { workspace = true }
 trust-ir = { workspace = true }
 thiserror = { workspace = true }
-rmp-serde = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-# `asm` selects the ARMv8 SHA2 instruction path (this host reports `sha2` in
-# /proc/cpuinfo). Identical digest, ~4x faster: the solver-identity hash runs
-# over the ~95MB `ay` binary once per compile and cost ~230ms in the software
-# backend -- the largest remaining component of p3_gcd's compile time after the
-# resident-server fix. Same bytes in, same hash out, so the cache identity and
-# its security properties are unchanged.
-sha2 = { version = "0.10", features = ["asm"] }
+# Keep the portable implementation in the common dependency graph. The
+# `sha2-asm` backend deliberately does not support Windows, so enabling `asm`
+# here would make every Windows build fail before trust-cg's host support can
+# be evaluated.
+sha2 = "0.10"
 rayon = "1.10"
 trust-types = { workspace = true, optional = true }
 tempfile = "3"
@@ -64,7 +61,26 @@ tempfile = "3"
 # checker, not a solver: it can only confirm or reject a recorded refutation,
 # never mint one, and every rejection falls back to the live solver discharge.
 trust-cg-drat-trim = { workspace = true }
+
+[target.'cfg(not(windows))'.dependencies]
+# `asm` selects the accelerated SHA2 path on supported Unix hosts. Identical
+# digest, ~4x faster on the measured ARMv8 host: the solver-identity hash runs
+# over the ~95MB `ay` binary once per compile and cost ~230ms in the software
+# backend. Target-scoping the feature preserves that acceleration while Windows
+# uses sha2's portable implementation.
+sha2 = { version = "0.10", features = ["asm"] }
+
 [dev-dependencies]
+# THE INCUMBENT, kept alive on purpose. `rmp-serde` was this crate's cache
+# payload format up to CegisCacheEntry::VERSION 5; `cegis_cache_codec` replaced
+# it so no third-party serializer sits on a shipping path. It is retained as a
+# DEV dependency because the acceptance gate for that swap is a differential
+# against it (tests/cegis_cache_codec.rs): the in-tree codec must round-trip
+# exactly what MessagePack round-trips, and each format must reject the other's
+# bytes. Do NOT promote this back to `[dependencies]` — that re-adds
+# `rmp-serde` + `rmp` to the shipping closure and re-adds one of the
+# third-party edges holding `serde` there.
+rmp-serde = { workspace = true }
 # Property-based testing for panic-fuzz harnesses (#448 / #387).
 # proptest is dev-only; it MUST NOT leak into the production graph.
 proptest = "1.7"
@@ -73,6 +89,15 @@ proptest = "1.7"
 # drive the iadd_i8 lowering miter (sat_blast.rs) to a checked (cnf, drat,
 # trace) artifact triple. Dev-only: no solver dependency in the production graph.
 trust-cg-sat-host = { workspace = true }
+# P4 wasm proof families (`wasm_abi_proofs.rs` and its siblings): the machine
+# side of every obligation is REBUILT BY DECODING the bytes the backend really
+# emitted, so the tests must run the real backend. DEV-ONLY and it must stay
+# that way — trust-cg-codegen depends on trust-cg-verify, so a normal
+# dependency here would be a build cycle; cargo permits the cycle only through
+# `[dev-dependencies]`. The `src/` modules themselves never name these crates:
+# they take module BYTES, which keeps the production graph one-way.
+trust-cg-codegen = { workspace = true }
+trust-ir-build = { workspace = true }
 
 
 [lints]

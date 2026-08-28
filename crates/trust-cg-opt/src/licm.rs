@@ -99,12 +99,15 @@ impl MachinePass for LoopInvariantCodeMotion {
     fn run(&mut self, func: &mut MachFunction) -> bool {
         let dom = DomTree::compute(func);
         let loop_analysis = LoopAnalysis::compute(func, &dom);
-        Self::run_with_loop_analysis(func, &loop_analysis)
+        Self::run_with_loop_analysis(func, &dom, &loop_analysis)
     }
 
     fn run_with_analyses(&mut self, func: &mut MachFunction, analyses: &mut AnalysisCache) -> bool {
-        let loop_analysis = analyses.loop_analysis(func).clone();
-        Self::run_with_loop_analysis(func, &loop_analysis)
+        // Borrowed from the cache (no clone, no dominator recompute): the
+        // cache's tree and loops are the ones computed for this CFG, which no
+        // pass since has changed (the manager invalidates them when it does).
+        let (dom, loop_analysis) = analyses.domtree_and_loops(func);
+        Self::run_with_loop_analysis(func, dom, loop_analysis)
     }
 
     fn run_with_provenance(
@@ -126,13 +129,20 @@ impl MachinePass for LoopInvariantCodeMotion {
     ) -> bool {
         // Same no-op provenance rationale as run_with_provenance, while still
         // using the cached loop analysis path.
-        let loop_analysis = analyses.loop_analysis(func).clone();
-        Self::run_with_loop_analysis(func, &loop_analysis)
+        // Borrowed from the cache (no clone, no dominator recompute): the
+        // cache's tree and loops are the ones computed for this CFG, which no
+        // pass since has changed (the manager invalidates them when it does).
+        let (dom, loop_analysis) = analyses.domtree_and_loops(func);
+        Self::run_with_loop_analysis(func, dom, loop_analysis)
     }
 }
 
 impl LoopInvariantCodeMotion {
-    fn run_with_loop_analysis(func: &mut MachFunction, loop_analysis: &LoopAnalysis) -> bool {
+    fn run_with_loop_analysis(
+        func: &mut MachFunction,
+        dom: &DomTree,
+        loop_analysis: &LoopAnalysis,
+    ) -> bool {
         if loop_analysis.is_empty() {
             return false;
         }
@@ -149,21 +159,22 @@ impl LoopInvariantCodeMotion {
         // dominators/loops per round, and the instruction tiers below run on a
         // freshly recomputed loop analysis.
         let recomputed_after_region;
-        let loop_analysis = if region_licm_enabled() && region_licm_run(func) {
+        let recomputed_dom;
+        let (dom, loop_analysis) = if region_licm_enabled() && region_licm_run(func) {
             changed = true;
-            let dom = DomTree::compute(func);
-            recomputed_after_region = LoopAnalysis::compute(func, &dom);
-            &recomputed_after_region
+            recomputed_dom = DomTree::compute(func);
+            recomputed_after_region = LoopAnalysis::compute(func, &recomputed_dom);
+            (&recomputed_dom, &recomputed_after_region)
         } else {
-            loop_analysis
+            (dom, loop_analysis)
         };
 
         // The dominator tree is needed by the load speculation guard. The
         // instruction tiers below only ever MOVE existing instructions between
         // existing blocks (they refuse synthetic preheaders), so they never
-        // mutate the CFG: one dominator tree computed here — after any region
-        // surgery above — stays valid across every hoist in this function.
-        let dom = DomTree::compute(func);
+        // mutate the CFG: the tree passed in (the cache's, computed for this
+        // very CFG — or the one recomputed after region surgery above) stays
+        // valid across every hoist in this function.
 
         // Process loops innermost-first (higher depth first).
         let mut loops: Vec<_> = loop_analysis.all_loops().cloned().collect();
@@ -187,6 +198,9 @@ impl LoopInvariantCodeMotion {
         let def_counts = build_def_counts(func);
         let def_map = build_def_map(func);
 
+        // Built lazily by the first loop that reaches the constant-chain tier,
+        // shared by the rest, dropped after any loop that hoisted.
+        let mut chain_index: Option<ConstChainIndex> = None;
         for lp in &loops {
             if std::env::var_os("TCG_DUMP_CHAINS").is_some() {
                 let mut b: Vec<u32> = lp.body.iter().map(|x| x.0).collect();
@@ -199,8 +213,9 @@ impl LoopInvariantCodeMotion {
                     b
                 );
             }
-            if hoist_loop_invariants(func, lp, &dom, &def_counts, &def_map) {
+            if hoist_loop_invariants(func, lp, &dom, &def_counts, &def_map, &mut chain_index) {
                 changed = true;
+                chain_index = None;
             }
         }
 
@@ -234,6 +249,7 @@ fn hoist_loop_invariants(
     dom: &DomTree,
     def_counts: &HashMap<VReg, usize>,
     def_map: &HashMap<VReg, InstId>,
+    chain_index: &mut Option<ConstChainIndex>,
 ) -> bool {
     // LICM currently hoists by physically moving instructions into an existing
     // preheader block. Creating a synthetic preheader here is not sound yet:
@@ -309,20 +325,27 @@ fn hoist_loop_invariants(
     // 0x…80808081 in ReedSolomon's `% 255` loops) are re-materialized every
     // iteration in integer kernels.
     //
-    // GATED on `lp.depth >= 2` (loop is itself nested): the tier only relocates
-    // a chain to a strictly-less-frequent region that is STILL inside a loop —
-    // it never performs the final "pull out of the OUTERMOST loop" step. That
-    // last move shrinks a single hot loop's body and, on the measured target,
-    // regresses tight FP kernels (flops-1/flops-7) for no critical-path benefit.
-    // (This comment used to attribute that to "fetch alignment"; see the R3
-    // control below — the regression is alignment-independent.) Deeply-nested kernels
-    // (perlin's fade/lerp coefficients, live in the depth-3/4 inner loops) still
-    // lift across every inner level and out of the hottest loops — only the
-    // outermost-loop hoist they never needed is skipped. `depth` is 1-based
-    // (outermost == 1), so a non-nested loop (`depth == 1`) is left untouched.
-    // Depth-1 (non-nested) loops are admitted ONLY for MULTI-instruction constant
-    // chains, gated behind `TCG_LICM_DEPTH1_MULTI`.
+    // DEPTH POLICY. The tier only ever relocates a chain to a strictly-less-
+    // frequent region. At `lp.depth >= 2` (loop is itself nested) that region is
+    // STILL inside a loop, the move is close to free, and every chain length is
+    // admitted. At `lp.depth == 1` the move is the final "pull out of the
+    // OUTERMOST loop" step, which shrinks a single hot loop's body and perturbs
+    // downstream passes (see ★ below), so a chain-length FLOOR applies there.
+    // `depth` is 1-based (outermost == 1). Deeply-nested kernels (perlin's
+    // fade/lerp coefficients, live in the depth-3/4 inner loops) lift across every
+    // inner level and out of the hottest loops regardless of that floor.
     //
+    // DEPTH-1 FLOOR: chains of >= 3 instructions hoist BY DEFAULT;
+    // `TCG_LICM_DEPTH1_MULTI` lowers the floor to >= 2. The default exists because
+    // a 4-instruction 64-bit magic reciprocal rebuilt every iteration cost
+    // p6_branch_match its entire ~2% vs LLVM (200M iterations; binary-patching the
+    // chain out of the loop reproduced LLVM parity exactly, 1380 -> 1330ms), and
+    // the same rematerialized-constant class is p3_gcd's residual. Measured
+    // old-vs-new, interleaved min-of-7: p6 0.989 (1.021 -> 1.011 vs LLVM), b1
+    // collateral 1.022 -> 0.997 vs LLVM, p3 neutral 0.998; 13/18 corpus programs
+    // at or below LLVM runtime parity.
+    //
+    // WHY THE FLOOR IS 3, AND WHY LOWERING IT TO 2 STAYS OPT-IN.
     // The blanket depth-1 hoist was tried and reverted (475d949b): it regressed
     // flops-1 by 8% and flops-7 by 2.3%. That revert note attributed the loss to
     // "fetch-alignment effects when a single hot loop's body shrinks", and this
@@ -334,19 +357,20 @@ fn hoist_loop_invariants(
     // tcg-vs-tcg (same .ll, same driver object, interleaved, min of 13, with a
     // byte-identical null arm on every row):
     //
-    //   * The guard does NOT exclude the reverted regressions. flops-1 still loses
-    //     8.15% and flops-7 1.73% WITH `chain.len() >= 2` in force — flops-1
+    //   * A floor of 2 does NOT exclude the reverted regressions. flops-1 still
+    //     loses 8.15% and flops-7 1.73% WITH `chain.len() >= 2` in force — flops-1
     //     reproducing the cited 8% almost exactly. The chain it hoists there is a
     //     2-instruction `mov`+`movk` of the loop bound 0x12a05f20, admitted by
-    //     precisely this guard.
+    //     precisely that guard. (It IS excluded by the >= 3 default above; that is
+    //     why the default is 3 and the floor-2 arm is behind an env var.)
     //   * It is NOT a fetch-alignment effect. Re-run under
     //     TCG_NO_LOOP_HEAD_ALIGN=1 the numbers are unchanged (flops-1 1.0815 vs
     //     1.0810, flops-3 0.7969 vs 0.7987, misr 1.0187 vs 1.0188), so R3 clears
     //     alignment as the cause. (Independently: 32-byte head alignment was
     //     priced at ZERO benefit on this target — see loop_align.rs.)
     //
-    // What the arm actually does is PERTURB DOWNSTREAM PASSES. On flops-3 the
-    // hoist suppresses a 4x unroll (`add x1,#4` -> `add x0,#1`), and the
+    // What the floor-2 arm actually does is PERTURB DOWNSTREAM PASSES. On flops-3
+    // the hoist suppresses a 4x unroll (`add x1,#4` -> `add x0,#1`), and the
     // un-unrolled form is 20% FASTER (0.7980/0.7997). Both flops programs run a
     // fixed 312.5M iterations (this llvm-test-suite copy is truncated to Module 1
     // with its outputs stabilized to `0 * 1e-30`, so `loops` never recalibrates),
@@ -354,24 +378,40 @@ fn hoist_loop_invariants(
     // flops-3 +4 insts/iter for -20% cycles. Instruction count does not predict
     // the sign, let alone the size.
     //
-    // ⇒ The tier is a SHAPE LOTTERY at depth 1, not a cost/benefit the guard can
-    // be tuned to capture. Corpus verdict over the 40 programs it changes:
+    // ⇒ At floor 2 the tier is a SHAPE LOTTERY, not a cost/benefit the guard can
+    // be tuned to capture. Corpus verdict over the 40 programs that arm changes:
     // geomean 1.0014 min / 1.0022 tmed against a null arm of 1.0002 / 1.0017 —
-    // inside the instrument's own envelope, i.e. nothing. It is kept OPT-IN
-    // (`TCG_LICM_DEPTH1_MULTI`) for that reason, NOT because the guard is safe.
-    // The p4_matmul motivation below is real but was never worth the variance.
+    // inside the instrument's own envelope, i.e. nothing. `TCG_LICM_DEPTH1_MULTI`
+    // is kept OPT-IN for that reason, NOT because floor 2 is safe. Note precisely
+    // what this does and does not say about the DEFAULT: the flops-1 regressor is
+    // a 2-instruction chain and the >= 3 floor excludes it, but the floor-3 arm
+    // was priced on the 18-program corpus above, not on these 65. Treat any new
+    // depth-1 regression as this class first, and re-price before lowering the
+    // floor.
     //
-    // A movz+movk... chain is a different trade: 2-4 instructions per iteration,
-    // and on p4_matmul's initialization loop a 4-instruction 64-bit magic
-    // constant is rebuilt every iteration inside a ~10-instruction body
-    // (measured: 12 movz/movk in `main` against LLVM's 6, LLVM hoisting the same
-    // constant). Real wins do exist in the set — almabench 0.9945/0.9964 in both
-    // alignment regimes — but they are outnumbered by same-size losses.
-    let depth1_multi = lp.depth == 1 && crate::env_lock::var_os("TCG_LICM_DEPTH1_MULTI").is_some();
-    if const_chain_hoist_enabled() && (lp.depth >= 2 || depth1_multi) {
-        for (carrier, chain) in find_hoistable_constant_chains(func, &lp.body, &def_counts) {
-            // At depth 1 admit only multi-instruction chains (see above).
-            if depth1_multi && chain.len() < 2 {
+    // A movz+movk... chain is a different trade from a single-instruction lift:
+    // 2-4 instructions per iteration, and on p4_matmul's initialization loop a
+    // 4-instruction 64-bit magic constant is rebuilt every iteration inside a
+    // ~10-instruction body (measured: 12 movz/movk in `main` against LLVM's 6,
+    // LLVM hoisting the same constant). Real wins do exist in the set — almabench
+    // 0.9945/0.9964 in both alignment regimes — but at floor 2 they are
+    // outnumbered by same-size losses.
+    let depth1_floor = if crate::env_lock::var_os("TCG_LICM_DEPTH1_MULTI").is_some() {
+        2
+    } else {
+        3
+    };
+    if const_chain_hoist_enabled() {
+        let chains = {
+            let index = chain_index.get_or_insert_with(|| ConstChainIndex::build(func));
+            find_hoistable_constant_chains(func, &lp.body, def_counts, index)
+        };
+        for (carrier, chain) in chains {
+            // At depth 1 admit only chains long enough that the removed
+            // per-iteration fetches dominate the downstream-pass perturbation the
+            // move causes (it is NOT a fetch-alignment effect — see the R3 control
+            // in the tier note above).
+            if lp.depth == 1 && chain.len() < depth1_floor {
                 continue;
             }
             invariant_vregs.insert(carrier);
@@ -1072,10 +1112,12 @@ fn const_chain_operands_are_immediate(inst: &MachInst) -> bool {
 ///   single-def `MOVZ`/`MOVN` head with no patches already lifts on the
 ///   ordinary single-def path, so admitting it here would only reorder
 ///   existing hoists. Behind its own kill switch
-///   (`TCG_NO_LICM_INT_CONST_CHAIN`) and the tier-wide `lp.depth >= 2` gate
-///   at the call site, which keeps the documented "never pull out of the
-///   OUTERMOST loop" fetch-alignment concern (flops-1/2/7) intact for
-///   integer chains too.
+///   (`TCG_NO_LICM_INT_CONST_CHAIN`) and the depth-1 chain-length floor at the
+///   call site (>= 3 instructions by default, >= 2 under
+///   `TCG_LICM_DEPTH1_MULTI`), which keeps the documented short-chain
+///   "pull out of the OUTERMOST loop" regression class (flops-1/2/7) excluded
+///   for integer chains too. That class is downstream-pass perturbation, not
+///   fetch alignment — see the R3 control in the tier note at the call site.
 ///
 /// # Soundness
 /// * **`V` holds a single value.** Requiring the whole def set to be one head
@@ -1091,10 +1133,66 @@ fn const_chain_operands_are_immediate(inst: &MachInst) -> bool {
 /// * **No partial-value hazard.** Contiguity guarantees no non-chain
 ///   instruction observes `V` between the head and the final `MOVK`, so lifting
 ///   the run cannot change any value an intermediate reader would have seen.
+/// The loop-INDEPENDENT half of `find_hoistable_constant_chains`, built once
+/// per LICM run and shared by every loop of the function: it reads only
+/// `block_order`, each block's instruction list and each instruction's
+/// opcode/operands, so between two loops that hoisted nothing it is
+/// bit-for-bit what a rebuild would produce. A hoist moves instructions
+/// (in-block indices change), so the caller drops it after any loop that
+/// returned `true` and the next loop rebuilds it — exactly the per-loop
+/// rebuild it replaces.
+struct ConstChainIndex {
+    /// Whole-function def sites of each vreg: (block, index-in-block, inst).
+    defs: HashMap<VReg, Vec<(BlockId, usize, InstId)>>,
+    /// GPRs consumed by an `FMOV Dn, Xv` (FP-literal chain carriers).
+    fmov_gpr_sources: HashSet<VReg>,
+    /// Position of each block in `block_order` (stable program order).
+    block_pos: HashMap<BlockId, usize>,
+}
+
+impl ConstChainIndex {
+    fn build(func: &MachFunction) -> Self {
+        let mut defs: HashMap<VReg, Vec<(BlockId, usize, InstId)>> = HashMap::new();
+        let mut fmov_gpr_sources: HashSet<VReg> = HashSet::new();
+        // Position of each block in the (deterministic) `block_order`, so the
+        // returned chains can be sorted into a stable program order below — the
+        // `defs` HashMap iteration order is nondeterministic and would otherwise
+        // leak into which chain lands first in the preheader (a reproducibility
+        // break for a verified compiler; cf. LoopAnalysis's BTreeMap rationale).
+        let mut block_pos: HashMap<BlockId, usize> = HashMap::new();
+        for (pos, &block_id) in func.block_order.iter().enumerate() {
+            block_pos.insert(block_id, pos);
+        }
+        for &block_id in &func.block_order {
+            let block = func.block(block_id);
+            for (idx, &inst_id) in block.insts.iter().enumerate() {
+                let inst = func.inst(inst_id);
+                if inst.opcode == AArch64Opcode::FmovGprFpr {
+                    // Operand 0 is the FPR destination; the GPR source(s) follow.
+                    for op in inst.operands.iter().skip(1) {
+                        if let MachOperand::VReg(src) = op {
+                            fmov_gpr_sources.insert(*src);
+                        }
+                    }
+                }
+                for_each_inst_def(inst, |def| {
+                    defs.entry(def).or_default().push((block_id, idx, inst_id));
+                });
+            }
+        }
+        Self {
+            defs,
+            fmov_gpr_sources,
+            block_pos,
+        }
+    }
+}
+
 fn find_hoistable_constant_chains(
     func: &MachFunction,
     body: &HashSet<BlockId>,
     def_counts: &HashMap<VReg, usize>,
+    index: &ConstChainIndex,
 ) -> Vec<(VReg, Vec<(InstId, BlockId)>)> {
     // Whole-function def sites of each vreg: (block, index-in-block, inst).
     // Function-wide (not body-restricted) so a def OUTSIDE the loop
@@ -1102,35 +1200,11 @@ fn find_hoistable_constant_chains(
     // Simultaneously collect the set of GPRs consumed by an `FMOV Dn, Xv`;
     // such carriers are FP-literal chains, admitted at any length (the
     // integer class needs >= 2 defs — see the scope note above).
-    let mut defs: HashMap<VReg, Vec<(BlockId, usize, InstId)>> = HashMap::new();
-    let mut fmov_gpr_sources: HashSet<VReg> = HashSet::new();
-    // Position of each block in the (deterministic) `block_order`, so the
-    // returned chains can be sorted into a stable program order below — the
-    // `defs` HashMap iteration order is nondeterministic and would otherwise
-    // leak into which chain lands first in the preheader (a reproducibility
-    // break for a verified compiler; cf. LoopAnalysis's BTreeMap rationale).
-    let mut block_pos: HashMap<BlockId, usize> = HashMap::new();
-    for (pos, &block_id) in func.block_order.iter().enumerate() {
-        block_pos.insert(block_id, pos);
-    }
-    for &block_id in &func.block_order {
-        let block = func.block(block_id);
-        for (idx, &inst_id) in block.insts.iter().enumerate() {
-            let inst = func.inst(inst_id);
-            if inst.opcode == AArch64Opcode::FmovGprFpr {
-                // Operand 0 is the FPR destination; the GPR source(s) follow.
-                for op in inst.operands.iter().skip(1) {
-                    if let MachOperand::VReg(src) = op {
-                        fmov_gpr_sources.insert(*src);
-                    }
-                }
-            }
-            for_each_inst_def(inst, |def| {
-                defs.entry(def).or_default().push((block_id, idx, inst_id));
-            });
-        }
-    }
-
+    let ConstChainIndex {
+        defs,
+        fmov_gpr_sources,
+        block_pos,
+    } = index;
     type ConstantChain = ((usize, usize), VReg, Vec<(InstId, BlockId)>);
 
     let int_chains = int_const_chain_hoist_enabled();
@@ -1139,7 +1213,7 @@ fn find_hoistable_constant_chains(
     // the overwhelming majority and are not chain candidates.
     let dump = std::env::var_os("TCG_DUMP_CHAINS").is_some();
     let mut chains: Vec<ConstantChain> = Vec::new();
-    for (&carrier, sites) in &defs {
+    for (&carrier, sites) in defs.iter() {
         macro_rules! decline {
             ($why:expr) => {{
                 if dump && sites.len() >= 2 {
@@ -3329,8 +3403,8 @@ mod tests {
         // is the lowering of a non-encodable f64 literal. The MOVK is a tied
         // def-use and v1 is multiply-defined, so the per-instruction screen
         // rejects the chain — yet v1 holds one compile-time constant. In a nested
-        // loop (the tier only fires for depth >= 2) the whole chain AND the
-        // consuming FMOV must move to the inner preheader.
+        // loop (depth >= 2, where the tier admits every chain length) the whole
+        // chain AND the consuming FMOV must move to the inner preheader.
         let (mut func, inner_ph, inner_body) = make_nested_loop(|func, bb| {
             let movz = func.push_inst(MachInst::new(
                 AArch64Opcode::Movz,
@@ -3444,10 +3518,13 @@ mod tests {
 
     #[test]
     fn test_licm_no_hoist_constant_chain_in_single_loop() {
-        // Depth gate: a constant chain in a NON-nested (depth-1) loop is left in
-        // place. The tier only relocates chains out of nested loops, where the
-        // recompute savings dominate; the depth-1→0 pull-out shrinks a single hot
-        // loop's body and can retune its fetch alignment for no benefit.
+        // Depth-1 chain-length floor: this 2-instruction chain in a NON-nested
+        // (depth-1) loop is left in place, because the floor at depth 1 is >= 3
+        // instructions by default. The depth-1→0 pull-out shrinks a single hot
+        // loop's body and perturbs downstream passes; a 2-instruction chain
+        // (flops-1's `mov`+`movk` loop bound) is exactly the measured regressor,
+        // so it only hoists under `TCG_LICM_DEPTH1_MULTI`. See the tier note at
+        // the call site.
         let mut func = MachFunction::new(
             "licm_single_loop_chain".to_string(),
             Signature::new(vec![], vec![]),
@@ -3501,7 +3578,8 @@ mod tests {
         assert_eq!(
             func.block(bb1).insts,
             original,
-            "depth-1 loop constant chain must stay in place (depth gate)"
+            "depth-1 loop constant chain shorter than the floor must stay in \
+             place (depth-1 chain-length floor)"
         );
     }
 
@@ -4038,7 +4116,7 @@ mod tests {
         let def_map = build_def_map(&func);
 
         assert!(
-            !hoist_loop_invariants(&mut func, &stale, &dom, &def_counts, &def_map),
+            !hoist_loop_invariants(&mut func, &stale, &dom, &def_counts, &def_map, &mut None),
             "an in-loop preheader candidate must fail closed before the splice"
         );
         assert!(func.block(bb0).insts.contains(&invariant));

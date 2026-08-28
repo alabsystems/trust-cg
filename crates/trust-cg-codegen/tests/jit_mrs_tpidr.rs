@@ -49,7 +49,7 @@ fn build_read_tpidr_el0() -> MachFunction {
     func.append_inst(entry, mrs_id);
 
     // RET
-    let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+    let ret = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
     let ret_id = func.push_inst(ret);
     func.append_inst(entry, ret_id);
 
@@ -96,7 +96,7 @@ fn build_read_tpidr_el0_plus_offset(name: &str, offset: u32) -> MachFunction {
         func.append_inst(entry, add_lo_id);
     }
 
-    let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+    let ret = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
     let ret_id = func.push_inst(ret);
     func.append_inst(entry, ret_id);
 

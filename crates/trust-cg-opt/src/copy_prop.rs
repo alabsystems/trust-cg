@@ -26,12 +26,12 @@
 //! The MOV instructions themselves are NOT removed by this pass — that's
 //! left to DCE, which will see that `dst` is no longer used.
 
-use std::collections::{HashMap, HashSet};
+use crate::fast_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use trust_cg_ir::{BlockId, InstId, MachFunction, MachOperand, PassId, ProvenanceMap, VReg};
 
 use crate::dom::DomTree;
-use crate::effects::{aarch64_def_operand_positions, aarch64_use_operand_positions};
+use crate::effects::aarch64_def_operand_positions;
 use crate::pass_manager::{AnalysisCache, MachinePass};
 
 /// Copy propagation pass.
@@ -48,8 +48,8 @@ impl MachinePass for CopyPropagation {
     }
 
     fn run_with_analyses(&mut self, func: &mut MachFunction, analyses: &mut AnalysisCache) -> bool {
-        let dom = analyses.domtree(func).clone();
-        run_copy_prop(func, Some(&dom), None)
+        let dom = analyses.domtree(func);
+        run_copy_prop(func, Some(dom), None)
     }
 
     fn run_with_provenance(
@@ -67,8 +67,8 @@ impl MachinePass for CopyPropagation {
         analyses: &mut AnalysisCache,
         provenance: &mut ProvenanceMap,
     ) -> bool {
-        let dom = analyses.domtree(func).clone();
-        run_copy_prop(func, Some(&dom), Some(provenance))
+        let dom = analyses.domtree(func);
+        run_copy_prop(func, Some(dom), Some(provenance))
     }
 }
 
@@ -99,7 +99,7 @@ fn run_copy_prop(
 
     // Step 2: Find copy instructions (MovR dst, src) where dst has
     // exactly one definition.
-    let mut copy_map: HashMap<VReg, CopyInfo> = HashMap::new();
+    let mut copy_map: HashMap<VReg, CopyInfo> = HashMap::default();
 
     for block_id in &func.block_order {
         let block = func.block(*block_id);
@@ -151,27 +151,25 @@ fn run_copy_prop(
         for (inst_index, &inst_id) in block.insts.clone().iter().enumerate() {
             let inst = func.inst(inst_id);
 
-            let def_positions: HashSet<usize> =
-                aarch64_def_operand_positions(inst.opcode, inst.operands.len())
-                    .into_iter()
-                    .collect();
-            let use_positions = aarch64_use_operand_positions(inst.opcode, inst.operands.len());
-            let operands = inst.operands.clone();
+            // Def positions as a bitmask over operand slots and the uses through
+            // the visitor: no per-instruction HashSet, position Vecs or operand
+            // clone. A use that is also a def (a tied operand) is skipped
+            // exactly as before.
+            let n = inst.operands.len();
+            let def_mask = crate::effects::def_position_mask(inst.opcode, n);
             let mut replacements = Vec::new();
-
-            for i in use_positions {
-                if def_positions.contains(&i) {
-                    continue;
+            crate::effects::aarch64_for_each_use_position(inst.opcode, n, |i| {
+                if i < 64 && def_mask & (1u64 << i) != 0 {
+                    return;
                 }
-                let operand = &operands[i];
-                if let MachOperand::VReg(vreg) = operand
+                if let MachOperand::VReg(vreg) = &inst.operands[i]
                     && let Some(replacement) = resolve_use_replacement(
                         *vreg, block_id, inst_index, &copy_map, &def_sites, func, dom,
                     )
                 {
                     replacements.push((i, replacement));
                 }
-            }
+            });
 
             if !replacements.is_empty() {
                 let inst = func.inst_mut(inst_id);
@@ -199,7 +197,7 @@ fn run_copy_prop(
 
 /// Collect definition sites for each VReg across the function.
 fn collect_defs(func: &MachFunction) -> HashMap<VReg, Vec<DefSite>> {
-    let mut defs: HashMap<VReg, Vec<DefSite>> = HashMap::new();
+    let mut defs: HashMap<VReg, Vec<DefSite>> = HashMap::default();
 
     for block_id in &func.block_order {
         let block = func.block(*block_id);
@@ -247,7 +245,7 @@ fn block_reaches(func: &MachFunction, from: BlockId, to: BlockId) -> bool {
     }
 
     let mut stack = vec![from];
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
 
     while let Some(block_id) = stack.pop() {
         if !seen.insert(block_id) {
@@ -312,7 +310,7 @@ fn resolve_use_replacement(
     dom: Option<&DomTree>,
 ) -> Option<VReg> {
     let mut current = original;
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     const MAX_CHAIN: usize = 64;
 
     for _ in 0..MAX_CHAIN {

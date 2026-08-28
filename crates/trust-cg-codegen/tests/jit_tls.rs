@@ -40,7 +40,9 @@ fn build_load_tls_u64() -> MachFunction {
     let load_id = func.push_inst(load);
     func.append_inst(entry, load_id);
 
-    let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+    // Signature returns [I64] -> the ABI return-register alias set is exactly
+    // [X0], matching `AppleAArch64ABI::required_return_pregs(&[Type::I64])`.
+    let ret = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
     let ret_id = func.push_inst(ret);
     func.append_inst(entry, ret_id);
 

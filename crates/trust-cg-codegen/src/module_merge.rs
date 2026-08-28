@@ -198,6 +198,77 @@ use trust_ir::{ClosureTyId, EnumId, EnumVariant, RecordId, StructId, TyId};
 
 use crate::global_stub::{decode_global_addr_stub, encode_global_addr_stub};
 
+/// Return the first `max` `copy` instructions whose declared result type does
+/// not match the operand type, rendered for gated bridge diagnostics.
+///
+/// This helper is observational only: callers still use [`merge_modules`] and
+/// its complete fail-closed validation boundary.
+pub fn describe_copy_type_mismatches(module: &Module, max: usize) -> Vec<String> {
+    use std::collections::BTreeMap;
+
+    let mut out = Vec::new();
+    for func in &module.functions {
+        let mut val_ty: BTreeMap<u32, trust_ir::Ty> = BTreeMap::new();
+        let mut val_def: BTreeMap<u32, String> = BTreeMap::new();
+        for block in &func.blocks {
+            for (vid, ty) in &block.params {
+                val_ty.insert(vid.index(), ty.clone());
+                val_def.insert(vid.index(), format!("param of block {}", block.id.index()));
+            }
+            for node in &block.body {
+                let tys = node.result_tys(module);
+                let variant = format!("{:?}", node.inst);
+                let variant = variant
+                    .split([' ', '{', '('])
+                    .next()
+                    .unwrap_or("?")
+                    .to_string();
+                for (vid, ty) in node.results.iter().zip(tys.iter()) {
+                    val_ty.insert(vid.index(), ty.clone());
+                    val_def.insert(vid.index(), variant.clone());
+                }
+            }
+        }
+        for block in &func.blocks {
+            for node in &block.body {
+                if let trust_ir::Inst::Copy { ty, operand } = &node.inst
+                    && let Some(actual) = val_ty.get(&operand.index())
+                    && actual != ty
+                {
+                    out.push(format!(
+                        "{} block {}: copy declared {:?} <- operand {:?} \
+                         (operand defined by {}) span={:?}",
+                        func.name,
+                        block.id.index(),
+                        ty,
+                        actual,
+                        val_def
+                            .get(&operand.index())
+                            .cloned()
+                            .unwrap_or_else(|| "?".into()),
+                        node.span
+                    ));
+                    if out.len() >= max {
+                        return out;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Return the canonical validation error count and the first `max` errors,
+/// rendered for gated bridge diagnostics.
+pub fn describe_validation_errors(module: &Module, max: usize) -> (usize, Vec<String>) {
+    let errors = trust_ir_build::validate_module(module);
+    let n = errors.len();
+    (
+        n,
+        errors.iter().take(max).map(|e| format!("{e:?}")).collect(),
+    )
+}
+
 /// Merge N per-function trust-ir modules into one multi-function module.
 ///
 /// See the module docs for the remap + fail-closed contract. Returns `Err` with
@@ -572,21 +643,32 @@ pub fn merge_modules(modules: &[Module]) -> Result<Module, String> {
     // Independent, comprehensive cross-check: if every INPUT validated clean,
     // the merge (a pure id-remap + concat) must also validate clean. This
     // catches any reference the hand-rolled self-check missed.
-    let inputs_clean = modules
-        .iter()
-        .all(|m| trust_ir_build::validate_module(m).is_empty());
-    if inputs_clean {
-        let errors = trust_ir_build::validate_module(&merged);
-        if !errors.is_empty() {
+    //
+    // Evaluated merged-module FIRST: validation is pure and its result only
+    // decides Ok/Err here, so the two orders are outcome-identical —
+    //   inputs clean, merged clean   -> Ok      (both orders)
+    //   inputs clean, merged dirty   -> Err     (both orders)
+    //   some input dirty             -> Ok      (the merged check is not
+    //                                            attributable; both orders)
+    // — while the common path runs ONE full validation instead of N+1 (each
+    // `validate_module` is a deep per-function pass through the bounded
+    // global pool; on the corpus every batch is N single-function inputs).
+    // The input validations run only when the merged module fails, to decide
+    // whether that failure is attributable to the merge.
+    let merged_errors = trust_ir_build::validate_module(&merged);
+    if !merged_errors.is_empty() {
+        let inputs_clean = modules
+            .iter()
+            .all(|m| trust_ir_build::validate_module(m).is_empty());
+        if inputs_clean {
             return Err(format!(
                 "merge_modules: merged module failed canonical validation ({} error(s)); \
                  first: {:?}",
-                errors.len(),
-                errors[0]
+                merged_errors.len(),
+                merged_errors[0]
             ));
         }
     }
-
     Ok(merged)
 }
 
@@ -1381,9 +1463,12 @@ fn remap_ty(
         Ty::FatPtr(FatPtrKind::Slice(tid)) => {
             Ty::FatPtr(FatPtrKind::Slice(TyId::new(resolve_tyid(tid.index())?)))
         }
-        // `Str` carries nothing; `TraitObject::trait_id` indexes no module
-        // table (nothing to remap, nothing that can dangle) — pass through.
-        Ty::FatPtr(k @ (FatPtrKind::Str | FatPtrKind::TraitObject { .. })) => Ty::FatPtr(*k),
+        // `Str` and `ContainerLen` carry nothing; `TraitObject::trait_id`
+        // indexes no module table (nothing to remap, nothing that can dangle)
+        // — pass through.
+        Ty::FatPtr(
+            k @ (FatPtrKind::Str | FatPtrKind::ContainerLen | FatPtrKind::TraitObject { .. }),
+        ) => Ty::FatPtr(*k),
         Ty::Vector(inner, n) => Ty::Vector(Box::new(remap_ty(inner, m, resolve_tyid)?), *n),
         Ty::Ref(inner) => Ty::Ref(Box::new(remap_ty(inner, m, resolve_tyid)?)),
         Ty::RefMut(inner) => Ty::RefMut(Box::new(remap_ty(inner, m, resolve_tyid)?)),
@@ -2483,7 +2568,8 @@ fn check_ty_resolvable(ty: &Ty, c: &TableCounts, loc: &str) -> Result<(), String
                 return Err(oob("types-table", tid.index(), c.types));
             }
         }
-        Ty::FatPtr(FatPtrKind::Str | FatPtrKind::TraitObject { .. }) => {}
+        Ty::FatPtr(FatPtrKind::Str | FatPtrKind::ContainerLen | FatPtrKind::TraitObject { .. }) => {
+        }
         Ty::Vector(inner, _)
         | Ty::Ref(inner)
         | Ty::RefMut(inner)
@@ -3221,6 +3307,12 @@ fn tys_equal_name_resolved(
             tys_equal_name_resolved(sm, st, mm, mt, depth)
         }
         (Ty::FatPtr(FatPtrKind::Str), Ty::FatPtr(FatPtrKind::Str)) => Ok(()),
+        // Id-less like `Str`. This arm is NOT optional: the matcher ends in
+        // `_ => Err(mismatch("variant"))`, so without it two identical
+        // `ContainerLen` types would be reported INCOMPATIBLE — a defect the
+        // compiler cannot catch, because a catch-all makes every match
+        // exhaustive.
+        (Ty::FatPtr(FatPtrKind::ContainerLen), Ty::FatPtr(FatPtrKind::ContainerLen)) => Ok(()),
         (
             Ty::FatPtr(FatPtrKind::TraitObject { trait_id: st }),
             Ty::FatPtr(FatPtrKind::TraitObject { trait_id: mt }),
@@ -3730,6 +3822,24 @@ mod tests {
 
         // The dedup'd def is structurally the input def (modulo the dense id).
         assert_eq!(merged.structs[0].fields, a2.structs[0].fields);
+    }
+
+    #[test]
+    fn merge_dedups_same_name_struct_with_container_len_fat_pointer() {
+        // ContainerLen is an id-less fat-pointer kind, like Str. Keep this
+        // regression on the same-name dedup path: tys_equal_name_resolved has
+        // a fail-closed catch-all, so an omitted explicit arm would reject two
+        // structurally identical definitions without a compiler error.
+        let container_len = Ty::FatPtr(FatPtrKind::ContainerLen);
+        let mut a = Module::new("mod_container_len_a");
+        a.structs = vec![tsdef(0, "Container", vec![container_len.clone()])];
+        let mut b = Module::new("mod_container_len_b");
+        b.structs = vec![tsdef(0, "Container", vec![container_len.clone()])];
+
+        let merged = merge_modules(&[a, b])
+            .expect("identical ContainerLen-bearing structs must deduplicate");
+        assert_eq!(merged.structs.len(), 1);
+        assert_eq!(merged.structs[0].fields[0].ty, container_len);
     }
 
     #[test]

@@ -28,10 +28,25 @@
 //!    proof fails (see [`proof_wrong_stride_overlaps`]). This catches a real
 //!    lowering bug class.
 //!
+//! # P3: the per-OPCODE half of the memory family
+//!
+//! The obligations here are about the MODEL and about address arithmetic; they
+//! say nothing about WHICH access opcode the backend emitted. The per-opcode
+//! half lives in [`crate::wasm_value_domain`], which decodes the real emitted
+//! byte across the whole spec §5.4.4 block (0x28..=0x3e — the sub-word and FP
+//! accesses this module's `i32`/`i64` pair never covered) and pins the
+//! EXTENSION, the store TRUNCATION, and the store WIDTH per byte. The two halves
+//! are complementary: without the model obligations the byte decode would rest
+//! on an unvalidated little-endian encoding; without the per-opcode obligations
+//! a correct model would still credit `i32.load8_s` for `i32.load8_u`.
+//!
 //! NOT yet covered (documented next slice): refinement against a trust-ir memory
 //! SMT encoder (none exists in `trust_ir_semantics` yet), aliasing against a
-//! symbolic prior memory (needs a free array-sort input), and the shadow-stack
-//! frame offset arithmetic.
+//! symbolic prior memory (needs a free array-sort input), the shadow-stack
+//! frame offset arithmetic, and the non-zero `memarg` static offset (every
+//! obligation here and in `wasm_value_domain` models offset 0, matching the
+//! current lowering). `memory.size`/`memory.grow` and data segments are NAMED
+//! deferrals — see `wasm_value_domain::WASM_VALUE_DOMAIN_DEFERRALS`.
 
 use crate::lowering_proof::ProofObligation;
 use crate::smt::SmtExpr;

@@ -34,7 +34,8 @@ pub struct NzcvFlags {
     pub n: SmtExpr,
     /// Z: Zero flag = (result == 0).
     pub z: SmtExpr,
-    /// C: Carry flag = unsigned carry out (for subtraction: Rn >= Rm unsigned).
+    /// C: Carry flag = unsigned carry out of the adder (for subtraction this
+    /// equals Rn >=_u Rm — a theorem the proofs establish, see `encode_cmp`).
     pub c: SmtExpr,
     /// V: oVerflow flag = signed overflow.
     pub v: SmtExpr,
@@ -50,8 +51,27 @@ pub struct NzcvFlags {
 /// For a subtraction `result = Rn - Rm`:
 /// - N = result[MSB]
 /// - Z = (result == 0)
-/// - C = (Rn >=_u Rm)  (unsigned borrow is inverted carry)
+/// - C = carry-out of `AddWithCarry(Rn, NOT Rm, 1)` (unsigned borrow is the
+///   inverted carry; architecturally C == (Rn >=_u Rm), but see below)
 /// - V = (sign(Rn) != sign(Rm)) AND (sign(Rn) != sign(result))
+///
+/// # Why C is derived from the adder and not written as `Rn >=_u Rm`
+///
+/// The C flag used to be encoded as `bvuge(Rn, Rm)` outright. That is the
+/// right VALUE, but it made `Icmp_UGE -> CMP+CSET_HS` the tautology
+/// `bvuge(a, b) == bvuge(a, b)` (retracted as degenerate, #62) and left the
+/// other unsigned predicates (LO/HI/LS) one negation away from their spec.
+/// The ARM pseudocode (DDI 0487, `AddWithCarry`) defines C as the carry-out
+/// of `Rn + NOT(Rm) + 1`; this model follows it with the full-adder carry-out
+/// identity at the most significant bit, entirely at the operand width:
+///
+/// ```text
+///   x = Rn, y = NOT Rm, s = x + y + 1 (= Rn - Rm mod 2^w)
+///   C = ((x & y) | ((x ^ y) & NOT s))[w-1]
+/// ```
+///
+/// `C == (Rn >=_u Rm)` is then a theorem about the adder that every
+/// unsigned comparison/branch proof establishes, not a definition.
 ///
 /// # Arguments
 ///
@@ -70,9 +90,23 @@ pub fn encode_cmp(rn: SmtExpr, rm: SmtExpr, width: u32) -> NzcvFlags {
     // Z: result == 0
     let z = result.clone().eq_expr(zero);
 
-    // C: unsigned borrow-out for subtraction is inverted carry.
-    // C = 1 iff Rn >=_u Rm (no borrow needed)
-    let c = rn.clone().bvuge(rm.clone());
+    // C: carry-out of AddWithCarry(Rn, NOT Rm, 1) — the full-adder carry-out
+    // at the MSB (see the doc comment). `result` is exactly x + y + 1.
+    let ones = SmtExpr::bv_const(
+        if width >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << width) - 1
+        },
+        width,
+    );
+    let x = rn.clone();
+    let y = rm.clone().bvxor(ones.clone()); // NOT Rm
+    let not_s = result.clone().bvxor(ones);
+    let carry_chain = x.clone().bvand(y.clone()).bvor(x.bvxor(y).bvand(not_s));
+    let c = carry_chain
+        .extract(width - 1, width - 1)
+        .eq_expr(SmtExpr::bv_const(1, 1));
 
     // V: signed overflow of subtraction.
     // Overflow when: operand signs differ AND result sign differs from Rn sign.
@@ -262,6 +296,52 @@ mod tests {
         // 3 < 10 (unsigned) -> C=false (borrow needed)
         let result = flags.c.eval(&env(&[("rn", 3), ("rm", 10)]));
         assert_eq!(result, EvalResult::Bool(false));
+    }
+
+    /// The adder-derived C equals `Rn >=_u Rm` on every 8-bit operand pair
+    /// (exhaustive), and on the width-32/64 edges (equal operands, zero, MAX,
+    /// the sign boundary) where the carry chain has to be exactly right.
+    #[test]
+    fn test_c_flag_is_unsigned_ge_exhaustively_at_8_bits_and_at_the_edges() {
+        let flags8 = encode_cmp(SmtExpr::var("rn", 8), SmtExpr::var("rm", 8), 8);
+        for a in 0u64..256 {
+            for b in 0u64..256 {
+                let got = flags8.c.eval(&env(&[("rn", a), ("rm", b)]));
+                assert_eq!(got, EvalResult::Bool(a >= b), "8-bit C for rn={a} rm={b}");
+            }
+        }
+        for width in [32u32, 64] {
+            let flags = encode_cmp(SmtExpr::var("rn", width), SmtExpr::var("rm", width), width);
+            let max = if width == 64 {
+                u64::MAX
+            } else {
+                u32::MAX as u64
+            };
+            let sign = 1u64 << (width - 1);
+            let pts = [0u64, 1, 2, sign - 1, sign, sign + 1, max - 1, max];
+            for &a in &pts {
+                for &b in &pts {
+                    let got = flags.c.eval(&env(&[("rn", a), ("rm", b)]));
+                    assert_eq!(
+                        got,
+                        EvalResult::Bool(a >= b),
+                        "{width}-bit C for rn={a:#x} rm={b:#x}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The machine-side flag model must not contain the spec predicate itself:
+    /// a CMP+CSET.HS obligation is only a theorem if C is not spelled `bvuge`.
+    #[test]
+    fn test_c_flag_is_not_spelled_as_bvuge() {
+        let flags = encode_cmp(SmtExpr::var("rn", 64), SmtExpr::var("rm", 64), 64);
+        let text = format!("{:?}", flags.c);
+        assert!(
+            !text.contains("BvUge") && !text.contains("BvUlt"),
+            "C is degenerate: {text}"
+        );
     }
 
     #[test]

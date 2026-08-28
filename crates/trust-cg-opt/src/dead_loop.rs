@@ -1582,4 +1582,23 @@ mod tests {
             "IV final value (10) must be materialized in the preheader"
         );
     }
+
+    /// IDEMPOTENCE: the deleted loop is gone, so a second run must change nothing.
+    #[test]
+    fn second_run_is_a_no_op() {
+        let (mut func, _bb0, _bb1, _bb2, _bb3) = make_rotated_empty_loop();
+        assert!(
+            DeadCountedLoopElimination::new().run(&mut func),
+            "first run must fire"
+        );
+        let (insts, blocks) = (func.insts.len(), func.blocks.len());
+        for again in 2..=4 {
+            assert!(
+                !(DeadCountedLoopElimination::new().run(&mut func)),
+                "run {again} re-fired on its own output"
+            );
+            assert_eq!(func.insts.len(), insts, "run {again} added instructions");
+            assert_eq!(func.blocks.len(), blocks, "run {again} added blocks");
+        }
+    }
 }

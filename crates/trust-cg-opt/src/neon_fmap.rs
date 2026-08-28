@@ -1253,6 +1253,16 @@ fn emit_ext_block(
 }
 
 fn apply_map(func: &mut MachFunction, rec: &RecognizedFMap, rotate: bool) -> bool {
+    // IDEMPOTENCE: never vectorize the remainder loop of a loop this pass
+    // already vectorized (see `crate::vector_remainder`).
+    if crate::vector_remainder::iv_is_vector_advanced_upstream(
+        func,
+        &rec.loop_insts,
+        rec.preheader,
+        rec.iv,
+    ) {
+        return false;
+    }
     let w = rec.w;
 
     // The INLINED rotated shape carries a genuinely-i64 bound (clang computes the
@@ -2484,6 +2494,11 @@ impl RecognizedFCount {
 }
 
 fn apply_count(func: &mut MachFunction, rec: &RecognizedFCount) -> bool {
+    // IDEMPOTENCE: never vectorize the remainder loop of a loop this pass
+    // already vectorized (see `crate::vector_remainder`).
+    if crate::vector_remainder::preheader_folds_neon_lane_into(func, rec.preheader, rec.acc) {
+        return false;
+    }
     let w = rec.w;
 
     let vh = func.create_block();

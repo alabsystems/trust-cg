@@ -523,6 +523,47 @@ pub enum Opcode {
     /// Divide two `<2 x f64>` V128 values lane-wise.
     V2F64Fdiv,
 
+    // Packed fused multiply-add, `d = a*b + c` per lane with a SINGLE rounding
+    // of the exact product-plus-addend.
+    //
+    // These carry the `llvm.fmuladd` FUSION-OPTIONAL license and ONLY that
+    // license: a strict `llvm.fma.v*` has no LIR opcode here on purpose. The
+    // distinction is not cosmetic — a later pass may legally split a licensed
+    // `Fmuladd` back into `Fmul`+`Fadd` (see `unfuse-serial-fma`), but doing
+    // that to a strict `fma` would round TWICE and is a bit-level miscompile.
+    // Keeping strict `fma` un-lowered means it fails closed to scalarization
+    // rather than sharing an opcode that carries the wrong permission.
+    //
+    // Ternary: three V128 operands, one V128 result. AArch64 lowers to
+    // `FMLA Vd.T, Vn.T, Vm.T`, whose `Vd` is a TIED def-use accumulator, so
+    // ISel must first copy the addend into the destination.
+    /// Fused multiply-add of three `<4 x f32>` V128 values lane-wise
+    /// (`args[0]*args[1] + args[2]`, four parallel binary32 FMAs).
+    V4F32Fmuladd,
+    /// Fused multiply-add of three `<2 x f64>` V128 values lane-wise.
+    V2F64Fmuladd,
+
+    /// Extract one scalar f64 lane of a `<2 x f64>` V128 value into an FPR.
+    ///
+    /// `args[0]` is the V128 vector, `lane` is 0 or 1, `results[0]` is F64.
+    ///
+    /// This exists to avoid a STACK ROUND-TRIP. FP lanes live in the vector
+    /// register file, so the integer `UMOV`-to-GPR path reads the wrong file;
+    /// the adapter's element-type-agnostic fallback therefore spills the whole
+    /// vector and reloads the lane — five LIR instructions (`StackAddr`,
+    /// `Store`, `Iconst`, `ArrayGep`, `Load`) plus the store-to-load forwarding
+    /// stall. AArch64 does this in ONE register-form instruction,
+    /// `MOV Dd, Vn.D[lane]`.
+    ///
+    /// f64 only, and EXTRACT only, on purpose: `NeonDupScalarD` is already
+    /// proof-covered at both `.2D` lanes because the FP-reduction vectorizer's
+    /// ordered drain emits it. `<4 x f32>` extract and both insert directions
+    /// have no register-form machine opcode yet and would each need a new one
+    /// plus a new obligation, so they keep the stack path and stay correct.
+    V2F64ExtractLane {
+        lane: u8,
+    },
+
     // Conditional select
     Select {
         cond: IntCC,

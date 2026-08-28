@@ -2956,6 +2956,18 @@ impl<'a> TrustIrAdapter<'a> {
                     .and_then(|def| def.fields.get(*field as usize))
                     .map(|field| field.ty.clone()),
                 Ty::Tuple(fields) => fields.get(*field as usize).cloned(),
+                // The ARRAY spelling of that same flat lane tuple: every element
+                // has the element type, resolved through the module `types`
+                // table the `TyId` indexes. Without this arm the extracted lane
+                // has no recorded type and the downstream `InsertField` fails
+                // closed -- exactly the failure the note above describes.
+                Ty::Array(elem_ty_id, len) => (u64::from(*field) < *len)
+                    .then(|| {
+                        self.module
+                            .and_then(|module| module.types.get(elem_ty_id.index() as usize))
+                            .cloned()
+                    })
+                    .flatten(),
                 Ty::Record(id) => self
                     .module
                     .and_then(|module| {
@@ -4161,6 +4173,27 @@ impl<'a> TrustIrAdapter<'a> {
                     field_index, aggregate_ty
                 ))
             }),
+            // Every element of an array has the element type; resolve it
+            // through the module `types` table the `TyId` indexes.
+            Ty::Array(elem_ty_id, len) => {
+                if field_index as u64 >= *len {
+                    return Err(AdapterError::UnsupportedInstruction(format!(
+                        "multi-index GEP array element {} out of bounds for {:?}",
+                        field_index, aggregate_ty
+                    )));
+                }
+                let module = self.module.ok_or(AdapterError::ModuleNotSet)?;
+                module
+                    .types
+                    .get(elem_ty_id.index() as usize)
+                    .cloned()
+                    .ok_or_else(|| {
+                        AdapterError::UnsupportedInstruction(format!(
+                            "array element TyId {:?} not in module types table",
+                            elem_ty_id
+                        ))
+                    })
+            }
             // A first-class closure is a struct of its captures (in capture
             // declaration order), so its "field" `Ty` is the capture type at
             // that index — resolved from the module `closure_types` table.
@@ -7382,6 +7415,14 @@ impl<'a> TrustIrAdapter<'a> {
                         &result_vals,
                     );
                 }
+                if let Some(opcode) = fma_vector_intrinsic_contract(&callee_name) {
+                    return self.translate_packed_fma_intrinsic(
+                        opcode,
+                        &callee_name,
+                        &arg_vals,
+                        &result_vals,
+                    );
+                }
 
                 // Propagate callee return types onto the Call result Values
                 // so ISel's `value_type()` returns the true type instead of
@@ -7689,6 +7730,21 @@ impl<'a> TrustIrAdapter<'a> {
                                 field, struct_ty
                             ))
                         })?
+                    }
+                    // `Array(t, n)` is the compact spelling of `Struct([t; n])`:
+                    // every element has type `t`, and `Type::offset_of` places
+                    // element `k` where field `k` of the struct spelling sits.
+                    Type::Array(elem, count) => {
+                        // `field` was rebound above by `niche_field_access`, so
+                        // it is a value here, not the original `&u32` operand —
+                        // same binding the `Type::Struct` arm uses.
+                        if field >= *count {
+                            return Err(AdapterError::UnsupportedInstruction(format!(
+                                "array element {} out of bounds for {:?}",
+                                field, struct_ty
+                            )));
+                        }
+                        (**elem).clone()
                     }
                     _ => {
                         return Err(AdapterError::UnsupportedInstruction(format!(
@@ -9270,6 +9326,32 @@ impl<'a> TrustIrAdapter<'a> {
             } else {
                 Opcode::Fma
             },
+            args: vec![args[0], args[1], args[2]],
+            results: vec![dst],
+        }])
+    }
+
+    /// Rewrite a PACKED `llvm.fmuladd.v*` call into its lane-wise LIR opcode.
+    ///
+    /// The result is typed `V128` — the LIR vector type erases the lane width,
+    /// which is exactly why the element precision rides the OPCODE (`V4F32…`
+    /// vs `V2F64…`) rather than the type.
+    fn translate_packed_fma_intrinsic(
+        &mut self,
+        opcode: Opcode,
+        callee_name: &str,
+        args: &[Value],
+        results: &[Value],
+    ) -> Result<Vec<Instruction>, AdapterError> {
+        if args.len() != 3 || results.len() != 1 {
+            return Err(AdapterError::UnsupportedInstruction(format!(
+                "{callee_name} expects three arguments and one result"
+            )));
+        }
+        let dst = results[0];
+        self.define_value_type(dst, Type::V128);
+        Ok(vec![Instruction {
+            opcode,
             args: vec![args[0], args[1], args[2]],
             results: vec![dst],
         }])
@@ -12767,6 +12849,18 @@ impl<'a> TrustIrAdapter<'a> {
                     )));
                 }
             }
+            // The array spelling of a uniform struct -- see the `InsertField`
+            // arm. Same element type, same offset, resolved by the same
+            // `Type::offset_of` through `StructGep` below.
+            Type::Array(elem, count) => {
+                if index >= *count {
+                    return Err(AdapterError::UnsupportedType(format!(
+                        "array element {} out of bounds for array of {} elements",
+                        index, count
+                    )));
+                }
+                (**elem).clone()
+            }
             _ => {
                 return Err(AdapterError::UnsupportedType(format!(
                     "field extract on non-struct type: {:?}",
@@ -13792,6 +13886,24 @@ impl<'a> TrustIrAdapter<'a> {
         let lane = self.require_const_lane_index(index, max_lane, "FP-vector ExtractElement")?;
         let vector_val = self.map_value(array);
         let lane_lir = self.translate_ty(&want_elem)?;
+        // `<2 x f64>` has a REGISTER form: `MOV Dd, Vn.D[lane]`. Take it and
+        // skip the spill entirely. `<4 x f32>` has no such opcode wired yet, so
+        // it keeps the stack path — correct either way, just slower.
+        if Self::is_v2f64_ty(&array_ty) {
+            let dst = self.map_result(results)?;
+            self.define_value_type(dst, Type::F64);
+            return Ok(vec![Instruction {
+                opcode: Opcode::V2F64ExtractLane {
+                    lane: u8::try_from(lane).map_err(|_| {
+                        AdapterError::UnsupportedInstruction(format!(
+                            "<2 x f64> ExtractElement lane {lane} out of range"
+                        ))
+                    })?,
+                },
+                args: vec![vector_val],
+                results: vec![dst],
+            }]);
+        }
         self.translate_vector_extract_lane_stack(vector_val, lane, lane_lir, results)
     }
 
@@ -17258,6 +17370,48 @@ fn swift_rewrite_module(module: &TrustIrModule) -> Option<TrustIrModule> {
 /// built modules and rely on the adapter's own precise fail-closed errors. The
 /// refinement classes are different because erasure would otherwise discard a
 /// semantic proof obligation and permit invalid consumption to compile.
+/// Is adapter stage timing on? Cached once: the env is read a single time so
+/// the default (timing OFF) path is a cheap atomic load, not a syscall.
+///
+/// Shares `TRUST_CG_TIME_PIPELINE` with the codegen pipeline so ONE knob covers
+/// the whole lowering path.
+fn adapter_timing_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("TRUST_CG_TIME_PIPELINE").is_some()
+            || std::env::var_os("TRUST_CG_TIME_PASSES").is_some()
+    })
+}
+
+/// Time one adapter stage.
+///
+/// WHY THIS EXISTS: the codegen pipeline's phase timing starts at `isel`, and
+/// the rustc bridge's `TCG_TIME_CODEGEN` covers `mir_to_trust_ir`. The
+/// trust_ir -> LIR adapter sits BETWEEN them and was timed by neither. On a
+/// single 1601-block function the two profilers together accounted for 0.19s
+/// of a 6.57s compile -- 97% of the time was in the gap, and a compiler you
+/// cannot profile is a compiler you cannot make fast. Everything they could
+/// not see was here.
+fn time_adapter_stage<T>(name: &str, module: &TrustIrModule, f: impl FnOnce() -> T) -> T {
+    if !adapter_timing_enabled() {
+        return f();
+    }
+    let started = std::time::Instant::now();
+    let out = f();
+    // Read the clock BEFORE the shape walk and the write: summing every
+    // function's block count is O(module), and charging that (plus an
+    // unbuffered stderr syscall) to the stage being measured is exactly the
+    // self-inflation the pipeline phase log was fixed for.
+    let elapsed_us = started.elapsed().as_micros();
+    let blocks: usize = module.functions.iter().map(|func| func.blocks.len()).sum();
+    eprintln!(
+        "[trust-cg-time-adapter] stage={name} elapsed_us={elapsed_us} funcs={} blocks={blocks}",
+        module.functions.len(),
+    );
+    out
+}
+
 fn validate_refinement_semantics(module: &TrustIrModule) -> Result<(), AdapterError> {
     let refinement_error = trust_ir_build::validate_module(module)
         .into_iter()
@@ -17337,7 +17491,9 @@ pub fn translate_module_for_arch_with_tls(
     guard_carrier_arch: GuardCarrierArch,
     tls_dialect: TlsDialect,
 ) -> Result<Vec<(Function, ProofContext)>, AdapterError> {
-    validate_refinement_semantics(module)?;
+    time_adapter_stage("validate-refinement", module, || {
+        validate_refinement_semantics(module)
+    })?;
 
     // Scalarize any Swift function with aggregate params/returns in the sound
     // subset into an equivalent flat-scalar-signature function BEFORE the
@@ -17366,7 +17522,9 @@ pub fn translate_module_for_arch_with_tls(
     // clones only when there is something to annotate. Arch-independent: the
     // annotation licenses guard elision on every target (x86 is the measured
     // win; AArch64 benefits identically).
-    let div_annotated = div_nonzero_const_annotate_module(module);
+    let div_annotated = time_adapter_stage("div-nonzero-annotate", module, || {
+        div_nonzero_const_annotate_module(module)
+    });
     let module = div_annotated.as_ref().unwrap_or(module);
 
     // Build function name table for resolving call targets. Wrapped in `Rc`
@@ -18444,6 +18602,29 @@ fn fma_intrinsic_contract(name: &str) -> Option<(Type, bool)> {
         "llvm.fmuladd.f64" => Some((Type::F64, true)),
         "llvm.fma.f32" => Some((Type::F32, false)),
         "llvm.fma.f64" => Some((Type::F64, false)),
+        _ => None,
+    }
+}
+
+/// The PACKED multiply-add opcode for an intrinsic name, or `None`.
+///
+/// Separate from [`fma_intrinsic_contract`] rather than folded into it: that
+/// function returns the scalar `Type` plus a fusion flag, which cannot name a
+/// vector opcode, and the two shapes select genuinely different machine
+/// arrangements.
+///
+/// Only the fusion-OPTIONAL `llvm.fmuladd` appears here, and there is no
+/// `may_unfuse` flag to return because every opcode this yields is licensed by
+/// construction. Strict `llvm.fma.v*` is deliberately absent: it REQUIRES
+/// fusion, so giving it an opcode that a later pass is permitted to split back
+/// into `fmul`+`fadd` would round TWICE — a bit-level miscompile. It stays
+/// scalarized. MUST mirror `parser::is_lowered_passthrough_intrinsic` exactly,
+/// or an un-rewritten intrinsic survives as an unresolved symbol and fails to
+/// link.
+fn fma_vector_intrinsic_contract(name: &str) -> Option<Opcode> {
+    match name {
+        "llvm.fmuladd.v4f32" => Some(Opcode::V4F32Fmuladd),
+        "llvm.fmuladd.v2f64" => Some(Opcode::V2F64Fmuladd),
         _ => None,
     }
 }

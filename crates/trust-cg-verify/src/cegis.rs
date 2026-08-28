@@ -48,17 +48,22 @@
 //!
 //! ```rust
 //! use trust_cg_verify::smt::SmtExpr;
-//! use trust_cg_verify::cegis::{CegisLoop, CegisResult};
+//! use trust_cg_verify::cegis::{CegisLoop, CegisResult, ConcreteInput};
 //!
 //! let mut cegis = CegisLoop::new(10, 5000);
 //!
-//! // x + 0 == x (should be equivalent)
-//! let source = SmtExpr::var("x", 32).bvadd(SmtExpr::bv_const(0, 32));
+//! // Seed the concrete fast path with a distinguishing input. This keeps the
+//! // example deterministic even when no independently trusted solver is installed.
+//! cegis.add_seed(ConcreteInput::from_pairs(&[("x", 0)]));
+//! let source = SmtExpr::var("x", 32).bvadd(SmtExpr::bv_const(1, 32));
 //! let target = SmtExpr::var("x", 32);
 //! let vars = vec![("x".to_string(), 32)];
 //!
 //! let result = cegis.verify(&source, &target, &vars);
-//! assert!(matches!(result, CegisResult::Equivalent { .. }));
+//! assert!(matches!(
+//!     result,
+//!     CegisResult::NotEquivalent { found_by_concrete: true, .. }
+//! ));
 //! ```
 
 use crate::ay_bridge::{AYConfig, AYResult, verify_with_ay};

@@ -330,6 +330,37 @@ pub(crate) fn single_inst_def(inst: &MachInst) -> Option<VReg> {
     if def_positions == 1 { one } else { None }
 }
 
+/// True iff operand 0 is WRITTEN by `opcode`, per the shared operand-role model.
+///
+/// TEST-ONLY WITNESS. The definition maps below no longer ask this question —
+/// they visit EVERY modeled def position via [`for_each_inst_def`], because an
+/// operand-0-only predicate silently drops the second destination of a paired
+/// load, the writeback base of a post-indexed access, and the result of an LSE
+/// atomic. This predicate is retained solely so
+/// `tests_defmap_authority::map_predicate_agrees_with_the_role_model_on_operand_zero`
+/// can keep pinning the operand-0 half of the role model, and is therefore
+/// compiled only under `cfg(test)`.
+///
+/// It is NOT the same question as [`produces_value`], and the difference is
+/// not academic. For the 36 LSE read-modify-write atomics (`Ldadd*`, `Ldclr*`,
+/// `Ldeor*`, `Ldset*`, `Ldsmax*`, `Ldsmin*`, `Ldumax*`, `Ldumin*`, `Swp*`)
+/// `produces_value` is TRUE while the role model puts the def at operand 1 and
+/// leaves operand 0 a READ — the value operand. A def map built on
+/// `produces_value` therefore recorded that read as a definition, which is the
+/// exact hazard the map exists to avoid; and because [`live_def_count`] asks the
+/// ROLE MODEL, it would not count that write, so a uniqueness check could return
+/// 1 while the map entry named an instruction that defines nothing at all.
+#[cfg(test)]
+fn operand_zero_is_def(opcode: AArch64Opcode, operand_count: usize) -> bool {
+    let mut yes = false;
+    aarch64_for_each_def_position(opcode, operand_count, |pos| {
+        if pos == 0 {
+            yes = true;
+        }
+    });
+    yes
+}
+
 /// Maps each vreg id to the instruction that DEFINES it, for the passes that
 /// resolve copy chains and constants back to a defining instruction
 /// (`strip_copies`, `same_as_iv`, `const_value` and friends).
@@ -359,11 +390,16 @@ pub(crate) fn single_inst_def(inst: &MachInst) -> Option<VReg> {
 ///    Only instructions in the emitted layout define anything, so the sweep is
 ///    restricted to it.
 ///
-/// 2. **Assuming operand 0 is the only def.** For stores, comparisons,
-///    branches, and traps operand 0 is a read. Conversely, paired loads, LSE
-///    atomics, and writeback addressing have real definitions after operand
-///    0. [`aarch64_for_each_def_position`] is the authority; a hand-rolled
-///    operand-0 predicate drifts behind the opcode set as it grows.
+/// 2. **Assuming operand 0 is the only def.** It is a def in neither
+///    direction reliably. For a store operand 0 is the stored VALUE, for a
+///    compare the compared value, for `Cbz`/`Tbz` the tested value, and for
+///    the `Trap*` carriers the checked index — every one a READ. Conversely,
+///    paired loads, LSE atomics, and writeback addressing have real
+///    definitions AFTER operand 0, which an operand-0 sweep drops entirely,
+///    leaving a stale older def looking unique and reachable.
+///    [`aarch64_for_each_def_position`] — reached here through
+///    [`for_each_inst_def`] — is the authority; neither [`produces_value`] nor
+///    a hand-rolled exclusion list keeps up with the opcode set as it grows.
 ///
 /// Both hazards point the same way: they make a resolver SUCCEED against a
 /// definition that does not reach the use, so `same_as_iv` can equate a
@@ -394,6 +430,25 @@ pub(crate) fn single_inst_def(inst: &MachInst) -> Option<VReg> {
 /// induction variable to its LATCH source, which is not what reaches the header
 /// on the entry iteration. Gating the map on uniqueness would drop every
 /// induction variable and disable the vectorizers wholesale.
+///
+/// This residual is LIVE, not theoretical: `neon_fill` shipped a wrong-code bug on
+/// exactly it — an `if`/`match` fill value resolved to whichever arm came last
+/// and was broadcast on every path — now guarded there by `live_def_count`.
+///
+/// A related shape, two DISTINCT loop-carried variables resolving to the same
+/// root, additionally needs one value threaded to two loop-header slots.
+/// `trust-cg-verify` flags that as `LoopCarriedSlotMisthreaded`
+/// (`[TCG-SSA-071]`), but do NOT read that as a structural backstop: the bridge
+/// intercepts an all-misthread violation set and discharges a semantic
+/// back-edge threading VC, ADMITTING when the threading is proven value-correct
+/// (`rustc-codegen-trust-cg`, "#84 SEMANTIC REFINEMENT"). Probed shapes
+/// (`while q < n { buf[m] = 1; q += s; m = q; }`, in raw-pointer, slice and
+/// pure-scalar spellings) are declined at O0-O3 in BOTH the proofs-off and
+/// default lanes because the VC does not refine — one is actively refuted with
+/// a counterexample — but a shape whose threading does refine would reach the
+/// passes, and nothing downstream re-checks the index. Treat any pass that
+/// resolves an index or a constant through this map without a uniqueness check
+/// as an open lead.
 ///
 /// The frontend's `LoopCarriedSlotMisthreaded` (`[TCG-SSA-071]`) check is NOT a
 /// structural safety backstop for this residual. The bridge may discharge an
@@ -788,21 +843,35 @@ pub fn aarch64_for_each_use_position(
 }
 
 /// Return explicit operand positions written by an AArch64 opcode.
+/// The def operand positions of an instruction as a bitmask over operand
+/// slots (bit `i` set iff slot `i` is a def). Operand lists are far below 64
+/// slots; a slot at 64 or beyond (never seen) is not representable here, so a
+/// caller that could meet one must fall back to the Vec form.
+#[inline]
+pub fn def_position_mask(opcode: AArch64Opcode, operand_count: usize) -> u64 {
+    debug_assert!(operand_count < 64, "operand list of {operand_count} slots");
+    let mut mask = 0u64;
+    aarch64_for_each_def_position(opcode, operand_count, |pos| {
+        if pos < 64 {
+            mask |= 1u64 << pos;
+        }
+    });
+    mask
+}
+
 pub fn aarch64_def_operand_positions(opcode: AArch64Opcode, operand_count: usize) -> Vec<usize> {
-    aarch64_operand_roles(opcode, operand_count)
-        .into_iter()
-        .enumerate()
-        .filter_map(|(pos, role)| role.is_def().then_some(pos))
-        .collect()
+    // Through the inline-buffer visitor (positions ascending, as before):
+    // one allocation for the result instead of one more for the roles Vec.
+    let mut positions = Vec::new();
+    aarch64_for_each_def_position(opcode, operand_count, |pos| positions.push(pos));
+    positions
 }
 
 /// Return explicit operand positions read by an AArch64 opcode.
 pub fn aarch64_use_operand_positions(opcode: AArch64Opcode, operand_count: usize) -> Vec<usize> {
-    aarch64_operand_roles(opcode, operand_count)
-        .into_iter()
-        .enumerate()
-        .filter_map(|(pos, role)| role.is_use().then_some(pos))
-        .collect()
+    let mut positions = Vec::new();
+    aarch64_for_each_use_position(opcode, operand_count, |pos| positions.push(pos));
+    positions
 }
 
 /// Returns true if an instruction with the given opcode can be safely
@@ -1086,6 +1155,12 @@ pub fn x86_opcode_effect(opcode: X86Opcode) -> MemoryEffect {
         Cmpxchg | Cmpxchg8 | Cmpxchg16 => MemoryEffect::Store,
         AtomicRmwCasLoop | AtomicRmwCasLoop8 | AtomicRmwCasLoop16 => MemoryEffect::Store,
 
+        // Memory-destination RMW ALU (XOR/ADD [mem], r64): reads AND writes
+        // the slot. Store is the correct conservative class — it is a barrier
+        // for both loads and stores (precedent: the mem-form Xchg/Cmpxchg
+        // above), so nothing forwards across or elides the read-modify-write.
+        XorMR | AddMR | XorMRSib | AddMRSib => MemoryEffect::Store,
+
         // Branches / control flow (no memory ops; DCE uses InstFlags)
         Jmp | JmpR | Jcc | Ret | Ud2 => MemoryEffect::Pure,
 
@@ -1161,6 +1236,9 @@ pub fn x86_produces_value(opcode: X86Opcode) -> bool {
         // Stores
         | MovMR8 | MovMR16 | MovMR32 | MovMR | MovsdMR | MovssMR | MovdquMR | MovdqaMR
         | MovMRSib | MovMR32Sib | MovMR8Sib
+        // Memory-destination RMW ALU: the destination is the memory slot;
+        // no register is defined.
+        | XorMR | AddMR | XorMRSib | AddMRSib
         // Branches and control flow
         | Jmp | Jcc | Call | CallR | CallM | Ret
         // Stack store
@@ -1281,6 +1359,8 @@ pub fn x86_writes_flags(opcode: X86Opcode) -> bool {
         | AdcRR | SbbRR
         | ImulRR | ImulRRI | ImulRM | ImulRMSib | Idiv | Div | Mul
         | Neg | Inc | Dec
+        // Memory-destination RMW ALU (same flag behavior as the RR forms)
+        | XorMR | AddMR | XorMRSib | AddMRSib
         // Logical
         | AndRR | AndRI | OrRR | OrRI | XorRR | XorRI | Not
         // Shifts
@@ -1326,8 +1406,15 @@ pub fn x86_defines_all_cc_flags(opcode: X86Opcode) -> bool {
         // Full-flag arithmetic (Intel SDM: CF/OF/SF/ZF/AF/PF all defined).
         AddRR | AddRI | AddRM | SubRR | SubRI | SubRM | Neg
         | AdcRR | SbbRR
+        // Memory-destination RMW arithmetic (SDM: mem-dest ADD defines
+        // CF/OF/SF/ZF/AF/PF, identical to the RR form).
+        | AddMR | AddMRSib
         // Full-flag logical (CF/OF cleared; SF/ZF/PF defined).
         | AndRR | AndRI | OrRR | OrRI | XorRR | XorRI
+        // Memory-destination RMW logical (SDM: mem-dest XOR clears CF/OF and
+        // defines SF/ZF/PF — every CondCode-consumable flag; AF undefined but
+        // AF is not CondCode-consumable).
+        | XorMR | XorMRSib
         // Compare/test (same flag behavior as SUB/AND).
         | CmpRR | CmpRI | CmpRI8 | CmpRM | TestRR | TestRI | TestRM
     )
@@ -2781,9 +2868,12 @@ mod tests_defmap_authority {
     use super::*;
     use trust_cg_ir::{AArch64Opcode, MachInst, MachOperand, RegClass, VReg};
 
-    /// The current `AArch64Opcode` inventory used to exercise the def visitor
-    /// over every supported operand arity. Keep this list synchronized with the
-    /// enum; concrete multi-def regressions below carry the soundness teeth.
+    /// The current `AArch64Opcode` inventory, used to exercise the def visitor
+    /// over every supported operand arity. A hand-written SUBSET would silently
+    /// stop covering opcodes as the ISA table grows, which is exactly how the
+    /// drift these tests pin came about — so keep this list synchronized with
+    /// the enum. The concrete multi-def regressions below carry the additional
+    /// soundness teeth.
     const ALL: &[AArch64Opcode] = &[
         AArch64Opcode::AddRR,
         AArch64Opcode::AddRI,
@@ -3077,9 +3167,42 @@ mod tests_defmap_authority {
         AArch64Opcode::AlignNop,
     ];
 
+    /// The operand-0 predicate and the role model must answer "is operand 0
+    /// written?" the same way. Both now read
+    /// [`aarch64_for_each_def_position`], so this holds by construction — the
+    /// test exists to keep it that way, and to keep the operand-0 half of the
+    /// model pinned independently of the whole-instruction visitor below.
+    ///
+    /// It did NOT hold before: the map used `produces_value`, which is TRUE for
+    /// the 36 LSE read-modify-write atomics while the role model puts their def
+    /// at operand 1 and leaves operand 0 a READ. That disagreed on 144
+    /// (opcode, arity) pairs — the map recorded the addend as a definition, and
+    /// `live_def_count` did not count it, so a uniqueness guard could return 1
+    /// while the map named an instruction that defines nothing.
+    #[test]
+    fn map_predicate_agrees_with_the_role_model_on_operand_zero() {
+        let mut bad = Vec::new();
+        for &op in ALL {
+            for n in 1..=4usize {
+                let mut role_says_def = false;
+                aarch64_for_each_def_position(op, n, |pos| {
+                    if pos == 0 {
+                        role_says_def = true;
+                    }
+                });
+                if operand_zero_is_def(op, n) != role_says_def {
+                    bad.push(format!("{op:?}/{n}"));
+                }
+            }
+        }
+        assert!(bad.is_empty(), "disagreement on: {}", bad.join(", "));
+    }
+
     /// The instruction-level visitor must enumerate exactly the vreg operands
     /// classified as definitions by the shared role model, including positions
-    /// after operand 0 and excluding reads at operand 0.
+    /// after operand 0 and excluding reads at operand 0. This is the STRONGER
+    /// statement: the operand-0 agreement above is one half of it, and the
+    /// definition maps are built on this visitor, not on the predicate.
     #[test]
     fn def_visitor_agrees_with_the_complete_role_model() {
         let mut bad = Vec::new();
@@ -3115,11 +3238,87 @@ mod tests_defmap_authority {
                     "{op:?}: operand 0 is the VALUE operand (a read); the def is operand 1",
                 );
                 assert!(
+                    !operand_zero_is_def(op, 3),
+                    "{op:?}: operand 0 must not be reported as written",
+                );
+                assert!(
                     produces_value(op),
                     "{op:?}: produces_value is still true — this test documents \
                      that the two predicates answer DIFFERENT questions",
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod position_enumeration_tests {
+    use super::*;
+
+    /// The Vec-returning position enumerations are the visitors' output in
+    /// visiting order, for every opcode the roles table knows and every
+    /// operand count up to the inline cap and beyond it.
+    #[test]
+    fn position_vecs_match_the_visitors() {
+        let mut checked = 0usize;
+        // Every opcode `fill_operand_roles` special-cases, plus common defaults.
+        let opcodes = [
+            AArch64Opcode::LdpPostIndex,
+            AArch64Opcode::LdpRI,
+            AArch64Opcode::LdrPostIndex,
+            AArch64Opcode::LdrPreIndex,
+            AArch64Opcode::NeonLd1Post,
+            AArch64Opcode::NeonLdpQPost,
+            AArch64Opcode::NeonSt1Post,
+            AArch64Opcode::NeonStpQPost,
+            AArch64Opcode::StpPreIndex,
+            AArch64Opcode::StrPostIndex,
+            AArch64Opcode::StrPreIndex,
+            AArch64Opcode::AddRR,
+            AArch64Opcode::AddRI,
+            AArch64Opcode::SubRR,
+            AArch64Opcode::MulRR,
+            AArch64Opcode::CmpRR,
+            AArch64Opcode::CmpRI,
+            AArch64Opcode::CSet,
+            AArch64Opcode::Csel,
+            AArch64Opcode::BCond,
+            AArch64Opcode::B,
+            AArch64Opcode::Ret,
+            AArch64Opcode::Bl,
+            AArch64Opcode::LdrRI,
+            AArch64Opcode::StrRI,
+            AArch64Opcode::MOVXrr,
+            AArch64Opcode::Nop,
+            AArch64Opcode::Tst,
+        ];
+        for opcode in opcodes.iter().copied() {
+            for count in 0..=(ROLE_INLINE_CAP + 2) {
+                let mut defs = Vec::new();
+                aarch64_for_each_def_position(opcode, count, |p| defs.push(p));
+                let mut uses = Vec::new();
+                aarch64_for_each_use_position(opcode, count, |p| uses.push(p));
+                assert_eq!(
+                    aarch64_def_operand_positions(opcode, count),
+                    defs,
+                    "{opcode:?}/{count}"
+                );
+                assert_eq!(
+                    aarch64_use_operand_positions(opcode, count),
+                    uses,
+                    "{opcode:?}/{count}"
+                );
+                assert!(
+                    defs.windows(2).all(|w| w[0] < w[1]),
+                    "{opcode:?}/{count}: defs not ascending"
+                );
+                assert!(
+                    uses.windows(2).all(|w| w[0] < w[1]),
+                    "{opcode:?}/{count}: uses not ascending"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 100);
     }
 }

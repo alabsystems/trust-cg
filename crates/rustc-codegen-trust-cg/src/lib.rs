@@ -119,6 +119,53 @@ pub struct TrustCgCodegenBackend {
 }
 
 #[derive(Debug)]
+/// Prints, under `TCG_TIME`, how long `join_codegen` took and where the
+/// process is relative to backend `init` when it returns (everything after is
+/// rustc's linking and exit).
+/// Drops at the end of `join_codegen`, after every object is written.
+struct ReleaseSweepPoolOnDrop;
+impl Drop for ReleaseSweepPoolOnDrop {
+    fn drop(&mut self) {
+        trust_cg_codegen::compiler::release_sweep_pool();
+    }
+}
+
+struct JoinCodegenMark(std::time::Instant);
+impl Drop for JoinCodegenMark {
+    fn drop(&mut self) {
+        if std::env::var_os("TCG_TIME").is_some() {
+            let since_init = BACKEND_INIT_AT
+                .get()
+                .map(|t| t.elapsed().as_secs_f64() * 1000.0)
+                .unwrap_or(f64::NAN);
+            eprintln!(
+                "TCG_TIME bridge_marks join_codegen={:.1}ms init_to_join_end={since_init:.1}ms",
+                self.0.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+    }
+}
+
+static BACKEND_INIT_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// Milliseconds from this process's start (kernel start time) to now; Linux
+/// only, `None` anywhere the procfs read fails.
+fn process_start_to_now_ms() -> Option<f64> {
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    // Field 22 (1-based) is starttime in clock ticks; fields after the
+    // parenthesised comm are whitespace-separated.
+    let after_comm = &stat[stat.rfind(')')? + 2..];
+    let starttime_ticks: f64 = after_comm.split_whitespace().nth(19)?.parse().ok()?;
+    let uptime_s: f64 = std::fs::read_to_string("/proc/uptime")
+        .ok()?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    let hz = 100.0; // CLK_TCK on every Linux config this backend targets
+    Some((uptime_s - starttime_ticks / hz) * 1000.0)
+}
+
 struct OngoingCodegen {
     modules: Vec<Result<CompiledModule, String>>,
     /// The default-allocator shim module (`__rust_alloc` -> `__rdl_alloc`, etc.)
@@ -153,7 +200,39 @@ impl CodegenBackend for TrustCgCodegenBackend {
         "trust-cg"
     }
 
-    fn init(&self, _sess: &Session) {
+    fn init(&self, sess: &Session) {
+        let _ = BACKEND_INIT_AT.set(std::time::Instant::now());
+        if std::env::var_os("TCG_TIME").is_some() {
+            // Process start -> this hook, from the kernel's start time of the
+            // process (`/proc/self/stat` field 22, clock ticks since boot) against
+            // the current uptime: everything before the backend existed.
+            if let Some(ms) = process_start_to_now_ms() {
+                eprintln!("TCG_TIME bridge_marks process_start_to_init={ms:.1}ms");
+            }
+        }
+        // Cargo already schedules many rustc processes concurrently. Keep this
+        // backend's recursive proof work on one process-local 32 MiB-stack
+        // worker by default so crate-level and instruction-level parallelism do
+        // not multiply across those processes. A positive operator-supplied
+        // TRUST_CG_MAX_PARALLELISM still takes precedence in the shared policy.
+        // `TCG_PROOF_WALK_WORKERS=N` widens the certificate WALK's pool for
+        // measurement; the default stays 1 (each worker carries a 32 MiB stack).
+        let walk_workers = std::env::var("TCG_PROOF_WALK_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(1);
+        let _ = trust_cg_verify::resource_limits::configure_proof_verifier_default_worker_limit(walk_workers);
+
+        // Bound rayon's GLOBAL pool before anything can create it implicitly.
+        // `trust_ir_build::validate_module` contains an unscoped `par_iter`, so
+        // the first validate of every compile was spawning a pool as wide as the
+        // host (20 threads here) whose idle workers then spin on `sched_yield` —
+        // 2126 of them per compile against LLVM's 1, and that syscall traffic was
+        // the bulk of the remaining compile-time deficit. See
+        // `resource_limits::bound_global_rayon_pool`.
+        trust_cg_codegen::resource_limits::bound_global_rayon_pool();
+
         // CT-9: start hashing the SOLVER CONTENT IDENTITY here, on a detached
         // thread, because this is the EARLIEST backend hook — rustc still has
         // its whole front end (parse, resolve, type-check, MIR build) to run
@@ -184,6 +263,38 @@ impl CodegenBackend for TrustCgCodegenBackend {
         {
             trust_cg_verify::ay_bridge::start_solver_identity_warm();
         }
+
+        // Same reasoning, one tier up: the statistical sweep lane is a FIXED
+        // per-process charge — every aarch64 program's certificate lane sweeps
+        // the same ~13 registry kinds (entry CGU, allocator shim, prologue /
+        // epilogue, frame layout, relocations) at 100k samples each, and after
+        // the kind-parallel, sample-chunked pre-warm those sweeps are CPU-bound:
+        // ~35ms of CPU that lands on the first CGU's critical path. Here the
+        // front end has ~100ms of single-threaded work ahead of it and 19 idle
+        // cores. So the invariant kinds are swept NOW, on the process-wide sweep
+        // pool, into the same memo cells the pre-warm will find already
+        // computed (or in flight — it blocks on those rather than recomputing).
+        // Not extra work: the same sweeps, earlier — which is also why it is
+        // gated on a session that will actually CODEGEN: `cargo check`, clippy
+        // and rustdoc run this hook too (`--emit=metadata`, `-Zno-codegen`) and
+        // never reach the certificate lane, so for them it would be pure waste.
+        // A plain thread, NOT `spawn_on_proof_verifier_stack`: that queues the
+        // job on the narrow verifier pool (one worker in the bridge), behind
+        // and in the way of the per-function walk that pool exists for. 32 MiB
+        // stack because building the proof database is the recursive part.
+        // `TCG_NO_SPECULATIVE_SWEEP=1` is the A/B kill switch.
+        if std::env::var_os("TCG_NO_PROOF_CERTS").is_none()
+            && std::env::var_os("TCG_NO_SPECULATIVE_SWEEP").is_none()
+            && matches!(sess.target.arch.desc(), "aarch64" | "arm64")
+            && sess.opts.output_types.should_codegen()
+            && !sess.opts.unstable_opts.no_codegen
+        {
+            let _ = std::thread::Builder::new()
+                .name("trust-cg-sweep-spec".to_owned())
+                .stack_size(trust_cg_verify::resource_limits::PROOF_VERIFIER_STACK_SIZE)
+                .spawn(trust_cg_codegen::compiler::speculative_sweep_aarch64_invariant_kinds);
+        }
+
         // rustc installs SIGPIPE as SIG_DFL (unlike std's default SIG_IGN) so that
         // `rustc … | head` terminates cleanly. This backend, however, discharges
         // refinement obligations through a *resident `ay` solver subprocess* over a
@@ -290,6 +401,10 @@ impl CodegenBackend for TrustCgCodegenBackend {
         sess: &Session,
         _outputs: &OutputFilenames,
     ) -> (CompiledModules, FxIndexMap<WorkProductId, WorkProduct>) {
+        let _join_mark = JoinCodegenMark(std::time::Instant::now());
+        // No sweep can run after this point; let the sweep pool's workers go
+        // while rustc links, not inside exit (see `release_sweep_pool`).
+        let _release = ReleaseSweepPoolOnDrop;
         let ongoing = *ongoing_codegen
             .downcast::<OngoingCodegen>()
             .expect("rustc_codegen_trust_cg: unexpected ongoing-codegen payload");
@@ -396,7 +511,36 @@ fn batch_parallel_enabled() -> bool {
 /// A `MonoItem::Fn` whose MIR lowering succeeded, awaiting per-CGU batched
 /// compilation (CT-BATCH Step 2, `TCG_BATCH_CGU=1` only). Pushed in CGU
 /// deterministic item order, so entries of one CGU form a contiguous run.
+/// One `MonoItem::Fn` seen by the crate-level pre-pass, recorded WITHOUT being
+/// lowered.
+///
+/// Everything here is a cheap `tcx` query — the mangled symbol, the two
+/// entry-point identity checks, and the GC-root predicate. Lowering is deferred
+/// until the reachability fixpoint proves the item is actually needed.
+struct FnMonoRecord<'tcx> {
+    /// Position in rustc's deterministic mono-item order.
+    ///
+    /// Demand-driven lowering visits items in REACHABILITY order, but emission
+    /// must stay in mono order: that is what keeps the merged CGU's function
+    /// layout — and therefore `.text` — byte-identical to the eager path.
+    /// Deciding WHICH items to lower and deciding in WHAT ORDER to emit them are
+    /// independent, so laziness costs no determinism.
+    order: usize,
+    /// Owning codegen unit — the CT-BATCH grouping key.
+    cgu_name: String,
+    instance: Instance<'tcx>,
+    /// Mangled symbol; the identity the reference graph is keyed on.
+    symbol: String,
+    /// The loop's historical `is_lang_start` bit (error routing).
+    is_lang_start: bool,
+    /// Link root: the entry fn, `lang_start`, or anything externally visible.
+    /// Computed exactly as the eager loop computed it.
+    is_gc_root: bool,
+}
+
 struct PendingBatchFn<'tcx> {
+    /// Position in rustc's deterministic mono-item order (see `FnMonoRecord`).
+    order: usize,
     /// The owning codegen unit's name — the batch grouping key and the merged
     /// object's stable, deterministic `temp_path_for_cgu` name.
     cgu_name: String,
@@ -423,6 +567,126 @@ struct PendingBatchFn<'tcx> {
 /// deferred-compile fallback can reuse the identical routing. See the arm
 /// comments in `codegen_crate` for the soundness notes.
 #[allow(clippy::too_many_arguments)]
+/// Lower (batch mode) or lower-and-compile (legacy mode) ONE `MonoItem::Fn`.
+///
+/// Extracted VERBATIM from the crate-level mono loop so the eager path (library
+/// crate types, which never GC) and the demand-driven path (executable crate
+/// types) run byte-identical code. Returns the symbols this item's emitted
+/// object REFERENCES — the edges the demand-driven driver follows, and exactly
+/// the set the post-hoc reachability GC used to consume.
+#[allow(clippy::too_many_arguments)]
+fn process_fn_mono_item<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+    symbol: &str,
+    is_lang_start: bool,
+    is_gc_root: bool,
+    entry_def_id: Option<DefId>,
+    batch_cgu: bool,
+    cgu_name: &str,
+    order: usize,
+    modules: &mut Vec<Result<CompiledModule, String>>,
+    compiled_any: &mut bool,
+    failed_roots: &mut Vec<String>,
+    skipped_internal: &mut Vec<String>,
+    deferred_unlowerable: &mut Vec<(String, String, bool)>,
+    pending_fns: &mut Vec<PendingBatchFn<'tcx>>,
+    tracked_modules: &mut Vec<(usize, String, std::collections::BTreeSet<String>, bool)>,
+    crate_refine_memo: &mut CrateRefineMemo,
+) -> std::collections::BTreeSet<String> {
+    let _item_timer = codegen_timing::ItemTimer::start_named(symbol);
+    let mut module_refs: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    // The `Err` routing for BOTH branches below (a lowering error
+    // here, or a backend compile error here or in the deferred
+    // CT-BATCH phase) is the shared `handle_failed_fn_object`: a
+    // pure extraction of the historical inline arms — trap-stub
+    // for dynamic-dispatch shims and dead std-iterator reduction
+    // bodies, fail-closed for lang_start/required roots, skip for
+    // std-internal shims, and the deferred reference-graph verdict
+    // for everything else (see the helper's arm comments).
+    if batch_cgu {
+        // CT-BATCH Step 2: run the EXISTING lowering (refinement
+        // obligations are queued and drained/discharged INSIDE
+        // `mir_to_trust_ir`, so the refinement lane's behavior is
+        // preserved exactly), but DEFER compilation: stash the
+        // lowered module so the post-GC batch phase can merge each
+        // CGU's survivors and compile once per CGU.
+        match mir_to_trust_ir(tcx, instance, symbol, crate_refine_memo) {
+            Ok(ir) => {
+                collect_module_referenced_symbols(&ir, &mut module_refs);
+                // GC roots: identical decision to the legacy branch.
+                pending_fns.push(PendingBatchFn {
+                    order,
+                    cgu_name: cgu_name.to_string(),
+                    symbol: symbol.to_string(),
+                    instance,
+                    is_lang_start,
+                    ir,
+                    dead: false,
+                });
+                // In batch mode the tracked index refers into
+                // `pending_fns` (nothing is in `modules` yet).
+                tracked_modules.push((
+                    pending_fns.len() - 1,
+                    symbol.to_string(),
+                    module_refs.clone(),
+                    is_gc_root,
+                ));
+            }
+            Err(err) => handle_failed_fn_object(
+                tcx,
+                instance,
+                symbol,
+                is_lang_start,
+                entry_def_id,
+                err,
+                modules,
+                compiled_any,
+                failed_roots,
+                skipped_internal,
+                deferred_unlowerable,
+            ),
+        }
+    } else {
+        match compile_mir_function_object(
+            tcx,
+            instance,
+            symbol,
+            &mut module_refs,
+            crate_refine_memo,
+        ) {
+            Ok(module) => {
+                *compiled_any = true;
+                modules.push(Ok(module));
+                // GC roots: the entry fn / lang_start / anything externally
+                // visible (no_mangle, used, exported symbol name). Everything
+                // else is kept only if reachable from a root.
+                tracked_modules.push((
+                    modules.len() - 1,
+                    symbol.to_string(),
+                    module_refs.clone(),
+                    is_gc_root,
+                ));
+            }
+            Err(err) => handle_failed_fn_object(
+                tcx,
+                instance,
+                symbol,
+                is_lang_start,
+                entry_def_id,
+                err,
+                modules,
+                compiled_any,
+                failed_roots,
+                skipped_internal,
+                deferred_unlowerable,
+            ),
+        }
+    }
+    module_refs
+}
+
 fn handle_failed_fn_object<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: Instance<'tcx>,
@@ -542,8 +806,19 @@ fn handle_failed_fn_object<'tcx>(
     }
 }
 
+static CODEGEN_CRATE_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
 fn codegen_crate(tcx: TyCtxt<'_>) -> OngoingCodegen {
     let _ct_codegen_crate = CodegenCrateTimer(std::time::Instant::now());
+    let _ = CODEGEN_CRATE_START.set(_ct_codegen_crate.0);
+    if std::env::var_os("TCG_TIME").is_some() {
+        if let Some(init_at) = BACKEND_INIT_AT.get() {
+            eprintln!(
+                "TCG_TIME bridge_marks init_to_codegen_crate={:.1}ms",
+                init_at.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+    }
     // CT-7: warm the shared x86-64 proof verifier (ProofDatabase build +
     // fixed-registry verdict sweeps) on a DETACHED background thread while
     // this function is still lowering MIR, so the per-CGU certificate lane
@@ -556,11 +831,39 @@ fn codegen_crate(tcx: TyCtxt<'_>) -> OngoingCodegen {
     if std::env::var_os("TCG_NO_PROOF_CERTS").is_none()
         && matches!(trust_cg_target_for_session(tcx), Ok(Target::X86_64))
     {
-        std::thread::Builder::new()
-            .name("trust-cg-proof-warm".to_string())
-            .stack_size(32 * 1024 * 1024)
-            .spawn(trust_cg_codegen::compiler::warm_x86_64_proof_verifier)
-            .ok();
+        let _ = trust_cg_verify::resource_limits::spawn_on_proof_verifier_stack(
+            "trust-cg-proof-warm",
+            trust_cg_codegen::compiler::warm_x86_64_proof_verifier,
+        );
+    }
+    // The AArch64 twin, which this path never had. The shared AArch64 verifier
+    // (a ~1650-proof `ProofDatabase`) is built on first use, and first use is
+    // the first CGU's certificate pre-warm — so its ~3.5-4ms construction sat on
+    // the critical path of every proofs-ON compile. MIR lowering of the first
+    // CGU takes ~7ms and needs no verifier, so building the database on a
+    // detached thread here hides it entirely. Pure cache warming: the OnceLock
+    // yields the same value whichever thread initialises it, and if this
+    // thread loses the race the first user simply builds it as before.
+    if std::env::var_os("TCG_NO_PROOF_CERTS").is_none()
+        && matches!(trust_cg_target_for_session(tcx), Ok(Target::Aarch64))
+    {
+        let t_crate = _ct_codegen_crate.0;
+        let _ = trust_cg_verify::resource_limits::spawn_on_proof_verifier_stack(
+            "trust-cg-proof-warm-aarch64",
+            move || {
+                let trace = std::env::var_os("TCG_TIME_SWEEP").is_some();
+                let t0 = std::time::Instant::now();
+                trust_cg_codegen::compiler::warm_aarch64_proof_verifier();
+                if trace {
+                    eprintln!(
+                        "TCG_WARM_RACE warm_started_at=+{:.1}ms warm_done_at=+{:.1}ms (took {:.1}ms)",
+                        (t0 - t_crate).as_secs_f64() * 1000.0,
+                        t_crate.elapsed().as_secs_f64() * 1000.0,
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+            },
+        );
     }
     let mut modules = Vec::new();
     // CT-BATCH Step 2: deferred per-fn lowering results awaiting per-CGU
@@ -568,6 +871,10 @@ fn codegen_crate(tcx: TyCtxt<'_>) -> OngoingCodegen {
     // every batching branch dead) in the default legacy mode.
     let batch_cgu = batch_cgu_enabled();
     let mut pending_fns: Vec<PendingBatchFn<'_>> = Vec::new();
+    // Every `MonoItem::Fn` the pre-pass saw, unlowered. Drained below by either
+    // the demand-driven driver (executable crates) or the eager driver
+    // (libraries, which never GC and so must lower everything).
+    let mut fn_records: Vec<FnMonoRecord<'_>> = Vec::new();
     let mut lang_start_symbol = None;
     let mut rust_main_symbol = None;
     let entry_fn = tcx.entry_fn(());
@@ -600,12 +907,23 @@ fn codegen_crate(tcx: TyCtxt<'_>) -> OngoingCodegen {
     // `mir_to_trust_ir` for every function lowered below.
     let mut crate_refine_memo = CrateRefineMemo::default();
 
+    // Region clocks for the crate-level bridge loop. `-Ztime-passes` puts the
+    // whole gap in `codegen_crate` (LLVM 8ms -> trust-cg 36ms on h2_vec_grow),
+    // and `mir_to_trust_ir` + `Compiler::compile` only account for ~20ms of it.
+    // These bracket the rest.
+    let t_lower_loop = codegen_timing::phase_start();
     for cgu in tcx.collect_and_partition_mono_items(()).codegen_units {
         // CT-BATCH: the batch grouping key and the merged object's stable
         // deterministic name (rustc's own per-CGU temp object name).
         let cgu_name = cgu.name().as_str().to_owned();
         for (mono_item, item_data) in cgu.items_in_deterministic_order(tcx) {
-            let _cg_item_timer = codegen_timing::ItemTimer::start(&mono_item, tcx);
+            // Functions are timed inside `process_fn_mono_item` (where the
+            // lowering actually happens); this covers statics and `global_asm!`.
+            let _cg_item_timer = if matches!(mono_item, MonoItem::Fn(_)) {
+                codegen_timing::ItemTimer::disabled()
+            } else {
+                codegen_timing::ItemTimer::start(&mono_item, tcx)
+            };
             if let MonoItem::Fn(instance) = mono_item {
                 let symbol = mono_item.symbol_name(tcx).name.to_string();
                 let is_lang_start = symbol.contains("lang_start");
@@ -677,98 +995,22 @@ fn codegen_crate(tcx: TyCtxt<'_>) -> OngoingCodegen {
                     continue;
                 }
 
-                let mut module_refs: std::collections::BTreeSet<String> =
-                    std::collections::BTreeSet::new();
-                // The `Err` routing for BOTH branches below (a lowering error
-                // here, or a backend compile error here or in the deferred
-                // CT-BATCH phase) is the shared `handle_failed_fn_object`: a
-                // pure extraction of the historical inline arms — trap-stub
-                // for dynamic-dispatch shims and dead std-iterator reduction
-                // bodies, fail-closed for lang_start/required roots, skip for
-                // std-internal shims, and the deferred reference-graph verdict
-                // for everything else (see the helper's arm comments).
-                if batch_cgu {
-                    // CT-BATCH Step 2: run the EXISTING lowering (refinement
-                    // obligations are queued and drained/discharged INSIDE
-                    // `mir_to_trust_ir`, so the refinement lane's behavior is
-                    // preserved exactly), but DEFER compilation: stash the
-                    // lowered module so the post-GC batch phase can merge each
-                    // CGU's survivors and compile once per CGU.
-                    match mir_to_trust_ir(tcx, instance, &symbol, &mut crate_refine_memo) {
-                        Ok(ir) => {
-                            collect_module_referenced_symbols(&ir, &mut module_refs);
-                            // GC roots: identical decision to the legacy branch.
-                            let is_gc_root =
-                                is_lang_start || is_required_root(tcx, instance, entry_def_id);
-                            pending_fns.push(PendingBatchFn {
-                                cgu_name: cgu_name.clone(),
-                                symbol: symbol.clone(),
-                                instance,
-                                is_lang_start,
-                                ir,
-                                dead: false,
-                            });
-                            // In batch mode the tracked index refers into
-                            // `pending_fns` (nothing is in `modules` yet).
-                            tracked_modules.push((
-                                pending_fns.len() - 1,
-                                symbol.clone(),
-                                module_refs,
-                                is_gc_root,
-                            ));
-                        }
-                        Err(err) => handle_failed_fn_object(
-                            tcx,
-                            instance,
-                            &symbol,
-                            is_lang_start,
-                            entry_def_id,
-                            err,
-                            &mut modules,
-                            &mut compiled_any,
-                            &mut failed_roots,
-                            &mut skipped_internal,
-                            &mut deferred_unlowerable,
-                        ),
-                    }
-                } else {
-                    match compile_mir_function_object(
-                        tcx,
-                        instance,
-                        &symbol,
-                        &mut module_refs,
-                        &mut crate_refine_memo,
-                    ) {
-                        Ok(module) => {
-                            compiled_any = true;
-                            modules.push(Ok(module));
-                            // GC roots: the entry fn / lang_start / anything externally
-                            // visible (no_mangle, used, exported symbol name). Everything
-                            // else is kept only if reachable from a root.
-                            let is_gc_root =
-                                is_lang_start || is_required_root(tcx, instance, entry_def_id);
-                            tracked_modules.push((
-                                modules.len() - 1,
-                                symbol.clone(),
-                                module_refs,
-                                is_gc_root,
-                            ));
-                        }
-                        Err(err) => handle_failed_fn_object(
-                            tcx,
-                            instance,
-                            &symbol,
-                            is_lang_start,
-                            entry_def_id,
-                            err,
-                            &mut modules,
-                            &mut compiled_any,
-                            &mut failed_roots,
-                            &mut skipped_internal,
-                            &mut deferred_unlowerable,
-                        ),
-                    }
-                }
+                // DEMAND-DRIVEN LOWERING: record the item, do not lower it yet.
+                // Which items are actually needed is decided below by the same
+                // reachability fixpoint the post-hoc GC used to run, so lowering
+                // eagerly here means lowering bodies that are then discarded.
+                // Measured across the 18-program corpus: 59% of all lowering time
+                // (37.6ms of 63.9ms) went to functions that were dropped — 60 of
+                // them lowered SUCCESSFULLY and were then GC'd away.
+                let is_gc_root = is_lang_start || is_required_root(tcx, instance, entry_def_id);
+                fn_records.push(FnMonoRecord {
+                    order: fn_records.len(),
+                    cgu_name: cgu_name.clone(),
+                    instance,
+                    symbol,
+                    is_lang_start,
+                    is_gc_root,
+                });
             } else if let MonoItem::Static(def_id) = mono_item {
                 // A `static` defined in this crate. rustc emits each static
                 // exactly once as its own `MonoItem::Static`, under its own
@@ -884,6 +1126,185 @@ fn codegen_crate(tcx: TyCtxt<'_>) -> OngoingCodegen {
         .crate_types()
         .iter()
         .all(|t| matches!(t, rustc_session::config::CrateType::Executable));
+
+    // ---- Drain the recorded `MonoItem::Fn`s -------------------------------
+    //
+    // DEMAND-DRIVEN for executable crates. The post-hoc GC below used to lower
+    // EVERY mono item, build the reference graph from the lowered objects, run a
+    // reachability fixpoint from the link roots, and then throw the unreachable
+    // ones away. This runs the SAME fixpoint over the SAME edges — the sets
+    // `collect_module_referenced_symbols` produces — but evaluates it lazily, so
+    // an item is lowered only once something already-reachable is known to
+    // reference it. The surviving set is identical by construction: both compute
+    // the least fixed point of `roots ∪ refs(reachable)`.
+    //
+    // Measured motivation (18-program corpus): 59% of all lowering time — 37.6ms
+    // of 63.9ms — went to functions that were then dropped. Sixty of them lowered
+    // SUCCESSFULLY and were discarded; `RawVecInner::finish_grow` alone cost
+    // 4.7-7.2ms to lower and was thrown away. It is concentrated in allocating
+    // programs (h3/h4 100% wasted, h1/h2 87-90%) and zero elsewhere.
+    //
+    // EAGER for library crate types, unchanged: there is no GC there (a
+    // downstream crate may reference any exported symbol), so every item must be
+    // lowered exactly as before.
+    // Fixed modules off the critical path: the entry wrapper's and the
+    // allocator shim's inputs are all fixed by the pre-pass above, so their
+    // compiles start now and overlap the lowering and the batch below; they are
+    // joined exactly where they used to be compiled (`spawn_fixed_module_compile`).
+    let entry_job = match (&rust_main_symbol, &lang_start_symbol, entry_sigpipe) {
+        (Some(rust_main), Some(lang_start), Some(sigpipe)) => Some(spawn_fixed_module_compile(
+            tcx,
+            "rustc_entry_main",
+            ModuleKind::Regular,
+            entry_call_trust_ir_module("rustc_entry_main", "main", rust_main, lang_start, sigpipe),
+        )),
+        _ => None,
+    };
+    let allocator_job = spawn_allocator_shim_job(tcx);
+    let mut reachable_refs: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    if crate_is_executable_only {
+        let by_symbol: std::collections::HashMap<&str, usize> = fn_records
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (r.symbol.as_str(), i))
+            .collect();
+        let mut lowered = vec![false; fn_records.len()];
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut worklist: Vec<String> = Vec::new();
+
+        // Seeds, exactly the GC's roots: the entry wrapper's callees, every
+        // root-flagged function, and every already-emitted static (statics are
+        // always roots and their initializers carry fn-pointer / cross-static
+        // edges that must keep their targets alive).
+        for root in [&lang_start_symbol, &rust_main_symbol] {
+            if let Some(sym) = root {
+                if seen.insert(sym.clone()) {
+                    worklist.push(sym.clone());
+                }
+            }
+        }
+        for record in &fn_records {
+            if record.is_gc_root && seen.insert(record.symbol.clone()) {
+                worklist.push(record.symbol.clone());
+            }
+        }
+        for (_, symbol, refs, is_root) in &tracked_modules {
+            if *is_root {
+                seen.insert(symbol.clone());
+                for r in refs {
+                    reachable_refs.insert(r.clone());
+                    if seen.insert(r.clone()) {
+                        worklist.push(r.clone());
+                    }
+                }
+            }
+        }
+
+        while let Some(sym) = worklist.pop() {
+            let Some(&index) = by_symbol.get(sym.as_str()) else {
+                // Not one of our mono items: an external symbol, a helper/stub,
+                // or a static. The linker resolves it exactly as before.
+                continue;
+            };
+            if lowered[index] {
+                continue;
+            }
+            lowered[index] = true;
+            // Copy the record out: `process_fn_mono_item` borrows the crate-level
+            // accumulators mutably, and `fn_records` must stay borrowable.
+            let (instance, symbol_owned, is_lang_start, is_gc_root, cgu_name_owned, order) = {
+                let record = &fn_records[index];
+                (
+                    record.instance,
+                    record.symbol.clone(),
+                    record.is_lang_start,
+                    record.is_gc_root,
+                    record.cgu_name.clone(),
+                    record.order,
+                )
+            };
+            let refs = process_fn_mono_item(
+                tcx,
+                instance,
+                &symbol_owned,
+                is_lang_start,
+                is_gc_root,
+                entry_def_id,
+                batch_cgu,
+                &cgu_name_owned,
+                order,
+                &mut modules,
+                &mut compiled_any,
+                &mut failed_roots,
+                &mut skipped_internal,
+                &mut deferred_unlowerable,
+                &mut pending_fns,
+                &mut tracked_modules,
+                &mut crate_refine_memo,
+            );
+            for r in refs {
+                reachable_refs.insert(r.clone());
+                if seen.insert(r.clone()) {
+                    worklist.push(r);
+                }
+            }
+        }
+
+        // Same verdict the GC used to reach for these, minus the wasted work:
+        // nothing kept references them, so their absence is unobservable.
+        for (index, record) in fn_records.iter().enumerate() {
+            if !lowered[index] {
+                // PARITY: the eager path lowered this, counted it toward
+                // `compiled_any`, and then dropped the object. `compiled_any`
+                // gates a fatal ("no local function body was codegenable"), so
+                // not counting it here would turn a crate whose functions are
+                // all unreachable into a spurious hard error.
+                compiled_any = true;
+                skipped_internal.push(format!(
+                    "{}: unreachable from any link root (every call site \
+                     intercepted or dead) — never lowered",
+                    record.symbol
+                ));
+            }
+        }
+    } else {
+        // Library crate types: no GC, so lower everything, in the original
+        // deterministic mono-item order.
+        for index in 0..fn_records.len() {
+            let (instance, symbol_owned, is_lang_start, is_gc_root, cgu_name_owned, order) = {
+                let record = &fn_records[index];
+                (
+                    record.instance,
+                    record.symbol.clone(),
+                    record.is_lang_start,
+                    record.is_gc_root,
+                    record.cgu_name.clone(),
+                    record.order,
+                )
+            };
+            let refs = process_fn_mono_item(
+                tcx,
+                instance,
+                &symbol_owned,
+                is_lang_start,
+                is_gc_root,
+                entry_def_id,
+                batch_cgu,
+                &cgu_name_owned,
+                order,
+                &mut modules,
+                &mut compiled_any,
+                &mut failed_roots,
+                &mut skipped_internal,
+                &mut deferred_unlowerable,
+                &mut pending_fns,
+                &mut tracked_modules,
+                &mut crate_refine_memo,
+            );
+            reachable_refs.extend(refs);
+        }
+    }
     // An RLIB is consumed by rustc itself, which resolves a missing symbol into a
     // clean undefined-symbol error at the downstream link. That is what makes it
     // safe to DROP a dead non-local std monomorphization there (see the
@@ -896,84 +1317,60 @@ fn codegen_crate(tcx: TyCtxt<'_>) -> OngoingCodegen {
     // from failing-closed to passing, which is exactly the silent-policy-change the
     // hole-#1 review warned about. Same for dylib/cdylib/proc-macro, whose symbol
     // resolution is at load time rather than link time.
+    codegen_timing::note_region("lower-loop", t_lower_loop);
+    let t_gc = codegen_timing::phase_start();
+
     let crate_is_rlib_only = !tcx.crate_types().is_empty()
         && tcx
             .crate_types()
             .iter()
             .all(|t| matches!(t, rustc_session::config::CrateType::Rlib));
-    let mut reachable_refs: std::collections::BTreeSet<String> =
-        std::collections::BTreeSet::new();
-    if crate_is_executable_only {
-        // Seed: root-flagged tracked modules plus the entry wrapper's callees
-        // (the wrapper module itself is emitted outside the tracked set).
-        let mut worklist: Vec<String> = Vec::new();
-        let mut reachable_syms: std::collections::BTreeSet<String> =
-            std::collections::BTreeSet::new();
-        for root in [&lang_start_symbol, &rust_main_symbol] {
-            if let Some(sym) = root {
-                if reachable_syms.insert(sym.clone()) {
-                    worklist.push(sym.clone());
-                }
+    // The reachability fixpoint now runs UP FRONT, as the demand-driven driver
+    // above: an item is lowered only when something already-reachable references
+    // it, so by construction nothing lowered is unreachable and there is no dead
+    // set left to sweep. `reachable_refs` was accumulated there over exactly the
+    // edges this block used to walk, and feeds the deferred-unlowerable
+    // resolution below unchanged.
+    //
+    // The library path is likewise already handled above (lower everything, union
+    // every emitted reference) because a downstream crate may reference any
+    // exported symbol.
+
+    codegen_timing::note_region("gc+refgraph", t_gc);
+    // The helpers referenced during lowering are known now: compile them on
+    // helper threads while the batch runs (the plan is re-taken after the batch
+    // so a helper first referenced later — never observed — is still emitted).
+    let helper_plan = planned_helper_modules(allocator_job.is_some(), &used_trustcg_helpers());
+    let mut early_jobs = EARLY_HELPER_JOBS
+        .lock()
+        .map(|mut jobs| std::mem::take(&mut *jobs))
+        .unwrap_or_default();
+    let helper_jobs: Vec<(HelperPlan, FixedModuleJob)> = helper_plan
+        .into_iter()
+        .map(|plan| {
+            if let Some(at) = early_jobs.iter().position(|(started, _)| *started == plan) {
+                let (_, job) = early_jobs.swap_remove(at);
+                return (plan, job);
             }
-        }
-        for (_, symbol, _, is_root) in &tracked_modules {
-            if *is_root && reachable_syms.insert(symbol.clone()) {
-                worklist.push(symbol.clone());
-            }
-        }
-        let by_symbol: std::collections::BTreeMap<&str, &std::collections::BTreeSet<String>> =
-            tracked_modules
-                .iter()
-                .map(|(_, symbol, refs, _)| (symbol.as_str(), refs))
-                .collect();
-        while let Some(sym) = worklist.pop() {
-            if let Some(refs) = by_symbol.get(sym.as_str()) {
-                for r in refs.iter() {
-                    reachable_refs.insert(r.clone());
-                    if reachable_syms.insert(r.clone()) {
-                        worklist.push(r.clone());
-                    }
-                }
-            }
-        }
-        // Remove tracked modules that are neither roots nor reachable. Nothing
-        // kept references them (that is what reachability means here), so the
-        // link result is identical minus the dead objects.
-        let mut dead_indices: Vec<usize> = Vec::new();
-        for (index, symbol, _, is_root) in &tracked_modules {
-            if !*is_root && !reachable_syms.contains(symbol) {
-                dead_indices.push(*index);
-                skipped_internal.push(format!(
-                    "{symbol}: emitted but unreachable from any link root \
-                     (every call site intercepted or dead) — dropped from the link"
-                ));
-            }
-        }
-        if !dead_indices.is_empty() {
-            if batch_cgu {
-                // CT-BATCH: tracked indices refer into `pending_fns` (deferred
-                // lowering results; no object was compiled yet). Mark them dead
-                // so the batch phase below neither merges nor compiles them —
-                // the same modules the legacy path compiles and then drops.
-                for idx in dead_indices {
-                    pending_fns[idx].dead = true;
-                }
-            } else {
-                let dead: std::collections::BTreeSet<usize> = dead_indices.into_iter().collect();
-                let mut idx = 0usize;
-                modules.retain(|_| {
-                    let keep = !dead.contains(&idx);
-                    idx += 1;
-                    keep
-                });
-            }
-        }
-    } else {
-        // Library crate types: every emitted reference counts (no GC).
-        for (_, _, refs, _) in &tracked_modules {
-            reachable_refs.extend(refs.iter().cloned());
+            let module = plan.build(tcx);
+            let job = spawn_fixed_module_compile(tcx, plan.symbol(), ModuleKind::Regular, module);
+            (plan, job)
+        })
+        .collect();
+    // The plan is a superset of every first-reference spawn (same function, same
+    // gate), so nothing is left; if it ever were, join it so no thread outlives
+    // the crate, and say so.
+    for (plan, job) in early_jobs {
+        let _ = job.join();
+        if bridge_notes_enabled() {
+            eprintln!(
+                "rustc_codegen_trust_cg: helper `{}` was compiled at first reference but is not \
+                 in the emission plan; its object is dropped",
+                plan.symbol()
+            );
         }
     }
+    let t_batch = codegen_timing::phase_start();
 
     // CT-BATCH Step 2 (`TCG_BATCH_CGU=1`): compile the deferred per-fn modules.
     // The reachability verdict above is FINAL, so each CGU's SURVIVORS are
@@ -989,24 +1386,46 @@ fn codegen_crate(tcx: TyCtxt<'_>) -> OngoingCodegen {
     if batch_cgu {
         let batch_trace = std::env::var_os("TCG_BATCH_TRACE").is_some();
         let batch_parallel = batch_parallel_enabled();
-        let mut i = 0usize;
-        while i < pending_fns.len() {
-            // `pending_fns` is pushed in CGU iteration order, so one CGU's
-            // entries form a contiguous run.
-            let run_start = i;
-            while i < pending_fns.len()
-                && pending_fns[i].cgu_name == pending_fns[run_start].cgu_name
-            {
-                i += 1;
-            }
-            let cgu_name = pending_fns[run_start].cgu_name.clone();
+        // Group by CGU WITHOUT assuming contiguity. `pending_fns` used to be
+        // pushed in CGU iteration order, so one CGU's entries formed a run;
+        // demand-driven lowering pushes in REACHABILITY order, which interleaves
+        // CGUs. A run-based scan would then emit several objects for the same
+        // CGU under the same deterministic `temp_path_for_cgu` name — each
+        // clobbering the last. First-appearance order keeps the emission order
+        // deterministic.
+        let mut cgu_order: Vec<String> = Vec::new();
+        let mut cgu_members: std::collections::HashMap<String, Vec<usize>> =
+            std::collections::HashMap::new();
+        for (index, pending) in pending_fns.iter().enumerate() {
+            let members = cgu_members.entry(pending.cgu_name.clone()).or_insert_with(|| {
+                cgu_order.push(pending.cgu_name.clone());
+                Vec::new()
+            });
+            members.push(index);
+        }
+        // Restore rustc's deterministic mono order for EMISSION: CGUs ordered by
+        // their earliest member, and each CGU's survivors in mono order. The
+        // reachability fixpoint chose the SET; this chooses the LAYOUT, and
+        // choosing it exactly as the eager path did keeps `.text` byte-identical.
+        for members in cgu_members.values_mut() {
+            members.sort_by_key(|&k| pending_fns[k].order);
+        }
+        cgu_order.sort_by_key(|name| {
+            cgu_members
+                .get(name)
+                .and_then(|m| m.first())
+                .map(|&k| pending_fns[k].order)
+                .unwrap_or(usize::MAX)
+        });
+        for cgu_name in cgu_order {
+            let members = cgu_members.remove(&cgu_name).unwrap_or_default();
             let survivor_idx: Vec<usize> =
-                (run_start..i).filter(|&k| !pending_fns[k].dead).collect();
+                members.iter().copied().filter(|&k| !pending_fns[k].dead).collect();
             // A GC-dropped pending fn is skipped before compilation. The
             // legacy path compiled it (successfully in every non-degenerate
             // case) and then dropped the object, so it still counts toward
             // `compiled_any` for parity with the legacy mode.
-            if survivor_idx.len() != i - run_start {
+            if survivor_idx.len() != members.len() {
                 compiled_any = true;
             }
             if survivor_idx.is_empty() {
@@ -1062,11 +1481,61 @@ fn codegen_crate(tcx: TyCtxt<'_>) -> OngoingCodegen {
                 // `merge_modules` takes a contiguous owned slice; clone the
                 // eligible subset (cheap relative to a compile, and only when
                 // >=2 modules actually batch).
-                let eligible_owned: Vec<TrustIrModule> =
+                let mut eligible_owned: Vec<TrustIrModule> =
                     eligible_pos.iter().map(|&pos| irs[pos].clone()).collect();
+                // ABI pinning (`ValidationError::TargetInfoRequired`): a merged
+                // CGU that carries an FFI boundary — here the bodyless external
+                // `std::rt::lang_start_internal` declaration, which the bridge
+                // emits with the C calling convention (`CallingConv::default()`)
+                // and which `Module::first_ffi_boundary` therefore treats as a
+                // foreign boundary — MUST name the target it was compiled for.
+                // The bridge never set `target_info`, so every such module was
+                // rejected. This is metadata, not an instruction: the only
+                // codegen reader of `target_info` is little-endian global
+                // emission (compiler.rs `module_object_globals`), which already
+                // defaults to `Endianness::Little` when it is `None`; both
+                // supported targets (x86_64, aarch64) are little-endian, so the
+                // emitted object is byte-identical. `merge_modules` requires
+                // every input to agree on `target_info`, so stamp the identical
+                // value on all of them.
+                {
+                    let target_info = trust_ir::TargetInfo {
+                        triple: tcx.sess.opts.target_triple.to_string(),
+                        pointer_size: tcx.data_layout.pointer_size().bytes() as u32,
+                        endianness: match tcx.data_layout.endian {
+                            rustc_abi::Endian::Little => trust_ir::Endianness::Little,
+                            rustc_abi::Endian::Big => trust_ir::Endianness::Big,
+                        },
+                        abi: None,
+                        struct_passing: trust_ir::StructPassingPolicy::Unclassified,
+                    };
+                    for module in &mut eligible_owned {
+                        module.target_info = Some(target_info.clone());
+                    }
+                }
                 match trust_cg_codegen::module_merge::merge_modules(&eligible_owned) {
                     Ok(mut merged) => {
                         merged.name = cgu_name.clone();
+                        // Expensive, observational diagnostics for bridge IR
+                        // hygiene. Keep the normal fail-closed merge and
+                        // compiler validation paths unchanged.
+                        if std::env::var_os("TRUST_CG_TRACE_MERGE_ERRORS").is_some() {
+                            let (n, errors) =
+                                trust_cg_codegen::module_merge::describe_validation_errors(
+                                    &merged, 5,
+                                );
+                            eprintln!("[trust-cg-merge-errors] cgu={cgu_name} errors={n}");
+                            for error in &errors {
+                                eprintln!("[trust-cg-merge-errors]   {error}");
+                            }
+                            for mismatch in
+                                trust_cg_codegen::module_merge::describe_copy_type_mismatches(
+                                    &merged, 8,
+                                )
+                            {
+                                eprintln!("[trust-cg-merge-errors]   copy: {mismatch}");
+                            }
+                        }
                         match compile_trust_ir_module_object_with_parallel(
                             tcx,
                             merged,
@@ -1273,193 +1742,44 @@ fn codegen_crate(tcx: TyCtxt<'_>) -> OngoingCodegen {
                  with Rust main `{rust_main_symbol}` (sigpipe={sigpipe})"
             );
         }
-        modules.insert(
-            0,
-            compile_entry_call_object(
+        let entry_module = match entry_job {
+            Some(job) => job.join(),
+            None => compile_entry_call_object(
                 tcx,
                 "main",
                 &rust_main_symbol,
                 &lang_start_symbol,
                 sigpipe,
             ),
-        );
+        };
+        modules.insert(0, entry_module);
     }
 
     // Emit the default-allocator shim when this crate is the one responsible for
     // providing `__rust_alloc` &c. (a std program with no upstream allocator
     // dylib). Without it libstd's allocator calls are undefined at link time.
-    let allocator_module = build_allocator_shim(tcx);
+    let allocator_module = allocator_job.map(FixedModuleJob::join);
 
-    // The `BTreeMap` interception lowers `insert`/`get` to calls of the
-    // `__trustcg_btm_*` runtime helpers, which call `__rust_realloc`. Emit those
-    // helper objects ONLY when this crate also provides the allocator shim (so
-    // `__rust_realloc` is defined). A crate without a shim never reaches the map
-    // interception's reallocating path anyway (it cannot allocate), so the
-    // helpers would be dead AND unlinkable — omitting them keeps non-allocating
-    // crates clean. Each helper is a self-contained object compiled through the
-    // same verified pipeline; an emission failure fails the crate closed.
-    if allocator_module.is_some() {
-        // LAZY emission: compile+verify a helper object only when a user CGU
-        // actually referenced it (recorded by `extern_callee_by_name`). The
-        // btm helpers cross-call each other, so ANY `__trustcg_btm_*` use
-        // emits the whole family; the vec_sort variants are independent and
-        // emit individually. An unreferenced helper family costs zero compile
-        // and proof time; a registry miss would fail LOUDLY at link, never
-        // silently.
-        let used = USED_TRUSTCG_HELPERS
-            .lock()
-            .map(|u| u.clone())
-            .unwrap_or_default();
-        if used.iter().any(|n| n.starts_with("__trustcg_btm_")) {
-            modules.push(build_btreemap_get_object(tcx));
-            modules.push(build_btreemap_insert_object(tcx));
-            modules.push(build_btreemap_entry_object(tcx));
-            modules.push(build_btreemap_remove_object(tcx));
+    // The `__trustcg_*` helper objects (see `planned_helper_modules`): join the
+    // compiles spawned before the batch, in emission order, then emit inline any
+    // helper first referenced since the plan was taken.
+    let mut helper_modules: Vec<(HelperPlan, Result<CompiledModule, String>)> = helper_jobs
+        .into_iter()
+        .map(|(plan, job)| (plan, job.join()))
+        .collect();
+    for plan in planned_helper_modules(allocator_module.is_some(), &used_trustcg_helpers()) {
+        if helper_modules.iter().any(|(done, _)| *done == plan) {
+            continue;
         }
-        // The eight `__trustcg_vec_sort_*` in-place slice-sort helpers (one per
-        // element width × signedness), used by the `<[T]>::sort` interception.
-        // Like the map helpers they are self-contained objects through the same
-        // verified pipeline; an emission failure fails the crate closed.
-        for (size, signed, symbol) in VEC_SORT_VARIANTS.iter().copied() {
-            if used.contains(symbol) {
-                modules.push(build_vec_sort_object(tcx, size, signed, symbol));
-            }
-        }
+        let module = plan.build(tcx);
+        let late = spawn_fixed_module_compile(tcx, plan.symbol(), ModuleKind::Regular, module).join();
+        helper_modules.push((plan, late));
+    }
+    for (_, module) in helper_modules {
+        modules.push(module);
     }
 
-    // The four `__trustcg_array_fill_*` large-`[v; N]`-repeat fill helpers (one
-    // per element width), used by the scalar-element memory-array `Repeat`
-    // lowering. Unlike the map / sort helpers these do NOT allocate, so they are
-    // emitted OUTSIDE the allocator-shim gate (a `#![no_std]` crate with a large
-    // array literal must still link). Lazy like the others: only the widths a
-    // user CGU actually referenced are compiled+verified; a registry miss would
-    // fail LOUDLY at link, never silently.
-    {
-        let used = USED_TRUSTCG_HELPERS
-            .lock()
-            .map(|u| u.clone())
-            .unwrap_or_default();
-        for (size, symbol) in ARRAY_FILL_VARIANTS.iter().copied() {
-            if used.contains(symbol) {
-                modules.push(build_array_fill_object(tcx, size, symbol, false));
-            }
-        }
-        // Float-element fill helpers (value stored at F32/F64), used by
-        // `Vec::<f32/f64>::resize`.
-        for (size, symbol) in ARRAY_FILL_FLOAT_VARIANTS.iter().copied() {
-            if used.contains(symbol) {
-                modules.push(build_array_fill_object(tcx, size, symbol, true));
-            }
-        }
-        // Integer `__trustcg_slice_contains_*` linear-scan helpers (one per
-        // element width), used by the `<[T]>::contains` interception. Allocation-
-        // free, so outside the allocator-shim gate. Lazy like the fill helpers.
-        for (size, symbol) in SLICE_CONTAINS_VARIANTS.iter().copied() {
-            if used.contains(symbol) {
-                modules.push(build_slice_contains_object(tcx, size, symbol, false));
-            }
-        }
-        // Float-element contains helpers (needle matched with IEEE `OEq`), used by
-        // the `<[f32]>`/`<[f64]>::contains` interception.
-        for (size, symbol) in SLICE_CONTAINS_FLOAT_VARIANTS.iter().copied() {
-            if used.contains(symbol) {
-                modules.push(build_slice_contains_object(tcx, size, symbol, true));
-            }
-        }
-        // The four `__trustcg_vec_remove_shift_*` down-shift helpers (one per
-        // element width), used by the `Vec::remove` interception. Allocation-free.
-        for (size, symbol) in VEC_REMOVE_SHIFT_VARIANTS.iter().copied() {
-            if used.contains(symbol) {
-                modules.push(build_vec_remove_shift_object(tcx, size, symbol));
-            }
-        }
-        // The eight `__trustcg_vec_lane_shift_{down,up}_*` helpers (one per LEAF
-        // width per direction), used by `Vec::remove` / `Vec::insert` on a class-2
-        // aggregate element. Allocation-free.
-        for (width, symbol) in VEC_LANE_SHIFT_DOWN_VARIANTS.iter().copied() {
-            if used.contains(symbol) {
-                modules.push(build_vec_lane_shift_object(tcx, width, symbol, false));
-            }
-        }
-        for (width, symbol) in VEC_LANE_SHIFT_UP_VARIANTS.iter().copied() {
-            if used.contains(symbol) {
-                modules.push(build_vec_lane_shift_object(tcx, width, symbol, true));
-            }
-        }
-        // The four `__trustcg_vec_dedup_*` in-place consecutive-dedup helpers (one
-        // per element width), used by the `Vec::dedup` interception. Allocation-free.
-        for (size, symbol) in VEC_DEDUP_VARIANTS.iter().copied() {
-            if used.contains(symbol) {
-                modules.push(build_vec_dedup_object(tcx, size, symbol, false));
-            }
-        }
-        // Float element widths use an IEEE-`UNe` comparison (correct `0.0`/`-0.0`
-        // and `NaN` PartialEq semantics), distinct symbols from the integer set.
-        for (size, symbol) in VEC_DEDUP_FLOAT_VARIANTS.iter().copied() {
-            if used.contains(symbol) {
-                modules.push(build_vec_dedup_object(tcx, size, symbol, true));
-            }
-        }
-        // The four `__trustcg_slice_eq_*` element-wise equality helpers (one per
-        // element width), used by the `<Vec<T>>` `==` interception.
-        for (size, symbol) in SLICE_EQ_VARIANTS.iter().copied() {
-            if used.contains(symbol) {
-                modules.push(build_slice_eq_object(tcx, size, symbol, false));
-            }
-        }
-        // Float-element equality helpers (per-element IEEE `OEq`), used by the
-        // `<Vec<f32>>`/`<Vec<f64>>` `==` interception.
-        for (size, symbol) in SLICE_EQ_FLOAT_VARIANTS.iter().copied() {
-            if used.contains(symbol) {
-                modules.push(build_slice_eq_object(tcx, size, symbol, true));
-            }
-        }
-        // The four `__trustcg_slice_cmp_*` lexicographic-compare helpers (one per
-        // width), used by the `<[T]>`/`<Vec<T>>` `<`/`<=`/`>`/`>=` interception.
-        for (size, symbol) in SLICE_CMP_VARIANTS.iter().copied() {
-            if used.contains(symbol) {
-                modules.push(build_slice_cmp_object(tcx, size, symbol, false));
-            }
-        }
-        // Float-element lexicographic-compare helpers (unordered lane -> 2 = the
-        // `None::<Ordering>` niche), used by the `<[f32]>`/`<[f64]>::partial_cmp`
-        // interception.
-        for (size, symbol) in SLICE_CMP_FLOAT_VARIANTS.iter().copied() {
-            if used.contains(symbol) {
-                modules.push(build_slice_cmp_object(tcx, size, symbol, true));
-            }
-        }
-        // The four `__trustcg_slice_repeat_*` copy-n-times helpers (one per width),
-        // used by the `<[T]>::repeat`/`str::repeat` interception.
-        for (size, symbol) in SLICE_REPEAT_VARIANTS.iter().copied() {
-            if used.contains(symbol) {
-                modules.push(build_slice_repeat_object(tcx, size, symbol));
-            }
-        }
-        // The four `__trustcg_slice_reverse_*` in-place reversal helpers (one per
-        // element width), used by the `<[T]>::rotate_left`/`rotate_right`
-        // interception (three reversals). Allocation-free.
-        for (size, symbol) in SLICE_REVERSE_VARIANTS.iter().copied() {
-            if used.contains(symbol) {
-                modules.push(build_slice_reverse_object(tcx, size, symbol));
-            }
-        }
-        // The four `__trustcg_vec_insert_shift_*` up-shift helpers (one per element
-        // width), used by the `Vec::insert` interception. Allocation-free.
-        for (size, symbol) in VEC_INSERT_SHIFT_VARIANTS.iter().copied() {
-            if used.contains(symbol) {
-                modules.push(build_vec_insert_shift_object(tcx, size, symbol));
-            }
-        }
-        // The `__trustcg_write_all` full-write helper, used by the
-        // `print!`/`println!`/`eprint!` interception. Allocation-free (its
-        // buffer is caller-owned), so it lives outside the allocator-shim
-        // gate with the fill helpers. Lazy like the others.
-        if used.contains(WRITE_ALL_SYMBOL) {
-            modules.push(build_write_all_object(tcx));
-        }
-    }
-
+    codegen_timing::note_region("batch+emit", t_batch);
     codegen_timing::report();
 
     OngoingCodegen {
@@ -1565,6 +1885,37 @@ mod codegen_timing {
         top_n().map(|_| Instant::now())
     }
 
+    /// Record the wall time of one crate-level region of `codegen_crate`.
+    ///
+    /// `-Ztime-passes` attributes the whole LLVM-vs-trust-cg gap to
+    /// `codegen_crate` (8ms -> 36ms on h2_vec_grow), and `mir_to_trust_ir` plus
+    /// `Compiler::compile` only account for ~20ms of that. These regions
+    /// bracket the remainder: the mono-item lowering loop, the reference-graph
+    /// GC, and the deferred batch compile.
+    pub(super) fn note_region(region: &str, start: Option<Instant>) {
+        if let Some(at) = start {
+            eprintln!(
+                "TCG_PHASE region={region:<14} {:8.2}ms",
+                at.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+    }
+
+    /// Record the wall time of one whole `Compiler::compile` call (one CGU).
+    ///
+    /// Brackets everything module-scoped: every function's pipeline run PLUS the
+    /// object emission and module assembly the per-function phase timers cannot
+    /// see. Comparing this against the sum of the per-function phases is what
+    /// localises the remaining unattributed codegen time.
+    pub(super) fn note_module_compile(cgu_name: &str, start: Option<Instant>) {
+        if let Some(at) = start {
+            eprintln!(
+                "TCG_PHASE module_compile={:8.2}ms cgu={cgu_name}",
+                at.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+    }
+
     /// Times `mir_to_trust_ir` itself, so the MIR->trust-ir half is attributed
     /// regardless of which caller drove it (the legacy and CT-BATCH paths reach
     /// it from different places). Refinement obligations are BUILT here, so
@@ -1613,29 +1964,33 @@ mod codegen_timing {
         );
     }
 
-    /// Times one refinement DRAIN inside `mir_to_trust_ir`. The drains are the
-    /// only `refinements_active()`-gated work left after obligation build and
-    /// scalar discharge were both excluded by measurement.
-    pub(super) struct DrainTimer {
-        started: Option<(Instant, &'static str, String)>,
+    /// `TCG_TIME_LOWER=1`: coarse per-function stage marks for
+    /// `mir_to_trust_ir` (instance_mir fetch/admission, precomputes, block
+    /// loop + refinement drains). Prints one line per stage over 0.2 ms —
+    /// warm runs only count (a freshly built dylib charges its page-in to
+    /// whatever stage runs first; see the 2026-08-13 cold-dylib lesson).
+    pub(super) struct LowerStageMarks {
+        state: Option<(Instant, String)>,
     }
 
-    impl DrainTimer {
-        pub(super) fn start(lane: &'static str, symbol: &str) -> Self {
+    impl LowerStageMarks {
+        pub(super) fn start(symbol: &str) -> Self {
+            use std::sync::OnceLock;
+            static ENABLED: OnceLock<bool> = OnceLock::new();
+            let on =
+                *ENABLED.get_or_init(|| std::env::var_os("TCG_TIME_LOWER").is_some());
             Self {
-                started: top_n().map(|_| (Instant::now(), lane, symbol.to_owned())),
+                state: on.then(|| (Instant::now(), symbol.chars().take(60).collect())),
             }
         }
-    }
 
-    impl Drop for DrainTimer {
-        fn drop(&mut self) {
-            if let Some((at, lane, sym)) = self.started.take() {
-                let ms = at.elapsed().as_secs_f64() * 1000.0;
-                if ms >= 1.0 {
-                    let short: String = sym.chars().take(80).collect();
-                    eprintln!("TCG_DRAIN {lane}={ms:8.2}ms {short}");
+        pub(super) fn mark(&mut self, label: &str) {
+            if let Some((last, sym)) = self.state.as_mut() {
+                let ms = last.elapsed().as_secs_f64() * 1000.0;
+                if ms >= 0.2 {
+                    eprintln!("TCG_TIME_LOWER {label}={ms:8.2}ms {sym}");
                 }
+                *last = Instant::now();
             }
         }
     }
@@ -1654,6 +2009,27 @@ mod codegen_timing {
     }
 
     impl ItemTimer {
+        /// Time an item whose symbol the caller already computed.
+        ///
+        /// Demand-driven lowering split the crate loop into a cheap pre-pass and
+        /// a separate driver, so the timer has to sit where the WORK is — inside
+        /// `process_fn_mono_item` — not around the pre-pass that merely records
+        /// the item. Starting it there measured 0.0ms and hid the lowering
+        /// entirely.
+        /// A timer that records nothing.
+        pub(super) fn disabled() -> Self {
+            Self { started: None }
+        }
+
+        pub(super) fn start_named(symbol: &str) -> Self {
+            if top_n().is_none() {
+                return Self { started: None };
+            }
+            Self {
+                started: Some((Instant::now(), symbol.to_string())),
+            }
+        }
+
         pub(super) fn start<'tcx>(item: &MonoItem<'tcx>, tcx: TyCtxt<'tcx>) -> Self {
             if top_n().is_none() {
                 return Self { started: None };
@@ -2802,18 +3178,23 @@ fn compile_thread_local_static_object(
 ///
 /// Returns `None` when no shim is needed (`allocator_kind_for_codegen` reports
 /// nothing — e.g. an upstream allocator dylib, or a no_std/no-alloc program).
-fn build_allocator_shim(tcx: TyCtxt<'_>) -> Option<Result<CompiledModule, String>> {
+/// The allocator shim, when this crate provides `__rust_alloc` &c. Built on
+/// the main thread (it reads the allocator kind and method list from `tcx`),
+/// compiled on a helper thread — see `spawn_fixed_module_compile`.
+fn spawn_allocator_shim_job(tcx: TyCtxt<'_>) -> Option<FixedModuleJob> {
     let kind = allocator_kind_for_codegen(tcx)?;
-    if bridge_notes_enabled() {
-        eprintln!("rustc_codegen_trust_cg: emitting default-allocator shim (kind={kind:?})");
-    }
-    Some(build_allocator_shim_inner(tcx, kind))
+    Some(spawn_fixed_module_compile(
+        tcx,
+        "allocator_shim",
+        ModuleKind::Allocator,
+        allocator_shim_trust_ir_module(tcx, kind),
+    ))
 }
 
-fn build_allocator_shim_inner(
+fn allocator_shim_trust_ir_module(
     tcx: TyCtxt<'_>,
     kind: rustc_ast::expand::allocator::AllocatorKind,
-) -> Result<CompiledModule, String> {
+) -> Result<TrustIrModule, String> {
     // The allocator ABI lowers every layout/ptr/usize argument and the result
     // pointer to a single pointer-width integer (matching cranelift's
     // `usize_ty` treatment). We only support 64-bit pointer targets (x86_64,
@@ -2940,7 +3321,7 @@ fn build_allocator_shim_inner(
     marker.blocks.push(marker_block);
     module.add_function(marker);
 
-    compile_trust_ir_module_object(tcx, module, "allocator_shim", ModuleKind::Allocator)
+    Ok(module)
 }
 
 // ===========================================================================
@@ -3231,7 +3612,7 @@ const BTM_SLOT_LEN_OFFSET: u64 = 16;
 
 /// Build the `__trustcg_btm_get(slot: Ptr, key: I64) -> (I64, Ptr)` helper
 /// object: a linear scan of the entries for a matching key.
-fn build_btreemap_get_object(tcx: TyCtxt<'_>) -> Result<CompiledModule, String> {
+fn build_btreemap_get_module(_tcx: TyCtxt<'_>) -> Result<TrustIrModule, String> {
     let mut module = TrustIrModule::new(BTM_GET_SYMBOL);
     let func_ty = module.add_func_type(FuncTy {
         params: vec![TrustIrTy::Ptr, TrustIrTy::I64],
@@ -3300,13 +3681,13 @@ fn build_btreemap_get_object(tcx: TyCtxt<'_>) -> Result<CompiledModule, String> 
     let mut func = TrustIrFunction::new(FuncId::new(0), BTM_GET_SYMBOL, func_ty, BlockId::new(0));
     func.blocks = b.blocks;
     module.add_function(func);
-    compile_first_trust_ir_function(tcx, module, BTM_GET_SYMBOL)
+    Ok(module)
 }
 
 /// Build the `__trustcg_btm_insert(slot: Ptr, key: I64, val: I64) -> (I64, I64)`
 /// helper object: linear scan for the key; overwrite-in-place on a hit, else
 /// grow-if-needed + append, bumping `len`.
-fn build_btreemap_insert_object(tcx: TyCtxt<'_>) -> Result<CompiledModule, String> {
+fn build_btreemap_insert_module(tcx: TyCtxt<'_>) -> Result<TrustIrModule, String> {
     let mut module = TrustIrModule::new(BTM_INSERT_SYMBOL);
     let func_ty = module.add_func_type(FuncTy {
         params: vec![TrustIrTy::Ptr, TrustIrTy::I64, TrustIrTy::I64],
@@ -3448,7 +3829,7 @@ fn build_btreemap_insert_object(tcx: TyCtxt<'_>) -> Result<CompiledModule, Strin
         TrustIrFunction::new(FuncId::new(0), BTM_INSERT_SYMBOL, func_ty, BlockId::new(0));
     func.blocks = b.blocks;
     module.add_function(func);
-    compile_first_trust_ir_function(tcx, module, BTM_INSERT_SYMBOL)
+    Ok(module)
 }
 
 /// Build the `__trustcg_btm_entry(slot: Ptr, key: I64, default: I64) -> Ptr`
@@ -3462,7 +3843,7 @@ fn build_btreemap_insert_object(tcx: TyCtxt<'_>) -> Result<CompiledModule, Strin
 /// land in the map's real backing buffer. Structurally this is
 /// `__trustcg_btm_insert` with the overwrite path returning the address instead
 /// of mutating.
-fn build_btreemap_entry_object(tcx: TyCtxt<'_>) -> Result<CompiledModule, String> {
+fn build_btreemap_entry_module(tcx: TyCtxt<'_>) -> Result<TrustIrModule, String> {
     let mut module = TrustIrModule::new(BTM_ENTRY_SYMBOL);
     let func_ty = module.add_func_type(FuncTy {
         params: vec![TrustIrTy::Ptr, TrustIrTy::I64, TrustIrTy::I64],
@@ -3591,7 +3972,7 @@ fn build_btreemap_entry_object(tcx: TyCtxt<'_>) -> Result<CompiledModule, String
         TrustIrFunction::new(FuncId::new(0), BTM_ENTRY_SYMBOL, func_ty, BlockId::new(0));
     func.blocks = b.blocks;
     module.add_function(func);
-    compile_first_trust_ir_function(tcx, module, BTM_ENTRY_SYMBOL)
+    Ok(module)
 }
 
 /// Build the `__trustcg_btm_remove(slot: Ptr, key: I64) -> (I64, I64)` helper
@@ -3601,7 +3982,7 @@ fn build_btreemap_entry_object(tcx: TyCtxt<'_>) -> Result<CompiledModule, String
 /// return `(0, 0)`. The buffer stays a dense prefix of `len` entries (the only
 /// observable state), so shift-deletion preserves the representation invariant
 /// the other helpers rely on. Capacity is never shrunk (unobservable).
-fn build_btreemap_remove_object(tcx: TyCtxt<'_>) -> Result<CompiledModule, String> {
+fn build_btreemap_remove_module(_tcx: TyCtxt<'_>) -> Result<TrustIrModule, String> {
     let mut module = TrustIrModule::new(BTM_REMOVE_SYMBOL);
     let func_ty = module.add_func_type(FuncTy {
         params: vec![TrustIrTy::Ptr, TrustIrTy::I64],
@@ -3717,7 +4098,7 @@ fn build_btreemap_remove_object(tcx: TyCtxt<'_>) -> Result<CompiledModule, Strin
         TrustIrFunction::new(FuncId::new(0), BTM_REMOVE_SYMBOL, func_ty, BlockId::new(0));
     func.blocks = b.blocks;
     module.add_function(func);
-    compile_first_trust_ir_function(tcx, module, BTM_REMOVE_SYMBOL)
+    Ok(module)
 }
 
 /// Build a `__trustcg_vec_sort_T(data: Ptr, len: I64) -> ()` helper object: an
@@ -3730,12 +4111,12 @@ fn build_btreemap_remove_object(tcx: TyCtxt<'_>) -> Result<CompiledModule, Strin
 /// keys (strictly-`>` shift), matching `slice::sort`'s observable result. Only
 /// already-proven opcodes (load/store, BinOp Add/Sub/Mul, ICmp, SExt/ZExt, Br/
 /// CondBr) appear, so the helper compiles under the default per-compile certs.
-fn build_vec_sort_object(
-    tcx: TyCtxt<'_>,
+fn build_vec_sort_module(
+    _tcx: TyCtxt<'_>,
     size: u64,
     signed: bool,
     symbol: &str,
-) -> Result<CompiledModule, String> {
+) -> Result<TrustIrModule, String> {
     let ety = match size {
         1 => TrustIrTy::I8,
         2 => TrustIrTy::I16,
@@ -3843,7 +4224,7 @@ fn build_vec_sort_object(
     let mut func = TrustIrFunction::new(FuncId::new(0), symbol, func_ty, BlockId::new(0));
     func.blocks = b.blocks;
     module.add_function(func);
-    compile_first_trust_ir_function(tcx, module, symbol)
+    Ok(module)
 }
 
 /// Build a `__trustcg_slice_contains_{iN|fN}` helper object: a linear scan
@@ -3854,14 +4235,14 @@ fn build_vec_sort_object(
 /// never matches, while `+0.0` and `-0.0` do. One variant per supported element
 /// width. Compiled and verified through the same pipeline as every user
 /// function; an emission failure fails the crate closed.
-fn build_slice_contains_object(
-    tcx: TyCtxt<'_>,
+fn build_slice_contains_module(
+    _tcx: TyCtxt<'_>,
     size: u64,
     symbol: &str,
     is_float: bool,
-) -> Result<CompiledModule, String> {
+) -> Result<TrustIrModule, String> {
     let module = slice_contains_trust_ir_module(size, symbol, is_float)?;
-    compile_first_trust_ir_function(tcx, module, symbol)
+    Ok(module)
 }
 
 /// Construct the contains helper before target lowering so its comparison class
@@ -3976,11 +4357,11 @@ fn slice_contains_trust_ir_module(
 /// `start < len`, and decrements `len` after this returns. Pure byte moves, sound
 /// for any pow2-<=8-byte element. One variant per width. Compiled + verified
 /// through the same pipeline; an emission failure fails the crate closed.
-fn build_vec_remove_shift_object(
-    tcx: TyCtxt<'_>,
+fn build_vec_remove_shift_module(
+    _tcx: TyCtxt<'_>,
     size: u64,
     symbol: &str,
-) -> Result<CompiledModule, String> {
+) -> Result<TrustIrModule, String> {
     let ety = match size {
         1 => TrustIrTy::I8,
         2 => TrustIrTy::I16,
@@ -4041,7 +4422,7 @@ fn build_vec_remove_shift_object(
     let mut func = TrustIrFunction::new(FuncId::new(0), symbol, func_ty, BlockId::new(0));
     func.blocks = b.blocks;
     module.add_function(func);
-    compile_first_trust_ir_function(tcx, module, symbol)
+    Ok(module)
 }
 
 /// Build a `__trustcg_vec_lane_shift_{down,up}_iN(data: Ptr, start: I64, len: I64,
@@ -4063,12 +4444,12 @@ fn build_vec_remove_shift_object(
 /// up:   `for k in (len-1)..=start (descending) { lane[k+1] = lane[k] }` — opens
 ///       a hole at `start`. Descending order is REQUIRED: an ascending copy would
 ///       overwrite each source before reading it.
-fn build_vec_lane_shift_object(
-    tcx: TyCtxt<'_>,
+fn build_vec_lane_shift_module(
+    _tcx: TyCtxt<'_>,
     size: u64,
     symbol: &str,
     up: bool,
-) -> Result<CompiledModule, String> {
+) -> Result<TrustIrModule, String> {
     let ety = match size {
         1 => TrustIrTy::I8,
         2 => TrustIrTy::I16,
@@ -4156,7 +4537,7 @@ fn build_vec_lane_shift_object(
     let mut func = TrustIrFunction::new(FuncId::new(0), symbol, func_ty, BlockId::new(0));
     func.blocks = b.blocks;
     module.add_function(func);
-    compile_first_trust_ir_function(tcx, module, symbol)
+    Ok(module)
 }
 
 /// Build a `__trustcg_vec_dedup_{iN|fN}(data: Ptr, len: I64) -> I64` helper
@@ -4171,14 +4552,14 @@ fn build_vec_lane_shift_object(
 /// unordered-or-not-equal (`FCmp UNe`), matching `PartialEq`: `+0.0 == -0.0`
 /// while every comparison involving a NaN is unequal. Pure in-place
 /// loads/stores within `data[0..len]`, no allocation. One variant per width.
-fn build_vec_dedup_object(
-    tcx: TyCtxt<'_>,
+fn build_vec_dedup_module(
+    _tcx: TyCtxt<'_>,
     size: u64,
     symbol: &str,
     is_float: bool,
-) -> Result<CompiledModule, String> {
+) -> Result<TrustIrModule, String> {
     let module = vec_dedup_trust_ir_module(size, symbol, is_float)?;
-    compile_first_trust_ir_function(tcx, module, symbol)
+    Ok(module)
 }
 
 /// Construct the dedup helper before target lowering. Keeping this stage pure
@@ -4308,14 +4689,14 @@ fn vec_dedup_trust_ir_module(
 /// `UNe` to detect a differing pair, matching `PartialEq` for NaNs and signed
 /// zero. One variant per supported width. Direct slice equality follows core's
 /// slice implementation rather than this Vec-specific interception.
-fn build_slice_eq_object(
-    tcx: TyCtxt<'_>,
+fn build_slice_eq_module(
+    _tcx: TyCtxt<'_>,
     size: u64,
     symbol: &str,
     is_float: bool,
-) -> Result<CompiledModule, String> {
+) -> Result<TrustIrModule, String> {
     let module = slice_eq_trust_ir_module(size, symbol, is_float)?;
-    compile_first_trust_ir_function(tcx, module, symbol)
+    Ok(module)
 }
 
 /// Construct the equality helper before target lowering so its comparison
@@ -4431,14 +4812,14 @@ fn slice_eq_trust_ir_module(
 /// at runtime); if all shared lanes are equal, the shorter slice is the smaller.
 /// Float variants use IEEE ordered comparisons and return `2`, the niche value of
 /// `None::<Ordering>`, when either first-differing lane is NaN.
-fn build_slice_cmp_object(
-    tcx: TyCtxt<'_>,
+fn build_slice_cmp_module(
+    _tcx: TyCtxt<'_>,
     size: u64,
     symbol: &str,
     is_float: bool,
-) -> Result<CompiledModule, String> {
+) -> Result<TrustIrModule, String> {
     let module = slice_cmp_trust_ir_module(size, symbol, is_float)?;
-    compile_first_trust_ir_function(tcx, module, symbol)
+    Ok(module)
 }
 
 /// Construct the lexicographic comparison helper before target lowering so the
@@ -4680,11 +5061,11 @@ fn slice_cmp_trust_ir_module(
 /// multiply/add index arithmetic (no division). `dst` is a fresh `len*n`-element
 /// buffer disjoint from `src`, so the copies are non-overlapping. One variant per
 /// width.
-fn build_slice_repeat_object(
-    tcx: TyCtxt<'_>,
+fn build_slice_repeat_module(
+    _tcx: TyCtxt<'_>,
     size: u64,
     symbol: &str,
-) -> Result<CompiledModule, String> {
+) -> Result<TrustIrModule, String> {
     let ety = match size {
         1 => TrustIrTy::I8,
         2 => TrustIrTy::I16,
@@ -4773,7 +5154,7 @@ fn build_slice_repeat_object(
     let mut func = TrustIrFunction::new(FuncId::new(0), symbol, func_ty, BlockId::new(0));
     func.blocks = b.blocks;
     module.add_function(func);
-    compile_first_trust_ir_function(tcx, module, symbol)
+    Ok(module)
 }
 
 /// Build a `__trustcg_slice_reverse_iN(data: Ptr, lo: I64, hi: I64) -> ()` helper
@@ -4782,11 +5163,11 @@ fn build_slice_repeat_object(
 /// for any pow2-<=8-byte element. Used by `<[T]>::rotate_left`/`rotate_right`
 /// (three reversals). One variant per width. Compiled + verified through the same
 /// pipeline; an emission failure fails the crate closed.
-fn build_slice_reverse_object(
-    tcx: TyCtxt<'_>,
+fn build_slice_reverse_module(
+    _tcx: TyCtxt<'_>,
     size: u64,
     symbol: &str,
-) -> Result<CompiledModule, String> {
+) -> Result<TrustIrModule, String> {
     let ety = match size {
         1 => TrustIrTy::I8,
         2 => TrustIrTy::I16,
@@ -4853,7 +5234,7 @@ fn build_slice_reverse_object(
     let mut func = TrustIrFunction::new(FuncId::new(0), symbol, func_ty, BlockId::new(0));
     func.blocks = b.blocks;
     module.add_function(func);
-    compile_first_trust_ir_function(tcx, module, symbol)
+    Ok(module)
 }
 
 /// Build a `__trustcg_vec_insert_shift_iN(data: Ptr, index: I64, len: I64) -> ()`
@@ -4864,11 +5245,11 @@ fn build_slice_reverse_object(
 /// hole at `index`). The caller (`Vec::insert`) has grown the buffer to hold one
 /// more element and stores the incoming element at `data[index]` afterwards.
 /// `index == len` (append) does zero iterations. Pure byte moves, any pow2-<=8.
-fn build_vec_insert_shift_object(
-    tcx: TyCtxt<'_>,
+fn build_vec_insert_shift_module(
+    _tcx: TyCtxt<'_>,
     size: u64,
     symbol: &str,
-) -> Result<CompiledModule, String> {
+) -> Result<TrustIrModule, String> {
     let ety = match size {
         1 => TrustIrTy::I8,
         2 => TrustIrTy::I16,
@@ -4931,7 +5312,7 @@ fn build_vec_insert_shift_object(
     let mut func = TrustIrFunction::new(FuncId::new(0), symbol, func_ty, BlockId::new(0));
     func.blocks = b.blocks;
     module.add_function(func);
-    compile_first_trust_ir_function(tcx, module, symbol)
+    Ok(module)
 }
 
 /// Build a `__trustcg_array_fill_{iN,fN}` helper object. Integer variants take an
@@ -4948,15 +5329,6 @@ fn build_vec_insert_shift_object(
 /// proof fails the crate closed. The `i < count` bound is a SIGNED compare:
 /// `count` comes from a MIR array length (`<= isize::MAX`), so it is always
 /// non-negative and the signed test is exact.
-fn build_array_fill_object(
-    tcx: TyCtxt<'_>,
-    size: u64,
-    symbol: &str,
-    is_float: bool,
-) -> Result<CompiledModule, String> {
-    let module = array_fill_trust_ir_module(size, symbol, is_float)?;
-    compile_first_trust_ir_function(tcx, module, symbol)
-}
 
 /// Construct the fill helper before target lowering so its value ABI, store type,
 /// and integer-only truncation are testable without a `TyCtxt` or target linker.
@@ -5065,7 +5437,7 @@ const WRITE_ALL_SYMBOL: &str = "__trustcg_write_all";
 /// like the `memset`/`memcpy` externals. Only already-proven opcodes (loads/
 /// stores none; Add/Sub, ICmp, Call, Br/CondBr) appear, so the helper
 /// compiles under the default per-compile certs.
-fn build_write_all_object(tcx: TyCtxt<'_>) -> Result<CompiledModule, String> {
+fn build_write_all_module(_tcx: TyCtxt<'_>) -> Result<TrustIrModule, String> {
     let mut module = TrustIrModule::new(WRITE_ALL_SYMBOL);
     let func_ty = module.add_func_type(FuncTy {
         params: vec![TrustIrTy::I64, TrustIrTy::Ptr, TrustIrTy::I64],
@@ -5143,7 +5515,7 @@ fn build_write_all_object(tcx: TyCtxt<'_>) -> Result<CompiledModule, String> {
     );
     func.blocks = b.blocks;
     module.add_function(func);
-    compile_first_trust_ir_function(tcx, module, WRITE_ALL_SYMBOL)
+    Ok(module)
 }
 
 /// Map rustc's requested target architecture to a Trust Codegen [`Target`].
@@ -5175,6 +5547,250 @@ fn compile_first_trust_ir_function(
     cgu_name: &str,
 ) -> Result<CompiledModule, String> {
     compile_trust_ir_module_object(tcx, module, cgu_name, ModuleKind::Regular)
+}
+
+/// One `__trustcg_*` helper object the crate needs: the single decision of
+/// WHICH helpers are emitted (taken from `USED_TRUSTCG_HELPERS` and whether
+/// this crate provides the allocator shim), in emission order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum HelperPlan {
+    BtmGet,
+    BtmInsert,
+    BtmEntry,
+    BtmRemove,
+    VecSort { size: u64, signed: bool, symbol: &'static str },
+    ArrayFill { size: u64, symbol: &'static str, is_float: bool },
+    SliceContains { size: u64, symbol: &'static str, is_float: bool },
+    VecRemoveShift { size: u64, symbol: &'static str },
+    VecLaneShift { width: u64, symbol: &'static str, up: bool },
+    VecDedup { size: u64, symbol: &'static str, is_float: bool },
+    SliceEq { size: u64, symbol: &'static str, is_float: bool },
+    SliceCmp { size: u64, symbol: &'static str, is_float: bool },
+    SliceRepeat { size: u64, symbol: &'static str },
+    SliceReverse { size: u64, symbol: &'static str },
+    VecInsertShift { size: u64, symbol: &'static str },
+    WriteAll,
+}
+
+impl HelperPlan {
+    fn symbol(&self) -> &'static str {
+        match self {
+            HelperPlan::BtmGet => BTM_GET_SYMBOL,
+            HelperPlan::BtmInsert => BTM_INSERT_SYMBOL,
+            HelperPlan::BtmEntry => BTM_ENTRY_SYMBOL,
+            HelperPlan::BtmRemove => BTM_REMOVE_SYMBOL,
+            HelperPlan::WriteAll => WRITE_ALL_SYMBOL,
+            HelperPlan::VecSort { symbol, .. }
+            | HelperPlan::ArrayFill { symbol, .. }
+            | HelperPlan::SliceContains { symbol, .. }
+            | HelperPlan::VecRemoveShift { symbol, .. }
+            | HelperPlan::VecLaneShift { symbol, .. }
+            | HelperPlan::VecDedup { symbol, .. }
+            | HelperPlan::SliceEq { symbol, .. }
+            | HelperPlan::SliceCmp { symbol, .. }
+            | HelperPlan::SliceRepeat { symbol, .. }
+            | HelperPlan::SliceReverse { symbol, .. }
+            | HelperPlan::VecInsertShift { symbol, .. } => symbol,
+        }
+    }
+
+    fn build(&self, tcx: TyCtxt<'_>) -> Result<TrustIrModule, String> {
+        match *self {
+            HelperPlan::BtmGet => build_btreemap_get_module(tcx),
+            HelperPlan::BtmInsert => build_btreemap_insert_module(tcx),
+            HelperPlan::BtmEntry => build_btreemap_entry_module(tcx),
+            HelperPlan::BtmRemove => build_btreemap_remove_module(tcx),
+            HelperPlan::VecSort { size, signed, symbol } => {
+                build_vec_sort_module(tcx, size, signed, symbol)
+            }
+            HelperPlan::ArrayFill { size, symbol, is_float } => {
+                array_fill_trust_ir_module(size, symbol, is_float)
+            }
+            HelperPlan::SliceContains { size, symbol, is_float } => {
+                build_slice_contains_module(tcx, size, symbol, is_float)
+            }
+            HelperPlan::VecRemoveShift { size, symbol } => {
+                build_vec_remove_shift_module(tcx, size, symbol)
+            }
+            HelperPlan::VecLaneShift { width, symbol, up } => {
+                build_vec_lane_shift_module(tcx, width, symbol, up)
+            }
+            HelperPlan::VecDedup { size, symbol, is_float } => {
+                build_vec_dedup_module(tcx, size, symbol, is_float)
+            }
+            HelperPlan::SliceEq { size, symbol, is_float } => {
+                build_slice_eq_module(tcx, size, symbol, is_float)
+            }
+            HelperPlan::SliceCmp { size, symbol, is_float } => {
+                build_slice_cmp_module(tcx, size, symbol, is_float)
+            }
+            HelperPlan::SliceRepeat { size, symbol } => build_slice_repeat_module(tcx, size, symbol),
+            HelperPlan::SliceReverse { size, symbol } => {
+                build_slice_reverse_module(tcx, size, symbol)
+            }
+            HelperPlan::VecInsertShift { size, symbol } => {
+                build_vec_insert_shift_module(tcx, size, symbol)
+            }
+            HelperPlan::WriteAll => build_write_all_module(tcx),
+        }
+    }
+}
+
+/// The helpers a user CGU referenced during lowering (recorded by
+/// `extern_callee_by_name`).
+fn used_trustcg_helpers() -> std::collections::BTreeSet<String> {
+    USED_TRUSTCG_HELPERS
+        .lock()
+        .map(|u| u.clone())
+        .unwrap_or_default()
+}
+
+/// Helper compiles started at a helper's FIRST reference during lowering
+/// (`spawn_helper_jobs_at_first_reference`), taken over by the plan before the
+/// batch. Process-global like `USED_TRUSTCG_HELPERS` (one crate per process).
+static EARLY_HELPER_JOBS: std::sync::Mutex<Vec<(HelperPlan, FixedModuleJob)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// The earliest point a helper's compile can start is the moment lowering
+/// first references it — the rest of the (single-threaded) MIR lowering is
+/// then free to overlap the helper's prepare, sweeps (the array-fill helper's
+/// NEON kinds are real sweep work no user code shares) and certificate walk,
+/// instead of contending with the batch. Uses the SAME plan function as the
+/// batch, restricted to this one symbol, so it can never emit a helper the
+/// plan would not; inline mode (`TCG_NO_HELPER_OVERLAP=1`) does nothing here.
+fn spawn_helper_jobs_at_first_reference(tcx: TyCtxt<'_>, symbol: &str) {
+    if !helper_overlap_enabled() {
+        return;
+    }
+    let just_this: std::collections::BTreeSet<String> = [symbol.to_owned()].into_iter().collect();
+    let allocator_present = allocator_kind_for_codegen(tcx).is_some();
+    let Ok(mut early) = EARLY_HELPER_JOBS.lock() else {
+        return;
+    };
+    for plan in planned_helper_modules(allocator_present, &just_this) {
+        if early.iter().any(|(done, _)| *done == plan) {
+            continue;
+        }
+        let module = plan.build(tcx);
+        let job = spawn_fixed_module_compile(tcx, plan.symbol(), ModuleKind::Regular, module);
+        early.push((plan, job));
+    }
+}
+
+/// LAZY emission: compile+verify a helper object only when a user CGU actually
+/// referenced it. The `__trustcg_btm_*` helpers cross-call each other, so ANY
+/// use emits the whole family, and they call `__rust_realloc`, so — like the
+/// vec_sort helpers — they are emitted ONLY when this crate also provides the
+/// allocator shim (a crate without a shim cannot allocate and never reaches
+/// the reallocating path; emitting them would be dead AND unlinkable). The
+/// array-fill and slice-contains helpers do not allocate, so a `#![no_std]`
+/// crate with a large array literal still links. An unreferenced helper costs
+/// zero compile and proof time; a registry miss fails LOUDLY at link, never
+/// silently. Order = emission order.
+fn planned_helper_modules(
+    allocator_shim_present: bool,
+    used: &std::collections::BTreeSet<String>,
+) -> Vec<HelperPlan> {
+    let mut plan = Vec::new();
+    if allocator_shim_present {
+        if used.iter().any(|n| n.starts_with("__trustcg_btm_")) {
+            plan.extend([
+                HelperPlan::BtmGet,
+                HelperPlan::BtmInsert,
+                HelperPlan::BtmEntry,
+                HelperPlan::BtmRemove,
+            ]);
+        }
+        for (size, signed, symbol) in VEC_SORT_VARIANTS.iter().copied() {
+            if used.contains(symbol) {
+                plan.push(HelperPlan::VecSort { size, signed, symbol });
+            }
+        }
+    }
+    for (size, symbol) in ARRAY_FILL_VARIANTS.iter().copied() {
+        if used.contains(symbol) {
+            plan.push(HelperPlan::ArrayFill { size, symbol, is_float: false });
+        }
+    }
+    for (size, symbol) in ARRAY_FILL_FLOAT_VARIANTS.iter().copied() {
+        if used.contains(symbol) {
+            plan.push(HelperPlan::ArrayFill { size, symbol, is_float: true });
+        }
+    }
+    for (size, symbol) in SLICE_CONTAINS_VARIANTS.iter().copied() {
+        if used.contains(symbol) {
+            plan.push(HelperPlan::SliceContains { size, symbol, is_float: false });
+        }
+    }
+    for (size, symbol) in SLICE_CONTAINS_FLOAT_VARIANTS.iter().copied() {
+        if used.contains(symbol) {
+            plan.push(HelperPlan::SliceContains { size, symbol, is_float: true });
+        }
+    }
+    for (size, symbol) in VEC_REMOVE_SHIFT_VARIANTS.iter().copied() {
+        if used.contains(symbol) {
+            plan.push(HelperPlan::VecRemoveShift { size, symbol });
+        }
+    }
+    for (width, symbol) in VEC_LANE_SHIFT_DOWN_VARIANTS.iter().copied() {
+        if used.contains(symbol) {
+            plan.push(HelperPlan::VecLaneShift { width, symbol, up: false });
+        }
+    }
+    for (width, symbol) in VEC_LANE_SHIFT_UP_VARIANTS.iter().copied() {
+        if used.contains(symbol) {
+            plan.push(HelperPlan::VecLaneShift { width, symbol, up: true });
+        }
+    }
+    for (size, symbol) in VEC_DEDUP_VARIANTS.iter().copied() {
+        if used.contains(symbol) {
+            plan.push(HelperPlan::VecDedup { size, symbol, is_float: false });
+        }
+    }
+    for (size, symbol) in VEC_DEDUP_FLOAT_VARIANTS.iter().copied() {
+        if used.contains(symbol) {
+            plan.push(HelperPlan::VecDedup { size, symbol, is_float: true });
+        }
+    }
+    for (size, symbol) in SLICE_EQ_VARIANTS.iter().copied() {
+        if used.contains(symbol) {
+            plan.push(HelperPlan::SliceEq { size, symbol, is_float: false });
+        }
+    }
+    for (size, symbol) in SLICE_EQ_FLOAT_VARIANTS.iter().copied() {
+        if used.contains(symbol) {
+            plan.push(HelperPlan::SliceEq { size, symbol, is_float: true });
+        }
+    }
+    for (size, symbol) in SLICE_CMP_VARIANTS.iter().copied() {
+        if used.contains(symbol) {
+            plan.push(HelperPlan::SliceCmp { size, symbol, is_float: false });
+        }
+    }
+    for (size, symbol) in SLICE_CMP_FLOAT_VARIANTS.iter().copied() {
+        if used.contains(symbol) {
+            plan.push(HelperPlan::SliceCmp { size, symbol, is_float: true });
+        }
+    }
+    for (size, symbol) in SLICE_REPEAT_VARIANTS.iter().copied() {
+        if used.contains(symbol) {
+            plan.push(HelperPlan::SliceRepeat { size, symbol });
+        }
+    }
+    for (size, symbol) in SLICE_REVERSE_VARIANTS.iter().copied() {
+        if used.contains(symbol) {
+            plan.push(HelperPlan::SliceReverse { size, symbol });
+        }
+    }
+    for (size, symbol) in VEC_INSERT_SHIFT_VARIANTS.iter().copied() {
+        if used.contains(symbol) {
+            plan.push(HelperPlan::VecInsertShift { size, symbol });
+        }
+    }
+    if used.contains(WRITE_ALL_SYMBOL) {
+        plan.push(HelperPlan::WriteAll);
+    }
+    plan
 }
 
 /// Map a typed codegen [`trust_cg_codegen::compiler::CompileError`] to a stable
@@ -5273,15 +5889,138 @@ fn compile_trust_ir_module_object_with_parallel(
     kind: ModuleKind,
     parallel: bool,
 ) -> Result<CompiledModule, String> {
+    let env = module_compile_env(tcx)?;
+    let object_path = temp_object_path(tcx, cgu_name);
+    compile_trust_ir_module_object_in_env(&env, module, cgu_name, kind, parallel, object_path)
+}
+
+/// Everything the module compile funnel reads from `TyCtxt`, captured on the
+/// main thread. `TyCtxt` is `!Send`; with the inputs copied out, a module whose
+/// trust-ir is already built can be compiled on a helper thread
+/// (`spawn_fixed_module_compile`). Objects are a pure function of
+/// `(module, env)`, so where the compile runs never changes their bytes.
+#[derive(Clone, Debug)]
+struct ModuleCompileEnv {
+    target: Target,
+    rustc_opt_level: OptLevel,
+    panic_unwind: bool,
+}
+
+fn module_compile_env(tcx: TyCtxt<'_>) -> Result<ModuleCompileEnv, String> {
+    let target = trust_cg_target_for_session(tcx)?;
+    let rustc_opt_level = {
+        use rustc_session::config::OptLevel as RustcOptLevel;
+        match tcx.sess.opts.optimize {
+            RustcOptLevel::No => OptLevel::O0,
+            RustcOptLevel::Less => OptLevel::O1,
+            RustcOptLevel::Aggressive => OptLevel::O3,
+            _ => OptLevel::O2,
+        }
+    };
+    Ok(ModuleCompileEnv {
+        target,
+        rustc_opt_level,
+        panic_unwind: !panic_is_abort(tcx),
+    })
+}
+
+/// A fixed module (entry wrapper, allocator shim, `__trustcg_*` helper) being
+/// compiled off the main thread, or already compiled inline.
+enum FixedModuleJob {
+    Spawned {
+        cgu_name: String,
+        handle: std::thread::JoinHandle<Result<CompiledModule, String>>,
+    },
+    Done(Result<CompiledModule, String>),
+}
+
+impl FixedModuleJob {
+    fn join(self) -> Result<CompiledModule, String> {
+        match self {
+            FixedModuleJob::Done(result) => result,
+            FixedModuleJob::Spawned { cgu_name, handle } => handle.join().unwrap_or_else(|_| {
+                Err(format!(
+                    "rustc_codegen_trust_cg: the compile thread for fixed module `{cgu_name}` \
+                     panicked; failing the crate closed (TCG_NO_HELPER_OVERLAP=1 compiles it inline)"
+                ))
+            }),
+        }
+    }
+}
+
+/// `TCG_NO_HELPER_OVERLAP=1`: compile the fixed modules inline on the main
+/// thread (the pre-overlap behaviour; the A/B switch for this lever).
+fn helper_overlap_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("TCG_NO_HELPER_OVERLAP").is_none())
+}
+
+/// Compile a fixed module whose trust-ir is already built. With overlap on, the
+/// compile (adapter + validate, prepare, pre-warm, certificate walk, object
+/// write) runs on its own thread with the proof-verifier stack, overlapping the
+/// main thread's MIR lowering and the user CGUs' batch; the result is joined
+/// where the module used to be compiled, so `modules` keeps its order. The
+/// certificate walk still serialises on the one-worker verifier pool.
+fn spawn_fixed_module_compile(
+    tcx: TyCtxt<'_>,
+    cgu_name: &str,
+    kind: ModuleKind,
+    module: Result<TrustIrModule, String>,
+) -> FixedModuleJob {
+    let module = match module {
+        Ok(module) => module,
+        Err(err) => return FixedModuleJob::Done(Err(err)),
+    };
+    let env = match module_compile_env(tcx) {
+        Ok(env) => env,
+        Err(err) => return FixedModuleJob::Done(Err(err)),
+    };
+    let object_path = temp_object_path(tcx, cgu_name);
+    if !helper_overlap_enabled() {
+        return FixedModuleJob::Done(compile_trust_ir_module_object_in_env(
+            &env,
+            module,
+            cgu_name,
+            kind,
+            false,
+            object_path,
+        ));
+    }
+    let name = cgu_name.to_owned();
+    let thread_name = format!("trust-cg-fixed-{cgu_name}");
+    match std::thread::Builder::new()
+        .name(thread_name)
+        .stack_size(trust_cg_verify::resource_limits::PROOF_VERIFIER_STACK_SIZE)
+        .spawn(move || {
+            compile_trust_ir_module_object_in_env(&env, module, &name, kind, false, object_path)
+        }) {
+        Ok(handle) => FixedModuleJob::Spawned {
+            cgu_name: cgu_name.to_owned(),
+            handle,
+        },
+        Err(err) => FixedModuleJob::Done(Err(format!(
+            "rustc_codegen_trust_cg: could not spawn the compile thread for fixed module \
+             `{cgu_name}`: {err} (TCG_NO_HELPER_OVERLAP=1 compiles it inline)"
+        ))),
+    }
+}
+
+fn compile_trust_ir_module_object_in_env(
+    env: &ModuleCompileEnv,
+    module: TrustIrModule,
+    cgu_name: &str,
+    kind: ModuleKind,
+    parallel: bool,
+    object_path: PathBuf,
+) -> Result<CompiledModule, String> {
     // Route object emission through the target-aware Trust Codegen `Compiler`
     // so the emitted object matches rustc's requested `--target`. The
     // `Compiler` dispatches on `config.target` (X86_64 -> X86Pipeline,
     // Aarch64 -> the AArch64 Pipeline) and produces host object bytes for the
     // selected ISA. Past the M1 contract we run O1 (verified peephole + DCE)
     // for competitive codegen; proofs-off and sequential are still kept.
-    let target = trust_cg_target_for_session(tcx)?;
     let mut compiler_config = CompilerConfig::default();
-    compiler_config.target = target;
+    compiler_config.target = env.target;
     // Machine-opt level: default O1 (the production policy). `TCG_OPT_LEVEL`
     // (0..=3) overrides it OPT-IN so the O2+ pass ladder (const-fold + CSE
     // today; unroll and friends as they land) is exercisable end-to-end by
@@ -5309,18 +6048,7 @@ fn compile_trust_ir_module_object_with_parallel(
     // regalloc validator) runs AFTER the passes on the final instruction stream,
     // so lowering the level moves no gate. `opt_level` is already part of the AOT
     // compile-artifact cache identity, so no cache-schema bump is required.
-    let rustc_opt_level = {
-        use rustc_session::config::OptLevel as RustcOptLevel;
-        match tcx.sess.opts.optimize {
-            RustcOptLevel::No => OptLevel::O0,
-            RustcOptLevel::Less => OptLevel::O1,
-            RustcOptLevel::Aggressive => OptLevel::O3,
-            // `Default` plus the size-tuned levels map to O2: the backend has no
-            // size-specific schedule, and O2 is the level whose output is
-            // differential-validated byte-identical to O1's fail-closed set.
-            _ => OptLevel::O2,
-        }
-    };
+    let rustc_opt_level = env.rustc_opt_level;
     compiler_config.opt_level = match std::env::var("TCG_OPT_LEVEL").as_deref() {
         Ok("0") => OptLevel::O0,
         Ok("1") => OptLevel::O1,
@@ -5376,7 +6104,7 @@ fn compile_trust_ir_module_object_with_parallel(
     // alone (an unwind-mode object with no local pad looks identical to an
     // abort-mode object), so the frontend — which knows `panic_strategy()` — must
     // signal it. Abort mode (flag false) keeps the object byte-identical.
-    compiler_config.panic_unwind = !panic_is_abort(tcx);
+    compiler_config.panic_unwind = env.panic_unwind;
     // `TCG_TIME=1`: surface the compiler's per-phase wall-clock trace + the
     // proof-cert count per CGU on stderr. Pure diagnostics (default off, no
     // behavior change): converts the backend time into attributed phase
@@ -5388,6 +6116,19 @@ fn compile_trust_ir_module_object_with_parallel(
     }
     let emit_proofs = compiler_config.emit_proofs;
     let compiler = attach_compile_artifact_cache(Compiler::new(compiler_config), emit_proofs);
+    // MODULE-level clock. The pipeline's per-function phase timers plus
+    // `mir_to_trust_ir` accounted for only ~36-39% of trust-cg's codegen time;
+    // encoding and the post-RA recheck were measured and ruled out. Whatever is
+    // left is module-scoped, and this is the boundary that brackets it.
+    let module_compile_start = codegen_timing::phase_start();
+    if std::env::var_os("TCG_TIME_SWEEP").is_some() {
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        FIRST.call_once(|| {
+            if let Some(t) = CODEGEN_CRATE_START.get() {
+                eprintln!("TCG_WARM_RACE first_compile_at=+{:.1}ms", t.elapsed().as_secs_f64() * 1000.0);
+            }
+        });
+    }
     let result = compiler.compile(&module).map_err(|err| {
         if std::env::var_os("TCG_TRACE_TY").is_some() {
             eprintln!("TCG_TRACE_IR emission failed in cgu={cgu_name}:\n{module:#?}");
@@ -5403,6 +6144,8 @@ fn compile_trust_ir_module_object_with_parallel(
         trust_cg_verify::diag::gate_message_kv(code, cgu_name, &why, &field_refs)
     })?;
     // Bridge-side fail-closed re-check of the proof-certificate bundle.
+    codegen_timing::note_module_compile(cgu_name, module_compile_start);
+
     // `Compiler::compile` already rejects unverified certs internally
     // (`ensure_object_proofs_promotable`), but the bridge MUST NOT promote an
     // object on the compiler's say-so alone: if proofs were requested, the
@@ -5501,7 +6244,7 @@ fn compile_trust_ir_module_object_with_parallel(
 
     let object = result.object_code;
 
-    let path = temp_object_path(tcx, cgu_name);
+    let path = object_path;
     fs::write(&path, object).map_err(|err| {
         format!(
             "rustc_codegen_trust_cg: failed to write {}: {err}",
@@ -5807,6 +6550,15 @@ struct MirLoweringCtx<'tcx> {
     //     in the CFG but never taken at run time — lowered to a trap.
     // Populated once per function (`compute_vec_with_capacity_chain`).
     vec_wc_dead_locals: HashSet<Local>,
+    /// Locals whose EVERY transitive use is an `assume(..)` operand — the
+    /// O3-inlined `Vec` bounds hints (`len <= isize::MAX/elem` compare
+    /// chains at every `Vec::len`/index site). `assume` lowers to nothing,
+    /// so the chain is never read at run time; `lower_statement` skips the
+    /// (pure, projection-free) defining assigns. Body-wide generalization
+    /// of the with-capacity chain's assume-scratch classification. Computed
+    /// once per body by `compute_assume_scratch_dead`; empty under
+    /// `TCG_NO_ASSUME_SCRATCH_ELIDE`.
+    assume_scratch_dead_locals: HashSet<Local>,
     vec_wc_switch_targets: HashMap<Local, mir::BasicBlock>,
     vec_wc_trap_blocks: HashSet<mir::BasicBlock>,
     // The `-O2`/`-O3`-inlined & SROA'd `<[T]>::to_vec` / `<[T] as ToOwned>::to_owned`
@@ -6873,7 +7625,11 @@ impl<'tcx> MirLoweringCtx<'tcx> {
         Self {
             tcx,
             instance,
-            module: TrustIrModule::new(module_name),
+            module: {
+                let mut module = TrustIrModule::new(module_name);
+                seed_slot_lane_types(&mut module);
+                module
+            },
             extern_callees: HashMap::new(),
             black_box_func_ids: HashSet::new(),
             scalar_values: HashMap::new(),
@@ -6894,6 +7650,7 @@ impl<'tcx> MirLoweringCtx<'tcx> {
             fmt_dead_locals: HashSet::new(),
             fmt_niche_switch_blocks: HashMap::new(),
             vec_wc_dead_locals: HashSet::new(),
+            assume_scratch_dead_locals: HashSet::new(),
             vec_wc_switch_targets: HashMap::new(),
             vec_wc_trap_blocks: HashSet::new(),
             to_vec_ptr_alloc: HashMap::new(),
@@ -7646,8 +8403,12 @@ impl<'tcx> MirLoweringCtx<'tcx> {
         // helper objects (~100-150ms of proof discharge per crate). Missing a
         // use would be a LOUD link error, never a silent miscompile.
         if name.starts_with("__trustcg_") {
-            if let Ok(mut used) = USED_TRUSTCG_HELPERS.lock() {
-                used.insert(name.to_owned());
+            let first_reference = USED_TRUSTCG_HELPERS
+                .lock()
+                .map(|mut used| used.insert(name.to_owned()))
+                .unwrap_or(false);
+            if first_reference {
+                spawn_helper_jobs_at_first_reference(self.tcx, name);
             }
         }
         if let Some(id) = self.extern_callees.get(name) {
@@ -7909,6 +8670,55 @@ fn report_bridge_phase_totals() {
     );
 }
 
+fn canonicalize_int_reinterpret_copies(func: &mut TrustIrFunction) {
+    use std::collections::HashMap;
+    let mut val_ty: HashMap<u32, TrustIrTy> = HashMap::new();
+    for block in &func.blocks {
+        for (vid, ty) in &block.params {
+            val_ty.insert(vid.index(), ty.clone());
+        }
+        for node in &block.body {
+            let ty = match &node.inst {
+                Inst::Copy { ty, .. }
+                | Inst::Const { ty, .. }
+                | Inst::BinOp { ty, .. }
+                | Inst::UnOp { ty, .. }
+                | Inst::Load { ty, .. } => Some(ty.clone()),
+                Inst::Cast { dst_ty, .. } => Some(dst_ty.clone()),
+                _ => None,
+            };
+            if let Some(ty) = ty {
+                if let Some(result) = node.results.first() {
+                    val_ty.insert(result.index(), ty);
+                }
+            }
+        }
+    }
+    for block in &mut func.blocks {
+        for node in &mut block.body {
+            if let Inst::Copy { ty, operand } = &node.inst {
+                let declared = ty.clone();
+                let operand = *operand;
+                if let Some(op_ty) = val_ty.get(&operand.index()) {
+                    if op_ty != &declared
+                        && declared.is_integer()
+                        && op_ty.is_integer()
+                        && declared.bit_width().is_some()
+                        && declared.bit_width() == op_ty.bit_width()
+                    {
+                        node.inst = Inst::Cast {
+                            op: CastOp::Bitcast,
+                            src_ty: op_ty.clone(),
+                            dst_ty: declared,
+                            operand,
+                        };
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn mir_to_trust_ir<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: Instance<'tcx>,
@@ -7918,7 +8728,13 @@ fn mir_to_trust_ir<'tcx>(
     let _ct_timer = MirLowerTimer(std::time::Instant::now());
     let mut _ct_pre = Some(PhaseNs(std::time::Instant::now(), &MIR_PRE_NS));
     let _lower_timer = codegen_timing::LowerTimer::start(symbol);
+    // `TCG_TIME_LOWER=1`: coarse wall-clock stage marks for THIS function's
+    // lowering (the TCG_TIME family; used to attribute per-main lowering cost
+    // — the compile-time front's largest single per-function item).
+    let mut lower_marks = codegen_timing::LowerStageMarks::start(symbol);
     let body = tcx.instance_mir(instance.def);
+    lower_marks.mark("instance_mir");
+    clear_memory_aggregate_layout_memo();
     let mut ctx = MirLoweringCtx::new(symbol, tcx, instance);
     // At O1 and above rustc can inline `.step_by()` before the call-level
     // iterator interception sees it. Reject any surviving `StepBy` local at
@@ -7936,12 +8752,15 @@ fn mir_to_trust_ir<'tcx>(
         );
     }
     ctx.seed_values_from_body(body);
+    lower_marks.mark("pc.seed_values");
     ctx.persistent_zero_locals = compute_persistent_zero_locals(&ctx, body);
+    lower_marks.mark("pc.persistent_zero");
     // EXCEPTION HANDLING: under `panic=unwind`, find every cleanup/landing-pad
     // block (the target of an `UnwindAction::Cleanup(bb)` edge) so the block loop
     // can prefix it with an `Inst::LandingPad`, and decide whether this function
     // lowers real unwind edges at all. No-op under `panic=abort`.
     ctx.seed_eh_landing_pads(body);
+    lower_marks.mark("pc.eh_pads");
     let func_ty = ctx.func_ty_for_instance(instance)?;
     // Record whether THIS function's ABI is C-compatible (non-"rustic"), so the
     // entry-block formal-parameter lowering can give a by-value SSE aggregate param
@@ -7951,6 +8770,7 @@ fn mir_to_trust_ir<'tcx>(
     ctx.current_fn_c_abi = instance_abi_is_c_compatible(tcx, instance);
     let mut func = TrustIrFunction::new(FuncId::new(0), symbol, func_ty, BlockId::new(0));
     let predecessors = basic_block_predecessors(body);
+    lower_marks.mark("pc.preds");
     let mut block_out_states = vec![None; body.basic_blocks.len()];
 
     // The set of locals that will be memory-backed (a stack slot). These must be
@@ -7958,24 +8778,47 @@ fn mir_to_trust_ir<'tcx>(
     // identity is its STABLE slot pointer (the same `ValueId` in every block), so
     // it never needs a header block parameter. Computed once here (before slots are
     // allocated) so `compute_loop_header_params` can skip them.
-    let mut memory_backed_locals = compute_memory_backed_locals(&ctx, body)?;
+    // Computed ONCE here and threaded into `allocate_memory_slots` below. These
+    // two analyses are the precompute region: between them they make 31
+    // unconditional whole-body basic-block scans, against one or two for every
+    // other pass here. They used to run a second time inside
+    // `allocate_memory_slots`, which is reached from this same function on the
+    // first RPO iteration -- pure duplicated work, and a duplicated DECISION,
+    // which is the shape this codebase keeps getting bitten by.
+    //
+    // They stay SEPARATE (rather than only the union being kept) because they
+    // drive different allocations: `backed` feeds `memory_backed_local_layout`
+    // into `ctx.memory_slots`, `cells` feeds `memory_scalar_leaf_ty` into
+    // `ctx.scalar_cells`, and a local in BOTH correctly receives both allocas.
+    let memory_backed_only = compute_memory_backed_locals(&ctx, body)?;
+    lower_marks.mark("pc.memory_backed");
     // Scalar-cell locals live entirely in memory (read via `Load`, written via
     // `Store`), so — like memory-backed aggregates — they must be excluded from
     // the loop-carried scalar phi machinery: their identity is the stable cell
     // pointer, not an SSA value threaded through block parameters.
-    memory_backed_locals.extend(compute_scalar_cell_locals(&ctx, body)?);
+    let scalar_cell_only = compute_scalar_cell_locals(&ctx, body)?;
+    lower_marks.mark("pc.scalar_cell");
+    // The union is what the phi-exclusion readers below consult
+    // (`compute_slice_to_vec_sroa_chains`, `compute_box_into_vec_chains`,
+    // `compute_loop_header_params`, `loop_carried_completeness_error`, and the
+    // TCG_TRACE_TY dump). Never mutated after this point.
+    let mut memory_backed_locals = memory_backed_only.clone();
+    memory_backed_locals.extend(scalar_cell_only.iter().copied());
 
     // Dead `format!`/`write!`-feeder locals (the `&value` refs, the args tuple,
     // the `[Argument; N]` array, the `fmt::Arguments` value). Their assignments
     // are skipped by `lower_statement`. Computed once per function.
     ctx.fmt_dead_locals = compute_fmt_dead_locals(&ctx, body);
+    lower_marks.mark("pc.fmt_dead");
     // The dead `as_str()` niche-check switches on the O3-inlined `format!` path —
     // replaced by an unconditional branch (see the field's doc).
     ctx.fmt_niche_switch_blocks = compute_fmt_niche_switch_blocks(&ctx, body);
+    lower_marks.mark("pc.fmt_niche");
     // The O3-inlined `Vec::with_capacity` allocator chain (dead intermediates, the
     // Result discriminant-switch to redirect, the `handle_error` Err arm to trap).
     // See the `vec_wc_*` field docs and `compute_vec_with_capacity_chain`.
     let wc_chain = compute_vec_with_capacity_chain(&ctx, body);
+    lower_marks.mark("pc.vec_wc");
     ctx.vec_wc_dead_locals = wc_chain.dead_locals;
     ctx.vec_wc_switch_targets = wc_chain.switch_targets;
     ctx.vec_wc_trap_blocks = wc_chain.trap_blocks;
@@ -7987,6 +8830,7 @@ fn mir_to_trust_ir<'tcx>(
     // pass already claimed. Reuses the `vec_wc_*` switch-redirect / trap / dead-local
     // tables; adds the ptr/cap bindings. See `compute_slice_to_vec_sroa_chains`.
     let tv_sroa = compute_slice_to_vec_sroa_chains(&ctx, body, &memory_backed_locals);
+    lower_marks.mark("pc.tv_sroa");
     ctx.vec_wc_dead_locals.extend(tv_sroa.dead_locals);
     ctx.vec_wc_switch_targets.extend(tv_sroa.switch_targets);
     ctx.vec_wc_trap_blocks.extend(tv_sroa.trap_blocks);
@@ -8000,9 +8844,16 @@ fn mir_to_trust_ir<'tcx>(
     // chains above; sharing `vec_wc_dead_locals` is a union of dead sets. See
     // `compute_box_into_vec_chains` and the `box_into_vec_recipes` field docs.
     let biv = compute_box_into_vec_chains(&ctx, body, &memory_backed_locals);
+    lower_marks.mark("pc.box_into_vec");
     ctx.vec_wc_dead_locals.extend(biv.dead_locals);
     ctx.box_into_vec_bindings = biv.bindings;
     ctx.box_into_vec_recipes = biv.recipes;
+    // Body-wide assume-scratch elision (independent of the chains above;
+    // union semantics like the vec_wc dead set — a local claimed by an
+    // earlier chain analysis is simply skipped by whichever set sees it
+    // first in `lower_statement`).
+    ctx.assume_scratch_dead_locals = compute_assume_scratch_dead(body);
+    lower_marks.mark("pc.assume_scratch");
 
     if std::env::var_os("TCG_TRACE_TY").is_some() {
         let mut mb: Vec<_> = memory_backed_locals.iter().map(|l| l.index()).collect();
@@ -8023,6 +8874,7 @@ fn mir_to_trust_ir<'tcx>(
     // cannot supply the header's incoming value through the forward dataflow.
     let loop_header_params =
         compute_loop_header_params(&ctx, body, &predecessors, &memory_backed_locals);
+    lower_marks.mark("pc.loop_header_params");
     // Closed-world loop-completeness check: fail closed (rather than silently
     // miscompile) when a local is mutated inside a loop but is neither memory-backed
     // nor threaded through the loop-header phi — its update would be dropped across
@@ -8035,6 +8887,7 @@ fn mir_to_trust_ir<'tcx>(
         &memory_backed_locals,
         &loop_header_params,
     )?;
+    lower_marks.mark("pc.loop_completeness");
     // NOTE: loop-carried i128/u128 scalars are a SILENT MISCOMPILE (the GPR64
     // register-pair phi drops a limb across the back-edge) and are rejected
     // fail-closed where the loop-header scalar params are built (the
@@ -8049,6 +8902,7 @@ fn mir_to_trust_ir<'tcx>(
     // Visit blocks in reverse postorder so every forward predecessor is lowered
     // before its successors; only loop back-edges remain unsatisfied, and those
     // are handled by the explicit loop-header parameters + a deferred patch pass.
+    lower_marks.mark("precompute");
     let rpo: Vec<mir::BasicBlock> = body.basic_blocks.reverse_postorder().to_vec();
     for bb in rpo {
         let data = &body.basic_blocks[bb];
@@ -8200,7 +9054,13 @@ fn mir_to_trust_ir<'tcx>(
             // the entry block; their pointer is stable across the whole body. Done
             // FIRST so a by-value aggregate parameter can store its incoming ABI
             // value into the (already allocated) slot below.
-            allocate_memory_slots(&mut ctx, body, &mut block)?;
+            allocate_memory_slots(
+                &mut ctx,
+                body,
+                &mut block,
+                &memory_backed_only,
+                &scalar_cell_only,
+            )?;
             // EXCEPTION HANDLING: a single i64 stack slot to carry the in-flight
             // exception pointer from a `LandingPad` (which stores it) to a later
             // `Resume` (which loads it to re-raise). Allocated once in the entry
@@ -8389,7 +9249,23 @@ fn mir_to_trust_ir<'tcx>(
                     store_incoming_aggregate_param(&mut ctx, &mut block, arg, &layout, param_value)?;
                     continue;
                 }
-                let ty = local_trust_ir_ty(&ctx, body, arg)?;
+                // A `FnOnce::call_once` VTableShim receives `self` by POINTER, so
+                // `classify_func_ty` forces signature param 0 to `Ptr`
+                // (`receiver_is_by_ptr`, the sibling of the `func_ty_for_instance`
+                // rewrite). The MIR receiver local is `*mut Closure`, whose
+                // `local_trust_ir_ty` is a typed `*mut (..)` — declaring THAT as the
+                // entry-block param makes the entry params disagree with the declared
+                // `FuncTy::params` (audit #6 `EntryParamsMismatch`). The receiver value
+                // is only ever used as a load address (`load .. ptr %1`, and the
+                // `move (*_1)` deref marshaling), so pinning it to `Ptr` is a pure
+                // relabel that matches the signature.
+                let ty = if matches!(ctx.instance.def, ty::InstanceKind::VTableShim(_))
+                    && body.args_iter().next() == Some(arg)
+                {
+                    TrustIrTy::Ptr
+                } else {
+                    local_trust_ir_ty(&ctx, body, arg)?
+                };
                 // A zero-sized parameter (`self: ()` on `<() as Termination>::
                 // report`, the `Args = ()` tuple of the call shims) occupies no ABI
                 // slot, so `func_ty_for_instance` drops it. It must NOT become a
@@ -8628,6 +9504,7 @@ fn mir_to_trust_ir<'tcx>(
             header_scalar_params.insert(bb, loop_scalar_params);
         }
     }
+    lower_marks.mark("blocks");
 
     // Deferred patch pass: now that every block (hence every predecessor,
     // including loop back-edges) is lowered and its out-state known, supply each
@@ -8850,6 +9727,20 @@ fn mir_to_trust_ir<'tcx>(
             }
         }
     }
+
+    // Canonicalize every SAME-WIDTH integer reinterpret `Copy` (`copy i64 <-
+    // u64` / `copy u64 <- i64`) into a `Bitcast`. The address/arithmetic and
+    // bit-manipulation lowerings pun a `usize`/`u64` value onto the `I64` carrier
+    // every width-only op declares, and write a bit-op's `I64` result back onto a
+    // `u64` destination — via a `Copy` whose declared type disagrees with its
+    // operand's tracked type. That is bit-for-bit the same register move as a
+    // `Bitcast`, but the canonical validator flags the punning `Copy` as
+    // `OperandTypeMismatch`. Rewriting to the `Bitcast` the reinterpret actually is
+    // keeps the merged module canonical WITHOUT changing codegen (same-width `Copy`
+    // and `Bitcast` isel to the identical move). Only same-width integer mismatches
+    // are touched; the operand's type is resolved function-locally, which — unlike
+    // the per-emit-site view — sees a cross-block operand's definition.
+    canonicalize_int_reinterpret_copies(&mut func);
 
     // P1.3 (proof-gap program): structural SSA + loop-completeness gate on the
     // produced trust-ir. Generalizes the bug-specific `loop_carried_aggregate_error`
@@ -10580,6 +11471,7 @@ fn mir_to_trust_ir<'tcx>(
     ctx.coverage.finish(symbol);
 
     ctx.module.functions.insert(0, func);
+    lower_marks.mark("blocks_and_drains");
     Ok(ctx.module)
 }
 
@@ -14417,6 +15309,153 @@ fn ok_arm_reaches_empty_vec<'tcx>(
 /// A use as the `len` field, or any use outside this scaffolding (returned,
 /// stored, passed to a live call, a non-Vec destination), is a HARD use that keeps
 /// the local LIVE — so a genuinely-observed value is never wrongly dropped.
+/// An Rvalue whose evaluation is side-effect-free and whose elision cannot
+/// change observable behavior when its destination is never read: the
+/// compare/arith/cast/copy family. Deliberately fail-closed — `Ref`/`RawPtr`
+/// (escape), `Aggregate`, `Len`, `Discriminant`, `Repeat`, box/deref forms
+/// and anything unrecognized are NOT pure for this purpose.
+fn assume_scratch_rvalue_is_pure<'tcx>(rvalue: &Rvalue<'tcx>) -> bool {
+    matches!(
+        rvalue,
+        Rvalue::BinaryOp(..) | Rvalue::UnaryOp(..) | Rvalue::Cast(..) | Rvalue::Use(_)
+    )
+}
+
+/// Body-wide backward fixpoint: the set of locals whose EVERY transitive use
+/// is an `assume(..)` operand. Such a local is never read by any lowered
+/// instruction (`assume` lowers to nothing — see `lower_statement`'s
+/// `NonDivergingIntrinsic::Assume` arm), so skipping its pure defining
+/// assigns is observationally invisible.
+///
+/// FAIL-CLOSED discipline (a fail-open bug here is a silent miscompile):
+/// * Readers of a non-whitelisted rvalue, of any projection-destination
+///   assign, of any non-`Assume` statement kind that mentions locals, and of
+///   EVERY terminator (generic visitor — no per-kind allowlist to go stale)
+///   are HARD uses.
+/// * A local with NO recorded uses is left alone (rustc's own DCE owns it).
+/// * The skip site re-checks `assume_scratch_rvalue_is_pure` per assign, so
+///   even a dead-marked local keeps any non-pure def (e.g. a `&x`
+///   materialization) it might have.
+fn compute_assume_scratch_dead<'tcx>(body: &Body<'tcx>) -> HashSet<Local> {
+    use rustc_middle::mir::visit::{PlaceContext, Visitor};
+    if std::env::var_os("TCG_NO_ASSUME_SCRATCH_ELIDE").is_some() {
+        return HashSet::new();
+    }
+    /// Generic local collector for the fail-closed arms below.
+    struct AssumeScratchScan {
+        out: Vec<Local>,
+    }
+    impl<'tcx> Visitor<'tcx> for AssumeScratchScan {
+        fn visit_local(&mut self, local: Local, _context: PlaceContext, _location: mir::Location) {
+            self.out.push(local);
+        }
+    }
+    let n = body.local_decls.len();
+    let sentinel = Local::from_usize(n + 1); // hard use
+    let assume_sink = Local::from_usize(n + 2); // dead-ward sink (seeded dead)
+    let mut uses: Vec<Vec<Local>> = vec![Vec::new(); n];
+    let record = |reader: Local, dest: Local, uses: &mut Vec<Vec<Local>>| {
+        if reader.index() < uses.len() {
+            uses[reader.index()].push(dest);
+        }
+    };
+    for (_bb, data) in body.basic_blocks.iter_enumerated() {
+        for stmt in &data.statements {
+            match &stmt.kind {
+                StatementKind::Assign(boxed) => {
+                    let (dst, rvalue) = &**boxed;
+                    let mut readers = Vec::new();
+                    collect_rvalue_locals(rvalue, &mut readers);
+                    let dest = if dst.projection.is_empty()
+                        && assume_scratch_rvalue_is_pure(rvalue)
+                    {
+                        dst.local
+                    } else {
+                        // Projection write (reads the base) or non-pure
+                        // rvalue: every operand is a hard use, and so is the
+                        // written-through base.
+                        record(dst.local, sentinel, &mut uses);
+                        sentinel
+                    };
+                    for r in readers {
+                        record(r, dest, &mut uses);
+                    }
+                }
+                StatementKind::Intrinsic(intrinsic) => {
+                    if let mir::NonDivergingIntrinsic::Assume(op) = &**intrinsic {
+                        let mut readers = Vec::new();
+                        collect_operand_locals(op, &mut readers);
+                        for r in readers {
+                            record(r, assume_sink, &mut uses);
+                        }
+                    } else {
+                        // CopyNonOverlapping etc.: every mentioned local is a
+                        // hard use.
+                        let mut scan = AssumeScratchScan { out: Vec::new() };
+                        scan.visit_statement(
+                            stmt,
+                            mir::Location { block: _bb, statement_index: 0 },
+                        );
+                        for r in scan.out {
+                            record(r, sentinel, &mut uses);
+                        }
+                    }
+                }
+                StatementKind::StorageLive(_)
+                | StatementKind::StorageDead(_)
+                | StatementKind::Nop => {}
+                _ => {
+                    // Any other statement kind: every mentioned local is a
+                    // hard use (fail-closed; most never appear in optimized
+                    // MIR).
+                    let mut scan = AssumeScratchScan { out: Vec::new() };
+                    scan.visit_statement(
+                        stmt,
+                        mir::Location { block: _bb, statement_index: 0 },
+                    );
+                    for r in scan.out {
+                        record(r, sentinel, &mut uses);
+                    }
+                }
+            }
+        }
+        // EVERY terminator read is a hard use — generic visitor, no per-kind
+        // allowlist to go stale.
+        let mut scan = AssumeScratchScan { out: Vec::new() };
+        scan.visit_terminator(data.terminator(), mir::Location {
+            block: _bb,
+            statement_index: data.statements.len(),
+        });
+        for r in scan.out {
+            record(r, sentinel, &mut uses);
+        }
+    }
+
+    let mut dead: HashSet<Local> = HashSet::new();
+    dead.insert(assume_sink);
+    loop {
+        let mut changed = false;
+        for l in body.local_decls.indices() {
+            if dead.contains(&l) {
+                continue;
+            }
+            let l_uses = &uses[l.index()];
+            if l_uses.is_empty() {
+                continue;
+            }
+            if l_uses.iter().all(|&d| d != sentinel && dead.contains(&d)) {
+                dead.insert(l);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    dead.remove(&assume_sink);
+    dead
+}
+
 fn compute_wc_dead_fixpoint<'tcx>(
     ctx: &MirLoweringCtx<'tcx>,
     body: &Body<'tcx>,
@@ -15961,6 +17000,21 @@ fn lower_statement<'tcx>(
                 ctx.clear_full_place_bindings(place.local);
                 return Ok(());
             }
+            // An ASSUME-SCRATCH local: every transitive use is an
+            // `assume(..)` operand (the O3-inlined Vec bounds hints — 7-9
+            // instruction compare chains into never-read frame slots at
+            // every `Vec::len` site; measured as h2_vec_grow's dominant
+            // hot-loop residue). `assume` lowers to nothing, so skipping the
+            // pure defining assign is observationally invisible. The purity
+            // re-check keeps any non-pure def a dead-marked local might
+            // have. Kill switch: `TCG_NO_ASSUME_SCRATCH_ELIDE`.
+            if place.projection.is_empty()
+                && ctx.assume_scratch_dead_locals.contains(&place.local)
+                && assume_scratch_rvalue_is_pure(rvalue)
+            {
+                ctx.clear_full_place_bindings(place.local);
+                return Ok(());
+            }
             // A BINDING-CLASS local of a recognized `-O3` box->Vec chain
             // (`compute_box_into_vec_chains`): skip its repackaging def and bind
             // the local directly to its chain-proven value — the root box heap
@@ -16753,6 +17807,11 @@ fn lower_assign<'tcx>(
             {
                 return Ok(());
             }
+            if lower_aggregate_transmute_slot_copy(
+                ctx, body, block, place, *kind, operand, *dst_ty,
+            )? {
+                return Ok(());
+            }
             let target = prepare_assign_target(ctx, place)?;
             let ty = place_trust_ir_ty(ctx, body, place)?;
             lower_cast(
@@ -17445,6 +18504,75 @@ fn store_overflow_pair_into_memory_slot<'tcx>(
 ///   * `arr[i] = scalar` (projected store): store the leaf at the element offset.
 ///   * `arr = src_arr` (whole-array move/copy from another memory-backed array):
 ///     copy the slot bytes lane by lane.
+/// `dst = src as T (Transmute)` between two MEMORY-BACKED aggregates.
+///
+/// A transmute is a byte reinterpretation between two types of the SAME size,
+/// so with a slot on both sides the lowering is a slot copy — and
+/// `copy_memory_aggregate_leaves` copies by byte lanes without consulting
+/// either type, which is exactly the right primitive.
+///
+/// This is what `<[T; N] as IntoIterator>::into_iter` inlines to at -O2/-O3:
+///
+/// ```text
+/// _15 = copy _3 as [MaybeUninit<usize>; 5] (Transmute);
+/// _16 = PolymorphicIter { alive: const .., data: copy _15 };
+/// ```
+///
+/// Without it the scalarized fall-through asks `place_trust_ir_ty` for a scalar
+/// trust-ir type an array has none of, and the whole program declines — which is
+/// why `for n in [0usize, 1, 2]` compiled at -O0/-O1 and failed at -O2/-O3.
+/// Rule 0f in `compute_memory_backed_locals` is what puts the slots on both
+/// sides; if either is missing this returns `false` and the caller keeps its
+/// existing fail-closed path rather than guessing.
+///
+/// The size equality is ASSERTED. A transmute between differently-sized types is
+/// not something to paper over with a short copy.
+fn lower_aggregate_transmute_slot_copy<'tcx>(
+    ctx: &mut MirLoweringCtx<'tcx>,
+    body: &Body<'tcx>,
+    block: &mut Block,
+    place: &Place<'tcx>,
+    kind: mir::CastKind,
+    operand: &Operand<'tcx>,
+    dst_ty: Ty<'tcx>,
+) -> Result<bool, String> {
+    if !matches!(kind, mir::CastKind::Transmute) || !place.projection.is_empty() {
+        return Ok(false);
+    }
+    let (Operand::Copy(src) | Operand::Move(src)) = operand else {
+        return Ok(false);
+    };
+    if !src.projection.is_empty()
+        || !local_is_memory_backed(ctx, place.local)
+        || !local_is_memory_backed(ctx, src.local)
+    {
+        return Ok(false);
+    }
+    let dst_rust_ty = ctx.monomorphize_ty(dst_ty);
+    let src_rust_ty = ctx.monomorphize_ty(local_rust_ty(ctx, body, src.local));
+    let cx = LayoutCx(ctx.tcx);
+    let dst_layout = ctx
+        .tcx
+        .layout_of(ty::TypingEnv::fully_monomorphized().as_query_input(dst_rust_ty))
+        .map_err(|e| format!("transmute dst layout_of failed: {e:?}"))?;
+    let src_layout = ctx
+        .tcx
+        .layout_of(ty::TypingEnv::fully_monomorphized().as_query_input(src_rust_ty))
+        .map_err(|e| format!("transmute src layout_of failed: {e:?}"))?;
+    if dst_layout.size != src_layout.size {
+        return Err(format!(
+            "aggregate transmute size mismatch: {src_rust_ty:?} ({} bytes) -> \
+             {dst_rust_ty:?} ({} bytes)",
+            src_layout.size.bytes(),
+            dst_layout.size.bytes()
+        ));
+    }
+    let src_ptr = memory_slot_ptr(ctx, src.local)?;
+    let dst_ptr = memory_slot_ptr(ctx, place.local)?;
+    copy_memory_aggregate_leaves(ctx, block, &cx, &dst_layout, src_ptr, dst_ptr, 0)?;
+    Ok(true)
+}
+
 fn lower_memory_array_assign<'tcx>(
     ctx: &mut MirLoweringCtx<'tcx>,
     body: &Body<'tcx>,
@@ -17824,6 +18952,31 @@ fn lower_memory_array_assign<'tcx>(
         Rvalue::Use(operand) if place.projection.is_empty() => {
             store_operand_into_memory_at(ctx, body, block, slot_ptr, 0, dst_ty, operand)
         }
+        // `arr = src as [U; N] (Transmute)`: the memory-backed-array sibling of
+        // the same case `lower_assign` handles for general aggregates. Reached
+        // when the DESTINATION is an array, which is the `into_iter` shape.
+        Rvalue::Cast(kind, operand, dst_cast_ty) if place.projection.is_empty() => {
+            if lower_aggregate_transmute_slot_copy(
+                ctx,
+                body,
+                block,
+                place,
+                *kind,
+                operand,
+                *dst_cast_ty,
+            )? {
+                Ok(())
+            } else {
+                Err(format!(
+                    "memory array assignment Rvalue::Cast ({})",
+                    if matches!(kind, mir::CastKind::Transmute) {
+                        "transmute, but a side is not a memory-backed aggregate"
+                    } else {
+                        "non-transmute cast into a whole array"
+                    }
+                ))
+            }
+        }
         other => Err(format!(
             "memory array assignment Rvalue::{}",
             rvalue_kind_name(other)
@@ -18083,7 +19236,7 @@ fn lower_memory_whole_aggregate_element_store<'tcx>(
     if let ty::Adt(adt, _) = element_ty.kind() {
         if adt.is_enum()
             && adt.variants().len() > 1
-            && memory_aggregate_layout(ctx.tcx, element_ty)?.is_some()
+            && memory_aggregate_layout_shared(ctx.tcx, element_ty)?.is_some()
         {
             if let Rvalue::Use(operand) = rvalue {
                 return store_operand_into_memory_at(
@@ -19135,7 +20288,7 @@ fn lower_memory_aggregate_use<'tcx>(
             && !projection_has_index_element(&source.projection)
         {
             let dst_ty = ctx.monomorphize_ty(local_rust_ty(ctx, body, place.local));
-            if memory_aggregate_layout(ctx.tcx, dst_ty)?.is_some() {
+            if memory_aggregate_layout_shared(ctx.tcx, dst_ty)?.is_some() {
                 let base_ty = ctx.monomorphize_ty(local_rust_ty(ctx, body, source.local));
                 let (base_offset, projected_ty) =
                     walk_memory_projection_offset_raw(ctx, base_ty, &source.projection)?;
@@ -19191,7 +20344,7 @@ fn lower_memory_aggregate_use<'tcx>(
             );
             if matches!(base_ty.kind(), ty::Array(..))
                 && dst_is_multi_variant_enum
-                && memory_aggregate_layout(ctx.tcx, dst_ty)?.is_some()
+                && memory_aggregate_layout_shared(ctx.tcx, dst_ty)?.is_some()
             {
                 let src_slot = memory_slot_ptr(ctx, source.local)?;
                 let (src_addr, addr_ty) = walk_memory_projection_runtime_place_address(
@@ -19243,7 +20396,7 @@ fn lower_memory_aggregate_use<'tcx>(
             };
             if pointee == dst_ty
                 && !is_slice_or_str_fat_ptr_ty(ref_ty)
-                && memory_aggregate_layout(ctx.tcx, dst_ty)?.is_some()
+                && memory_aggregate_layout_shared(ctx.tcx, dst_ty)?.is_some()
             {
                 let cx = LayoutCx(ctx.tcx);
                 let ty_layout = ctx
@@ -19287,10 +20440,22 @@ fn lower_memory_aggregate_use<'tcx>(
     // Whole-aggregate `dst = src`. Only a memory-backed source of identical
     // layout is supported; copy the raw lanes. Anything else fails closed.
     let source_place = match operand {
-        Operand::Copy(p) | Operand::Move(p) if p.projection.is_empty() => p,
+        Operand::Copy(p) | Operand::Move(p) => p,
         _ => return Err("memory aggregate whole assignment from non-local operand".to_owned()),
     };
-    if !local_is_memory_backed(ctx, source_place.local) {
+    // A PROJECTED source (`arr[i]`, `(*p).f`, a struct field — the whole-struct
+    // swap / array-element copy idiom, e.g. `let t = arr[i]; arr[i] = arr[i+1]`)
+    // is supported only when its BASE local is memory-backed: the element byte
+    // address is resolved with `memory_place_address_raw` and lane-copied like a
+    // bare slot. A projected source over a non-memory base falls closed (the
+    // scalarized paths below require a bare local).
+    let source_is_projected = !source_place.projection.is_empty();
+    if source_is_projected && !local_is_memory_backed(ctx, source_place.local) {
+        return Err(
+            "memory aggregate whole assignment from projected non-memory source".to_owned(),
+        );
+    }
+    if !source_is_projected && !local_is_memory_backed(ctx, source_place.local) {
         // A SCALARIZED struct/tuple source (a flat scalar-leaf aggregate whose
         // fields are held as `projected_values` bindings — e.g. a per-iteration
         // construction temp `_t = S { .. }` then `_mem = move _t` writing back into
@@ -19326,7 +20491,13 @@ fn lower_memory_aggregate_use<'tcx>(
         return Err("memory aggregate whole assignment from non-memory source".to_owned());
     }
     let dst_ty = local_rust_ty(ctx, body, place.local);
-    let src_ty = local_rust_ty(ctx, body, source_place.local);
+    // For a projected source the copied type is the PROJECTED place's element /
+    // field type, not the base local's whole aggregate type.
+    let src_ty = if source_is_projected {
+        ctx.monomorphize_ty(source_place.ty(body, ctx.tcx).ty)
+    } else {
+        local_rust_ty(ctx, body, source_place.local)
+    };
     // A by-value CAPTURING closure (`ty::Closure`) is a single-variant aggregate
     // laid out as a struct of its upvars; it has no `memory_aggregate_layout` (that
     // helper only models named ADTs / tuples / arrays), so fall back to
@@ -19350,12 +20521,15 @@ fn lower_memory_aggregate_use<'tcx>(
         return Err("memory aggregate whole assignment between differing layouts".to_owned());
     }
     let dst_ptr = memory_slot_ptr(ctx, place.local)?;
-    let src_ptr = ctx
-        .memory_slots
-        .get(&source_place.local)
-        .cloned()
-        .unwrap()
-        .ptr;
+    let src_ptr = if source_is_projected {
+        memory_place_address_raw(ctx, body, block, source_place)?
+    } else {
+        ctx.memory_slots
+            .get(&source_place.local)
+            .cloned()
+            .unwrap()
+            .ptr
+    };
     // Copy lane by lane using the slot's natural-aligned integer lane type.
     let (lane_ty, lane_size) = match layout.align {
         1 => (TrustIrTy::I8, 1u64),
@@ -19710,7 +20884,7 @@ fn lower_memory_aggregate_use_from_scalarized_enum<'tcx>(
         return Ok(false);
     }
     // The destination must be a Direct-tagged memory enum.
-    let Some(layout) = memory_aggregate_layout(ctx.tcx, dst_ty)? else {
+    let Some(layout) = memory_aggregate_layout_shared(ctx.tcx, dst_ty)? else {
         return Ok(false);
     };
     let Some(tag) = &layout.tag else {
@@ -19791,7 +20965,7 @@ fn lower_memory_nested_enum_field_use<'tcx>(
     if source_field_ty != dst_ty {
         return Ok(false);
     }
-    let Some(layout) = memory_aggregate_layout(ctx.tcx, dst_ty)? else {
+    let Some(layout) = memory_aggregate_layout_shared(ctx.tcx, dst_ty)? else {
         return Ok(false);
     };
 
@@ -20528,7 +21702,7 @@ fn store_whole_const_aggregate_into_slot<'tcx>(
         return Ok(false);
     };
     let dst_ty = ctx.monomorphize_ty(local_rust_ty(ctx, body, place.local));
-    let Some(layout) = memory_aggregate_layout(ctx.tcx, dst_ty)? else {
+    let Some(layout) = memory_aggregate_layout_shared(ctx.tcx, dst_ty)? else {
         return Ok(false);
     };
     let Some(slot) = ctx.memory_slots.get(&place.local).cloned() else {
@@ -22497,30 +23671,28 @@ fn emit_vtable_ptr_value<'tcx>(
     let trait_ref = ctx.tcx.erase_and_anonymize_regions(trait_ref);
     let self_ty = ctx.tcx.erase_and_anonymize_regions(self_ty);
     let vtable_symbol = emit_vtable_global(ctx, self_ty, trait_ref)?;
-    let vtable_addr_int = ctx.fresh_value();
     let vtable_global_index = ctx
         .module
         .globals
         .iter()
         .position(|g| g.name == vtable_symbol)
         .ok_or_else(|| format!("vtable global `{vtable_symbol}` missing after emission"))?;
-    let vtable_addr_stub =
-        trust_cg_codegen::global_stub::encode_global_addr_stub(vtable_global_index as u64, 0)
-            .map_err(|e| format!("vtable `{vtable_symbol}` address stub: {e}"))?;
-    block.body.push(
-        InstrNode::new(Inst::Const {
-            ty: TrustIrTy::I64,
-            value: Constant::Int(vtable_addr_stub),
-        })
-        .with_result(vtable_addr_int),
-    );
+    // Canonical global reference: a `GlobalAddr` to the emitted vtable global
+    // (result type `Ptr`), instead of a `Const(encode_global_addr_stub(idx,0))`
+    // + IntToPtr tagged-integer stub. The stub carried a `ConstTypeMismatch`
+    // (its I64 carrier cannot be canonicalized to the value's usize type
+    // without breaking the in-band stub-tag ambiguity guard), and offset 0 is
+    // exactly what `GlobalAddr` provides. `GlobalAddr`'s `GlobalId` is remapped
+    // by module merge identically to the stub's index, so this is merge-safe.
+    if vtable_global_index > u16::MAX as usize {
+        return Err(format!(
+            "vtable `{vtable_symbol}` global index {vtable_global_index} exceeds the 16-bit range"
+        ));
+    }
     let vtable_ptr = ctx.fresh_value();
     block.body.push(
-        InstrNode::new(Inst::Cast {
-            op: CastOp::IntToPtr,
-            src_ty: TrustIrTy::I64,
-            dst_ty: TrustIrTy::Ptr,
-            operand: vtable_addr_int,
+        InstrNode::new(Inst::GlobalAddr {
+            global: GlobalId::new(vtable_global_index as u32),
         })
         .with_result(vtable_ptr),
     );
@@ -22740,9 +23912,24 @@ fn emit_vtable_global<'tcx>(
         }
     }
 
+    // Declare the global's type to MATCH its heterogeneous aggregate initializer
+    // (byte `Int` elements for the size/align/vacant words, one pointer-sized
+    // `SymbolAddr` per drop/method reloc). Without this the global was declared
+    // `Ptr` (8 bytes) while its initializer is an aggregate of the full vtable
+    // width, which `validate_module` flags as ConstTypeMismatch on the merged
+    // module. Codegen emits the initializer bytes regardless of the declared
+    // type; the type is validation metadata. Per-element: `SymbolAddr` matches
+    // `Ty::Ptr`, every `Int` byte matches `Ty::U8`.
+    let field_tys: Vec<TrustIrTy> = elems
+        .iter()
+        .map(|c| match c {
+            Constant::SymbolAddr { .. } => TrustIrTy::Ptr,
+            _ => TrustIrTy::U8,
+        })
+        .collect();
     ctx.module.globals.push(TrustIrGlobal {
         name: symbol.clone(),
-        ty: TrustIrTy::Ptr,
+        ty: TrustIrTy::Tuple(field_tys),
         mutable: false,
         initializer: Some(Constant::Aggregate(elems)),
         linkage: Linkage::Internal,
@@ -24658,6 +25845,9 @@ fn lower_array_repeat<'tcx>(
     {
         ctx.zero_filled_locals.insert(place.local);
     }
+    // O(N): one projected binding per element. Left unbounded for the same
+    // reason as `memory_slot_lane_ty` -- there is no per-function fallback, so a
+    // budget here would turn a working large repeat into a compile error.
     let value = lower_operand_to_value(ctx, body, block, operand)?;
     ctx.clear_full_place_bindings(place.local);
     for index in 0..repeat_count {
@@ -25909,6 +27099,59 @@ fn lower_discriminant<'tcx>(
         // any other projected scalar-enum keeps failing closed below.
         if !local_is_memory_backed(ctx, source.local) {
             let proj_ty = ctx.monomorphize_ty(place_rust_ty(ctx, body, source));
+            // A single-`Field` projection of a FIELDLESS Direct-tagged enum — e.g.
+            // `match (state, x) { .. }` reads `discriminant((tuple).0)` where `.0` is
+            // a fieldless enum. For a fieldless Direct encoding the field's SCALAR
+            // VALUE already IS the tag == discriminant, so read the projected scalar
+            // binding and widen it (by the tag's signedness) to the discriminant
+            // result type. Restricted to fieldless enums (`fieldless_enum_tag_scalar_ty`
+            // is `Some`); any niche / data-carrying projected enum stays fail-closed.
+            if let [ProjectionElem::Field(field_idx, _)] = source.projection.as_ref() {
+                if let Some(tag_ty) = fieldless_enum_tag_scalar_ty(ctx.tcx, proj_ty) {
+                    let result_ty = place_trust_ir_ty(ctx, body, place)?;
+                    let widen = match (tag_ty.bit_width(), result_ty.bit_width()) {
+                        (Some(t), Some(r)) if r == t => Some(None),
+                        (Some(t), Some(r)) if r > t => Some(Some(
+                            if is_signed_trust_ir_integer(&tag_ty) {
+                                CastOp::SExt
+                            } else {
+                                CastOp::ZExt
+                            },
+                        )),
+                        _ => None,
+                    };
+                    if let Some(cast_op) = widen {
+                        let value = value_for_scalar_binding(
+                            ctx,
+                            ScalarPlaceBinding::Projection {
+                                local: source.local,
+                                field: field_idx.as_u32(),
+                            },
+                        )?;
+                        let target = prepare_assign_target(ctx, place)?;
+                        match cast_op {
+                            None => block.body.push(
+                                InstrNode::new(Inst::Copy {
+                                    ty: result_ty,
+                                    operand: value,
+                                })
+                                .with_result(target.value),
+                            ),
+                            Some(op) => block.body.push(
+                                InstrNode::new(Inst::Cast {
+                                    op,
+                                    src_ty: tag_ty,
+                                    dst_ty: result_ty,
+                                    operand: value,
+                                })
+                                .with_result(target.value),
+                            ),
+                        }
+                        finish_assign_target(ctx, body, block, place, target)?;
+                        return Ok(());
+                    }
+                }
+            }
             let base_ty = ctx.monomorphize_ty(local_rust_ty(ctx, body, source.local));
             let is_option_ordering = matches!(base_ty.kind(), ty::Adt(a, args)
                 if ctx.tcx.get_diagnostic_item(rustc_span::sym::Option) == Some(a.did())
@@ -26222,7 +27465,7 @@ fn lower_reference_deref_discriminant<'tcx>(
         },
         None => return Ok(None),
     };
-    let Some(tag) = layout.tag else {
+    let Some(tag) = layout.tag.clone() else {
         return Ok(None);
     };
     // The reference's pointer value must already be bound (a `&local` slot pointer,
@@ -26367,10 +27610,10 @@ fn lower_memory_discriminant<'tcx>(
     source: &Place<'tcx>,
 ) -> Result<(), String> {
     let src_ty = local_rust_ty(ctx, body, source.local);
-    let Some(layout) = memory_aggregate_layout(ctx.tcx, src_ty)? else {
+    let Some(layout) = memory_aggregate_layout_shared(ctx.tcx, src_ty)? else {
         return Err("memory discriminant on local without aggregate layout".to_owned());
     };
-    let Some(tag) = layout.tag else {
+    let Some(tag) = layout.tag.clone() else {
         // A TAGLESS aggregate. For an ENUM this means a single-INHABITED-variant
         // layout (`Variants::Single`): either a genuine 1-variant enum, or a
         // multi-variant enum type whose other variants are uninhabited (e.g.
@@ -26510,10 +27753,10 @@ fn lower_memory_projected_discriminant<'tcx>(
         finish_assign_target(ctx, body, block, place, target)?;
         return Ok(true);
     }
-    let Some(proj_layout) = memory_aggregate_layout(ctx.tcx, proj_ty)? else {
+    let Some(proj_layout) = memory_aggregate_layout_shared(ctx.tcx, proj_ty)? else {
         return Ok(false);
     };
-    let Some(tag) = proj_layout.tag else {
+    let Some(tag) = proj_layout.tag.clone() else {
         // Tagless (single inhabited variant) sub-enum: leave to the fail-closed path.
         return Ok(false);
     };
@@ -28020,6 +29263,117 @@ fn lower_cast<'tcx>(
         return Ok(());
     };
 
+    // WRONG-CODE FIX: `float as {i8,i16,i32,u8,u16,u32}` must SATURATE to the
+    // narrow integer range. The AArch64 fcvtzs/fcvtzu encoder emits a 64-bit
+    // conversion (`sf_64 = true`, saturating to the i64/u64 range) and the
+    // narrow result was then TRUNCATED with no narrow clamp — so an
+    // out-of-narrow-range float gave the wrong value (300.0 as u8 -> 44 not 255;
+    // 1e300 as i32 -> -1 not i32::MAX). Compose the correct saturating cast from
+    // proof-covered primitives: 64-bit fcvt (correct 64-bit saturation) + clamp
+    // to [NARROW::MIN, NARROW::MAX] + truncate. (float->i64/u64 is already
+    // correct and is left on the direct path below.)
+    if matches!(kind, mir::CastKind::FloatToInt) {
+        if let Some(narrow_w) = dst_ty.bit_width() {
+            if narrow_w < 64 {
+                let signed = is_signed_integer(dst_rust_ty);
+                let wide_ty = integer_trust_ir_ty_for_width(signed, 64)
+                    .ok_or_else(|| "float->narrow-int: no 64-bit integer type".to_owned())?;
+                let push_const = |ctx: &mut MirLoweringCtx<'tcx>,
+                                  block: &mut Block,
+                                  v: i128|
+                 -> ValueId {
+                    let c = ctx.fresh_value();
+                    block.body.push(
+                        InstrNode::new(Inst::Const {
+                            ty: wide_ty.clone(),
+                            value: Constant::Int(v),
+                        })
+                        .with_result(c),
+                    );
+                    c
+                };
+                // 1. 64-bit fcvt (fcvtzs/fcvtzu x — saturates to the 64-bit range).
+                let wide = ctx.fresh_value();
+                block.body.push(
+                    InstrNode::new(Inst::Cast {
+                        op,
+                        src_ty: src_ty.clone(),
+                        dst_ty: wide_ty.clone(),
+                        operand,
+                    })
+                    .with_result(wide),
+                );
+                refine_push_float_to_int(ctx, signed, &src_ty, &wide_ty);
+                // 2. Clamp the 64-bit value to [NARROW::MIN, NARROW::MAX].
+                let (nmin, nmax): (i128, i128) = if signed {
+                    ((-(1i128 << (narrow_w - 1))), (1i128 << (narrow_w - 1)) - 1)
+                } else {
+                    (0, (1i128 << narrow_w) - 1)
+                };
+                let max_c = push_const(ctx, block, nmax);
+                let gt = ctx.fresh_value();
+                block.body.push(
+                    InstrNode::new(Inst::ICmp {
+                        op: if signed { ICmpOp::Sgt } else { ICmpOp::Ugt },
+                        ty: wide_ty.clone(),
+                        lhs: wide,
+                        rhs: max_c,
+                    })
+                    .with_result(gt),
+                );
+                let hi = ctx.fresh_value();
+                block.body.push(
+                    InstrNode::new(Inst::Select {
+                        ty: wide_ty.clone(),
+                        cond: gt,
+                        then_val: max_c,
+                        else_val: wide,
+                    })
+                    .with_result(hi),
+                );
+                // Low clamp is needed only for signed dst: fcvtzu already
+                // saturates negative floats to 0, so an unsigned value is >= 0.
+                let clamped = if signed {
+                    let min_c = push_const(ctx, block, nmin);
+                    let lt = ctx.fresh_value();
+                    block.body.push(
+                        InstrNode::new(Inst::ICmp {
+                            op: ICmpOp::Slt,
+                            ty: wide_ty.clone(),
+                            lhs: hi,
+                            rhs: min_c,
+                        })
+                        .with_result(lt),
+                    );
+                    let lo = ctx.fresh_value();
+                    block.body.push(
+                        InstrNode::new(Inst::Select {
+                            ty: wide_ty.clone(),
+                            cond: lt,
+                            then_val: min_c,
+                            else_val: hi,
+                        })
+                        .with_result(lo),
+                    );
+                    lo
+                } else {
+                    hi
+                };
+                // 3. Truncate the in-range 64-bit value to the narrow dst.
+                block.body.push(
+                    InstrNode::new(Inst::Cast {
+                        op: CastOp::Trunc,
+                        src_ty: wide_ty,
+                        dst_ty,
+                        operand: clamped,
+                    })
+                    .with_result(result),
+                );
+                return Ok(());
+            }
+        }
+    }
+
     let refine_src_ty = src_ty.clone();
     let refine_dst_ty = dst_ty.clone();
     let refine_op = op;
@@ -28916,7 +30270,7 @@ fn lower_overflowing_divrem_call<'tcx>(
         block.body.push(
             InstrNode::new(Inst::Const {
                 ty: TrustIrTy::Bool,
-                value: Constant::Int(0),
+                value: Constant::Bool(false),
             })
             .with_result(c),
         );
@@ -31395,6 +32749,61 @@ fn lower_binary_op<'tcx>(
                 );
                 masked
             }
+        } else if matches!(
+            op,
+            TrustIrBinOp::Shl | TrustIrBinOp::LShr | TrustIrBinOp::AShr
+        ) {
+            // BinOpTypeMismatch fix: the trust-ir validator requires a BinOp's
+            // two operands to share one representation, but a Rust shift's
+            // AMOUNT carries its own (typically `i32`) type, distinct from the
+            // shifted value's type -- so `x << 13` reaches here as
+            // `Shl(u64, i32)` and trips `BinOpTypeMismatch`. Re-type the amount
+            // to the value's type. A shift consults only the low `log2(width)`
+            // bits of the amount, which every width-preserving retype / extend /
+            // truncate keeps, so the machine result -- and the `MaskedShift`
+            // refinement model, built from `lhs_trust_ir_ty` below -- are
+            // unchanged. The `i128` masked forms above already normalized their
+            // own amount and never reach this arm.
+            let count_ty = rust_ty_to_trust_ir_ty(ctx.tcx, rhs_rust_ty)?;
+            if count_ty == lhs_trust_ir_ty {
+                rhs
+            } else if let Some(raw) = rhs_const_i128 {
+                // Constant amount: re-materialize the SAME immediate in the
+                // value's type. The shift selects by-immediate, so the emitted
+                // machine code is byte-identical and the now-unused original
+                // constant is dead-code-eliminated -- a pure type-label change.
+                let c = ctx.fresh_value();
+                block.body.push(
+                    InstrNode::new(Inst::Const {
+                        ty: lhs_trust_ir_ty.clone(),
+                        value: Constant::Int(raw),
+                    })
+                    .with_result(c),
+                );
+                c
+            } else if let Some(cast_op) =
+                union_projection_cast_op(&count_ty, &lhs_trust_ir_ty).flatten()
+            {
+                // Runtime amount of a different width: widen / narrow to the
+                // value's type. Only the low bits survive the shift's own
+                // masking, and Trunc/ZExt/SExt all preserve them.
+                let casted = ctx.fresh_value();
+                block.body.push(
+                    InstrNode::new(Inst::Cast {
+                        op: cast_op,
+                        src_ty: count_ty,
+                        dst_ty: lhs_trust_ir_ty.clone(),
+                        operand: rhs,
+                    })
+                    .with_result(casted),
+                );
+                casted
+            } else {
+                // Uncoercible width (e.g. a 128-bit amount on a <=64-bit
+                // value): preserve today's exact behavior rather than fail a
+                // compile that currently succeeds. Leaves that rare dirty edge.
+                rhs
+            }
         } else {
             rhs
         };
@@ -31493,7 +32902,7 @@ fn lower_unary_op<'tcx>(
             block.body.push(
                 InstrNode::new(Inst::Const {
                     ty: TrustIrTy::Bool,
-                    value: Constant::Int(0),
+                    value: Constant::Bool(false),
                 })
                 .with_result(false_value),
             );
@@ -31637,7 +33046,11 @@ fn lower_operand_to_value<'tcx>(
             block.body.push(
                 InstrNode::new(Inst::Const {
                     ty: TrustIrTy::Bool,
-                    value: Constant::Int(enabled as i128),
+                    // A `Bool`-typed const must carry a `Constant::Bool`: the
+                    // validator has no `(Int, Ty::Bool)` shape match, so an
+                    // integer body is a ConstTypeMismatch on the merged module.
+                    // Same lowered byte (0/1); this is the canonical form.
+                    value: Constant::Bool(enabled),
                 })
                 .with_result(result),
             );
@@ -34711,27 +36124,29 @@ struct DomBceFact {
 
 /// The right-hand side of a dominating guard.
 ///
-/// `Const` is the original scope (a fixed-size array). `DynLocal` is a heap
-/// slice or `Vec` whose length is only known at runtime — `while k < v.len()`.
-///
-/// The two discharge COMPLETELY DIFFERENTLY, which is the point of separating
-/// them. `Const` goes to the ay solver, which proves an arithmetic implication
-/// between two numbers. `DynLocal` needs NO solver: when the guard's length and
-/// the carrier's length are the same local, `k <u L => k <u L` holds by
-/// IDENTITY. What must be established instead is that the local is not
-/// reassigned between the guard and the use — a dataflow fact, and the entire
-/// safety argument for the dynamic case.
+/// `Const` is the certified scope (a fixed-size array). `DynLocal` records that
+/// the recognizer saw a heap slice or `Vec` length known only at runtime —
+/// `while k < v.len()` — but it is NOT an authority-bearing bound. Dynamic
+/// identity discharge remains fail-closed until the bridge proves both the
+/// exact statement-position interval (including the guard/assert endpoint
+/// blocks) and alias provenance for the shared length source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DomBceBound {
     Const(u64),
-    /// The length local, plus WHERE the guard read it — the block and the
-    /// statement index of the compare. Both are needed to ask whether the local
-    /// is reassigned anywhere the check could observe.
-    DynLocal {
-        local: Local,
-        guard_block: mir::BasicBlock,
-        guard_stmt: usize,
-    },
+    /// Recognized for a precise refusal diagnostic only. This variant cannot
+    /// produce a discharged obligation or enter the elimination kernel.
+    DynLocal,
+}
+
+/// Return the one bound kind whose authority is implemented. Keeping this as
+/// a production helper gives the fail-closed policy a platform-independent
+/// canary: a future dynamic re-enable must replace this boundary with a real
+/// interval + alias proof, not merely change an integration fixture.
+fn dom_bce_constant_bound(bound: DomBceBound) -> Option<u64> {
+    match bound {
+        DomBceBound::Const(k) => Some(k),
+        DomBceBound::DynLocal => None,
+    }
 }
 
 /// Ask the ay solver lane to discharge the per-instance IMPLICATION
@@ -34964,175 +36379,6 @@ fn dom_bce_address_taken<'tcx>(body: &Body<'tcx>, locals: &[Local]) -> bool {
     false
 }
 
-/// Resolve `local` to the PLACE it was last copied from within `block_data`
-/// before `upto`, following `Copy`/`Move` assignments.
-///
-/// The guard and the bounds check each read the length into their OWN temp
-/// (h1: `_23` at the guard, `_33` at the check), so comparing local ids fails
-/// even though both are copies of the same `(_3.1: usize)` field. Comparing the
-/// SOURCE PLACES is the right identity test.
-///
-/// Returns `None` when the local is not a plain in-block copy of a place, which
-/// declines rather than guessing.
-fn dom_bce_len_source_place<'tcx>(
-    block_data: &mir::BasicBlockData<'tcx>,
-    upto: usize,
-    local: Local,
-) -> Option<mir::Place<'tcx>> {
-    // TRANSITIVE: a length can reach its temp through several copies
-    // (`_23 = copy _15; _15 = copy (_3.1)`), so follow the chain to the first
-    // non-copy source rather than stopping at one hop. Bounded to keep this
-    // O(1)-ish and to terminate on any cycle a malformed body could present.
-    let mut cur = local;
-    let mut cur_upto = upto;
-    for _ in 0..BRIDGE_DOM_BCE_MAX_IDOM_WALK {
-        let mut stepped = false;
-        for (idx, statement) in block_data.statements[..cur_upto].iter().enumerate().rev() {
-            let StatementKind::Assign(boxed) = &statement.kind else {
-                continue;
-            };
-            let (place, rvalue) = &**boxed;
-            if place.local != cur || !place.projection.is_empty() {
-                continue;
-            }
-            let Rvalue::Use(Operand::Copy(src) | Operand::Move(src)) = rvalue else {
-                return None;
-            };
-            // A projected source (`(_3.1: usize)`) is the root we compare on.
-            if !src.projection.is_empty() {
-                return Some(*src);
-            }
-            cur = src.local;
-            cur_upto = idx;
-            stepped = true;
-            break;
-        }
-        if !stepped {
-            // No further in-block definition: the current local IS the source.
-            return Some(mir::Place::from(cur));
-        }
-    }
-    None
-}
-
-/// Does any block on a path from `guard_block` to `assert_bb` write `local`,
-/// or take its address?
-///
-/// The whole-body sibling below is sound but too weak for the shape this
-/// feature exists for: in `h1_vec_push_sum` the Vec `_3` is written by the PUSH
-/// loop, which precedes the sum loop entirely and cannot affect a check inside
-/// it. Only writes BETWEEN the guard and the use can invalidate the guard's
-/// fact.
-///
-/// Forward reachability from `guard_block`, stopping at `assert_bb`. The guard
-/// block and the assert block are exempt from the write scan: each legitimately
-/// reads the length into its own temp, and those two reads are already proven
-/// to share a source place before this is called.
-///
-/// Conservative in two ways that keep it fail-safe: path feasibility is not
-/// required, and exhausting the block budget refuses. An unmodelled CFG can
-/// therefore cost an optimization, never soundness.
-fn dom_bce_source_written_between<'tcx>(
-    body: &Body<'tcx>,
-    local: Local,
-    guard_block: mir::BasicBlock,
-    assert_bb: mir::BasicBlock,
-) -> bool {
-    let mut seen = std::collections::HashSet::new();
-    let mut work = vec![guard_block];
-    let mut budget = 512usize;
-
-    while let Some(bb) = work.pop() {
-        if budget == 0 {
-            return true;
-        }
-        budget -= 1;
-        if !seen.insert(bb) {
-            continue;
-        }
-        let block = &body.basic_blocks[bb];
-
-        if bb != guard_block && bb != assert_bb {
-            for statement in &block.statements {
-                if let StatementKind::Assign(boxed) = &statement.kind {
-                    if boxed.0.local == local {
-                        return true;
-                    }
-                    // Taking the address on this path is equally disqualifying:
-                    // a callee could mutate the length through it.
-                    match &boxed.1 {
-                        Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place) => {
-                            if place.local == local {
-                                return true;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        if let TerminatorKind::Call { destination, .. } = &block.terminator().kind {
-            if destination.local == local {
-                return true;
-            }
-        }
-
-        if bb == assert_bb {
-            continue;
-        }
-        for succ in block.terminator().successors() {
-            work.push(succ);
-        }
-    }
-    false
-}
-
-/// Is `len_local` assigned anywhere OTHER than inside `guard_block`/// Is `len_local` assigned anywhere OTHER than inside `guard_block` at or before
-/// statement index `guard_stmt`?
-///
-/// This is the entire safety argument for a DYNAMIC dominating bound. When the
-/// guard reads `k <u L` and the carrier checks `k <u L` with the same `L`, the
-/// implication holds by identity — but ONLY if `L` still holds the value the
-/// guard saw. A reassignment anywhere the check can observe breaks it, and the
-/// consequence is a deleted bounds guard on a stale length: silent
-/// out-of-bounds, strictly worse than a wrong value.
-///
-/// Deliberately whole-body and conservative rather than path-sensitive. Any
-/// assignment outside the guard's own prefix returns true (= refuse), so an
-/// unmodelled control-flow shape can only cost an optimization, never
-/// soundness. `dom_bce_address_taken` is checked separately and covers the
-/// aliasing route by which `L` could be mutated without a visible assignment.
-fn dom_bce_len_reassigned_outside_guard<'tcx>(
-    body: &Body<'tcx>,
-    len_local: Local,
-    guard_block: mir::BasicBlock,
-    guard_stmt: usize,
-) -> bool {
-    for (bb, block) in body.basic_blocks.iter_enumerated() {
-        for (idx, statement) in block.statements.iter().enumerate() {
-            let StatementKind::Assign(boxed) = &statement.kind else {
-                continue;
-            };
-            if boxed.0.local != len_local {
-                continue;
-            }
-            // The guard's own definition of the length, at or before the
-            // compare, is the value the guard read — that one is fine.
-            if bb == guard_block && idx <= guard_stmt {
-                continue;
-            }
-            return true;
-        }
-        // A call writing into the length local also reassigns it.
-        if let TerminatorKind::Call { destination, .. } = &block.terminator().kind {
-            if destination.local == len_local {
-                return true;
-            }
-        }
-    }
-    false
-}
-
 /// Find a dominating compare that establishes `index_local <op> K` at the
 /// assert block `assert_bb`'s terminator. See the module comment above for
 /// the exact soundness argument; every bullet is enforced here, and any
@@ -35240,11 +36486,11 @@ fn dom_bce_find_dominating_fact<'tcx>(
                     if body.local_decls[place.local].ty != ctx.tcx.types.usize {
                         break;
                     }
-                    DomBceBound::DynLocal {
-                        local: place.local,
-                        guard_block: dom,
-                        guard_stmt: idx,
-                    }
+                    // Recognize this only so the caller can issue a precise
+                    // fail-closed diagnostic. No dynamic source identity is
+                    // authority until statement-position interval and alias
+                    // provenance are both implemented.
+                    DomBceBound::DynLocal
                 }
                 // Any other operand form is not a bound this analysis models.
                 _ => break,
@@ -35452,15 +36698,13 @@ fn try_lower_bounds_check_as_dominated_verified_guard<'tcx>(
     };
     let trace = trust_cg_codegen::env_lock::var_os("TCG_BCE_TRACE").is_some();
     if trace {
-        eprintln!("TCG-BCE-DYN entry: bb={bb:?} len={len:?} index={index:?}");
+        eprintln!("TCG-BCE-DOM entry: bb={bb:?} len={len:?} index={index:?}");
     }
     // Constant `len`, on every backend's carrier-expander cap (same cap as
     // OPT-6a: the surviving carrier must expand to a real runtime check).
-    // The length is a compile-time constant (fixed-size array) or a RUNTIME
-    // value (heap slice / `Vec`). The dynamic case used to bail here, so such
-    // checks never became a proof carrier at all — which is what kept
-    // h1_vec_push_sum's loop unvectorizable, since the vectorizer's opcode
-    // whitelist correctly rejects the panic call the raw check lowers to.
+    // A runtime length is retained only long enough to produce the explicit
+    // fail-closed dynamic-authority diagnostic below; it never becomes a proof
+    // carrier.
     let const_bound = match scalar_constant_from_operand(ctx, len) {
         Ok(Some(raw)) => {
             let Ok(b) = u64::try_from(raw) else {
@@ -35483,7 +36727,7 @@ fn try_lower_bounds_check_as_dominated_verified_guard<'tcx>(
         Operand::Copy(place) | Operand::Move(place) if place.projection.is_empty() => place.local,
         _ => {
             if trace {
-                eprintln!("TCG-BCE-DYN bail: index is not a bare local");
+                eprintln!("TCG-BCE-DOM bail: index is not a bare local");
             }
             return false;
         }
@@ -35491,144 +36735,36 @@ fn try_lower_bounds_check_as_dominated_verified_guard<'tcx>(
     // The dominating fact, or keep the check.
     let Some(fact) = dom_bce_find_dominating_fact(ctx, body, bb, index_local) else {
         if trace {
-            eprintln!("TCG-BCE-DYN bail: no dominating fact for {index_local:?}");
+            eprintln!("TCG-BCE-DOM bail: no dominating fact for {index_local:?}");
         }
         return false;
     };
     if trace {
-        eprintln!("TCG-BCE-DYN fact: {:?}", fact.bound);
+        eprintln!("TCG-BCE-DOM fact: {:?}", fact.bound);
     }
-    // THE LICENSE: the ay lane must genuinely discharge the implication.
+    // THE LICENSE: only a constant dominating bound has implemented proof
+    // authority. Dynamic identity used to manufacture a Discharged obligation
+    // after a block-level scan that skipped both endpoint blocks and did not
+    // prove provenance of a preexisting raw/mutable alias. Until a
+    // statement-position interval proof AND alias provenance exist, every
+    // dynamic fact keeps the legacy check.
+    let Some(dom_bound) = dom_bce_constant_bound(fact.bound) else {
+        if trace {
+            eprintln!(
+                "TCG-BCE-DYN refused: statement-position interval and alias \
+                 provenance are not certified"
+            );
+        }
+        return false;
+    };
+    let Some(bound) = const_bound else {
+        // A constant dominating fact cannot discharge a dynamic check length.
+        return false;
+    };
     // Refuted (e.g. `<=u len` off-by-one, or a weaker `K > len` guard) /
     // unknown / timeout / solver-off => the check stays.
-    // Discharge splits by bound kind. A CONSTANT dominating bound is an
-    // arithmetic implication and goes to the solver. A DYNAMIC one is not: when
-    // the guard's length and this check's length are the same local, the
-    // implication holds by IDENTITY, and what must be established instead is
-    // that the local is not reassigned between them.
-    //
-    // The identity/no-redefinition path is NOT implemented yet, so a dynamic
-    // fact declines here — fail-safe, exactly as an unproven constant does.
-    // Emitting the carrier without that check would delete a live bounds guard
-    // whenever the length is reassigned mid-loop.
-    // `Some(k)` = constant dominating bound, still to be discharged by the
-    // solver below. `None` = dynamic bound ALREADY discharged by identity.
-    let dom_bound: Option<u64> = match fact.bound {
-        DomBceBound::Const(k) => Some(k),
-        DomBceBound::DynLocal {
-            local,
-            guard_block,
-            guard_stmt,
-        } => {
-            // IDENTITY discharge. The guard established `idx <u local`. This
-            // check is `idx <u len`. If `len` IS that same local and the local
-            // is not reassigned anywhere the check can observe, the implication
-            // is `x <u L => x <u L` — true without a solver.
-            //
-            // Both halves are required. Same-local alone is not enough: a
-            // length recomputed to a SMALLER value between guard and use would
-            // make the guard's fact stale and delete a live bounds check.
-            if const_bound.is_some() {
-                // A constant `len` against a dynamic guard bound is not
-                // something this identity argument covers.
-                return false;
-            }
-            {
-                // `len` is itself dynamic — compare locals.
-                let (Operand::Copy(len_place) | Operand::Move(len_place)) = len else {
-                    return false;
-                };
-                if !len_place.projection.is_empty() {
-                    return false;
-                }
-                // Same local is the easy case; otherwise both temps must be
-                // copies of the SAME source place. h1 hits the second: the
-                // guard reads the length into one temp and the check into
-                // another, both from `(_3.1: usize)`.
-                let same_value = len_place.local == local || {
-                    let guard_src = dom_bce_len_source_place(
-                        &body.basic_blocks[guard_block],
-                        guard_stmt,
-                        local,
-                    );
-                    let check_src = dom_bce_len_source_place(
-                        &body.basic_blocks[bb],
-                        body.basic_blocks[bb].statements.len(),
-                        len_place.local,
-                    );
-                    match (guard_src, check_src) {
-                        (Some(a), Some(b)) => a == b,
-                        _ => false,
-                    }
-                };
-                if trace {
-                    eprintln!(
-                        "TCG-BCE-DYN identity: guard_local={local:?} check_local={:?} \
-                         same_value={same_value}",
-                        len_place.local
-                    );
-                }
-                if !same_value {
-                    return false;
-                }
-                // The no-redefinition obligation attaches to BOTH temps and to
-                // the shared source's base local: what must not change between
-                // guard and use is the underlying length, not one copy of it.
-                // The obligation belongs on the SOURCE, not on the temps.
-                //
-                // Each site legitimately re-reads the length into its own temp
-                // (`_33 = copy (_3.1)` in the check's block), and that is a
-                // fresh read of the same place — not a mutation. Guarding the
-                // temps rejected exactly the shape this feature exists for.
-                // What must not change between guard and use is the underlying
-                // length: the base local of the shared source place.
-                let source_base = dom_bce_len_source_place(
-                    &body.basic_blocks[guard_block],
-                    guard_stmt,
-                    local,
-                )
-                .map(|pl| pl.local);
-                let Some(source_base) = source_base else {
-                    if trace {
-                        eprintln!("TCG-BCE-DYN bail: no resolvable length source");
-                    }
-                    return false;
-                };
-                if dom_bce_source_written_between(body, source_base, guard_block, bb) {
-                    if trace {
-                        eprintln!(
-                            "TCG-BCE-DYN bail: source {source_base:?} written between \
-                             guard and use"
-                        );
-                    }
-                    return false;
-                }
-                // The TEMPS' addresses are never legitimately taken, so the
-                // whole-body check remains right for them.
-                if dom_bce_address_taken(body, &[local, len_place.local]) {
-                    if trace {
-                        eprintln!("TCG-BCE-DYN bail: length address-taken");
-                    }
-                    return false;
-                }
-                if trace {
-                    eprintln!("TCG-BCE-DYN DISCHARGED by identity");
-                }
-                // Discharged by identity. Fall THROUGH to the shared probe
-                // emission — returning true here would skip it, leaving the
-                // block without the replacement terminator the caller expects
-                // (caught by [TCG-SSA-071] loop-completeness).
-                None
-            }
-        }
-    };
-    if let Some(dom_bound) = dom_bound {
-        let Some(bound) = const_bound else {
-            // A constant dominating fact cannot discharge a dynamic length.
-            return false;
-        };
-        if !ay_proves_dominating_bounds_implication(fact.op, dom_bound, bound) {
-        if std::env::var_os("TCG_BCE_TRACE").is_some() {
+    if !ay_proves_dominating_bounds_implication(fact.op, dom_bound, bound) {
+        if trace {
             eprintln!(
                 "TCG-BCE-DOM refused (solver): {} k={} len={} at {:?}",
                 match fact.op {
@@ -35640,8 +36776,7 @@ fn try_lower_bounds_check_as_dominated_verified_guard<'tcx>(
                 bb,
             );
         }
-            return false;
-        }
+        return false;
     }
     let Ok(pid_raw) = u32::try_from(ctx.module.proof_obligations.len()) else {
         return false;
@@ -35672,65 +36807,27 @@ fn try_lower_bounds_check_as_dominated_verified_guard<'tcx>(
         DomBceCmpOp::Ult => ("bvult", "ult"),
         DomBceCmpOp::Ule => ("bvule", "ule"),
     };
-    let (k, l) = (dom_bound.unwrap_or(0), const_bound.unwrap_or(0));
+    let (k, l) = (dom_bound, bound);
     let pid = TrustIrProofId::new(pid_raw);
-    // The two bound kinds are discharged by DIFFERENT arguments and must record
-    // different obligations. Emitting the constant/solver formula for a dynamic
-    // bound would state `implies(ult(idx, 0), bvult(idx, 0))` — a vacuous
-    // X-implies-X of exactly the kind retracted in #62, registered as
-    // Discharged. That is worse than not firing at all.
-    let obligation = if const_bound.is_some() {
-        TrustIrProofObligation::new(
-            pid,
-            TrustIrObligationKind::MemorySafety,
-            TrustIrProofStatus::Discharged,
-            format!(
-                "OPT-6b: bounds check proven redundant by a dominating compare, \
-                 discharged by the ay solver lane: (idx {op_name} {k}) => (idx < len {l})"
-            ),
-        )
-        .with_formula(TrustIrProofFormula {
-            schema: "trust-cg.bridge-bounds-dominated@1".to_string(),
-            payload: format!("implies({op_smt}(idx64, bv64:{k}), bvult(idx64, bv64:{l}))"),
-            smtlib: Some(format!(
-                "(declare-const bridge_dom_bce_idx (_ BitVec 64)) (assert (and \
-                 ({op_smt} bridge_dom_bce_idx (_ bv{k} 64)) (not (bvult \
-                 bridge_dom_bce_idx (_ bv{l} 64)))))"
-            )),
-            sort: Some("Bool".to_string()),
-        })
-    } else {
-        // DYNAMIC length. No solver ran and none was needed: the guard
-        // established `idx <u L` and this check is `idx <u L` for the SAME L,
-        // so the implication is an instance of reflexivity. The load-bearing
-        // content is the DATAFLOW side condition, which is what the formula
-        // records — the length is unchanged between guard and use.
-        TrustIrProofObligation::new(
-            pid,
-            TrustIrObligationKind::MemorySafety,
-            TrustIrProofStatus::Discharged,
-            format!(
-                "OPT-6b-dyn: bounds check redundant by IDENTITY with a dominating \
-                 compare on the same runtime length; side condition: the length \
-                 source is neither written nor address-taken on any path from the \
-                 guard to the use ({op_name})"
-            ),
-        )
-        .with_formula(TrustIrProofFormula {
-            schema: "trust-cg.bridge-bounds-dominated-dyn@1".to_string(),
-            payload: format!(
-                "reflexive({op_smt}(idx64, len64)) given unchanged(len64, guard..use)"
-            ),
-            smtlib: Some(
-                "(declare-const bridge_dyn_bce_idx (_ BitVec 64)) \
-                 (declare-const bridge_dyn_bce_len (_ BitVec 64)) \
-                 (assert (and (bvult bridge_dyn_bce_idx bridge_dyn_bce_len) \
-                 (not (bvult bridge_dyn_bce_idx bridge_dyn_bce_len))))"
-                    .to_string(),
-            ),
-            sort: Some("Bool".to_string()),
-        })
-    };
+    let obligation = TrustIrProofObligation::new(
+        pid,
+        TrustIrObligationKind::MemorySafety,
+        TrustIrProofStatus::Discharged,
+        format!(
+            "OPT-6b: bounds check proven redundant by a dominating compare, \
+             discharged by the ay solver lane: (idx {op_name} {k}) => (idx < len {l})"
+        ),
+    )
+    .with_formula(TrustIrProofFormula {
+        schema: "trust-cg.bridge-bounds-dominated@1".to_string(),
+        payload: format!("implies({op_smt}(idx64, bv64:{k}), bvult(idx64, bv64:{l}))"),
+        smtlib: Some(format!(
+            "(declare-const bridge_dom_bce_idx (_ BitVec 64)) (assert (and \
+             ({op_smt} bridge_dom_bce_idx (_ bv{k} 64)) (not (bvult \
+             bridge_dom_bce_idx (_ bv{l} 64)))))"
+        )),
+        sort: Some("Bool".to_string()),
+    });
     ctx.module.proof_obligations.push(obligation);
 
     if std::env::var_os("TCG_BCE_TRACE").is_some() {
@@ -35747,26 +36844,14 @@ fn try_lower_bounds_check_as_dominated_verified_guard<'tcx>(
     // it to the bare `GuardBoundsCheck` carrier with no dead
     // flag-materialization (a `cmp`+`setcc` the machine DCE would
     // conservatively keep) left in the loop body.
-    // Constant bound -> materialize it. Dynamic -> lower the length operand with
-    // the SAME helper the index uses, so the probe compares against the runtime
-    // value and the adapter sees a non-const RHS (its `BoundsProbeBound::Dyn`).
-    let bound_v = match const_bound {
-        Some(bound) => {
-            let v = ctx.fresh_value();
-            block.body.push(
-                InstrNode::new(Inst::Const {
-                    ty: TrustIrTy::I64,
-                    value: Constant::Int(bound as i128),
-                })
-                .with_result(v),
-            );
-            v
-        }
-        None => match lower_operand_to_value(ctx, body, block, len) {
-            Ok(v) => v,
-            Err(_) => return false,
-        },
-    };
+    let bound_v = ctx.fresh_value();
+    block.body.push(
+        InstrNode::new(Inst::Const {
+            ty: TrustIrTy::I64,
+            value: Constant::Int(bound as i128),
+        })
+        .with_result(bound_v),
+    );
     block.body.push(
         InstrNode::new(Inst::ICmp {
             op: ICmpOp::Ult,
@@ -36157,7 +37242,7 @@ fn lower_assert_terminator<'tcx>(
         block.body.push(
             InstrNode::new(Inst::Const {
                 ty: TrustIrTy::Bool,
-                value: Constant::Int(0),
+                value: Constant::Bool(false),
             })
             .with_result(expected_value),
         );
@@ -37874,7 +38959,7 @@ fn lower_closure_call_terminator<'tcx>(
         // layout offset — the same lane-copy `lower_memory_aggregate_byval_call_arg`
         // produces for a whole local. Fails closed (no slot / non-aggregate-leaf)
         // rather than miscompiling.
-        if memory_aggregate_layout(ctx.tcx, elem_ty)?.is_some() {
+        if memory_aggregate_layout_shared(ctx.tcx, elem_ty)?.is_some() {
             let Some(slot) = ctx.memory_slots.get(&tuple_place.local).cloned() else {
                 return Err(format!(
                     "closure call by-value aggregate element {field} requires a \
@@ -39289,7 +40374,9 @@ fn lower_intrinsic_call<'tcx>(
         block.body.push(
             InstrNode::new(Inst::Const {
                 ty: TrustIrTy::Bool,
-                value: Constant::Int(0),
+                // Bool-typed const carries `Constant::Bool` (no `(Int, Ty::Bool)`
+                // validator shape match); same lowered byte, canonical form.
+                value: Constant::Bool(false),
             })
             .with_result(f),
         );
@@ -40873,6 +41960,55 @@ fn lower_typed_swap_intrinsic<'tcx>(
         emit_call_successor(block, call.target);
         return Ok(());
     }
+    // AGGREGATE `T` (a struct / array / tuple swap, e.g. `mem::swap(&mut a, &mut b)`
+    // on two `[u64; N]` locals). `rust_ty_to_trust_ir_ty` has no scalar type for it,
+    // so swap the two `T`-sized regions LANE BY LANE over the proven Load/Store
+    // (the same lane machinery the whole-aggregate copy uses). The two regions are
+    // non-overlapping (the intrinsic's contract), so per-lane load-both-then-store-
+    // crossed is correct.
+    if let Some(layout) = memory_aggregate_layout(ctx.tcx, t_ty)? {
+        let x_ptr = lower_operand_to_value(ctx, body, block, &call.args[0].node)?;
+        let y_ptr = lower_operand_to_value(ctx, body, block, &call.args[1].node)?;
+        let x_ptr = coerce_to_plain_ptr(ctx, block, x_ptr);
+        let y_ptr = coerce_to_plain_ptr(ctx, block, y_ptr);
+        let (lane_ty, lane_size) = match layout.align {
+            1 => (TrustIrTy::I8, 1u64),
+            2 => (TrustIrTy::I16, 2),
+            4 => (TrustIrTy::I32, 4),
+            8 => (TrustIrTy::I64, 8),
+            16 => (TrustIrTy::I128, 16),
+            other => {
+                return Err(format!(
+                    "typed_swap_nonoverlapping aggregate alignment {other} unsupported"
+                ))
+            }
+        };
+        if layout.size % lane_size != 0 {
+            return Err(format!(
+                "typed_swap_nonoverlapping aggregate size {} not a multiple of lane {lane_size}",
+                layout.size
+            ));
+        }
+        let lanes = layout.size / lane_size;
+        for lane in 0..lanes {
+            let offset = lane * lane_size;
+            let (xa, ya) = if offset == 0 {
+                (x_ptr, y_ptr)
+            } else {
+                let ix = emit_i64_const(ctx, block, i128::from(offset));
+                let xa = emit_element_addr(ctx, block, x_ptr, ix, 1);
+                let iy = emit_i64_const(ctx, block, i128::from(offset));
+                let ya = emit_element_addr(ctx, block, y_ptr, iy, 1);
+                (xa, ya)
+            };
+            let xv = emit_typed_load(ctx, block, xa, lane_ty.clone());
+            let yv = emit_typed_load(ctx, block, ya, lane_ty.clone());
+            emit_typed_store(block, xa, lane_ty.clone(), yv);
+            emit_typed_store(block, ya, lane_ty.clone(), xv);
+        }
+        emit_call_successor(block, call.target);
+        return Ok(());
+    }
     let t_ir = rust_ty_to_trust_ir_ty(ctx.tcx, t_ty)?;
     if t_ir.bit_width().is_none() {
         return Err(format!(
@@ -41658,7 +42794,7 @@ fn lower_raw_eq_intrinsic<'tcx>(
     block.body.push(
         InstrNode::new(Inst::Const {
             ty: TrustIrTy::Bool,
-            value: Constant::Int(1),
+            value: Constant::Bool(true),
         })
         .with_result(acc),
     );
@@ -41682,7 +42818,7 @@ fn lower_raw_eq_intrinsic<'tcx>(
         block.body.push(
             InstrNode::new(Inst::Const {
                 ty: TrustIrTy::Bool,
-                value: Constant::Int(0),
+                value: Constant::Bool(false),
             })
             .with_result(false_bool),
         );
@@ -43442,7 +44578,7 @@ fn lower_from_residual_call<'tcx>(
                 .to_owned(),
         );
     }
-    let layout = memory_aggregate_layout(ctx.tcx, dest_ty)?
+    let layout = memory_aggregate_layout_shared(ctx.tcx, dest_ty)?
         .ok_or_else(|| "from_residual destination without aggregate layout".to_owned())?;
 
     if is_option {
@@ -44630,6 +45766,24 @@ fn lower_iter_for_each<'tcx>(
     Ok(true)
 }
 
+/// rustc `RawVec::MIN_NON_ZERO_CAP` for an element of `size` bytes: 8 for
+/// 1-byte elements, 4 otherwise (all intercepted element types are <= 8
+/// bytes, far under RawVec's 1025-byte threshold for a floor of 1). Using
+/// the real schedule makes an empty Vec's growth sequence allocator-call
+/// identical to rustc+LLVM's (h4: alloc(4)+realloc 8,16,32,64,128 = 7 calls
+/// vs the old cap=1 doubling's 9) — the cap=1 eager reservation was measured
+/// as the dominant h4_vec_dropper gap (2026-08-27 recon, ablation-attributed).
+/// `TCG_NO_VEC_MINCAP` restores the legacy cap=1 schedule for a one-dylib
+/// A/B. The soundness argument is verbatim `lower_vec_new`'s: over-allocation
+/// is unobservable (observable Vec state is elements + len) and the buffer is
+/// freed on Drop.
+fn vec_min_nonzero_cap(size: u64) -> i128 {
+    if std::env::var_os("TCG_NO_VEC_MINCAP").is_some() {
+        return 1;
+    }
+    if size == 1 { 8 } else { 4 }
+}
+
 /// `dest = Vec::new()` / `Vec::with_capacity(cap)`: alloca a `{ptr,cap,len}`
 /// slot, initialize it, and bind the destination `Vec` local to the slot
 /// address.
@@ -44668,35 +45822,39 @@ fn lower_vec_new<'tcx>(
         .with_result(slot_ptr),
     );
 
-    // Requested capacity: `with_capacity(cap)` reads its argument; `new()` is 0.
-    let requested_cap = if with_capacity {
-        lower_operand_to_value(ctx, body, block, &call.args[0].node)?
+    // Capacity. `Vec::new()` gets the compile-time RawVec floor (see
+    // `vec_min_nonzero_cap`); `with_capacity(cap)` keeps the dynamic
+    // `max(cap, 1)` so an explicit request is honored exactly (and its
+    // grow-path shape tests keep their pinned behavior).
+    let cap_value = if with_capacity {
+        let requested_cap = lower_operand_to_value(ctx, body, block, &call.args[0].node)?;
+        // Eagerly reserve at least one element so the data pointer is always a
+        // real heap allocation (`cap_value = max(requested_cap, 1)`).
+        let one = emit_i64_const(ctx, block, 1);
+        let need_min = ctx.fresh_value();
+        block.body.push(
+            InstrNode::new(Inst::ICmp {
+                op: ICmpOp::Ugt,
+                ty: TrustIrTy::I64,
+                lhs: requested_cap,
+                rhs: one,
+            })
+            .with_result(need_min),
+        );
+        let cap_value = ctx.fresh_value();
+        block.body.push(
+            InstrNode::new(Inst::Select {
+                ty: TrustIrTy::I64,
+                cond: need_min,
+                then_val: requested_cap,
+                else_val: one,
+            })
+            .with_result(cap_value),
+        );
+        cap_value
     } else {
-        emit_i64_const(ctx, block, 0)
+        emit_i64_const(ctx, block, vec_min_nonzero_cap(size))
     };
-    // Eagerly reserve at least one element so the data pointer is always a real
-    // heap allocation (`cap_value = max(requested_cap, 1)`).
-    let one = emit_i64_const(ctx, block, 1);
-    let need_min = ctx.fresh_value();
-    block.body.push(
-        InstrNode::new(Inst::ICmp {
-            op: ICmpOp::Ugt,
-            ty: TrustIrTy::I64,
-            lhs: requested_cap,
-            rhs: one,
-        })
-        .with_result(need_min),
-    );
-    let cap_value = ctx.fresh_value();
-    block.body.push(
-        InstrNode::new(Inst::Select {
-            ty: TrustIrTy::I64,
-            cond: need_min,
-            then_val: requested_cap,
-            else_val: one,
-        })
-        .with_result(cap_value),
-    );
 
     let size_const = emit_i64_const(ctx, block, i128::from(size));
     let bytes = ctx.fresh_value();
@@ -44742,9 +45900,9 @@ fn lower_vec_new<'tcx>(
     Ok(())
 }
 
-/// Alloca a fresh EMPTY-`Vec` `{ ptr, cap, len }` slot (cap = 1 reserved element,
-/// len = 0, a real `__rust_alloc`'d heap buffer of `size` bytes) and return its
-/// address. Used by the inlined-`new` aggregate interception (at `-O3` rustc
+/// Alloca a fresh EMPTY-`Vec` `{ ptr, cap, len }` slot (cap = the RawVec
+/// floor from `vec_min_nonzero_cap`, len = 0, a real `__rust_alloc`'d heap
+/// buffer of `cap * size` bytes) and return its address. Used by the inlined-`new` aggregate interception (at `-O3` rustc
 /// inlines `Vec::new()` into an `Rvalue::Aggregate` `Vec { buf: const RawVec
 /// {..}, len: const 0 }`). The eager one-element reservation keeps the data
 /// pointer a valid heap allocation that `push`'s unconditional `__rust_realloc`
@@ -44765,10 +45923,12 @@ fn emit_vec_empty_slot(
         })
         .with_result(slot_ptr),
     );
-    // Reserve one element (cap = 1) so the data pointer is always a real heap
-    // allocation that `__rust_realloc` may grow.
-    let cap_value = emit_i64_const(ctx, block, 1);
-    let bytes = emit_i64_const(ctx, block, i128::from(size));
+    // Reserve the RawVec floor (see `vec_min_nonzero_cap`) so the data
+    // pointer is always a real heap allocation that `__rust_realloc` may
+    // grow, and the growth schedule matches rustc+LLVM's allocator calls.
+    let cap = vec_min_nonzero_cap(size);
+    let cap_value = emit_i64_const(ctx, block, cap);
+    let bytes = emit_i64_const(ctx, block, cap * i128::from(size));
     let align_const = emit_i64_const(ctx, block, i128::from(align));
     let alloc_callee = vec_alloc_callee(ctx);
     let data_ptr = ctx.fresh_value();
@@ -56799,7 +57959,7 @@ fn lower_write_fmt<'tcx>(
         let (ok_variant, adt) = result_ok_variant(ctx, dest_rust_ty)
             .ok_or_else(|| "write! result is not a recognizable Result<(),E>".to_owned())?;
         if local_is_memory_backed(ctx, dest_local) {
-            let layout = memory_aggregate_layout(ctx.tcx, dest_rust_ty)?
+            let layout = memory_aggregate_layout_shared(ctx.tcx, dest_rust_ty)?
                 .ok_or_else(|| "write! Result destination without aggregate layout".to_owned())?;
             write_memory_enum_variant_no_payload(
                 ctx, body, cur, dest_local, adt, &layout, ok_variant,
@@ -59034,7 +60194,6 @@ fn lower_range_into_iter<'tcx>(
     call: &DirectCallTerminator<'_, 'tcx>,
     index_ty: Ty<'tcx>,
 ) -> Result<(), String> {
-    let _ = body;
     if call.args.len() != 1 {
         return Err(format!("Range::into_iter with {} args", call.args.len()));
     }
@@ -59052,6 +60211,36 @@ fn lower_range_into_iter<'tcx>(
 
     // The argument is a `move Range` — read its two fields from the source's slot.
     let (Operand::Copy(src) | Operand::Move(src)) = &call.args[0].node else {
+        // ...unless rustc const-propagated it. A literal `for i in 0..64` reaches
+        // codegen at -O1 as
+        //
+        //     _3 = <Range<usize> as IntoIterator>::into_iter(
+        //              const Range::<usize> {{ start: 0_usize, end: 64_usize }})
+        //
+        // with no source place to copy from. The place path below is a straight
+        // two-field copy between IDENTICAL layouts — i.e. a memcpy of the struct
+        // image — so writing the constant's own byte image into the destination
+        // slot produces exactly the same iterator state, field order and padding
+        // included, without this code having to know either.
+        //
+        // `store_const_aggregate_bytes_into_memory_at` returns Ok(false) rather
+        // than guessing for a const it cannot image byte-exactly (notably one
+        // carrying pointer provenance, which a `Range<usize>` never does), and
+        // that falls through to the same fail-closed error as before.
+        if matches!(&call.args[0].node, Operand::Constant(_)) {
+            let arg_ty = operand_rust_ty(ctx, body, &call.args[0].node)?;
+            if store_const_aggregate_bytes_into_memory_at(
+                ctx,
+                block,
+                dest_slot,
+                0,
+                arg_ty,
+                &call.args[0].node,
+            )? {
+                emit_call_successor(block, call.target);
+                return Ok(());
+            }
+        }
         return Err("Range::into_iter argument is not a place".to_owned());
     };
     if !src.projection.is_empty() {
@@ -59163,6 +60352,26 @@ fn lower_range_inclusive_into_iter<'tcx>(
         range_inclusive_field_offsets(ctx.tcx, dest_ty)?;
 
     let (Operand::Copy(src) | Operand::Move(src)) = &call.args[0].node else {
+        // The twin of the const-propagated case in `lower_range_into_iter` — see
+        // the comment there. `for i in 0..=63` const-folds the same way, and the
+        // copy below is likewise a straight field-for-field move between
+        // identical layouts, so the constant's own byte image is that same state.
+        // Writing it whole also covers `exhausted` without this path having to
+        // know where rustc put it.
+        if matches!(&call.args[0].node, Operand::Constant(_)) {
+            let arg_ty = operand_rust_ty(ctx, body, &call.args[0].node)?;
+            if store_const_aggregate_bytes_into_memory_at(
+                ctx,
+                block,
+                dest_slot,
+                0,
+                arg_ty,
+                &call.args[0].node,
+            )? {
+                emit_call_successor(block, call.target);
+                return Ok(());
+            }
+        }
         return Err("RangeInclusive::into_iter argument is not a place".to_owned());
     };
     if !src.projection.is_empty() {
@@ -59295,7 +60504,7 @@ fn lower_range_inclusive_next<'tcx>(
     block.body.push(
         InstrNode::new(Inst::Const {
             ty: TrustIrTy::Bool,
-            value: Constant::Int(0),
+            value: Constant::Bool(false),
         })
         .with_result(false_bool),
     );
@@ -60303,10 +61512,10 @@ fn lower_range_next<'tcx>(
             Some(layout.fields.offset(0).bytes() == 0 && layout.fields.offset(1).bytes() == size)
         })()
         .unwrap_or(false);
-        let tag = memory_aggregate_layout(ctx.tcx, dest_ty)
+        let tag = memory_aggregate_layout_shared(ctx.tcx, dest_ty)
             .ok()
             .flatten()
-            .and_then(|layout| layout.tag);
+            .and_then(|layout| layout.tag.clone());
         if let Some(tag) = tag.filter(|_| range_layout_is_canonical) {
             if matches!(tag.encoding, MemoryTagEncoding::Direct) {
                 if let (Ok((some_variant, none_variant, some_field_offset, _)), Ok(did)) = (
@@ -60446,10 +61655,10 @@ fn lower_slice_iter_next<'tcx>(
     // faithful to the Rust iterator semantics OVER that model, and the
     // ctor/next agreement is by shared-constant construction.
     if refine {
-        let tag = memory_aggregate_layout(ctx.tcx, dest_ty)
+        let tag = memory_aggregate_layout_shared(ctx.tcx, dest_ty)
             .ok()
             .flatten()
-            .and_then(|layout| layout.tag);
+            .and_then(|layout| layout.tag.clone());
         if let Some(tag) = tag {
             if let MemoryTagEncoding::Niche {
                 untagged_variant,
@@ -60983,10 +62192,10 @@ fn lower_step_by_next<'tcx>(
                 && matches!(elem_ty, TrustIrTy::I64)
                 && *size == 8
             {
-                let tag = memory_aggregate_layout(ctx.tcx, dest_ty)
+                let tag = memory_aggregate_layout_shared(ctx.tcx, dest_ty)
                     .ok()
                     .flatten()
-                    .and_then(|layout| layout.tag);
+                    .and_then(|layout| layout.tag.clone());
                 if let Some(tag) = tag {
                     if matches!(tag.encoding, MemoryTagEncoding::Direct) {
                         if let (Ok((some_variant, none_variant, some_field_offset, _)), Ok(did)) = (
@@ -61037,10 +62246,10 @@ fn lower_step_by_next<'tcx>(
                 && matches!(elem_ty, TrustIrTy::U64)
                 && *size == 8
             {
-                let tag = memory_aggregate_layout(ctx.tcx, dest_ty)
+                let tag = memory_aggregate_layout_shared(ctx.tcx, dest_ty)
                     .ok()
                     .flatten()
-                    .and_then(|layout| layout.tag);
+                    .and_then(|layout| layout.tag.clone());
                 if let Some(tag) = tag {
                     if matches!(tag.encoding, MemoryTagEncoding::Direct) {
                         if let (Ok((some_variant, none_variant, some_field_offset, _)), Ok(did)) = (
@@ -61145,10 +62354,10 @@ fn lower_step_by_next<'tcx>(
             // (`SLICE_ITER_END_OFFSET`, the lane-9 trusted-model boundary).
             // Every miss SKIPS (skip-not-fail).
             if refine {
-                let tag = memory_aggregate_layout(ctx.tcx, dest_ty)
+                let tag = memory_aggregate_layout_shared(ctx.tcx, dest_ty)
                     .ok()
                     .flatten()
-                    .and_then(|layout| layout.tag);
+                    .and_then(|layout| layout.tag.clone());
                 if let Some(tag) = tag {
                     if let MemoryTagEncoding::Niche {
                         untagged_variant,
@@ -61453,7 +62662,7 @@ fn lower_filter_next<'tcx>(
             header.body.push(
                 InstrNode::new(Inst::Const {
                     ty: TrustIrTy::Bool,
-                    value: Constant::Int(0),
+                    value: Constant::Bool(false),
                 })
                 .with_result(false_bool),
             );
@@ -61604,7 +62813,7 @@ fn lower_filter_next<'tcx>(
     some_exit.body.push(
         InstrNode::new(Inst::Const {
             ty: TrustIrTy::Bool,
-            value: Constant::Int(1),
+            value: Constant::Bool(true),
         })
         .with_result(true_bool),
     );
@@ -61628,7 +62837,7 @@ fn lower_filter_next<'tcx>(
     none_exit.body.push(
         InstrNode::new(Inst::Const {
             ty: TrustIrTy::Bool,
-            value: Constant::Int(0),
+            value: Constant::Bool(false),
         })
         .with_result(false_bool),
     );
@@ -61865,7 +63074,7 @@ fn lower_filter_map_next<'tcx>(
             header.body.push(
                 InstrNode::new(Inst::Const {
                     ty: TrustIrTy::Bool,
-                    value: Constant::Int(0),
+                    value: Constant::Bool(false),
                 })
                 .with_result(false_bool),
             );
@@ -61995,7 +63204,7 @@ fn lower_filter_map_next<'tcx>(
     some_exit.body.push(
         InstrNode::new(Inst::Const {
             ty: TrustIrTy::Bool,
-            value: Constant::Int(1),
+            value: Constant::Bool(true),
         })
         .with_result(true_bool),
     );
@@ -62022,7 +63231,7 @@ fn lower_filter_map_next<'tcx>(
     none_exit.body.push(
         InstrNode::new(Inst::Const {
             ty: TrustIrTy::Bool,
-            value: Constant::Int(0),
+            value: Constant::Bool(false),
         })
         .with_result(false_bool),
     );
@@ -62957,7 +64166,7 @@ fn resolve_iter_chain<'tcx>(
                 // register pair of scalar / pointer leaves). Validate that here;
                 // otherwise fail closed.
                 if input.tuple.is_some() {
-                    if memory_aggregate_layout(ctx.tcx, input.rust_ty)?.is_none() {
+                    if memory_aggregate_layout_shared(ctx.tcx, input.rust_ty)?.is_none() {
                         return Err(
                             "map over a tuple item whose tuple is not a by-value \
                              register-pair aggregate is not modeled"
@@ -63278,7 +64487,7 @@ fn option_direct_payload_offset<'tcx>(
     tcx: TyCtxt<'tcx>,
     option_ty: Ty<'tcx>,
 ) -> Result<u64, String> {
-    let Some(layout) = memory_aggregate_layout(tcx, option_ty)? else {
+    let Some(layout) = memory_aggregate_layout_shared(tcx, option_ty)? else {
         return Err("chain() sub-source Option has no memory layout".to_owned());
     };
     match &layout.tag {
@@ -63721,7 +64930,7 @@ fn build_tuple_item_arg<'tcx>(
     comp1: (ValueId, &TrustIrTy),
 ) -> Result<ValueId, String> {
     let tuple_ty = ctx.monomorphize_ty(tuple_ty);
-    let Some(layout) = memory_aggregate_layout(ctx.tcx, tuple_ty)? else {
+    let Some(layout) = memory_aggregate_layout_shared(ctx.tcx, tuple_ty)? else {
         return Err(format!(
             "tuple-item closure argument {tuple_ty:?} has no by-value aggregate layout"
         ));
@@ -64216,7 +65425,7 @@ fn lower_chain_ctor<'tcx>(
         // already encodes `Some` — writing a synthetic tag there would corrupt the
         // payload — so skip the write entirely in the niche case (tag absent OR a
         // niche encoding).
-        let opt_layout = memory_aggregate_layout(ctx.tcx, opt_ty)?
+        let opt_layout = memory_aggregate_layout_shared(ctx.tcx, opt_ty)?
             .ok_or_else(|| "iterator chain Option has no memory layout".to_owned())?;
         if let Some(tag) = &opt_layout.tag {
             if matches!(tag.encoding, MemoryTagEncoding::Direct) {
@@ -64921,7 +66130,7 @@ fn peel_fold_glue_to_sum<'tcx>(
                 // can build (`build_tuple_item_arg`); `F` then collapses it to a
                 // scalar (`bit_width` checked below).
                 if item.tuple.is_some()
-                    && !matches!(memory_aggregate_layout(ctx.tcx, item.rust_ty), Ok(Some(_)))
+                    && !matches!(memory_aggregate_layout_shared(ctx.tcx, item.rust_ty), Ok(Some(_)))
                 {
                     return None;
                 }
@@ -65822,7 +67031,7 @@ fn lower_flatmap_bounded_consumer<'tcx>(
     // declared return type — bottoms out to for a plain struct, so this is
     // GUARANTEED to agree with the callee's own declared `FuncTy`, not an
     // independently-derived guess that could drift from it).
-    let Some(range_layout) = memory_aggregate_layout(ctx.tcx, shape.range_ty)? else {
+    let Some(range_layout) = memory_aggregate_layout_shared(ctx.tcx, shape.range_ty)? else {
         return Err("flat_map inner Range<T> has no aggregate call-return layout".to_owned());
     };
     if range_layout.tag.is_some() {
@@ -66235,7 +67444,7 @@ fn lower_iter_try_fold<'tcx>(
     if cf_adt.variants().len() != 2 {
         return Err("iterator try_fold result is not a 2-variant ControlFlow".to_owned());
     }
-    let Some(layout) = memory_aggregate_layout(ctx.tcx, cf_ty)? else {
+    let Some(layout) = memory_aggregate_layout_shared(ctx.tcx, cf_ty)? else {
         return Err("iterator try_fold result has no memory layout".to_owned());
     };
     let Some(tag) = layout.tag.clone() else {
@@ -66638,7 +67847,7 @@ fn lower_control_flow_eq<'tcx>(
             }
         }
     }
-    let Some(layout) = memory_aggregate_layout(ctx.tcx, cf_ty)? else {
+    let Some(layout) = memory_aggregate_layout_shared(ctx.tcx, cf_ty)? else {
         return Ok(false);
     };
     let Some(tag) = layout.tag.clone() else {
@@ -69376,7 +70585,7 @@ fn emit_source_next<'tcx>(
             block.body.push(
                 InstrNode::new(Inst::Const {
                     ty: TrustIrTy::Bool,
-                    value: Constant::Int(0),
+                    value: Constant::Bool(false),
                 })
                 .with_result(false_bool),
             );
@@ -69608,7 +70817,7 @@ fn emit_source_next<'tcx>(
             block.body.push(
                 InstrNode::new(Inst::Const {
                     ty: TrustIrTy::Bool,
-                    value: Constant::Int(1),
+                    value: Constant::Bool(true),
                 })
                 .with_result(always),
             );
@@ -69630,7 +70839,7 @@ fn emit_source_next<'tcx>(
             block.body.push(
                 InstrNode::new(Inst::Const {
                     ty: TrustIrTy::Bool,
-                    value: Constant::Int(0),
+                    value: Constant::Bool(false),
                 })
                 .with_result(bfalse),
             );
@@ -70000,7 +71209,7 @@ fn store_option_some_value<'tcx>(
         .cloned()
         .ok_or_else(|| "iterator next destination is not memory-backed".to_owned())?
         .ptr;
-    let Some(layout) = memory_aggregate_layout(ctx.tcx, dest_ty)? else {
+    let Some(layout) = memory_aggregate_layout_shared(ctx.tcx, dest_ty)? else {
         return Err(format!("iterator next destination {dest_ty:?} has no memory layout"));
     };
     let Some(tag) = layout.tag.clone() else {
@@ -70560,7 +71769,7 @@ fn option_payload_scalar_item<'tcx>(
     ctx: &MirLoweringCtx<'tcx>,
     opt_ty: Ty<'tcx>,
 ) -> Result<ChainItem<'tcx>, String> {
-    let Some(layout) = memory_aggregate_layout(ctx.tcx, opt_ty)? else {
+    let Some(layout) = memory_aggregate_layout_shared(ctx.tcx, opt_ty)? else {
         return Err("filter_map/scan Option return has no memory layout".to_owned());
     };
     let Some(tag) = &layout.tag else {
@@ -70612,7 +71821,7 @@ fn emit_option_step<'tcx>(
     let ty::Adt(opt_adt, _) = opt_ty.kind() else {
         return Err("filter_map/scan Option return is not an ADT".to_owned());
     };
-    let Some(layout) = memory_aggregate_layout(ctx.tcx, opt_ty)? else {
+    let Some(layout) = memory_aggregate_layout_shared(ctx.tcx, opt_ty)? else {
         return Err("filter_map/scan Option return has no memory layout".to_owned());
     };
     let Some(tag) = layout.tag.clone() else {
@@ -70979,6 +72188,22 @@ fn lower_aggregate_reference_call_arg<'tcx>(
         || nested_aggregate_thin_ref
         || memory_union_thin_ref
     {
+        // A const-pointer enum/union reference arg (O1 promotes `&E::A(7)` to a
+        // `const &E`): immutable, no writeback. The const-eval allocation holds the
+        // enum's tag+payload bytes at their layout offsets, so its ADDRESS is a
+        // valid `&E` the callee matches through. Emit it directly.
+        if matches!(expected_mutability, rustc_hir::Mutability::Not) {
+            if let Operand::Constant(constant) = operand {
+                let evaluated = ctx.eval_const_operand(constant);
+                if let Some((alloc_id, offset)) = const_pointer_target(ctx, &evaluated)? {
+                    let addr = emit_const_alloc_addr(ctx, block, alloc_id, offset, TrustIrTy::Ptr)?;
+                    return Ok(Some(PreparedCallArg {
+                        value: addr,
+                        mutable_reloads: Vec::new(),
+                    }));
+                }
+            }
+        }
         let (Operand::Copy(place) | Operand::Move(place)) = operand else {
             return Err(format!(
                 "direct call enum reference arg {index} is not a place operand"
@@ -71013,6 +72238,24 @@ fn lower_aggregate_reference_call_arg<'tcx>(
         return Ok(None);
     };
     let fields = aggregate_memory_field_tys(&pointee_ty)?;
+
+    // A CONST-pointer aggregate reference arg — e.g. `f(&P { .. })` where O1
+    // promotes the `&P{..}` to a `const &P` (O0/O2/O3 pass a place). It is an
+    // IMMUTABLE `&T` (no writeback); the evaluated const points into a const-eval
+    // allocation holding the struct's bytes at their layout offsets, so its
+    // ADDRESS is a valid `&T` the callee reads fields through. Emit it directly.
+    if matches!(expected_mutability, rustc_hir::Mutability::Not) {
+        if let Operand::Constant(constant) = operand {
+            let evaluated = ctx.eval_const_operand(constant);
+            if let Some((alloc_id, offset)) = const_pointer_target(ctx, &evaluated)? {
+                let addr = emit_const_alloc_addr(ctx, block, alloc_id, offset, TrustIrTy::Ptr)?;
+                return Ok(Some(PreparedCallArg {
+                    value: addr,
+                    mutable_reloads: Vec::new(),
+                }));
+            }
+        }
+    }
 
     let (Operand::Copy(place) | Operand::Move(place)) = operand else {
         return Err(format!(
@@ -71137,7 +72380,7 @@ fn lower_memory_aggregate_byval_call_arg<'tcx>(
     // contiguous lane bytes the callee ABI expects), so it routes here too. An
     // AGGREGATE union (`MaybeUninit<(i64,i64)>` passed by value into `assume_init`)
     // also routes here: its slot lane tuple IS the by-value ABI value.
-    if memory_aggregate_layout(ctx.tcx, expected_ty)?.is_none()
+    if memory_aggregate_layout_shared(ctx.tcx, expected_ty)?.is_none()
         && closure_memory_layout(ctx.tcx, expected_ty)?.is_none()
         && nonscalar_union_memory_layout(ctx.tcx, expected_ty)?.is_none()
     {
@@ -71391,7 +72634,7 @@ fn lower_memory_aggregate_byval_call_arg<'tcx>(
     // reordered struct (#69). Pack each scalar-leaf projected field at its rustc byte
     // offset into a fresh `slot_ty` slot instead, exactly as the callee reads it.
     let source_ty = ctx.monomorphize_ty(local_rust_ty(ctx, body, place.local));
-    if let Some(layout) = memory_aggregate_layout(ctx.tcx, expected_ty)? {
+    if let Some(layout) = memory_aggregate_layout_shared(ctx.tcx, expected_ty)? {
         if layout.tag.is_none() {
             if let Some(agg) =
                 pack_scalarized_aggregate_byval_slot(ctx, block, place.local, expected_ty, &layout)?
@@ -71464,7 +72707,7 @@ fn materialize_byval_aggregate_from_slot<'tcx>(
     elem_ty: Ty<'tcx>,
     enclosing_size: u64,
 ) -> Result<ValueId, String> {
-    let Some(layout) = memory_aggregate_layout(ctx.tcx, elem_ty)? else {
+    let Some(layout) = memory_aggregate_layout_shared(ctx.tcx, elem_ty)? else {
         return Err(format!(
             "by-value aggregate element has no aggregate layout: {elem_ty:?}"
         ));
@@ -71726,6 +72969,24 @@ fn lower_scalar_reference_call_arg<'tcx>(
         return Err(format!(
             "direct call scalar reference arg {index} target is not scalarizable: {pointee_ty:?}"
         ));
+    }
+
+    // A CONST-pointer scalar reference arg — e.g. `unwrap_or(&0)` where `&0` is
+    // promoted to a `&'static` const (the O1 shape; O0/O2/O3 pass a place). It is
+    // an IMMUTABLE `&T` (no writeback), so emit the const-eval allocation address
+    // and pass it directly. Only for a shared reference; a `&mut` const is not a
+    // valid Rust shape and stays fail-closed below.
+    if matches!(expected_mutability, rustc_hir::Mutability::Not) {
+        if let Operand::Constant(constant) = operand {
+            let evaluated = ctx.eval_const_operand(constant);
+            if let Some((alloc_id, offset)) = const_pointer_target(ctx, &evaluated)? {
+                let addr = emit_const_alloc_addr(ctx, block, alloc_id, offset, TrustIrTy::Ptr)?;
+                return Ok(Some(PreparedCallArg {
+                    value: addr,
+                    mutable_reloads: Vec::new(),
+                }));
+            }
+        }
     }
 
     let (Operand::Copy(place) | Operand::Move(place)) = operand else {
@@ -72089,7 +73350,14 @@ fn direct_scalar_ref_select_return<'tcx>(
         return Ok(None);
     };
     if matches!(mutability, rustc_hir::Mutability::Mut) {
-        return Err("promoted mutable scalar reference return is unsupported".to_owned());
+        // This recognizer only models a fn that SELECTS one of two IMMUTABLE `&T`
+        // referents (its value is threaded). A `&mut T`-returning fn is not this
+        // shape — DECLINE to recognize it here (`Ok(None)`) so it falls through to
+        // general call lowering (the same path that handles it at O2/O3 when the
+        // call is inlined). Returning `Err` failed the whole compile at O0/O1 for a
+        // fn this recognizer never handled anyway. Soundness of the general
+        // `&mut`-return path is validated by a RUN differential at O0/O1 (call ABI).
+        return Ok(None);
     }
     let inner = ctx.monomorphize_ty(*inner);
     if let Some(kind_name) = scalarized_aggregate_kind_name(ctx.tcx, inner)? {
@@ -72772,7 +74040,13 @@ fn integer_cast_op(
     let src_width = cast_int_bit_width(src_ty)?;
     let dst_width = cast_int_bit_width(dst_ty)?;
     if src_width == dst_width {
-        return Some(None);
+        // Same width: identical types are a plain `Copy`; a signedness change
+        // (`u64 as i64`) is a canonical `Bitcast` — the validator rejects a
+        // `Copy` whose declared type differs from its operand's
+        // (`OperandTypeMismatch`), which every corpus CGU used to carry.
+        // Lowering is identical: isel emits a GPR `MovR` for an equal-width
+        // integer `Bitcast`, and the refinement model treats it as identity.
+        return Some(if src_ty == dst_ty { None } else { Some(CastOp::Bitcast) });
     }
     if dst_width < src_width {
         return Some(Some(CastOp::Trunc));
@@ -73427,7 +74701,7 @@ fn sysv_c_abi_aggregate_lane_ty<'tcx>(
     // Must be a by-value memory aggregate the bridge slot-backs; this gives the
     // authoritative (size, align) whose uniform-lane structure we mirror, and
     // excludes fat pointers / closures / unions (routed elsewhere).
-    let Some(layout) = memory_aggregate_layout(tcx, ty)? else {
+    let Some(layout) = memory_aggregate_layout_shared(tcx, ty)? else {
         return Ok(None);
     };
     // A Direct-tagged enum's payload eightbyte float classification is not modeled
@@ -73878,8 +75152,8 @@ fn memory_enum_reference_pointee_lane_ty<'tcx>(
     if !adt.is_enum() || adt.variants().len() <= 1 {
         return Ok(None);
     }
-    match memory_aggregate_layout(tcx, ty) {
-        Ok(Some(layout)) => Ok(Some(layout.slot_ty)),
+    match memory_aggregate_layout_shared(tcx, ty) {
+        Ok(Some(layout)) => Ok(Some(layout.slot_ty.clone())),
         Ok(None) | Err(_) => Ok(None),
     }
 }
@@ -73923,11 +75197,11 @@ fn memory_aggregate_reference_pointee_lane_ty<'tcx>(
     // array pointee keeps its existing representation, and a layout the byte
     // model cannot address keeps its existing fail-closed handling.
     if matches!(ty.kind(), ty::Array(..)) {
-        return match memory_aggregate_layout(tcx, ty) {
+        return match memory_aggregate_layout_shared(tcx, ty) {
             Ok(Some(layout))
                 if layout.has_nested_enum_leaf || layout.has_nested_niche_enum_leaf =>
             {
-                Ok(Some(layout.slot_ty))
+                Ok(Some(layout.slot_ty.clone()))
             }
             Ok(_) | Err(_) => Ok(None),
         };
@@ -73955,8 +75229,8 @@ fn memory_aggregate_reference_pointee_lane_ty<'tcx>(
     // `Ok(None)` when `rust_ty_to_trust_ir_ty` already maps the type (a single-field
     // newtype scalar) — leave that to the direct mapping — and `Err` for a shape the
     // byte model cannot address (wide / niche / non-scalar leaf), which fails closed.
-    match memory_aggregate_layout(tcx, ty) {
-        Ok(Some(layout)) => Ok(Some(layout.slot_ty)),
+    match memory_aggregate_layout_shared(tcx, ty) {
+        Ok(Some(layout)) => Ok(Some(layout.slot_ty.clone())),
         Ok(None) | Err(_) => Ok(None),
     }
 }
@@ -74030,6 +75304,18 @@ fn aggregate_reference_pointee_to_trust_ir_ty<'tcx>(
             if len == 0 {
                 return Ok(None);
             }
+            // An array is scalarized into ONE LEAF PER ELEMENT, so this is O(len)
+            // in both time and memory. Unbounded, that is a hazard rather than a
+            // slowdown: a `[u8; 4 << 20]` local drove the compiler to 640MB RSS
+            // and 2.0s (LLVM: 98MB, 0.11s, FLAT in the array size), and it grows
+            // from there — the leaf vector is the whole array.
+            //
+            // Past a few thousand leaves, field-wise modelling is also simply the
+            // wrong model: `Ok(None)` routes the aggregate down the MEMORY path,
+            // which is what a large array wants and what LLVM effectively does.
+            // The bound is set well above anything real: the largest array in the
+            // benchmarks or bridge tests is 8192 elements (v2_memfill), so every
+            // shape exercised today keeps its exact current lowering.
             if let Some(element_fields) = scalar_field_aggregate_trust_ir_fields(tcx, *element)? {
                 let mut fields = Vec::with_capacity(element_fields.len() * len);
                 for _ in 0..len {
@@ -74284,6 +75570,16 @@ fn reference_local_pointee_to_trust_ir_ty<'tcx>(
 
 fn aggregate_memory_field_tys(ty: &TrustIrTy) -> Result<Vec<(u32, TrustIrTy)>, String> {
     match ty {
+        // The array spelling of a uniform lane tuple -- see `memory_slot_lane_ty`.
+        // Enumerated identically: lane `k` of `Array(l, n)` IS field `k` of
+        // `Tuple([l; n])`, same type at the same offset.
+        TrustIrTy::Array(elem, len) if *len > 0 => {
+            let lane = slot_lane_ty_by_id(elem.index())
+                .ok_or_else(|| format!("aggregate array element TyId {elem:?} is not a slot lane"))?;
+            let len = u32::try_from(*len)
+                .map_err(|_| format!("aggregate array length {len} out of u32 range"))?;
+            Ok((0..len).map(|field| (field, lane.clone())).collect())
+        }
         TrustIrTy::Tuple(fields) if !fields.is_empty() => fields
             .iter()
             .enumerate()
@@ -75065,6 +76361,83 @@ struct MemoryAggregateLayout {
 
 /// A flat integer-lane tuple covering `size` bytes at `align` (one of 1/2/4/8).
 /// `size` is always a multiple of `align` for a valid layout, so this is exact.
+/// How many lane types [`memory_slot_lane_ty`] can pick from.
+const SLOT_LANE_TY_COUNT: u32 = 5;
+
+/// THE mapping from a fixed `TyId` to its lane type.
+///
+/// These are seeded into EVERY bridge-built module at ids `0..SLOT_LANE_TY_COUNT`
+/// so a slot type can name its element without threading module context down to
+/// `memory_slot_lane_ty` (a free function of `(size, align)`). The bridge
+/// otherwise never touches `Module::types`, so these ids are ours to define, and
+/// `merge_modules` hash-conses the tables structurally -- the identical prefixes
+/// across merged modules collapse back to one set with the `TyId`s remapped.
+///
+/// [`slot_lane_ty_id`] is the inverse and is derived from THIS match, pinned by
+/// `slot_lane_ty_ids_round_trip`. Two hand-written directions would be one more
+/// instance of the duplicated-decision bug this file keeps paying for.
+fn slot_lane_ty_by_id(index: u32) -> Option<TrustIrTy> {
+    Some(match index {
+        0 => TrustIrTy::I8,
+        1 => TrustIrTy::I16,
+        2 => TrustIrTy::I32,
+        3 => TrustIrTy::I64,
+        4 => TrustIrTy::I128,
+        _ => return None,
+    })
+}
+
+/// The fixed `TyId` for a lane type, or `None` if it is not one of them.
+fn slot_lane_ty_id(lane: &TrustIrTy) -> Option<trust_ir::TyId> {
+    (0..SLOT_LANE_TY_COUNT)
+        .find(|&index| slot_lane_ty_by_id(index).as_ref() == Some(lane))
+        .map(trust_ir::TyId::new)
+}
+
+/// Seed the lane types into a freshly created bridge module.
+///
+/// INVARIANT: any module that can carry a MEMORY SLOT type must be seeded,
+/// because a slot spells its element as a fixed `TyId` into this table. Today
+/// that is exactly the MIR-lowering module (`MirLoweringCtx::new`); the other
+/// bridge modules are hand-built and slot-free -- the trap/no-op function stubs
+/// (`Unreachable` / `Return` bodies) and the static-data modules (globals typed
+/// `Ptr`), none of which run `memory_aggregate_layout`.
+///
+/// Getting this wrong FAILS CLOSED rather than miscompiling: an unseeded table
+/// makes the adapter reject the `TyId` with "types table 0 entries, index out
+/// of range" at translation time.
+fn seed_slot_lane_types(module: &mut TrustIrModule) {
+    debug_assert!(
+        module.types.is_empty(),
+        "slot lane types must occupy the first TyIds"
+    );
+    for index in 0..SLOT_LANE_TY_COUNT {
+        let lane = slot_lane_ty_by_id(index).expect("lane id below the count resolves");
+        module.add_type(lane);
+    }
+}
+
+/// Smallest lane count spelled as `Ty::Array` rather than an inline
+/// `Ty::Tuple`. Both are the SAME type -- `Array(l, n)` and `Tuple([l; n])`
+/// agree on size (`n * l.bytes()`, since every lane type has
+/// `bytes() == align()`) and on alignment (`l.align()`) -- but the tuple
+/// materializes one `Ty` per lane and the array does not.
+/// Smallest lane count spelled as `Ty::Array` rather than an inline
+/// `Ty::Tuple`. The default is 1, i.e. ALWAYS the array spelling; the knob
+/// exists to bisect a suspected divergence back onto the tuple path, and
+/// raising it is always safe because the tuple spelling is the older one.
+///
+/// Read once -- this sits on the per-type layout path.
+fn slot_array_min_lanes() -> usize {
+    static MIN_LANES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MIN_LANES.get_or_init(|| {
+        std::env::var("TCG_SLOT_ARRAY_MIN_LANES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1)
+    })
+}
+
 fn memory_slot_lane_ty(size: u64, align: u64) -> Result<TrustIrTy, String> {
     let lane = match align {
         1 => TrustIrTy::I8,
@@ -75089,6 +76462,22 @@ fn memory_slot_lane_ty(size: u64, align: u64) -> Result<TrustIrTy, String> {
     let lanes = (size / align) as usize;
     if lanes == 0 {
         return Err("memory slot is zero-sized".to_owned());
+    }
+    // A slot is `size / align` lanes. Spelled inline as a tuple that vector is
+    // as large as the slot itself -- for a `[u8; N]` local, align is 1, so it
+    // is one `Ty` PER BYTE, and every later walk of the type re-traverses it.
+    // That was the dominant cost of compiling a large stack array: 625MB of
+    // compiler RSS and 2.0s for `[0u8; 4 << 20]`, against LLVM's 98MB and
+    // 0.12s, with LLVM FLAT in the array size where this was linear.
+    //
+    // `Ty::Array(elem, n)` is the same type in O(1). It is used above a lane
+    // threshold rather than universally only so the threshold can be lowered to
+    // 1 in testing to prove the two spellings really are interchangeable; both
+    // paths are exact.
+    if lanes >= slot_array_min_lanes() {
+        if let Some(lane_id) = slot_lane_ty_id(&lane) {
+            return Ok(TrustIrTy::Array(lane_id, lanes as u64));
+        }
     }
     Ok(TrustIrTy::Tuple(vec![lane; lanes]))
 }
@@ -75267,6 +76656,23 @@ fn validate_memory_aggregate_field_leaves<'tcx>(
                 has_nested_enum_leaf: false,
                 has_nested_niche_enum_leaf: false,
             };
+            // An ARRAY (or SIMD vector) has one field SHAPE repeated `count`
+            // times, so every element yields the IDENTICAL leaf info and the
+            // loop below would OR the same three bools `count` times. Validate
+            // one element and answer for all of them.
+            //
+            // This is not a heuristic — it is the same answer, reached in O(1)
+            // instead of O(count). It matters because `count` is the array
+            // LENGTH: a `[u8; 4 << 20]` local otherwise drives 4.2M recursive
+            // layout descents, which is the dominant cost of compiling a large
+            // stack array (645ms of a 2.0s compile, against LLVM's 122ms flat).
+            if let rustc_abi::FieldsShape::Array { count, .. } = field_layout.fields {
+                if count == 0 {
+                    return Ok(info);
+                }
+                let element = field_layout.field(cx, 0);
+                return validate_memory_aggregate_field_leaves(tcx, cx, &element);
+            }
             for field in 0..field_layout.fields.count() {
                 let inner = field_layout.field(cx, field);
                 let inner_info = validate_memory_aggregate_field_leaves(tcx, cx, &inner)?;
@@ -75617,11 +77023,82 @@ fn scalar_byval_tuple_eligible<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Result<
     Ok(all_in_scope)
 }
 
+thread_local! {
+    /// Memo for [`memory_aggregate_layout`], keyed by the interned `TyKind`
+    /// address (the same stable, collision-free type identity `TY_LOWER_ACTIVE`
+    /// uses).
+    ///
+    /// WHY: the layout's `slot_ty` is a tuple with ONE LANE PER `align` BYTES of
+    /// the aggregate, so for a `[u8; N]` local it is an N-element vector — and
+    /// the function is called ~10 times for the same type on one compile
+    /// (`compute_memory_backed_locals` alone walks every local three times).
+    /// Rebuilding a 4M-lane tuple ten times is what put a `[0u8; 4 << 20]`
+    /// compile at 625MB RSS.
+    ///
+    /// ONLY CONTEXT-FREE RESULTS ARE CACHED — see the guard at the insert. This
+    /// function sits in the mutually-recursive type-classification cluster that
+    /// `TY_LOWER_ACTIVE` breaks cycles for, and its answer genuinely DEPENDS on
+    /// that stack: it early-returns `Ok(None)` when `rust_ty_to_trust_ir_ty`
+    /// succeeds, and that call returns the cycle `Err` instead when the type is
+    /// already being resolved further up. A result computed mid-descent can
+    /// therefore differ from the same type's top-level answer, so caching one
+    /// would poison the other. Entries are only recorded when the active-descent
+    /// stack is EMPTY, which is exactly the top-level classification the hot
+    /// callers perform. Errors are never cached (they are the cheap fail-closed
+    /// path, and the cycle `Err` is context-dependent by construction).
+    static MEMORY_AGGREGATE_LAYOUT_MEMO: std::cell::RefCell<
+        std::collections::HashMap<usize, Option<std::rc::Rc<MemoryAggregateLayout>>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Drop every memoized layout. Called once per function lowering so no entry can
+/// outlive the arena that minted its key.
+fn clear_memory_aggregate_layout_memo() {
+    MEMORY_AGGREGATE_LAYOUT_MEMO.with(|m| m.borrow_mut().clear());
+}
+
+/// Whether any type classification is currently in progress on this thread. The
+/// memo is only safe to populate when this is false — see the memo's doc.
+fn ty_classification_descent_is_active() -> bool {
+    TY_LOWER_ACTIVE.with(|active| !active.borrow().is_empty())
+}
+
+/// [`memory_aggregate_layout`], but handing back a shared `Rc` so a caller that
+/// only needs the FLAGS (`has_fat_pointer_leaf`, …) or a `is_some()` test never
+/// deep-clones the lane tuple.
+fn memory_aggregate_layout_shared<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ty: Ty<'tcx>,
+) -> Result<Option<std::rc::Rc<MemoryAggregateLayout>>, String> {
+    let ty_key = ty.kind() as *const ty::TyKind<'tcx> as usize;
+    if let Some(hit) = MEMORY_AGGREGATE_LAYOUT_MEMO.with(|m| m.borrow().get(&ty_key).cloned()) {
+        return Ok(hit);
+    }
+    let computed = memory_aggregate_layout_uncached(tcx, ty)?.map(std::rc::Rc::new);
+    if !ty_classification_descent_is_active() {
+        MEMORY_AGGREGATE_LAYOUT_MEMO
+            .with(|m| m.borrow_mut().insert(ty_key, computed.clone()));
+    }
+    Ok(computed)
+}
+
 /// Compute the memory-aggregate layout for `ty` IF it is a kind the memory model
 /// supports AND the scalarization path cannot already represent it. Returns
 /// `Ok(None)` for any type that should keep the existing (scalar / interception)
 /// path, so this is purely additive and never steals a working case.
+///
+/// Prefer [`memory_aggregate_layout_shared`] when you only need the flags or an
+/// `is_some()` test: this wrapper DEEP-CLONES the layout, and `slot_ty` is one
+/// lane per `align` bytes, so for a big array local that clone is the size of
+/// the array.
 fn memory_aggregate_layout<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ty: Ty<'tcx>,
+) -> Result<Option<MemoryAggregateLayout>, String> {
+    Ok(memory_aggregate_layout_shared(tcx, ty)?.map(|shared| (*shared).clone()))
+}
+
+fn memory_aggregate_layout_uncached<'tcx>(
     tcx: TyCtxt<'tcx>,
     ty: Ty<'tcx>,
 ) -> Result<Option<MemoryAggregateLayout>, String> {
@@ -75704,12 +77181,35 @@ fn memory_aggregate_layout<'tcx>(
             // A struct / single-variant enum: validate every field's leaves are
             // scalars, descending through nested aggregate fields.
             let variant = ty_and_layout.for_variant(&cx, rustc_abi::FIRST_VARIANT);
-            for field in 0..variant.fields.count() {
-                let field_layout = variant.field(&cx, field);
-                let info = validate_memory_aggregate_field_leaves(tcx, &cx, &field_layout)?;
-                has_fat_pointer_leaf |= info.has_fat_pointer_leaf;
-                has_nested_enum_leaf |= info.has_nested_enum_leaf;
-                has_nested_niche_enum_leaf |= info.has_nested_niche_enum_leaf;
+            // Uniform-element short circuit, exactly as in
+            // `validate_memory_aggregate_field_leaves` -- this is the arm a
+            // top-level `[T; N]` local takes, so without it the array length
+            // drives the loop.
+            let uniform_element_count =
+                if let rustc_abi::FieldsShape::Array { count, .. } = variant.fields {
+                    Some(count)
+                } else {
+                    None
+                };
+            match uniform_element_count {
+                Some(0) => {}
+                Some(_) => {
+                    let element = variant.field(&cx, 0);
+                    let info = validate_memory_aggregate_field_leaves(tcx, &cx, &element)?;
+                    has_fat_pointer_leaf |= info.has_fat_pointer_leaf;
+                    has_nested_enum_leaf |= info.has_nested_enum_leaf;
+                    has_nested_niche_enum_leaf |= info.has_nested_niche_enum_leaf;
+                }
+                None => {
+                    for field in 0..variant.fields.count() {
+                        let field_layout = variant.field(&cx, field);
+                        let info =
+                            validate_memory_aggregate_field_leaves(tcx, &cx, &field_layout)?;
+                        has_fat_pointer_leaf |= info.has_fat_pointer_leaf;
+                        has_nested_enum_leaf |= info.has_nested_enum_leaf;
+                        has_nested_niche_enum_leaf |= info.has_nested_niche_enum_leaf;
+                    }
+                }
             }
             None
         }
@@ -76277,7 +77777,7 @@ fn memory_aggregate_address_taken_needs_slot<'tcx>(
     // which `memory_aggregate_layout` returns `Err`) — must NOT be memory-backed
     // here; it keeps the existing path (which fails closed on its own terms). So
     // an `Err`/`None` layout means "not memory-backable".
-    if !matches!(memory_aggregate_layout(tcx, ty), Ok(Some(_))) {
+    if !matches!(memory_aggregate_layout_shared(tcx, ty), Ok(Some(_))) {
         return Ok(false);
     }
     // The scalarized reference path can flatten this pointee (a flat scalar-leaf
@@ -76787,35 +78287,64 @@ fn lower_vec_range_subslice_index_call<'tcx>(
     let (start, end) = match kind {
         VecSubsliceKind::Full => (emit_i64_const(ctx, block, 0), len),
         _ => {
-            let range_local = match &call.args[1].node {
-                Operand::Copy(p) | Operand::Move(p) if p.projection.is_empty() => p.local,
-                _ => {
-                    return Err("vec subslice index range argument is not a bare local".to_owned())
-                }
+            // O1 mir-opt folds the range to a `const Range/RangeFrom/RangeTo`
+            // argument (O2/O3 pass a bare local); read the usize bound constants
+            // from its image. RangeFrom/RangeTo carry their single bound at field
+            // 0; Range carries start@0, end@1. A non-constant / unreadable range
+            // falls through to the bare-local path unchanged.
+            let range_ty = ctx.monomorphize_ty(operand_rust_ty(ctx, body, &call.args[1].node)?);
+            let const_field = |ctx: &MirLoweringCtx<'tcx>, i: usize| {
+                read_const_range_usize_field(ctx, &call.args[1].node, range_ty, i)
             };
-            let usize_ty = ctx.tcx.types.usize;
-            let range_field = |tcx: TyCtxt<'tcx>, i: usize| {
-                Operand::Copy(Place {
-                    local: range_local,
-                    projection: tcx
-                        .mk_place_elems(&[ProjectionElem::Field(FieldIdx::new(i), usize_ty)]),
-                })
+            let const_bounds: Option<(i64, Option<i64>)> = match kind {
+                VecSubsliceKind::Range => match (const_field(ctx, 0)?, const_field(ctx, 1)?) {
+                    (Some(s), Some(e)) => Some((s as i64, Some(e as i64))),
+                    _ => None,
+                },
+                VecSubsliceKind::From => const_field(ctx, 0)?.map(|s| (s as i64, None)),
+                VecSubsliceKind::To => const_field(ctx, 0)?.map(|e| (0i64, Some(e as i64))),
+                VecSubsliceKind::Full => None,
             };
-            match kind {
-                VecSubsliceKind::Range => {
-                    let s = lower_operand_to_value(ctx, body, block, &range_field(ctx.tcx, 0))?;
-                    let e = lower_operand_to_value(ctx, body, block, &range_field(ctx.tcx, 1))?;
-                    (coerce_to_i64(ctx, block, s), coerce_to_i64(ctx, block, e))
+            if let Some((s, e_opt)) = const_bounds {
+                let start = emit_i64_const(ctx, block, i128::from(s));
+                let end = match e_opt {
+                    Some(e) => emit_i64_const(ctx, block, i128::from(e)),
+                    None => len,
+                };
+                (start, end)
+            } else {
+                let range_local = match &call.args[1].node {
+                    Operand::Copy(p) | Operand::Move(p) if p.projection.is_empty() => p.local,
+                    _ => {
+                        return Err(
+                            "vec subslice index range argument is not a bare local".to_owned(),
+                        )
+                    }
+                };
+                let usize_ty = ctx.tcx.types.usize;
+                let range_field = |tcx: TyCtxt<'tcx>, i: usize| {
+                    Operand::Copy(Place {
+                        local: range_local,
+                        projection: tcx
+                            .mk_place_elems(&[ProjectionElem::Field(FieldIdx::new(i), usize_ty)]),
+                    })
+                };
+                match kind {
+                    VecSubsliceKind::Range => {
+                        let s = lower_operand_to_value(ctx, body, block, &range_field(ctx.tcx, 0))?;
+                        let e = lower_operand_to_value(ctx, body, block, &range_field(ctx.tcx, 1))?;
+                        (coerce_to_i64(ctx, block, s), coerce_to_i64(ctx, block, e))
+                    }
+                    VecSubsliceKind::From => {
+                        let s = lower_operand_to_value(ctx, body, block, &range_field(ctx.tcx, 0))?;
+                        (coerce_to_i64(ctx, block, s), len)
+                    }
+                    VecSubsliceKind::To => {
+                        let e = lower_operand_to_value(ctx, body, block, &range_field(ctx.tcx, 0))?;
+                        (emit_i64_const(ctx, block, 0), coerce_to_i64(ctx, block, e))
+                    }
+                    VecSubsliceKind::Full => unreachable!(),
                 }
-                VecSubsliceKind::From => {
-                    let s = lower_operand_to_value(ctx, body, block, &range_field(ctx.tcx, 0))?;
-                    (coerce_to_i64(ctx, block, s), len)
-                }
-                VecSubsliceKind::To => {
-                    let e = lower_operand_to_value(ctx, body, block, &range_field(ctx.tcx, 0))?;
-                    (emit_i64_const(ctx, block, 0), coerce_to_i64(ctx, block, e))
-                }
-                VecSubsliceKind::Full => unreachable!(),
             }
         }
     };
@@ -76954,6 +78483,51 @@ fn lower_vec_range_subslice_index_call<'tcx>(
 /// panic) or the reserved trap block under `-Cpanic=abort`/nounwind; otherwise
 /// the computed `{data,len}` pair is stored into the destination slice's
 /// memory-backed slot and control continues to the call's success target.
+/// Read a usize field (0 = start, 1 = end) out of a CONSTANT `Range`/`RangeTo`/
+/// `RangeFrom` operand's in-memory image, at its rustc layout offset. O2/O3 pass
+/// the range as a bare local; O1 mir-opt folds `a..b` to a `const Range { start,
+/// end }` operand — this recovers the bound constants so the subslice lowerings
+/// need not require a bare local. Returns `None` (caller falls closed) for any
+/// non-constant / non-`Indirect` / pointer-bearing const.
+fn read_const_range_usize_field<'tcx>(
+    ctx: &MirLoweringCtx<'tcx>,
+    operand: &Operand<'tcx>,
+    range_ty: Ty<'tcx>,
+    field_idx: usize,
+) -> Result<Option<u64>, String> {
+    let Operand::Constant(constant) = operand else {
+        return Ok(None);
+    };
+    let evaluated = ctx.eval_const_operand(constant);
+    // A single-field range (`RangeTo`/`RangeFrom`, one usize bound at field 0) is
+    // a bare `ConstValue::Scalar`, not an in-memory aggregate — read it directly.
+    if field_idx == 0 {
+        if let Some(v) = const_to_scalar_i128(&evaluated) {
+            return Ok(Some(v as u64));
+        }
+    }
+    let mir::Const::Val(ConstValue::Indirect { alloc_id, offset }, _) = evaluated else {
+        return Ok(None);
+    };
+    let Some(GlobalAlloc::Memory(const_alloc)) = ctx.tcx.try_get_global_alloc(alloc_id) else {
+        return Ok(None);
+    };
+    let alloc = const_alloc.inner();
+    if !alloc.provenance().ptrs().is_empty() {
+        return Ok(None);
+    }
+    let layout = ctx
+        .tcx
+        .layout_of(ty::TypingEnv::fully_monomorphized().as_query_input(range_ty))
+        .map_err(|e| format!("const range layout_of failed: {e:?}"))?;
+    let field_off = layout.fields.offset(field_idx).bytes() as usize;
+    let base = offset.bytes() as usize + field_off;
+    let raw = alloc.inspect_with_uninit_and_ptr_outside_interpreter(base..base + 8);
+    let v = read_target_uint(ctx.tcx.data_layout.endian, raw)
+        .map_err(|e| format!("const range field read failed: {e:?}"))?;
+    Ok(Some(v as u64))
+}
+
 fn lower_local_array_subslice_index_call<'tcx>(
     ctx: &mut MirLoweringCtx<'tcx>,
     body: &Body<'tcx>,
@@ -76989,27 +78563,46 @@ fn lower_local_array_subslice_index_call<'tcx>(
     // `start` and `end` from the `Range<usize>` argument's two integer fields. Build
     // projected field operands (`range.0` = start, `range.1` = end) and lower them —
     // `lower_operand_to_value` handles both a scalarized and a memory-backed range.
-    let range_local = match &call.args[1].node {
-        Operand::Copy(p) | Operand::Move(p) if p.projection.is_empty() => p.local,
-        _ => return Err("subslice index range argument is not a bare local".to_owned()),
+    // O1 mir-opt folds `a..b` to a `const Range { start, end }` argument (O2/O3
+    // pass a bare local). Read the two usize bound constants from the const's
+    // image; a non-constant / unreadable range falls through to the bare-local
+    // path (or its fail-closed guard) unchanged.
+    let range_ty = ctx.monomorphize_ty(operand_rust_ty(ctx, body, &call.args[1].node)?);
+    let (start, end) = if let (Some(s), Some(e)) = (
+        read_const_range_usize_field(ctx, &call.args[1].node, range_ty, 0)?,
+        read_const_range_usize_field(ctx, &call.args[1].node, range_ty, 1)?,
+    ) {
+        (
+            emit_i64_const(ctx, block, i128::from(s)),
+            emit_i64_const(ctx, block, i128::from(e)),
+        )
+    } else {
+        let range_local = match &call.args[1].node {
+            Operand::Copy(p) | Operand::Move(p) if p.projection.is_empty() => p.local,
+            _ => {
+                return Err("subslice index range argument is not a bare local".to_owned())
+            }
+        };
+        let usize_ty = ctx.tcx.types.usize;
+        let start_place = Operand::Copy(Place {
+            local: range_local,
+            projection: ctx
+                .tcx
+                .mk_place_elems(&[ProjectionElem::Field(FieldIdx::new(0), usize_ty)]),
+        });
+        let end_place = Operand::Copy(Place {
+            local: range_local,
+            projection: ctx
+                .tcx
+                .mk_place_elems(&[ProjectionElem::Field(FieldIdx::new(1), usize_ty)]),
+        });
+        let start = lower_operand_to_value(ctx, body, block, &start_place)?;
+        let end = lower_operand_to_value(ctx, body, block, &end_place)?;
+        (
+            coerce_to_i64(ctx, block, start),
+            coerce_to_i64(ctx, block, end),
+        )
     };
-    let usize_ty = ctx.tcx.types.usize;
-    let start_place = Operand::Copy(Place {
-        local: range_local,
-        projection: ctx
-            .tcx
-            .mk_place_elems(&[ProjectionElem::Field(FieldIdx::new(0), usize_ty)]),
-    });
-    let end_place = Operand::Copy(Place {
-        local: range_local,
-        projection: ctx
-            .tcx
-            .mk_place_elems(&[ProjectionElem::Field(FieldIdx::new(1), usize_ty)]),
-    });
-    let start = lower_operand_to_value(ctx, body, block, &start_place)?;
-    let end = lower_operand_to_value(ctx, body, block, &end_place)?;
-    let start = coerce_to_i64(ctx, block, start);
-    let end = coerce_to_i64(ctx, block, end);
 
     // Bounds check: `ok = (start <=u end) && (end <=u N)`. Unsigned comparisons —
     // a `usize` start/end is never negative; this rejects `start > end` (the
@@ -77139,30 +78732,54 @@ fn lower_str_range_subslice_index_call<'tcx>(
     // `start`/`end` from the `Range*<usize>` argument's projected usize fields
     // (the array-subslice template): `Range` = {start, end}, `RangeFrom` =
     // {start}, `RangeTo` = {end}.
-    let range_local = match &call.args[1].node {
-        Operand::Copy(p) | Operand::Move(p) if p.projection.is_empty() => p.local,
-        _ => return Err("str subslice index range argument is not a bare local".to_owned()),
+    // O1 mir-opt folds `a..b` to a `const Range/RangeFrom/RangeTo` (O2/O3 pass a
+    // bare local). Recover the usize bound constants; a non-constant range falls
+    // through to the bare-local path unchanged.
+    let range_ty = ctx.monomorphize_ty(operand_rust_ty(ctx, body, &call.args[1].node)?);
+    let const_field = |ctx: &MirLoweringCtx<'tcx>, i: usize| {
+        read_const_range_usize_field(ctx, &call.args[1].node, range_ty, i)
     };
-    let usize_ty = ctx.tcx.types.usize;
-    let range_field = |tcx: TyCtxt<'tcx>, i: usize| {
-        Operand::Copy(Place {
-            local: range_local,
-            projection: tcx.mk_place_elems(&[ProjectionElem::Field(FieldIdx::new(i), usize_ty)]),
-        })
+    let const_bounds: Option<(i64, Option<i64>)> = match kind {
+        StrSubsliceKind::Range => match (const_field(ctx, 0)?, const_field(ctx, 1)?) {
+            (Some(s), Some(e)) => Some((s as i64, Some(e as i64))),
+            _ => None,
+        },
+        StrSubsliceKind::From => const_field(ctx, 0)?.map(|s| (s as i64, None)),
+        StrSubsliceKind::To => const_field(ctx, 0)?.map(|e| (0i64, Some(e as i64))),
     };
-    let (start, end) = match kind {
-        StrSubsliceKind::Range => {
-            let s = lower_operand_to_value(ctx, body, block, &range_field(ctx.tcx, 0))?;
-            let e = lower_operand_to_value(ctx, body, block, &range_field(ctx.tcx, 1))?;
-            (coerce_to_i64(ctx, block, s), coerce_to_i64(ctx, block, e))
-        }
-        StrSubsliceKind::From => {
-            let s = lower_operand_to_value(ctx, body, block, &range_field(ctx.tcx, 0))?;
-            (coerce_to_i64(ctx, block, s), len)
-        }
-        StrSubsliceKind::To => {
-            let e = lower_operand_to_value(ctx, body, block, &range_field(ctx.tcx, 0))?;
-            (emit_i64_const(ctx, block, 0), coerce_to_i64(ctx, block, e))
+    let (start, end) = if let Some((s, e_opt)) = const_bounds {
+        let start = emit_i64_const(ctx, block, i128::from(s));
+        let end = match e_opt {
+            Some(e) => emit_i64_const(ctx, block, i128::from(e)),
+            None => len,
+        };
+        (start, end)
+    } else {
+        let range_local = match &call.args[1].node {
+            Operand::Copy(p) | Operand::Move(p) if p.projection.is_empty() => p.local,
+            _ => return Err("str subslice index range argument is not a bare local".to_owned()),
+        };
+        let usize_ty = ctx.tcx.types.usize;
+        let range_field = |tcx: TyCtxt<'tcx>, i: usize| {
+            Operand::Copy(Place {
+                local: range_local,
+                projection: tcx.mk_place_elems(&[ProjectionElem::Field(FieldIdx::new(i), usize_ty)]),
+            })
+        };
+        match kind {
+            StrSubsliceKind::Range => {
+                let s = lower_operand_to_value(ctx, body, block, &range_field(ctx.tcx, 0))?;
+                let e = lower_operand_to_value(ctx, body, block, &range_field(ctx.tcx, 1))?;
+                (coerce_to_i64(ctx, block, s), coerce_to_i64(ctx, block, e))
+            }
+            StrSubsliceKind::From => {
+                let s = lower_operand_to_value(ctx, body, block, &range_field(ctx.tcx, 0))?;
+                (coerce_to_i64(ctx, block, s), len)
+            }
+            StrSubsliceKind::To => {
+                let e = lower_operand_to_value(ctx, body, block, &range_field(ctx.tcx, 0))?;
+                (emit_i64_const(ctx, block, 0), coerce_to_i64(ctx, block, e))
+            }
         }
     };
 
@@ -78244,8 +79861,8 @@ fn lower_slice_split_first_last<'tcx>(
     if refine {
         (|| -> Option<()> {
             use trust_cg_verify::mir_semantics::SliceEndKind;
-            let layout = memory_aggregate_layout(ctx.tcx, dest_ty).ok().flatten()?;
-            let tag = layout.tag?;
+            let layout = memory_aggregate_layout_shared(ctx.tcx, dest_ty).ok().flatten()?;
+            let tag = layout.tag.clone()?;
             let MemoryTagEncoding::Niche {
                 untagged_variant,
                 niche_variants_start,
@@ -78635,7 +80252,7 @@ fn compute_memory_backed_locals<'tcx>(
         }
         let ty = ctx.monomorphize_ty(local_rust_ty(ctx, body, local));
         if matches!(
-            memory_aggregate_layout(ctx.tcx, ty),
+            memory_aggregate_layout_shared(ctx.tcx, ty),
             Ok(Some(layout)) if layout.has_fat_pointer_leaf
         ) {
             locals.insert(local);
@@ -78728,6 +80345,101 @@ fn compute_memory_backed_locals<'tcx>(
             )
         {
             locals.insert(destination.local);
+        }
+    }
+
+    // (0e) An aggregate local the SCALARIZED path cannot spell but the MEMORY
+    // path can. The scalarized representation binds a local's leaves as
+    // individual SSA values and has no spelling for an ARRAY field, so
+    // `scalar_field_aggregate_trust_ir_fields` fails closed on `Ty::[T; N]`.
+    //
+    // This is the other half of rule 0f. Once `<[T; N] as IntoIterator>::
+    // into_iter` inlines at -O2/-O3, the array-to-`MaybeUninit` transmute (0f)
+    // is followed by the wrappers that CARRY the array — `PolymorphicIter`,
+    // `ManuallyDrop`, `MaybeDangling` — each of which has an array field and so
+    // has no scalarized form either. Both rules are needed: with only 0e the
+    // transmute still declines, and with only 0f the wrapper construction does.
+    //
+    // The predicate is exactly "no scalarized representation, but a memory one",
+    // so it cannot steal a working case: every local it adds would otherwise
+    // fail closed wherever it is used. Bare arrays are excluded — they have
+    // their own established handling (rules 0d / 3e and `memory_slot_lane_ty`),
+    // and this must not redirect them.
+    for local in body.local_decls.indices() {
+        if fmt_internal_locals.contains(&local) || locals.contains(&local) {
+            continue;
+        }
+        let ty = ctx.monomorphize_ty(local_rust_ty(ctx, body, local));
+        if matches!(ty.kind(), ty::Array(..)) {
+            continue;
+        }
+        if scalar_leaf_trust_ir_fields(ctx.tcx, ty).is_ok() {
+            continue;
+        }
+        if matches!(memory_aggregate_layout_shared(ctx.tcx, ty), Ok(Some(_))) {
+            locals.insert(local);
+        }
+    }
+
+    // (0f) Both sides of an AGGREGATE-to-AGGREGATE `Transmute`. rustc emits one
+    // for `<[T; N] as IntoIterator>::into_iter` once it inlines (-O2/-O3):
+    //
+    //   _15 = copy _3 as [MaybeUninit<usize>; 5] (Transmute);
+    //   _16 = PolymorphicIter { alive: const .., data: copy _15 };
+    //
+    // The scalarized path has no representation for a whole-array VALUE, so
+    // `place_trust_ir_ty` fails closed on `Ty::[T; N]` and the whole program
+    // declines — that is what made `for n in [0usize, 1, 2]` uncompilable at
+    // -O2 while working at -O0/-O1 (rule 0d covers only the shape where
+    // `into_iter` survives as a CALL to intercept).
+    //
+    // A transmute is a byte reinterpretation between two types of the SAME size,
+    // and `copy_memory_aggregate_leaves` copies a slot by byte lanes without
+    // consulting either type — so a slot on both sides IS the lowering (see the
+    // Transmute arm in `lower_assign`).
+    //
+    // Scoped to the case where BOTH sides are non-scalar AND memory-representable:
+    // that excludes the `int <-> [u8; N]` reinterpret (`to_le_bytes` and friends),
+    // which has its own arm in `lower_assign` and must keep it. Additive on the
+    // same argument as rules 0c/0d: absent slots this statement fails closed
+    // today, so a slot steals no working case.
+    for bb in body.basic_blocks.iter() {
+        for statement in &bb.statements {
+            let StatementKind::Assign(boxed) = &statement.kind else {
+                continue;
+            };
+            let (place, rvalue) = &**boxed;
+            let Rvalue::Cast(mir::CastKind::Transmute, operand, dst_ty) = rvalue else {
+                continue;
+            };
+            if !place.projection.is_empty() {
+                continue;
+            }
+            let (Operand::Copy(src) | Operand::Move(src)) = operand else {
+                continue;
+            };
+            if !src.projection.is_empty() {
+                continue;
+            }
+            let dst_ty = ctx.monomorphize_ty(*dst_ty);
+            let src_ty = ctx.monomorphize_ty(local_rust_ty(ctx, body, src.local));
+            let both_aggregate = rust_ty_to_trust_ir_ty(ctx.tcx, dst_ty).is_err()
+                && rust_ty_to_trust_ir_ty(ctx.tcx, src_ty).is_err();
+            if !both_aggregate {
+                continue;
+            }
+            let representable = matches!(
+                memory_aggregate_layout_shared(ctx.tcx, dst_ty),
+                Ok(Some(_))
+            ) && matches!(
+                memory_aggregate_layout_shared(ctx.tcx, src_ty),
+                Ok(Some(_))
+            );
+            if !representable {
+                continue;
+            }
+            locals.insert(place.local);
+            locals.insert(src.local);
         }
     }
 
@@ -78907,7 +80619,7 @@ fn compute_memory_backed_locals<'tcx>(
         }
         let ty = ctx.monomorphize_ty(local_rust_ty(ctx, body, local));
         if matches!(
-            memory_aggregate_layout(ctx.tcx, ty),
+            memory_aggregate_layout_shared(ctx.tcx, ty),
             Ok(Some(layout)) if layout.has_nested_enum_leaf
                 || (layout.has_nested_niche_enum_leaf && matches!(ty.kind(), ty::Tuple(..)))
         ) {
@@ -78985,7 +80697,7 @@ fn compute_memory_backed_locals<'tcx>(
                     continue;
                 }
                 let borrowed_ty = ctx.monomorphize_ty(local_rust_ty(ctx, body, borrowed));
-                if matches!(memory_aggregate_layout(ctx.tcx, borrowed_ty), Ok(Some(_))) {
+                if matches!(memory_aggregate_layout_shared(ctx.tcx, borrowed_ty), Ok(Some(_))) {
                     locals.insert(borrowed);
                 }
             }
@@ -79024,7 +80736,7 @@ fn compute_memory_backed_locals<'tcx>(
                 continue;
             }
             let projected_ty = ctx.monomorphize_ty(src.ty(body, ctx.tcx).ty);
-            if matches!(memory_aggregate_layout(ctx.tcx, projected_ty), Ok(Some(_))) {
+            if matches!(memory_aggregate_layout_shared(ctx.tcx, projected_ty), Ok(Some(_))) {
                 locals.insert(dst.local);
             }
         }
@@ -79253,12 +80965,12 @@ fn compute_memory_backed_locals<'tcx>(
         // has a memory layout the slot machinery can build.
         let has_aggregate_elem = elem_tys.iter().any(|elem| {
             matches!(
-                memory_aggregate_layout(ctx.tcx, ctx.monomorphize_ty(elem)),
+                memory_aggregate_layout_shared(ctx.tcx, ctx.monomorphize_ty(elem)),
                 Ok(Some(_))
             )
         });
         if has_aggregate_elem
-            && matches!(memory_aggregate_layout(ctx.tcx, tuple_ty), Ok(Some(_)))
+            && matches!(memory_aggregate_layout_shared(ctx.tcx, tuple_ty), Ok(Some(_)))
         {
             locals.insert(tuple_place.local);
         }
@@ -79425,7 +81137,7 @@ fn compute_memory_backed_locals<'tcx>(
                             // the function lowerable; it can never miscompile.
                             if adt.is_enum()
                                 && adt.variants().len() > 1
-                                && matches!(memory_aggregate_layout(ctx.tcx, ty), Ok(Some(_)))
+                                && matches!(memory_aggregate_layout_shared(ctx.tcx, ty), Ok(Some(_)))
                             {
                                 locals.insert(place.local);
                             }
@@ -79473,7 +81185,7 @@ fn compute_memory_backed_locals<'tcx>(
                 mir::AggregateKind::Tuple => {
                     dst.projection.is_empty()
                         && matches!(
-                            memory_aggregate_layout(
+                            memory_aggregate_layout_shared(
                                 ctx.tcx,
                                 ctx.monomorphize_ty(local_rust_ty(ctx, body, dst.local)),
                             ),
@@ -79497,7 +81209,7 @@ fn compute_memory_backed_locals<'tcx>(
                 if let ty::Adt(adt, _) = ty.kind() {
                     if adt.is_enum()
                         && adt.variants().len() > 1
-                        && matches!(memory_aggregate_layout(ctx.tcx, ty), Ok(Some(_)))
+                        && matches!(memory_aggregate_layout_shared(ctx.tcx, ty), Ok(Some(_)))
                     {
                         locals.insert(place.local);
                     }
@@ -79547,7 +81259,7 @@ fn compute_memory_backed_locals<'tcx>(
                             ctx.monomorphize_ty(local_rust_ty(ctx, body, place.local));
                         matches!(base_ty.kind(), ty::Array(..))
                             && matches!(
-                                memory_aggregate_layout(ctx.tcx, base_ty),
+                                memory_aggregate_layout_shared(ctx.tcx, base_ty),
                                 Ok(Some(layout)) if layout.has_nested_enum_leaf
                                     || layout.has_nested_niche_enum_leaf
                             )
@@ -79562,7 +81274,7 @@ fn compute_memory_backed_locals<'tcx>(
                     ty::Adt(adt, _) => {
                         adt.is_enum()
                             && adt.variants().len() > 1
-                            && matches!(memory_aggregate_layout(ctx.tcx, ty), Ok(Some(_)))
+                            && matches!(memory_aggregate_layout_shared(ctx.tcx, ty), Ok(Some(_)))
                     }
                     _ => false,
                 }
@@ -79772,7 +81484,7 @@ fn compute_memory_backed_locals<'tcx>(
             if matches!(src_ty.kind(), ty::Int(_) | ty::Uint(_))
                 && matches!(dst_ty_m.kind(), ty::Adt(adt, _) if adt.is_enum())
                 && dst.projection.is_empty()
-                && memory_aggregate_layout(ctx.tcx, dst_ty_m)?.is_some()
+                && memory_aggregate_layout_shared(ctx.tcx, dst_ty_m)?.is_some()
             {
                 locals.insert(dst.local);
             }
@@ -80301,7 +82013,7 @@ fn compute_memory_backed_locals<'tcx>(
                 continue;
             }
             let dst_ty = ctx.monomorphize_ty(local_rust_ty(ctx, body, dst.local));
-            if matches!(memory_aggregate_layout(ctx.tcx, dst_ty), Ok(Some(_))) {
+            if matches!(memory_aggregate_layout_shared(ctx.tcx, dst_ty), Ok(Some(_))) {
                 locals.insert(dst.local);
             }
         }
@@ -80346,7 +82058,7 @@ fn compute_memory_backed_locals<'tcx>(
                 if !is_enum {
                     continue;
                 }
-                if !matches!(memory_aggregate_layout(ctx.tcx, dst_ty), Ok(Some(_))) {
+                if !matches!(memory_aggregate_layout_shared(ctx.tcx, dst_ty), Ok(Some(_))) {
                     continue;
                 }
                 assign_blocks.entry(dst.local).or_default().insert(bb);
@@ -80481,7 +82193,7 @@ fn compute_memory_backed_locals<'tcx>(
         let is_layout_eligible_enum = |local: Local| {
             let ty = ctx.monomorphize_ty(local_rust_ty(ctx, body, local));
             matches!(ty.kind(), ty::Adt(adt, _) if adt.is_enum())
-                && matches!(memory_aggregate_layout(ctx.tcx, ty), Ok(Some(_)))
+                && matches!(memory_aggregate_layout_shared(ctx.tcx, ty), Ok(Some(_)))
         };
         let mut changed = true;
         while changed {
@@ -80646,7 +82358,7 @@ fn compute_memory_backed_locals<'tcx>(
                 continue;
             };
             let dst_ty = ctx.monomorphize_ty(local_rust_ty(ctx, body, dst.local));
-            if matches!(memory_aggregate_layout(ctx.tcx, dst_ty), Ok(Some(_))) {
+            if matches!(memory_aggregate_layout_shared(ctx.tcx, dst_ty), Ok(Some(_))) {
                 locals.insert(dst.local);
             }
         }
@@ -80778,7 +82490,7 @@ fn compute_memory_backed_locals<'tcx>(
         }
         let ty = ctx.monomorphize_ty(local_rust_ty(ctx, body, place.local));
         if is_user_drop_copy_fields_struct(ctx.tcx, ty)
-            && matches!(memory_aggregate_layout(ctx.tcx, ty), Ok(Some(_)))
+            && matches!(memory_aggregate_layout_shared(ctx.tcx, ty), Ok(Some(_)))
         {
             locals.insert(place.local);
         }
@@ -81435,14 +83147,20 @@ fn compute_loop_blocks<'tcx>(body: &Body<'tcx>) -> HashSet<mir::BasicBlock> {
 
 /// Allocate a stack slot for every memory-backed local, in the entry block, and
 /// record each in `ctx.memory_slots`. Runs once before any block is lowered.
+/// `backed` / `cells` come from the caller, which has already run
+/// `compute_memory_backed_locals` / `compute_scalar_cell_locals` for its own
+/// phi-exclusion set. Both are pure in `(tcx, instance, body)`, so recomputing
+/// them here returned the identical answer at the cost of a second pass over the
+/// whole body -- and left the same decision implemented in two places.
 fn allocate_memory_slots<'tcx>(
     ctx: &mut MirLoweringCtx<'tcx>,
     body: &Body<'tcx>,
     block: &mut Block,
+    backed: &HashSet<Local>,
+    cells: &HashSet<Local>,
 ) -> Result<(), String> {
-    let backed = compute_memory_backed_locals(ctx, body)?;
     // Allocate in stable local order for deterministic output.
-    let mut backed: Vec<Local> = backed.into_iter().collect();
+    let mut backed: Vec<Local> = backed.iter().copied().collect();
     backed.sort_by_key(|local| local.index());
     for local in backed {
         let ty = local_rust_ty(ctx, body, local);
@@ -81482,8 +83200,7 @@ fn allocate_memory_slots<'tcx>(
     // scalar leaf type. Reads/writes of the local route through this cell so
     // `&local` is a stable address (see the cell intercepts). Allocated in stable
     // local order after the slots, in the same entry block.
-    let cells = compute_scalar_cell_locals(ctx, body)?;
-    let mut cells: Vec<Local> = cells.into_iter().collect();
+    let mut cells: Vec<Local> = cells.iter().copied().collect();
     cells.sort_by_key(|local| local.index());
     for local in cells {
         let ty = ctx.monomorphize_ty(local_rust_ty(ctx, body, local));
@@ -84353,6 +86070,42 @@ pub fn __rustc_codegen_backend() -> Box<dyn CodegenBackend> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The `TyId` <-> lane-type mapping must round-trip in both directions for
+    /// every seeded id, and reject anything outside the seeded range. A slot
+    /// type names its element by fixed id; if the two directions disagreed, a
+    /// slot would resolve to the WRONG lane width -- silent wrong code, not a
+    /// fail-closed error.
+    #[test]
+    fn slot_lane_ty_ids_round_trip() {
+        for index in 0..SLOT_LANE_TY_COUNT {
+            let lane = slot_lane_ty_by_id(index).expect("seeded id resolves to a lane");
+            assert_eq!(
+                slot_lane_ty_id(&lane).map(|id| id.index()),
+                Some(index),
+                "lane {lane:?} must map back to TyId {index}"
+            );
+        }
+        assert_eq!(slot_lane_ty_by_id(SLOT_LANE_TY_COUNT), None);
+        // A non-lane type has no id.
+        assert_eq!(slot_lane_ty_id(&TrustIrTy::Ptr), None);
+        assert_eq!(slot_lane_ty_id(&TrustIrTy::F64), None);
+    }
+
+    /// Every lane `memory_slot_lane_ty` can pick must be a seeded lane type --
+    /// otherwise the array spelling silently falls back to the tuple and the
+    /// hazard returns for that alignment.
+    #[test]
+    fn every_slot_alignment_yields_the_array_spelling() {
+        for (align, lanes) in [(1u64, 4096u64), (2, 4096), (4, 4096), (8, 4096), (16, 4096)] {
+            let size = align * lanes;
+            let ty = memory_slot_lane_ty(size, align).expect("supported alignment");
+            assert!(
+                matches!(ty, TrustIrTy::Array(_, n) if n == lanes),
+                "align {align} slot of {lanes} lanes must use the array spelling, got {ty:?}"
+            );
+        }
+    }
     use super::*;
 
     #[test]
@@ -85042,6 +86795,28 @@ mod tests {
     // and a WRONG obligation (the synthetic-refutation requirement) is
     // REFUTED — never credited. Skipped when no solver is reachable (the
     // production path then refuses every elimination anyway).
+
+    /// The dynamic lane has three independently load-bearing missing proofs:
+    /// a write after the guard's read in the guard endpoint block, a write
+    /// before the check's read in the assert endpoint block, and mutation
+    /// through a raw/mutable alias created before the scanned interval. The
+    /// production authority boundary must refuse all three classes, while the
+    /// constant lane remains admitted to the solver.
+    #[test]
+    fn dom_bce_dynamic_identity_is_fail_closed_at_the_authority_boundary() {
+        assert_eq!(dom_bce_constant_bound(DomBceBound::Const(64)), Some(64));
+        for missing_proof in [
+            "guard-endpoint statement position",
+            "assert-endpoint statement position",
+            "preexisting raw/mutable alias provenance",
+        ] {
+            assert_eq!(
+                dom_bce_constant_bound(DomBceBound::DynLocal),
+                None,
+                "dynamic BCE admitted without {missing_proof}"
+            );
+        }
+    }
 
     fn dom_bce_solver_reachable() -> bool {
         if trust_cg_codegen::env_lock::var_os("TCG_REFINE_SOLVER").is_some_and(|v| v == "0") {

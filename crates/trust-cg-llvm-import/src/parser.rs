@@ -1274,25 +1274,15 @@ impl Parser {
     fn le_bytes_of_scalar(&self, ty: &Ty, value: &str) -> Result<Vec<u8>> {
         let value = value.trim();
         match ty {
-            Ty::Bool | Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::I128 => {
-                let width = match ty {
-                    Ty::Bool | Ty::I8 => 1usize,
-                    Ty::I16 => 2,
-                    Ty::I32 => 4,
-                    Ty::I64 => 8,
-                    Ty::I128 => 16,
-                    _ => unreachable!(),
-                };
-                let v: i128 = match value {
-                    "zeroinitializer" | "null" | "false" => 0,
-                    "true" => 1,
-                    other => parse_int_literal(other).ok_or_else(|| {
-                        self.err_unsupported(&format!("integer aggregate field `{}`", other))
-                    })?,
-                };
-                let u = v as u128;
-                Ok((0..width).map(|i| (u >> (i * 8)) as u8).collect())
-            }
+            // The byte width IS the arm pattern, so there is no residual
+            // integer case to fall through: a `Ty` variant this table does not
+            // name reaches the `other =>` arm below and fails CLOSED with a
+            // diagnostic, instead of being silently given some default width.
+            Ty::Bool | Ty::I8 => self.le_bytes_of_int_scalar(1, value),
+            Ty::I16 => self.le_bytes_of_int_scalar(2, value),
+            Ty::I32 => self.le_bytes_of_int_scalar(4, value),
+            Ty::I64 => self.le_bytes_of_int_scalar(8, value),
+            Ty::I128 => self.le_bytes_of_int_scalar(16, value),
             Ty::F32 => {
                 let d = self.aggregate_float_bits(value)?;
                 Ok((d as f32).to_bits().to_le_bytes().to_vec())
@@ -1312,6 +1302,21 @@ impl Parser {
             }
             other => Err(self.err_unsupported(&format!("aggregate field type `{:?}`", other))),
         }
+    }
+
+    /// The little-endian byte image of an integer/bool aggregate field that
+    /// occupies exactly `width` bytes. `width` comes from the caller's match
+    /// arm on the field type, never from the initializer text.
+    fn le_bytes_of_int_scalar(&self, width: usize, value: &str) -> Result<Vec<u8>> {
+        let v: i128 = match value {
+            "zeroinitializer" | "null" | "false" => 0,
+            "true" => 1,
+            other => parse_int_literal(other).ok_or_else(|| {
+                self.err_unsupported(&format!("integer aggregate field `{}`", other))
+            })?,
+        };
+        let u = v as u128;
+        Ok((0..width).map(|i| (u >> (i * 8)) as u8).collect())
     }
 
     fn aggregate_float_bits(&self, value: &str) -> Result<f64> {
@@ -2510,6 +2515,7 @@ impl Parser {
             NativeForm::SplatLane0 { splat_token } => {
                 self.emit_native_splat(name, tail, &splat_token, lineno, f)?
             }
+            NativeForm::Fmuladd => self.emit_native_vector_fmuladd(name, tail, lineno, f)?,
             NativeForm::Store => return Ok(false),
         }
 
@@ -2657,6 +2663,106 @@ impl Parser {
         let rhs = self.lookup_operand(&rhs_str, &ty, f)?;
         let dest = f.intern_value(name);
         f.push_inst(InstrNode::new(Inst::BinOp { op, ty, lhs, rhs }).with_result(dest));
+        Ok(())
+    }
+
+    /// The plan says this `call` is a native packed fused multiply-add: emit it
+    /// as an ordinary `Inst::Call` to the intrinsic symbol with V128-typed
+    /// operands, which `adapter::translate_fma_intrinsic` rewrites into
+    /// `V4F32Fmuladd`/`V2F64Fmuladd` before any `_llvm.*` symbol can escape.
+    ///
+    /// The callee is looked up, never declare-by-use synthesized: LLVM requires
+    /// every intrinsic to be `declare`d, so a missing id means the input is not
+    /// what the planner thought it was, and failing closed beats inventing a
+    /// signature whose types might disagree with the call site.
+    fn emit_native_vector_fmuladd(
+        &mut self,
+        name: &str,
+        tail: &str,
+        lineno: usize,
+        f: &mut FuncScratch,
+    ) -> Result<()> {
+        let (ty_str, callee) = split_ty_operand(tail)?;
+        let shape = self.require_native_shape(&ty_str)?;
+        let Some((callee_name, args)) = callee.split_once('(') else {
+            return Err(self.err_parse(lineno, "native fmuladd: expected a call argument list"));
+        };
+        let Some(args) = args.strip_suffix(')') else {
+            return Err(self.err_parse(lineno, "native fmuladd: unterminated argument list"));
+        };
+        // Re-derive the expected overload from the SHAPE and compare, mirroring
+        // the planner. This function is reachable from a single
+        // `NativeForm::Fmuladd` tag that does not record which overload was
+        // matched, so a future planner edit that widened the admitted set
+        // without widening the lowering would otherwise emit `FMLA .2d` for a
+        // `<4 x double>`. Cheap, local, and fails closed.
+        let callee_name = callee_name.trim();
+        if crate::native_vector::fmuladd_overload_for(shape) != Some(callee_name) {
+            return Err(self.err_unsupported(&format!(
+                "native vector lowering: `{callee_name}` is not the packed fmuladd overload for \
+                 `{ty_str}`"
+            )));
+        }
+        let elems = split_aggregate_elems(args);
+        if elems.len() != 3 {
+            return Err(self.err_parse(lineno, "native fmuladd: expected three arguments"));
+        }
+        let ty = shape.vector_ty();
+        let mut arg_vals = Vec::with_capacity(3);
+        for elem in &elems {
+            let (arg_ty, arg_tok) = split_ty_operand(elem)?;
+            if crate::native_vector::native_shape(&arg_ty) != Some(shape) {
+                return Err(self.err_unsupported(&format!(
+                    "native vector lowering: fmuladd operand type `{arg_ty}` does not match \
+                     result type `{ty_str}`"
+                )));
+            }
+            arg_vals.push(self.lookup_operand(&arg_tok, &ty, f)?);
+        }
+        // Declare-by-use. clang emits `declare` lines at the END of the module,
+        // so the intrinsic is NOT yet in `func_ids` while a function BODY is
+        // being parsed. The generic call path registers callees on demand for
+        // exactly this reason; the native path has to do the same or it fails
+        // on every real input while passing any hand-written .ll that happens
+        // to declare the intrinsic first.
+        //
+        // The signature is fully determined by the shape — three same-shape
+        // vector params, one vector result — so there is nothing to guess.
+        let bare = callee_name.trim_start_matches('@').to_string();
+        let fid = if let Some(&fid) = self.func_ids.get(&bare) {
+            fid
+        } else {
+            let sig = FuncSignature {
+                name: bare.clone(),
+                ret: Some(ty.clone()),
+                params: vec![(None, ty.clone()); 3],
+                is_vararg: false,
+                internal: false,
+                stack_protector: ImportedStackProtectorAttr::None,
+                libm_pure_math: false,
+            };
+            let fid = self.register_function(sig.clone())?;
+            if !self.module.functions.iter().any(|func| func.id == fid) {
+                let mut func = Function::new(
+                    fid,
+                    sig.name.clone(),
+                    self.func_tys[&sig.name],
+                    BlockId::new(0),
+                );
+                func.calling_conv = CallingConv::C;
+                func.linkage = Linkage::External;
+                self.module.add_function(func);
+            }
+            fid
+        };
+        let dest = f.intern_value(name);
+        f.push_inst(
+            InstrNode::new(Inst::Call {
+                callee: fid,
+                args: arg_vals,
+            })
+            .with_result(dest),
+        );
         Ok(())
     }
 
@@ -6265,6 +6371,14 @@ fn is_lowered_passthrough_intrinsic(name: &str) -> bool {
         || name == "llvm.fmuladd.f64"
         || name == "llvm.fma.f32"
         || name == "llvm.fma.f64"
+        // PACKED fused multiply-add, at the two shapes that are machine
+        // registers. Only the fusion-OPTIONAL `fmuladd` is passed through:
+        // strict `llvm.fma.v*` has no packed lowering and must keep
+        // scalarizing, because a representation something may later unfuse
+        // would round TWICE for an intrinsic that REQUIRES fusion. Mirrors
+        // `adapter::fma_vector_intrinsic_contract` exactly.
+        || name == "llvm.fmuladd.v4f32"
+        || name == "llvm.fmuladd.v2f64"
 }
 
 /// `@llvm.experimental.memset.pattern.*` — clang `-O1` emits this on Darwin for

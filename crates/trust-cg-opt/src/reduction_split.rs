@@ -4130,4 +4130,21 @@ mod tests {
             "runtime path must still bail when acc is read outside the reduction"
         );
     }
+
+    /// IDEMPOTENCE: the split (widened) reduction has no remaining splittable
+    /// shape, so a second run must change nothing.
+    #[test]
+    fn second_run_is_a_no_op() {
+        let mut func = make_reduction_loop(100, sumsq_body);
+        assert!(ReductionSplit.run(&mut func), "first run must fire");
+        let (insts, blocks) = (func.insts.len(), func.blocks.len());
+        for again in 2..=4 {
+            assert!(
+                !ReductionSplit.run(&mut func),
+                "run {again} re-fired on its own output"
+            );
+            assert_eq!(func.insts.len(), insts, "run {again} added instructions");
+            assert_eq!(func.blocks.len(), blocks, "run {again} added blocks");
+        }
+    }
 }

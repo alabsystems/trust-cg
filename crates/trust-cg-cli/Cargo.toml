@@ -38,6 +38,12 @@ trust-cg-codegen = { workspace = true }
 trust-ir = { workspace = true, features = ["serde"] }
 trust-ir-build = { workspace = true }
 serde_json = { workspace = true }
+# The REFERENCE wasm validator (Bytecode Alliance), same pin the codegen
+# crate's `tests/wasm_module_validation.rs` uses: the CLI wasm-lane tests
+# claim the emitted bytes are a well-formed module, so they validate them with
+# an independent implementation of the spec rather than checking the magic
+# header. Dev-only; the CLI's production graph MUST NOT gain this dependency.
+wasmparser = "0.240.0"
 
 [lints]
 workspace = true

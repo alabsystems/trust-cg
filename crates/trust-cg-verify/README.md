@@ -18,7 +18,7 @@ The crate keeps evidence strength explicit:
 The encoding, solver, and bridge are part of the trusted computing base for an
 SMT verdict. Independent replay exists only on named certificate paths.
 
-v0.1.0 intentionally exposes no native-AY Cargo feature. Solver-backed checks
+trust-cg intentionally exposes no native-AY Cargo feature. Solver-backed checks
 use the canonical external AY binary so Trust-CG keeps a one-way tool boundary
 instead of introducing an AY <-> Trust-CG Cargo cycle.
 
@@ -119,7 +119,7 @@ unsupported shapes fail closed with `Unknown` on this slice.
 The CLI's `--emit-proofs=<DIR>` path can write SMT-LIB obligations, structured
 certificate records, lowering reports, and function-level sidecars for
 supported compilations. A serialized record is not automatically an
-independently checked certificate. Unsigned v0.1.0 exports identify their
+independently checked certificate. Unsigned exports identify their
 authority, and missing or unsupported evidence causes proof-required paths to
 fail closed.
 

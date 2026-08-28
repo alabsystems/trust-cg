@@ -6889,7 +6889,7 @@ fn build_trust_cg_contains4_masked_backend_function() -> trust_cg_ir::MachFuncti
         AArch64Opcode::MovR,
         vec![MachOperand::PReg(W0), MachOperand::VReg(masked)],
     );
-    append_probe_inst(&mut func, entry, AArch64Opcode::Ret, vec![]);
+    append_probe_ret_x0(&mut func, entry);
 
     func
 }
@@ -7148,7 +7148,7 @@ fn build_trust_cg_contains_literal_scanner_backend_function() -> trust_cg_ir::Ma
         AArch64Opcode::MovR,
         vec![MachOperand::PReg(W0), MachOperand::PReg(W8)]
     );
-    emit!(AArch64Opcode::Ret, vec![]);
+    append_probe_ret_x0(&mut func, entry);
 
     patch_branch_imm(&mut func, entry, sentinel_done_branch, 1, done);
     patch_branch_imm(&mut func, entry, clause_done_branch, 1, done);
@@ -7499,7 +7499,7 @@ fn build_trust_cg_contains_literal_query_batch_backend_function() -> trust_cg_ir
         AArch64Opcode::MovR,
         vec![MachOperand::PReg(X0), MachOperand::PReg(X8)]
     );
-    emit!(AArch64Opcode::Ret, vec![]);
+    append_probe_ret_x0(&mut func, entry);
 
     patch_branch_imm(&mut func, entry, query_done_branch, 1, done);
     patch_branch_imm(&mut func, entry, sentinel_skip_branch, 1, accumulate_query);
@@ -7935,7 +7935,7 @@ fn build_trust_cg_batch_subsumption_scanner_backend_function() -> trust_cg_ir::M
         AArch64Opcode::MovR,
         vec![MachOperand::PReg(W0), MachOperand::PReg(W8)]
     );
-    emit!(AArch64Opcode::Ret, vec![]);
+    append_probe_ret_x0(&mut func, entry);
 
     patch_branch_imm(&mut func, entry, pair_done_branch, 1, done);
     patch_branch_imm(&mut func, entry, a_done_branch, 1, pair_true);
@@ -8547,7 +8547,7 @@ fn build_trust_cg_batch_subsumption_repeated_checksum_backend_function() -> trus
         AArch64Opcode::MovR,
         vec![MachOperand::PReg(X0), MachOperand::PReg(X8)],
     );
-    emit!(AArch64Opcode::Ret, vec![]);
+    append_probe_ret_x0(&mut func, entry);
 
     patch_branch_imm(&mut func, entry, repeat_done_branch, 1, done);
     patch_branch_imm(&mut func, entry, pair_done_branch, 1, checksum_reset);
@@ -8709,10 +8709,26 @@ fn build_trust_cg_contains4_masked_probe_function() -> trust_cg_ir::MachFunction
         ],
     );
 
-    append_probe_inst(&mut func, entry, AArch64Opcode::Ret, vec![]);
+    append_probe_ret_x0(&mut func, entry);
     func
 }
 
+#[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
+/// `append_probe_inst` for a `Ret` that returns a scalar in X0. The AArch64
+/// CFG-authority gate requires a `Ret` to carry EXACTLY the ABI
+/// return-register implicit-use alias set production isel attaches
+/// (`AppleAArch64ABI::required_return_pregs`); a bare `Ret` is malformed IR.
+/// Every probe here moves its result into W0/X0 immediately before returning.
+fn append_probe_ret_x0(func: &mut trust_cg_ir::MachFunction, block: trust_cg_ir::BlockId) {
+    let inst = trust_cg_ir::MachInst::new(trust_cg_ir::AArch64Opcode::Ret, vec![])
+        .with_implicit_uses(&[trust_cg_ir::regs::X0]);
+    let inst_id = func.push_inst(inst);
+    func.append_inst(block, inst_id);
+}
+
+// Same host gate as every caller (the AArch64 probe builders above): on a
+// non-aarch64 host the callers vanish and this helper would be dead code
+// under the workspace `-D warnings`.
 #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
 fn append_probe_inst(
     func: &mut trust_cg_ir::MachFunction,

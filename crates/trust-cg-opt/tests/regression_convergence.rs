@@ -305,15 +305,34 @@ fn regression_convergence_pipeline_o3_multiblock_terminates() {
     assert_under_five_seconds(start);
     assert!(stats.iterations >= 1);
     assert_eq!(stats.runs.len(), pass_count);
+    // The fixpoint drivers SKIP a pass whose function state has not mutated
+    // since that pass last returned changed=false (a deterministic no-op — see
+    // pass_manager.rs). The old assertion here — every pass runs on every
+    // iteration — encoded the pre-skip accounting, not a correctness property:
+    // emitted code is byte-identical with and without the skip. The invariants
+    // that ARE load-bearing:
+    //   * every pass runs AT LEAST once (iteration 1 never skips), and
+    //   * no pass runs more than once per iteration, and
+    //   * total runs never exceed the pre-skip ceiling — and on this diamond
+    //     they stay STRICTLY below it, so a regression that disables skipping
+    //     altogether is caught here instead of sliding under a `<=` bound.
     let unskipped_run_bound = pass_count * stats.iterations as usize;
+    let total_runs = stats.total_pass_runs();
     assert!(
-        stats.total_pass_runs() < unskipped_run_bound,
-        "the fixed-point driver should skip at least one deterministic no-op"
+        total_runs < unskipped_run_bound,
+        "the fixed-point driver should skip at least one deterministic no-op: \
+         {total_runs} runs against a pre-skip ceiling of {unskipped_run_bound} \
+         (skip must never ADD runs)"
     );
     for (pass_name, runs) in &stats.runs {
         assert!(
-            (1..=stats.iterations).contains(runs),
-            "pass {pass_name} ran {runs} times across {} O3 iterations",
+            *runs >= 1,
+            "pass {pass_name} must run at least once (iteration 1 never skips)"
+        );
+        assert!(
+            *runs <= stats.iterations,
+            "pass {pass_name} ran {runs} times across {} O3 iterations \
+             (no pass may run more than once per iteration)",
             stats.iterations
         );
     }

@@ -2,6 +2,8 @@
 use std::collections::HashMap;
 
 #[cfg(target_arch = "x86_64")]
+use trust_cg_codegen::HOST_JIT_SELECTED_CODEGEN_FEATURE_DOMAIN;
+#[cfg(target_arch = "x86_64")]
 use trust_cg_codegen::compiler::{CompileError, Compiler, CompilerConfig};
 #[cfg(target_arch = "x86_64")]
 use trust_cg_codegen::pipeline::OptLevel;
@@ -4156,6 +4158,42 @@ fn default_host_jit_uses_detected_features_for_chc_sse4_helpers() {
     }
 
     let result = result.expect("host JIT with detected SSE4 support must admit CHC SSE4 helpers");
+
+    let profile = result
+        .host_jit_selected_codegen_profile
+        .as_ref()
+        .expect("x86 host JIT must retain selected-codegen evidence");
+    assert_eq!(
+        result.buffer.host_jit_selected_codegen_profile(),
+        Some(profile),
+        "the result and executable buffer must carry identical evidence"
+    );
+    assert!(profile.verify_sha256());
+    let selected_codegen_features = profile
+        .selected_codegen_features()
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    assert_eq!(selected_codegen_features, host.enabled_feature_names());
+    assert_eq!(
+        profile
+            .selected_codegen_feature_domain()
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        HOST_JIT_SELECTED_CODEGEN_FEATURE_DOMAIN
+    );
+    for function in &result.per_function_metrics {
+        assert_eq!(
+            function
+                .x86_machine_code
+                .target_features
+                .enabled_feature_names(),
+            selected_codegen_features,
+            "{} must agree with the artifact-level selected profile",
+            function.name
+        );
+    }
 
     assert_eq!(result.metrics.function_count, 2);
     assert!(result.metrics.code_size_bytes > 0);

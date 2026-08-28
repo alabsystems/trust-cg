@@ -50,7 +50,9 @@ fn build_add() -> MachFunction {
     let add_id = func.push_inst(add);
     func.append_inst(entry, add_id);
 
-    let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+    // `add` returns [I64] -> AppleAArch64ABI::required_return_pregs yields
+    // exactly [X0], so RET must carry that implicit-use alias set.
+    let ret = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
     let ret_id = func.push_inst(ret);
     func.append_inst(entry, ret_id);
 

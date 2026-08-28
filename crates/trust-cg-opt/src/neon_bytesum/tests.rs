@@ -163,6 +163,82 @@ fn build_bytesum_loop(body: Body, n: i64) -> MachFunction {
     func
 }
 
+/// The pass must be IDEMPOTENT: `apply` keeps the scalar loop as the remainder
+/// of the vector loop it builds (same iv, same acc, vector partial sum folded
+/// into acc in the new preheader), and before the guard in `recognize` the
+/// remainder was recognized AGAIN on every fixpoint iteration — one more
+/// zero-trip vector loop per iteration (p7_sieve: +44 instructions x3, the
+/// fixpoint never converged). A second run must change nothing.
+fn assert_idempotent(mut func: MachFunction, label: &str) {
+    let mut pass = NeonBytesumPass::new();
+    assert!(pass.run(&mut func), "{label}: first run should vectorize");
+    assert_eq!(pass.fired(), 1, "{label}");
+    let after_first = func.insts.len();
+    let blocks_after_first = func.blocks.len();
+    for again in 2..=4 {
+        let mut pass = NeonBytesumPass::new();
+        assert!(
+            !pass.run(&mut func),
+            "{label}: run {again} re-vectorized the remainder loop"
+        );
+        assert_eq!(pass.fired(), 0, "{label}: run {again}");
+        assert_eq!(
+            func.insts.len(),
+            after_first,
+            "{label}: run {again} added instructions"
+        );
+        assert_eq!(
+            func.blocks.len(),
+            blocks_after_first,
+            "{label}: run {again} added blocks"
+        );
+    }
+}
+
+/// Through the REAL O3 fixpoint (`run_to_fixpoint(.., 4)`, the pipeline the
+/// bridge runs): the loop must converge — a non-idempotent vectorizer keeps
+/// re-vectorizing its own remainder after cfg-simplify/gvn clean up, so the
+/// fixpoint hits the 4-iteration cap and the function GROWS (v2_memfill
+/// +8 / p7_sieve +44 instructions per iteration before the guards).
+#[test]
+fn o3_fixpoint_converges_without_regrowth() {
+    use crate::pipeline::{OptLevel, OptimizationPipeline};
+    let mut func = build_countif_loop(1, false, false, 4096);
+    let mut pm = OptimizationPipeline::new(OptLevel::O3).build_pass_manager();
+    let stats = pm.run_to_fixpoint(&mut func, 4);
+    assert!(
+        stats.iterations < 4,
+        "count-if: O3 fixpoint hit the iteration cap ({} iterations) — a pass keeps re-firing",
+        stats.iterations
+    );
+    // No nested vector loops: a single vectorized copy of the loop.
+    let vector_headers = func
+        .blocks
+        .iter()
+        .flat_map(|b| b.insts.iter())
+        .filter(|&&id| matches!(func.inst(id).opcode, AArch64Opcode::NeonMovi))
+        .count();
+    assert!(
+        vector_headers <= 8,
+        "count-if: {vector_headers} NeonMovi — nested vector loops"
+    );
+}
+
+#[test]
+fn second_run_is_a_no_op_on_popcount_sum() {
+    assert_idempotent(build_bytesum_loop(Body::Popcount, 4096), "popcount");
+}
+
+#[test]
+fn second_run_is_a_no_op_on_plain_sum() {
+    assert_idempotent(build_bytesum_loop(Body::Sum, 4096), "sum");
+}
+
+#[test]
+fn second_run_is_a_no_op_on_count_if() {
+    assert_idempotent(build_countif_loop(1, false, false, 4096), "count-if");
+}
+
 #[test]
 fn fires_on_byte_popcount_sum_u64() {
     let mut func = build_bytesum_loop(Body::Popcount, 4096);

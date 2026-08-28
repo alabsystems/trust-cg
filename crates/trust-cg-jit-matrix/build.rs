@@ -18,15 +18,24 @@ use std::path::{Path, PathBuf};
 #[path = "src/pipeline_source_identity.rs"]
 mod pipeline_source_identity;
 
-fn main() {
-    let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by cargo");
+// `main` returns `Result` so the panic-family lint set is empty in this file,
+// the same discipline `trust-cg-sat-host` and `trust-cg-drat-trim` adopted in
+// 2c94d27d: the ratchet baseline's scope is `crates/*/src/**`, so a build
+// script can never be inventoried, and `check_panic_clippy.sh` compares it
+// against a baseline of 0 that no regeneration can satisfy. A build script's
+// only caller is cargo, and `Termination for Result` prints the error and exits
+// non-zero, so every path that aborted the build before still aborts it — with
+// a strictly more specific message. Nothing degrades to a silent fallback.
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let manifest_dir =
+        env::var("CARGO_MANIFEST_DIR").map_err(|_| "CARGO_MANIFEST_DIR is not set by cargo")?;
     let manifest_dir = Path::new(&manifest_dir);
     let workspace_root = manifest_dir
         .parent()
         .and_then(Path::parent)
-        .expect("trust-cg workspace root is two ancestors above CARGO_MANIFEST_DIR");
+        .ok_or("trust-cg workspace root is two ancestors above CARGO_MANIFEST_DIR")?;
     let identity = pipeline_source_identity::compute_pipeline_source_identity(workspace_root)
-        .unwrap_or_else(|error| panic!("compute machine-code pipeline source identity: {error}"));
+        .map_err(|error| format!("compute machine-code pipeline source identity: {error}"))?;
 
     // Cargo needs both file watches (content mutation/deletion) and directory
     // watches (addition/rename). The identity itself is workspace-relative, so
@@ -35,10 +44,11 @@ fn main() {
         println!("cargo:rerun-if-changed={}", path.display());
     }
 
-    let out_dir = env::var_os("OUT_DIR").expect("OUT_DIR is set by cargo");
+    let out_dir = env::var_os("OUT_DIR").ok_or("OUT_DIR is not set by cargo")?;
     fs::write(
         PathBuf::from(out_dir).join("pipeline_source_identity.txt"),
         identity.hex,
     )
-    .expect("write machine-code pipeline source identity");
+    .map_err(|error| format!("write machine-code pipeline source identity: {error}"))?;
+    Ok(())
 }

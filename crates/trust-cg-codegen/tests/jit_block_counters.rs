@@ -112,7 +112,7 @@ fn build_diamond() -> MachFunction {
     func.append_inst(then_b, mov_11_id);
 
     // join: RET
-    let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+    let ret = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
     let ret_id = func.push_inst(ret);
     func.append_inst(join_b, ret_id);
 
@@ -498,7 +498,7 @@ fn build_switch3() -> MachFunction {
     func.append_inst(default_b, bd_id);
 
     // end: RET
-    let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+    let ret = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
     let ret_id = func.push_inst(ret);
     func.append_inst(end_b, ret_id);
 

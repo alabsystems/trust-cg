@@ -16,20 +16,20 @@
 # trust-cg: this repo. Owns the gate test targets (soundness_manifest, the 9
 # differential bridges, coverage, meta-theorems, mutation, proof-gate /
 # non-degeneracy).
-trust_cg_rev = dadbf94aea6d88075492932f451fa2f51aa704ba
+trust_cg_rev = cd32d1e8d2e4dc022abe3c6aaf34ecff1a768be1
 
 # Clean checkout: the Clean kernel + the B-def / LRAT-checker .lean proofs and the
 # kernel diversity gate. The clean-check half of the constellation runs here.
-clean_rev = bedd2e01ea7f12f7264b62a04a5502fdca63e043
+clean_rev = 4b0bd98cf8f9303c2d3ed1990482887880a6e1c2
 
 # AY checkout: dependency-source provenance for the release context. The local
 # soundness script does not invoke AY and this pin does not attest fixture
 # generation or solver results.
 #
 # Moved by hand alongside the `ay-pb` / `ay-sat` manifest pins in
-# crates/trust-cg-regalloc/Cargo.toml (ay 0.6.0 -> 0.7.0). This slot records
+# crates/trust-cg-regalloc/Cargo.toml (ay 0.17.0 -> 0.18.0). This slot records
 # WHICH AY the cargo graph resolves, so it must move in the same commit as
 # those pins or check_lock_drift.sh reports a source it no longer builds
 # against. trust_cg_rev and clean_rev are untouched: they attest gate runs and
 # are re-pinned only by scripts/soundness_check.sh --update after a green run.
-ay_rev = 09951c0e62934ccdec7525b0a08e37342d19aefb
+ay_rev = bd3a01f15cbc683b433467abcea21553e6b810ec

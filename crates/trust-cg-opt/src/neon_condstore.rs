@@ -996,6 +996,16 @@ struct LowerCtx {
 }
 
 fn apply(func: &mut MachFunction, rec: &Recognized) -> bool {
+    // IDEMPOTENCE: never vectorize the remainder loop of a loop this pass
+    // already vectorized (see `crate::vector_remainder`).
+    if crate::vector_remainder::iv_is_vector_advanced_upstream(
+        func,
+        &rec.loop_insts,
+        rec.preheader,
+        rec.iv,
+    ) {
+        return false;
+    }
     // Per-width parameters (mirrors neon_minmax): i32 = `.4S` + sxtw guard;
     // i64 = `.2D` + precheck + unsigned guard.
     let (vf, elem_bytes, arr_code, elem_code, const_class) = if rec.is_i64 {

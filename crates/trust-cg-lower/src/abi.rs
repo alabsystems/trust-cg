@@ -368,26 +368,46 @@ const CALL_CLOBBER_FPRS: [PReg; 24] = [
 
 /// Which AArch64 C calling-convention variant to classify for.
 ///
-/// DarwinPCS and the base AAPCS64 agree on the register convention but differ
-/// in the layout of scalar arguments that overflow to the stack. Darwin packs
-/// narrow fixed arguments at their natural size/alignment; AAPCS64 gives every
-/// scalar stack argument at least one 8-byte, 8-aligned slot. Selecting the
-/// wrong variant is silent wrong code as soon as a call crosses a codegen
-/// boundary.
+/// AArch64 has two incompatible conventions in wide use and trust-cg targets
+/// both. DarwinPCS differs from base AAPCS64 in two argument-placement rules
+/// represented here:
+///
+/// * `Darwin` packs it at its natural size and alignment (a `u16` takes 2
+///   bytes), per "Writing ARM64 Code for Apple Platforms".
+/// * `Aapcs64` gives it a full 8-byte, 8-aligned slot, per AAPCS64 (IHI 0055)
+///   sec. 6.4.2 stage C.14 for integral types -- "if the size of the argument
+///   is less than 8 bytes then the size of the argument is set to 8 bytes" --
+///   and stage C.4/C.5 for half/single-precision floats.
+/// * A 16-byte-aligned integer-register argument may start in an odd-numbered
+///   register on Darwin. Base AAPCS64 rounds the NGRN up to an even register
+///   first (current rule C.10, formerly C.8).
+///
+/// Getting this wrong is a SILENT wrong-answer bug the moment a call crosses a
+/// codegen boundary: the caller writes its arguments at one set of offsets and
+/// the callee reads them from another. It does not show up in a program
+/// compiled entirely by trust-cg, because both sides are then wrong the same
+/// way -- only against LLVM-compiled code, libc, or any mixed build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AArch64AbiVariant {
-    /// Apple arm64 DarwinPCS.
+    /// Apple arm64 DarwinPCS: macOS/iOS on Apple silicon. Narrow fixed stack
+    /// arguments are packed at natural size/alignment.
     #[default]
     Darwin,
-    /// Base AAPCS64, used by AArch64 ELF targets.
+    /// Base AAPCS64: every AArch64 ELF target, including the
+    /// `aarch64-unknown-linux-gnu` target trust-cg is developed against.
+    /// Scalar stack arguments occupy at least an 8-byte, 8-aligned slot.
     Aapcs64,
 }
 
 impl AArch64AbiVariant {
     /// Select the ABI from the compilation target, never from the host.
     ///
+    /// Apple triples get DarwinPCS; everything else gets standard AAPCS64.
     /// An empty triple keeps the historical Darwin default for direct/test
-    /// construction sites; the production pipeline always supplies its target.
+    /// construction sites -- matching
+    /// `reject_unsupported_aarch64_object_format`'s empty-triple behaviour --
+    /// so this does not silently reclassify existing callers; the production
+    /// pipeline always supplies its target.
     pub fn from_target_triple(triple: &str) -> Self {
         if triple.is_empty() || triple.contains("-apple-") || triple.ends_with("-darwin") {
             Self::Darwin
@@ -397,11 +417,49 @@ impl AArch64AbiVariant {
     }
 }
 
-/// Place one scalar argument in the next stack slot.
+/// Place ONE scalar argument in the next stack slot.
 ///
-/// Keep the Darwin/AAPCS64 difference centralized so integer and FP overflow
-/// paths cannot drift. The location size describes the occupied ABI slot; the
-/// caller/callee still select the transfer width from the source type.
+/// This is the single place the Darwin-vs-AAPCS64 stack-slot difference lives.
+/// It was previously open-coded at each overflow branch, which is precisely the
+/// shape that drifts: two copies of a rule, each locally reasonable. Keeping it
+/// centralized is what stops the integer and FP overflow paths from diverging.
+///
+/// `size` describes the occupied ABI slot. It is the natural width and stays
+/// the natural width on Darwin, because consumers use it for the load width;
+/// under AAPCS64 the slot is widened to 8 so `stack_args_size` accounts for the
+/// real frame usage. Caller and callee still select the transfer width from the
+/// source type: the load itself is natural-width off the slot base
+/// (little-endian), which is exactly what LLVM emits: `ldrh w9, [sp]` /
+/// `ldrsh x8, [sp, #8]` / `ldrsw x9, [sp, #16]`.
+/// Base AAPCS64 stage C.10 (formerly C.8): an argument whose alignment is 16
+/// and that is passed in the general-purpose register sequence starts on an
+/// EVEN register — the NGRN is rounded up before the pair is allocated.
+///
+/// Apple explicitly relaxes this rule: the same argument may start in an odd
+/// `xN`. Consequently callers must invoke this helper only for the AAPCS64
+/// variant. Representative standard-ABI placements are:
+///
+/// ```text
+///   void f(void *o, __int128 a, __int128 b)  ->  o=x0   a=x2:x3   b=x4:x5
+///   struct S16 { __int128 x; };   /* align 16 */
+///   long g(void *o, struct S16 s)            ->  o=x0   s=x2:x3
+///   struct S8  { long a, b; };    /* align 8, rule does not apply */
+///   long h(void *o, struct S8 s)             ->  o=x0   s=x1:x2
+/// ```
+///
+/// Note the rule keys off ALIGNMENT, not size or type: a 16-byte composite of
+/// two i64s stays at x1:x2, while a 16-byte composite containing an i128 skips
+/// to x2:x3. Over-alignment attributes do not count — AAPCS64 uses the natural
+/// alignment of the most-aligned member, which is what `Type::align()` returns.
+///
+/// Applying the round-up to Darwin is the inverse silent wrong answer: Clang
+/// passes `(pointer, i128)` in `x0, x1:x2`, while a rounded TrustCG callee reads
+/// `x2:x3`. Every TrustCG-only call agrees with itself, so only a cross-backend
+/// link-and-run test exposes the disagreement.
+fn round_ngrn_to_even(gpr_idx: &mut usize) {
+    *gpr_idx = (*gpr_idx + 1) & !1;
+}
+
 fn place_scalar_stack_arg(
     variant: AArch64AbiVariant,
     stack_offset: &mut i64,
@@ -521,9 +579,8 @@ impl AppleAArch64ABI {
     /// - Integer/pointer types (I8, I16, I32, I64, B1): next available X0-X7
     /// - Float types (F32, F64): next available V0-V7
     /// - HFA (Homogeneous Floating-point Aggregate): consecutive V0-V7 registers
-    /// - I128: uses two consecutive GPR slots (must start on even register for
-    ///   alignment on standard AAPCS; Apple relaxes this but we follow the
-    ///   conservative rule for correctness)
+    /// - I128: uses two consecutive GPR slots; base AAPCS64 starts on an even
+    ///   register, while Darwin permits an odd start
     /// - Scalar overflow uses variant-specific stack slots: natural packing on
     ///   Darwin, at least 8 bytes/alignment under AAPCS64
     /// - Aggregates > 16 bytes: indirect via pointer in next GPR
@@ -533,8 +590,9 @@ impl AppleAArch64ABI {
 
     /// Classify parameters for an explicit AArch64 ABI variant.
     ///
-    /// Caller and callee must use the same variant or narrow stack arguments
-    /// are read from different offsets.
+    /// See [`AArch64AbiVariant`]. The caller side and the callee side MUST be
+    /// classified with the same variant or they disagree about where narrow
+    /// stack arguments live.
     pub fn classify_params_with(variant: AArch64AbiVariant, params: &[Type]) -> Vec<ArgLocation> {
         let mut result = Vec::with_capacity(params.len());
         let mut gpr_idx: usize = 0;
@@ -549,8 +607,11 @@ impl AppleAArch64ABI {
                         result.push(ArgLocation::Reg(GPR_ARG_REGS[gpr_idx]));
                         gpr_idx += 1;
                     } else {
-                        // Darwin packs narrow fixed arguments naturally;
-                        // AAPCS64 stage C.14 gives each at least an 8-byte slot.
+                        // Darwin packs narrow fixed stack arguments at their
+                        // natural size/alignment; standard AAPCS64 stage C.14
+                        // gives each an 8-byte slot (IHI 0055 sec. 6.4.2). Both
+                        // are silent wrong-answer bugs if applied to the other
+                        // target, so the rule lives in exactly one place.
                         result.push(place_scalar_stack_arg(
                             variant,
                             &mut stack_offset,
@@ -562,6 +623,12 @@ impl AppleAArch64ABI {
 
                 // 128-bit integer -> register pair (two consecutive GPRs) or stack
                 Type::I128 => {
+                    // Base AAPCS64 C.10 (formerly C.8) rounds 16-aligned
+                    // arguments to an even NGRN. DarwinPCS explicitly permits
+                    // the pair to start odd. See `round_ngrn_to_even`.
+                    if variant == AArch64AbiVariant::Aapcs64 {
+                        round_ngrn_to_even(&mut gpr_idx);
+                    }
                     // Need 2 consecutive GPRs.
                     if gpr_idx + 1 < GPR_ARG_REGS.len() {
                         result.push(ArgLocation::RegPair(
@@ -593,8 +660,10 @@ impl AppleAArch64ABI {
                         result.push(ArgLocation::Reg(typed_regs[fpr_idx]));
                         fpr_idx += 1;
                     } else {
-                        // Darwin packs fixed FP arguments naturally; AAPCS64
-                        // stages C.4/C.5 widen half/single slots to 8 bytes.
+                        // Darwin packs fixed FP stack arguments at natural
+                        // size/alignment (F32 -> 4 bytes, 4-aligned). AAPCS64
+                        // stages C.4/C.5 round the slot to 8 and widen half- and
+                        // single-precision to 8 bytes. Same one rule.
                         result.push(place_scalar_stack_arg(
                             variant,
                             &mut stack_offset,
@@ -685,6 +754,13 @@ impl AppleAArch64ABI {
                     } else {
                         // Non-HFA aggregate: pass in GPRs or indirect.
                         let size = ty.bytes();
+                        // Base AAPCS64 C.10 — see `round_ngrn_to_even`. Darwin
+                        // explicitly permits a 16-aligned aggregate to start
+                        // odd. Aggregates over 16 bytes go indirect as an
+                        // 8-aligned POINTER, so the rule must not reach them.
+                        if variant == AArch64AbiVariant::Aapcs64 && size <= 16 && ty.align() == 16 {
+                            round_ngrn_to_even(&mut gpr_idx);
+                        }
                         if size <= 16 && gpr_idx < GPR_ARG_REGS.len() {
                             // Small aggregates: pass in register(s)
                             if size <= 8 {
@@ -871,6 +947,32 @@ impl AppleAArch64ABI {
         }
 
         result
+    }
+
+    /// Physical registers whose values must remain live through an AArch64
+    /// `RET` for this signature.
+    ///
+    /// This is the single ABI authority used both when ISel annotates `RET`
+    /// implicit uses and when the public MachIR pipeline validates pre-built
+    /// functions.  Large indirect results are deliberately absent: X8 carries
+    /// the caller-provided destination pointer on entry, but the returned value
+    /// lives in memory and X8 is not a return-register live-out at `RET`.
+    pub fn required_return_pregs(returns: &[Type]) -> Vec<PReg> {
+        let mut required = Vec::new();
+        for loc in Self::classify_returns(returns) {
+            match loc {
+                ArgLocation::Reg(preg) => required.push(preg),
+                ArgLocation::RegPair(lo, hi) => {
+                    required.push(lo);
+                    required.push(hi);
+                }
+                ArgLocation::RegSequence(regs) => required.extend(regs),
+                ArgLocation::Indirect { .. } | ArgLocation::Stack { .. } => {}
+            }
+        }
+        required.sort_unstable();
+        required.dedup();
+        required
     }
 
     /// Callee-saved GPRs that a function must preserve.
@@ -2018,6 +2120,28 @@ mod tests {
     }
 
     #[test]
+    fn required_return_pregs_flattens_register_results_and_excludes_sret_pointer() {
+        assert_eq!(AppleAArch64ABI::required_return_pregs(&[]), Vec::new());
+        assert_eq!(
+            AppleAArch64ABI::required_return_pregs(&[Type::I128]),
+            vec![gpr::X0, gpr::X1]
+        );
+        assert_eq!(
+            AppleAArch64ABI::required_return_pregs(&[Type::Struct(vec![Type::F16, Type::F16,])]),
+            vec![gpr::H0, gpr::H1]
+        );
+        assert_eq!(
+            AppleAArch64ABI::required_return_pregs(&[Type::Struct(vec![
+                Type::I64,
+                Type::I64,
+                Type::I64,
+            ])]),
+            Vec::new(),
+            "X8 is an incoming sret pointer, not a value live through RET"
+        );
+    }
+
+    #[test]
     fn return_hfa_two_f32_in_v0() {
         // struct { float, float } -> HFA return in S0, S1 (typed FPR registers)
         let hfa = Type::Struct(vec![Type::F32, Type::F32]);
@@ -2188,6 +2312,130 @@ mod tests {
         assert_eq!(locs.len(), 8);
         // I128 at index 7: not enough consecutive GPRs -> stack
         assert!(matches!(locs[7], ArgLocation::Stack { size: 16, .. }));
+    }
+
+    // ===================================================================
+    // Base AAPCS64 stage C.10 (formerly C.8) — 16-byte-aligned GPR arguments
+    // start on an EVEN register. DarwinPCS explicitly relaxes this rule; the
+    // separate Darwin controls below pin its odd-start behavior.
+    //
+    //   long a1(long g, __int128 a)                     -> a in x2:x3
+    //   long a2(long g, __int128 a, long h)             -> h in x4 (no backfill)
+    //   long a3(__int128 a, long g)                     -> a in x0:x1, g in x2
+    //   long a4(long g, struct { __int128 x; } s)       -> s in x2:x3
+    //   long a5(long g, __int128 a, __int128 b)         -> b in x4:x5
+    //   long a6(long,long,long,long,long, __int128 a)   -> a in x6:x7 (x5 dead)
+    //   long a7(long*6, __int128 a)                     -> a in x6:x7
+    //
+    // The old code omitted the round-up, so a1 landed in x1:x2. Both sides of
+    // a trust-cg-only call agreed with each other, so no whole-program gate
+    // and no `.text` byte-identity check could see it; it only diverged when
+    // control crossed to rustc-compiled code. The three tests above missed it
+    // because every one of them happens to sit at an ALREADY-EVEN NGRN (0, 6,
+    // and 7-goes-to-stack).
+    // ===================================================================
+
+    #[test]
+    fn aapcs_c10_i128_after_one_gpr_skips_the_odd_register() {
+        // a1: the whole bug, in one line.
+        let locs = AppleAArch64ABI::classify_params_with(
+            AArch64AbiVariant::Aapcs64,
+            &[Type::I64, Type::I128],
+        );
+        assert_eq!(locs[0], ArgLocation::Reg(gpr::X0));
+        assert_eq!(locs[1], ArgLocation::RegPair(gpr::X2, gpr::X3));
+    }
+
+    #[test]
+    fn aapcs_c10_skipped_register_is_never_backfilled() {
+        // a2: x1 stays dead; the following i64 takes x4, not x1.
+        let locs = AppleAArch64ABI::classify_params_with(
+            AArch64AbiVariant::Aapcs64,
+            &[Type::I64, Type::I128, Type::I64],
+        );
+        assert_eq!(locs[1], ArgLocation::RegPair(gpr::X2, gpr::X3));
+        assert_eq!(locs[2], ArgLocation::Reg(gpr::X4));
+    }
+
+    #[test]
+    fn aapcs_c10_does_not_disturb_an_already_even_ngrn() {
+        // a3: an i128 first is already even, and the trailing i64 gets x2.
+        let locs = AppleAArch64ABI::classify_params_with(
+            AArch64AbiVariant::Aapcs64,
+            &[Type::I128, Type::I64],
+        );
+        assert_eq!(locs[0], ArgLocation::RegPair(gpr::X0, gpr::X1));
+        assert_eq!(locs[1], ArgLocation::Reg(gpr::X2));
+    }
+
+    #[test]
+    fn aapcs_c10_applies_to_an_aggregate_whose_alignment_is_16() {
+        // a4: the rule keys off ALIGNMENT, not type. `struct { i128 }` is a
+        // 16-byte composite that skips, ...
+        let s16 = Type::Struct(vec![Type::I128]);
+        assert_eq!(s16.align(), 16, "fixture must actually be 16-aligned");
+        let locs =
+            AppleAArch64ABI::classify_params_with(AArch64AbiVariant::Aapcs64, &[Type::I64, s16]);
+        assert_eq!(locs[1], ArgLocation::RegPair(gpr::X2, gpr::X3));
+    }
+
+    #[test]
+    fn aapcs_c10_leaves_an_eight_aligned_aggregate_on_an_odd_register() {
+        // ... while `struct { long, long }` is the SAME 16 bytes at align 8 and
+        // must NOT skip. This is the negative control for the test above: if
+        // the rule ever gets rewritten to key off size, this fails.
+        let s8 = Type::Struct(vec![Type::I64, Type::I64]);
+        assert_eq!(s8.bytes(), 16);
+        assert_eq!(s8.align(), 8);
+        let locs =
+            AppleAArch64ABI::classify_params_with(AArch64AbiVariant::Aapcs64, &[Type::I64, s8]);
+        assert_eq!(locs[1], ArgLocation::RegPair(gpr::X1, gpr::X2));
+    }
+
+    #[test]
+    fn aapcs_c10_two_i128s_after_a_pointer_land_at_x2_and_x4() {
+        // a5: the exact shape of the `checked_add(*mut PairI128, i128, i128)`
+        // shim whose divergence exposed this — see e2e_trust_fns_round4.
+        let locs = AppleAArch64ABI::classify_params_with(
+            AArch64AbiVariant::Aapcs64,
+            &[Type::I64, Type::I128, Type::I128],
+        );
+        assert_eq!(locs[1], ArgLocation::RegPair(gpr::X2, gpr::X3));
+        assert_eq!(locs[2], ArgLocation::RegPair(gpr::X4, gpr::X5));
+    }
+
+    #[test]
+    fn aapcs_c10_rounds_up_over_a_live_odd_register_at_the_top_of_the_file() {
+        // a6 vs a7: five i64s leave NGRN odd, so x5 is abandoned and the pair
+        // is x6:x7 — the same place six i64s put it.
+        let mut five: Vec<Type> = vec![Type::I64; 5];
+        five.push(Type::I128);
+        let locs5 = AppleAArch64ABI::classify_params_with(AArch64AbiVariant::Aapcs64, &five);
+        assert_eq!(locs5[5], ArgLocation::RegPair(gpr::X6, gpr::X7));
+
+        let mut six: Vec<Type> = vec![Type::I64; 6];
+        six.push(Type::I128);
+        let locs6 = AppleAArch64ABI::classify_params_with(AArch64AbiVariant::Aapcs64, &six);
+        assert_eq!(locs6[6], ArgLocation::RegPair(gpr::X6, gpr::X7));
+    }
+
+    #[test]
+    fn darwin_i128_after_one_gpr_starts_on_the_odd_register() {
+        let locs = AppleAArch64ABI::classify_params_with(
+            AArch64AbiVariant::Darwin,
+            &[Type::I64, Type::I128, Type::I64],
+        );
+        assert_eq!(locs[0], ArgLocation::Reg(gpr::X0));
+        assert_eq!(locs[1], ArgLocation::RegPair(gpr::X1, gpr::X2));
+        assert_eq!(locs[2], ArgLocation::Reg(gpr::X3));
+    }
+
+    #[test]
+    fn darwin_sixteen_aligned_aggregate_starts_on_the_odd_register() {
+        let s16 = Type::Struct(vec![Type::I128]);
+        let locs =
+            AppleAArch64ABI::classify_params_with(AArch64AbiVariant::Darwin, &[Type::I64, s16]);
+        assert_eq!(locs[1], ArgLocation::RegPair(gpr::X1, gpr::X2));
     }
 
     // ===================================================================
@@ -3860,60 +4108,72 @@ mod tests {
             .collect()
     }
 
+    /// AArch64 has two incompatible stack-argument layouts and trust-cg targets
+    /// both. Applying one to the other's target is a silent wrong-answer bug
+    /// across any codegen boundary (LLVM-compiled std, libc, mixed builds).
     #[test]
-    fn narrow_integer_stack_args_distinguish_darwin_and_aapcs64() {
-        let mut params = vec![Type::I64; 8];
+    fn narrow_integer_stack_args_darwin_packs_aapcs64_slots() {
+        let mut params = vec![Type::I64; 8]; // exhaust X0-X7
         params.extend([Type::I16, Type::I16, Type::I32]);
 
+        // Darwin packs at natural size/alignment: 0, 2, 4.
         assert_eq!(
             stack_offsets(&AppleAArch64ABI::classify_params_with(
                 AArch64AbiVariant::Darwin,
-                &params,
+                &params
             )),
-            vec![0, 2, 4],
+            vec![0, 2, 4]
         );
+
+        // AAPCS64 stage C.14 gives each an 8-byte slot: 0, 8, 16. This is
+        // exactly what LLVM emits for aarch64-unknown-linux-gnu -- verified
+        // against `rustc` on this signature: ldrh [sp], ldrsh [sp,#8],
+        // ldrsw [sp,#16].
         assert_eq!(
             stack_offsets(&AppleAArch64ABI::classify_params_with(
                 AArch64AbiVariant::Aapcs64,
-                &params,
+                &params
             )),
-            vec![0, 8, 16],
+            vec![0, 8, 16]
         );
     }
 
     #[test]
-    fn narrow_fp_stack_args_distinguish_darwin_and_aapcs64() {
-        let mut params = vec![Type::F64; 8];
+    fn narrow_fp_stack_args_darwin_packs_aapcs64_slots() {
+        let mut params = vec![Type::F64; 8]; // exhaust V0-V7
         params.extend([Type::F32, Type::F32, Type::F64]);
 
+        // Darwin: F32 takes 4 bytes, 4-aligned.
         assert_eq!(
             stack_offsets(&AppleAArch64ABI::classify_params_with(
                 AArch64AbiVariant::Darwin,
-                &params,
+                &params
             )),
-            vec![0, 4, 8],
+            vec![0, 4, 8]
         );
+        // AAPCS64 stages C.4/C.5: slot rounded to 8, single-precision widened.
         assert_eq!(
             stack_offsets(&AppleAArch64ABI::classify_params_with(
                 AArch64AbiVariant::Aapcs64,
-                &params,
+                &params
             )),
-            vec![0, 8, 16],
+            vec![0, 8, 16]
         );
     }
 
     #[test]
-    fn classify_params_default_remains_darwin() {
+    fn classify_params_default_stays_darwin() {
         let mut params = vec![Type::I64; 8];
         params.extend([Type::I16, Type::I16]);
         assert_eq!(
             AppleAArch64ABI::classify_params(&params),
             AppleAArch64ABI::classify_params_with(AArch64AbiVariant::Darwin, &params),
+            "the bare entry point must keep its historical Darwin behaviour"
         );
     }
 
     #[test]
-    fn abi_variant_is_selected_from_target_triple() {
+    fn abi_variant_from_target_triple() {
         for triple in [
             "aarch64-apple-darwin",
             "arm64-apple-ios",
@@ -3922,7 +4182,7 @@ mod tests {
             assert_eq!(
                 AArch64AbiVariant::from_target_triple(triple),
                 AArch64AbiVariant::Darwin,
-                "{triple}",
+                "{triple}"
             );
         }
         for triple in [
@@ -3934,15 +4194,19 @@ mod tests {
             assert_eq!(
                 AArch64AbiVariant::from_target_triple(triple),
                 AArch64AbiVariant::Aapcs64,
-                "{triple}",
+                "{triple}"
             );
         }
+        // The empty triple keeps the historical Darwin default so this change
+        // does not silently reclassify existing construction sites.
         assert_eq!(
             AArch64AbiVariant::from_target_triple(""),
-            AArch64AbiVariant::Darwin,
+            AArch64AbiVariant::Darwin
         );
     }
 
+    /// Aggregate and vector stack arguments already used 8-byte-rounded slots
+    /// on both targets; the variant must not perturb them.
     #[test]
     fn aggregate_stack_args_are_variant_independent() {
         let mut params = vec![Type::I64; 8];
@@ -3950,7 +4214,7 @@ mod tests {
         params.push(Type::I64);
         assert_eq!(
             AppleAArch64ABI::classify_params_with(AArch64AbiVariant::Darwin, &params),
-            AppleAArch64ABI::classify_params_with(AArch64AbiVariant::Aapcs64, &params),
+            AppleAArch64ABI::classify_params_with(AArch64AbiVariant::Aapcs64, &params)
         );
     }
 }

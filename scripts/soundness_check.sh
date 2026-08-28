@@ -17,9 +17,12 @@
 #   trust-cg (cargo test -p trust-cg-verify --test <target>):
 #     - soundness_manifest      (THE meta-gate: every invariant has a live
 #                                fail-closed test; every B-* id present)
-#     - coverage_gate_tests     (accepted/deferred inventory: AArch64 155/248
-#                                with 93 named RED rows; x86-64 163/192 with 29,
-#                                RISC-V 14/17 with 3, WebAssembly 109/111 with 2.
+#     - coverage_gate_tests     (accepted/deferred inventory: AArch64 156/248
+#                                with 92 named RED rows; x86-64 167/196 with 29,
+#                                RISC-V 14/17 with 3, WebAssembly 111/113 with 2
+#                                (f32.const/f64.const: a raw IEEE-754 immediate
+#                                is not a LEB128; see SOUNDNESS_CHECK.md for
+#                                what this gate does NOT claim).
 #                                Exact classifications are pinned; unknown drift
 #                                fails. Ratios are evidence coverage, not
 #                                correctness-proof percentages; Statistical
@@ -28,6 +31,36 @@
 #     - mutation_catalog        (mutation testing harness)
 #     - proof_gate_strict       (universal non-degeneracy gate + fail-closed)
 #     - fsym_real_function_corpus (real-function symbolic preflight corpus)
+#     - wasm_encoding_gate      (the P4 ENCODING families: module indexing over
+#                                REAL emitted bytes, an INDEPENDENT spec-derived
+#                                signed-LEB decoder, and TargetInfo conformance.
+#                                Pinned at 210 proven / 0 refuted / 108
+#                                not-applicable plus 7 named RED deferrals; a row
+#                                whose construct is ABSENT from a module reports
+#                                not-applicable, never credit. Establishes that
+#                                the emitted ENCODING says what the compiler
+#                                meant; says NOTHING about whether the lowering
+#                                chose the right value, and a forgotten import
+#                                shift is caught by the TWO-COMPILE differential,
+#                                not by any single-module row)
+#     - wasm_cfg_structural_gate (the P4 CFG family: the per-compile structural
+#                                invariant on the relooper's output — label
+#                                liveness, operand discipline, join heights and
+#                                types, bracket structure. It really is
+#                                per-compile: the evidence-carrying compile
+#                                routes run it on the bytes they emit, refusing
+#                                a refuted module and crediting nothing for an
+#                                inconclusive one. A NECESSARY CONDITION,
+#                                NOT a bisimulation: relooper bisimulation is a
+#                                named RED deferral and two blind-spot mutants
+#                                are shipped as its executable measurement)
+#     - wasm_abi_proofs_gate    (the P4 MEMORY and CALL-ABI families:
+#                                shadow-stack frame refinement and the
+#                                call/table ABI, over REAL emitted module
+#                                bytes with byte-mutation guards. Five HOST
+#                                obligations stay deferred BY NAME to
+#                                crates/trust-cg-codegen/src/wasm/OWNERSHIP.md;
+#                                none of this makes the wasm lane "verified")
 #     - the 9 differential bridges:
 #         bdefs_differential_bridge            (B-aarch64-int)
 #         bdefs_differential_bridge_x86        (B-x86-rosetta)
@@ -39,6 +72,18 @@
 #         bdefs_differential_bridge_neon_fp    (B-aarch64-neon-fp)
 #         fp_bitmodel_bridge                   (B-aarch64-fp / FP bit-model)
 #
+#   trust-cg wasm offline oracles (cargo example + node differential):
+#     - wasm-difftest           (control-flow-diverse corpus: the trust-ir
+#                                interpreter's expectations replayed against the
+#                                compiled wasm under node, bit-for-bit; any
+#                                divergence is a miscompile = FAIL)
+#     - wasm-cfg-fuzz           (bounded DETERMINISTIC reducible-CFG fuzz:
+#                                WASM_CFG_FUZZ_FUNCS random structured CFGs at a
+#                                fixed seed, same node oracle)
+#     The emit leg (compile_module + interpreter) always runs and fails closed;
+#     if node is not on PATH the node leg is a LOUD SKIP (recorded and counted
+#     in the summary — never a silent pass).
+#
 #   Clean checkout:
 #     - clean check <file>      for each B-def / LRAT-checker .lean proof
 #         aarch64_isa, aarch64_isa_chip, aarch64_fp, aarch64_fp_arith,
@@ -49,8 +94,11 @@
 #
 # EXIT CODE: 0 iff EVERY gate above passes. Nonzero if ANY gate fails, errors,
 # or cannot be run (a missing/erroring gate is a FAIL, never a silent skip).
+# Sole exception: the wasm node-oracle legs SKIP loudly (recorded, counted,
+# flagged in the summary) when node itself is absent — node is an external
+# runtime, not part of the pinned toolchain; the emit legs still fail closed.
 #
-# v0.1.0 has no tolerated failing/missing gate target. The opcode inventory has
+# The gate has no tolerated failing/missing gate target. The opcode inventory has
 # pinned, explicitly named RED model gaps; an unknown/unclassified RED fails the
 # inventory test. The separately run external-SMT full-database floor reports
 # solver-capacity pending results without calling them proofs; see
@@ -65,6 +113,11 @@
 #                                              # validate one Clean log and exit
 #   scripts/soundness_check.sh --self-test-clean-cargo-command
 #                                              # exercise the stock-Cargo wrapper only
+#   scripts/soundness_check.sh --validate-dependency-locks
+#                                              # validate all independent Cargo locks only
+#   scripts/soundness_check.sh --run-wasm-oracles
+#                                              # run ONLY the wasm offline-oracle
+#                                              # gates (difftest + CFG fuzz)
 #   scripts/soundness_check.sh -h | --help
 #
 # Each Cargo, Clean, and Lake workload is limited to 7200 seconds by default.
@@ -84,6 +137,18 @@ LOCK_FILE="${TRUST_CG_DIR}/soundness_revs.lock"
 TIMEOUT_RUNNER="${TRUST_CG_DIR}/scripts/run_with_timeout.py"
 SOUNDNESS_COMMAND_TIMEOUT_SECONDS="${SOUNDNESS_COMMAND_TIMEOUT_SECONDS:-7200}"
 
+# Wasm offline-oracle configuration. The shared node validator replays the
+# interpreter-computed expectations against the compiled wasm. The fuzzer
+# budget is bounded and deterministic: a fixed function count here, a fixed
+# LCG seed inside the example (never wall-clock).
+WASM_DIFFTEST_MJS="${TRUST_CG_DIR}/crates/trust-cg-codegen/examples/wasm_difftest.mjs"
+WASM_ISLAND_MJS="${TRUST_CG_DIR}/crates/trust-cg-codegen/examples/wasm_island_differential.mjs"
+# The vt islands need aterm's exported tables (schema aterm.vt-islands.tables
+# v1). Absent = a loud SKIP of that one gate, never a silent pass; point
+# ISLAND_VT_TABLES at a dump to run it.
+ISLAND_VT_TABLES="${ISLAND_VT_TABLES:-}"
+WASM_CFG_FUZZ_FUNCS="${WASM_CFG_FUZZ_FUNCS:-200}"
+
 # The Lean forward-simulation development (ENC-1) is a conditional model-level
 # theorem with classified gaps. The gate below asserts `lake build` is green and
 # pins the classified-sorry and explicit-axiom counts at their baselines.
@@ -93,20 +158,35 @@ BASELINE_LEAN_AXIOM=4    # explicit trusted axioms: srcStep_spec, x86Step_decode
 EXPECTED_RUSTC_VERSION="rustc 1.97.1"
 EXPECTED_CARGO_VERSION="cargo 1.97.1"
 
-# Older Clean development configs carried both the host tune and a Trust-only
-# verifier opt-out in their aarch64 target rustflags. This soundness lane
-# deliberately compiles Clean with a diverse stock toolchain. When that legacy
-# stanza is present on the one host where it applies, validate its complete
-# value before a global RUSTFLAGS replacement removes the Trust-only member and
-# retains the compatible tune. A config with no Trust-only flag is already
-# stock-compatible and must be preserved rather than rejected or overwritten.
-CLEAN_STOCK_AARCH64_RUSTFLAGS="-C target-cpu=native"
-CLEAN_TRUST_AARCH64_CONFIG_RUSTFLAGS='rustflags=["-C","target-cpu=native","-Ztrust-verify=off"]'
+# Clean development configs carry both the host tune and a Trust-only verifier
+# opt-out in their per-triple target rustflags. This soundness lane deliberately
+# compiles Clean with a diverse stock toolchain, which rejects `-Z` outright
+# ("the option `Z` is only accepted on the nightly compiler"). When that stanza
+# is present for the HOST triple, validate its complete value before a global
+# RUSTFLAGS replacement removes the Trust-only member and retains the compatible
+# tune. A config with no Trust-only flag is already stock-compatible and must be
+# preserved rather than rejected or overwritten.
+#
+# HOST-GENERAL, and it must stay that way. Until 2026-08-26 the predicate below
+# was `Darwin && arm64` and the stanza reader was hardcoded to
+# `[target.aarch64-apple-darwin]`. Clean's config carries a byte-identical
+# stanza for `aarch64-unknown-linux-gnu`, so on an aarch64 Linux host the
+# neutralization silently did not apply, the `-Z` survived into stock rustc, and
+# `cargo` died at "failed to run `rustc` to learn about target-specific
+# information" before compiling anything. That took out FOUR gates at once —
+# the Clean release binary, micro_diversity_gate, and (because the binary was
+# then missing) every clean-check leg. Key the stanza on the host triple, never
+# on one hardcoded triple.
+CLEAN_STOCK_HOST_RUSTFLAGS="-C target-cpu=native"
+CLEAN_TRUST_HOST_CONFIG_RUSTFLAGS='rustflags=["-C","target-cpu=native","-Ztrust-verify=off"]'
 
 export PATH="${HOME}/.cargo/bin:${HOME}/.elan/bin:${PATH}"
 export RUSTUP_TOOLCHAIN="1.97.1"
 unset RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER RUSTFLAGS CARGO_ENCODED_RUSTFLAGS \
-  CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS
+  CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS \
+  CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS \
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS \
+  CARGO_TARGET_X86_64_APPLE_DARWIN_RUSTFLAGS
 
 # ----------------------------------------------------------------------------
 # Flags.
@@ -116,9 +196,13 @@ MODE_UPDATE=0     # --update : re-pin lock after a green run
 MODE_LIST=0       # --list   : list gates and exit
 MODE_VALIDATE_CLEAN_SUMMARY=""
 MODE_SELF_TEST_CLEAN_CARGO_COMMAND=0
+MODE_VALIDATE_DEPENDENCY_LOCKS=0
+MODE_RUN_WASM_ORACLES=0
 
 usage() {
-  sed -n '2,80p' "$0" | sed 's/^# \{0,1\}//'
+  # The whole leading comment block (a fixed line range would silently
+  # truncate as the header grows).
+  awk 'NR == 1 { next } !/^#/ { exit } { sub(/^# ?/, ""); print }' "$0"
 }
 
 while [ "$#" -gt 0 ]; do
@@ -137,6 +221,12 @@ while [ "$#" -gt 0 ]; do
     --self-test-clean-cargo-command)
       MODE_SELF_TEST_CLEAN_CARGO_COMMAND=1
       ;;
+    --validate-dependency-locks)
+      MODE_VALIDATE_DEPENDENCY_LOCKS=1
+      ;;
+    --run-wasm-oracles)
+      MODE_RUN_WASM_ORACLES=1
+      ;;
     -h|--help) usage; exit 0 ;;
     *) echo "soundness_check.sh: unknown argument: $1" >&2
        echo "  try --help" >&2
@@ -150,13 +240,28 @@ if [ "$MODE_PINNED" -eq 1 ] && [ "$MODE_UPDATE" -eq 1 ]; then
 fi
 if [ -n "$MODE_VALIDATE_CLEAN_SUMMARY" ] && \
    { [ "$MODE_PINNED" -eq 1 ] || [ "$MODE_UPDATE" -eq 1 ] || [ "$MODE_LIST" -eq 1 ] || \
-     [ "$MODE_SELF_TEST_CLEAN_CARGO_COMMAND" -eq 1 ]; }; then
+     [ "$MODE_SELF_TEST_CLEAN_CARGO_COMMAND" -eq 1 ] || \
+     [ "$MODE_VALIDATE_DEPENDENCY_LOCKS" -eq 1 ]; }; then
   echo "soundness_check.sh: --validate-clean-summary cannot be combined with another mode" >&2
   exit 2
 fi
 if [ "$MODE_SELF_TEST_CLEAN_CARGO_COMMAND" -eq 1 ] && \
-   { [ "$MODE_PINNED" -eq 1 ] || [ "$MODE_UPDATE" -eq 1 ] || [ "$MODE_LIST" -eq 1 ]; }; then
+   { [ "$MODE_PINNED" -eq 1 ] || [ "$MODE_UPDATE" -eq 1 ] || [ "$MODE_LIST" -eq 1 ] || \
+     [ "$MODE_VALIDATE_DEPENDENCY_LOCKS" -eq 1 ]; }; then
   echo "soundness_check.sh: --self-test-clean-cargo-command cannot be combined with another mode" >&2
+  exit 2
+fi
+if [ "$MODE_RUN_WASM_ORACLES" -eq 1 ] && \
+   { [ "$MODE_PINNED" -eq 1 ] || [ "$MODE_UPDATE" -eq 1 ] || [ "$MODE_LIST" -eq 1 ] || \
+     [ -n "$MODE_VALIDATE_CLEAN_SUMMARY" ] || \
+     [ "$MODE_SELF_TEST_CLEAN_CARGO_COMMAND" -eq 1 ] || \
+     [ "$MODE_VALIDATE_DEPENDENCY_LOCKS" -eq 1 ]; }; then
+  echo "soundness_check.sh: --run-wasm-oracles cannot be combined with another mode" >&2
+  exit 2
+fi
+if [ "$MODE_VALIDATE_DEPENDENCY_LOCKS" -eq 1 ] && \
+   { [ "$MODE_PINNED" -eq 1 ] || [ "$MODE_UPDATE" -eq 1 ] || [ "$MODE_LIST" -eq 1 ]; }; then
+  echo "soundness_check.sh: --validate-dependency-locks cannot be combined with another mode" >&2
   exit 2
 fi
 
@@ -175,19 +280,27 @@ section() { printf '\n%s%s%s\n' "$C_BLD" "$1" "$C_RST"; hr; }
 
 # Per-gate result accounting. Parallel arrays keep order + status + detail.
 GATE_NAMES=()
-GATE_STATUS=()   # PASS / FAIL
+GATE_STATUS=()   # PASS / FAIL / SKIP
 GATE_DETAIL=()
 FAIL_COUNT=0
 PASS_COUNT=0
+SKIP_COUNT=0
 
 record() {
-  # record <name> <PASS|FAIL> <detail>
+  # record <name> <PASS|FAIL|SKIP> <detail>
+  # SKIP is reserved for a gate whose REQUIRED EXTERNAL RUNTIME (node) is
+  # absent on this host: it is recorded, counted, and shouted in the summary —
+  # never a silent pass — but does not by itself fail the run. Everything a
+  # pinned toolchain can run stays PASS/FAIL only.
   GATE_NAMES+=("$1")
   GATE_STATUS+=("$2")
   GATE_DETAIL+=("$3")
   if [ "$2" = "PASS" ]; then
     PASS_COUNT=$((PASS_COUNT + 1))
     printf '  %s[PASS]%s %-46s %s\n' "$C_GRN" "$C_RST" "$1" "$3"
+  elif [ "$2" = "SKIP" ]; then
+    SKIP_COUNT=$((SKIP_COUNT + 1))
+    printf '  %s[SKIP]%s %-46s %s\n' "$C_YEL" "$C_RST" "$1" "$3"
   else
     FAIL_COUNT=$((FAIL_COUNT + 1))
     printf '  %s[FAIL]%s %-46s %s\n' "$C_RED" "$C_RST" "$1" "$3"
@@ -206,6 +319,9 @@ TRUST_CG_GATES=(
   mutation_catalog
   proof_gate_strict
   fsym_real_function_corpus
+  wasm_encoding_gate
+  wasm_cfg_structural_gate
+  wasm_abi_proofs_gate
   bdefs_differential_bridge
   bdefs_differential_bridge_x86
   bdefs_differential_bridge_riscv
@@ -236,6 +352,11 @@ if [ "$MODE_LIST" -eq 1 ]; then
   echo "trust-cg gate test targets (cargo test -p trust-cg-verify --test <name>):"
   for g in "${TRUST_CG_GATES[@]}"; do echo "  - $g"; done
   echo
+  echo "trust-cg wasm offline oracles (cargo run --example <name> + node wasm_difftest.mjs):"
+  echo "  - wasm_difftest (interpreter-vs-compiled-wasm differential over the CF corpus)"
+  echo "  - wasm_cfg_fuzz (${WASM_CFG_FUZZ_FUNCS} reducible CFGs at a fixed seed, same oracle;"
+  echo "    node unavailable = loud SKIP of the node leg, never a silent pass)"
+  echo
   echo "Clean checkout: clean-check .lean proofs (clean check proofs/<name>.lean):"
   for f in "${CLEAN_LEAN[@]}"; do echo "  - $f"; done
   echo
@@ -249,7 +370,7 @@ if [ "$MODE_LIST" -eq 1 ]; then
   echo "  - cargo test -p trust-cg-codegen --test lean_encode_golden_binding (Rust leg;"
   echo "    Lean leg is the EncoderGolden.lean 'by decide' theorems compiled by lake above)"
   echo
-  echo "Named exclusions: none in the v0.1.0 soundness gate."
+  echo "Named exclusions: none in the soundness gate."
   exit 0
 fi
 
@@ -305,28 +426,40 @@ candidate_repository_org() {
   printf '%s\n' "$parsed_org"
 }
 
-candidate_dependency_rev() {
-  # Resolve one exact first-party Git revision from the candidate root lock.
-  # Require the dependency owner to match the candidate's declared upstream,
-  # query and fragment SHAs to agree, and exactly one distinct revision.
-  local repo="$1"
-  local repository_org
+candidate_dependency_lock_paths() {
+  # Independently resolved Cargo roots. AY is deliberately absent from the
+  # fuzz graph because the optional AY regalloc feature is not enabled there.
+  # TrustIR and its transitive Clean kernel must agree in all three roots.
+  case "$1" in
+    ay)
+      printf '%s\n' \
+        "Cargo.lock" \
+        "crates/rustc-codegen-trust-cg/Cargo.lock"
+      ;;
+    clean|trust-ir)
+      printf '%s\n' \
+        "Cargo.lock" \
+        "crates/rustc-codegen-trust-cg/Cargo.lock" \
+        "fuzz/Cargo.lock"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+dependency_rev_from_lock() {
+  # dependency_rev_from_lock <repo> <relative-lock> <repository-org>
+  # Require one exact source identity inside one independently resolved lock.
+  local repo="$1" relative_lock="$2" repository_org="$3"
+  local lock="${TRUST_CG_DIR}/${relative_lock}"
   local parsed_rev
 
-  [ -f "${TRUST_CG_DIR}/Cargo.lock" ] || { echo INVALID; return 1; }
-
-  if ! repository_org="$(candidate_repository_org)"; then
-    echo INVALID
+  if [ ! -f "$lock" ]; then
+    echo "soundness_check.sh: dependency authority: missing ${relative_lock}" >&2
     return 1
   fi
-  if ! printf '%s\n' "$repository_org" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9_.-]*$'; then
-    echo INVALID
-    return 1
-  fi
-
   if ! parsed_rev="$(
     grep -E "^[[:space:]]*source = \"git\+[^\"]*/${repo}\\.git([?#\"]|$)" \
-      "${TRUST_CG_DIR}/Cargo.lock" 2>/dev/null |
+      "$lock" 2>/dev/null |
       sed -E "s|^[[:space:]]*source = \"git\\+https://github.com/([^/]+)/${repo}\\.git\\?rev=([0-9a-f]{40})#([0-9a-f]{40})\"[[:space:]]*\$|\\1 \\2 \\3|" |
       awk -v repository_org="$repository_org" '
         NF != 3 || $1 != repository_org || $2 != $3 { bad=1; next }
@@ -338,11 +471,78 @@ candidate_dependency_rev() {
         }
       '
   )"; then
+    echo "soundness_check.sh: dependency authority: ${relative_lock} must contain one exact ${repo} Git revision owned by ${repository_org}" >&2
+    return 1
+  fi
+  printf '%s\n' "$parsed_rev"
+}
+
+candidate_dependency_rev() {
+  # Resolve one exact first-party Git revision across EVERY Cargo root that can
+  # resolve that repository independently. A coherent root Cargo.lock is not
+  # enough: the rustc backend and fuzz crates carry standalone lockfiles, and a
+  # stale one silently builds a second TrustIR/Clean/AY type universe.
+  local repo="$1"
+  local repository_org lock_paths relative_lock rev lock_revs parsed_rev
+
+  if ! repository_org="$(candidate_repository_org)"; then
+    echo INVALID
+    return 1
+  fi
+  if ! printf '%s\n' "$repository_org" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9_.-]*$'; then
+    echo INVALID
+    return 1
+  fi
+  if ! lock_paths="$(candidate_dependency_lock_paths "$repo")"; then
+    echo "soundness_check.sh: dependency authority: unknown repository ${repo}" >&2
+    echo INVALID
+    return 1
+  fi
+
+  lock_revs=""
+  while IFS= read -r relative_lock; do
+    [ -n "$relative_lock" ] || continue
+    if ! rev="$(dependency_rev_from_lock "$repo" "$relative_lock" "$repository_org")"; then
+      echo INVALID
+      return 1
+    fi
+    lock_revs="${lock_revs}${relative_lock}:${rev}"$'\n'
+  done <<<"$lock_paths"
+
+  if ! parsed_rev="$(
+    printf '%s' "$lock_revs" |
+      awk -F: '
+        NF != 2 || $1 == "" || $2 !~ /^[0-9a-f]{40}$/ { bad=1; next }
+        { rows += 1; seen[$2]=1 }
+        END {
+          for (rev in seen) { count += 1; only = rev }
+          if (!bad && rows > 0 && count == 1) print only
+          else exit 1
+        }
+      '
+  )"; then
+    echo "soundness_check.sh: dependency authority: split first-party ${repo} revisions: $(printf '%s' "$lock_revs" | tr '\n' ' ')" >&2
     echo INVALID
     return 1
   fi
   printf '%s\n' "$parsed_rev"
 }
+
+validate_candidate_dependency_locks() {
+  local trust_ir_rev clean_rev ay_rev
+  trust_ir_rev="$(candidate_dependency_rev trust-ir)" || return 1
+  clean_rev="$(candidate_dependency_rev clean)" || return 1
+  ay_rev="$(candidate_dependency_rev ay)" || return 1
+  printf '%s\n' \
+    "trust_ir_rev=${trust_ir_rev}" \
+    "clean_rev=${clean_rev}" \
+    "ay_rev=${ay_rev}"
+}
+
+if [ "$MODE_VALIDATE_DEPENDENCY_LOCKS" -eq 1 ]; then
+  validate_candidate_dependency_locks
+  exit $?
+fi
 
 repo_head() {
   # repo_head <dir> -> HEAD sha (or "MISSING")
@@ -406,9 +606,23 @@ run_bounded() {
     "$SOUNDNESS_COMMAND_TIMEOUT_SECONDS" "$@"
 }
 
-clean_stock_aarch64_override_required() {
-  [ "$(uname -s 2>/dev/null)" = "Darwin" ] && \
-    [ "$(uname -m 2>/dev/null)" = "arm64" ]
+clean_host_triple() {
+  # The triple Cargo will select a `[target.<triple>]` stanza with, asked of the
+  # very toolchain this lane compiles Clean with. Deriving it from `uname` would
+  # reintroduce the hardcoding this replaced.
+  local host
+  host="$(rustc -vV 2>/dev/null | awk '/^host:/ { print $2; exit }')"
+  [ -n "$host" ] || return 1
+  printf '%s\n' "$host"
+}
+
+clean_stock_host_override_required() {
+  # An override is required exactly when the host-triple stanza exists and
+  # carries the Trust-only opt-out that stock rustc refuses. Callers additionally
+  # require the stanza to equal the audited value before replacing it.
+  local flags
+  flags="$(clean_host_config_rustflags)" || return 1
+  printf '%s' "$flags" | grep -q -- '-Ztrust-verify'
 }
 
 clean_cargo_config_path() {
@@ -425,17 +639,34 @@ clean_cargo_config_path() {
   fi
 }
 
-clean_aarch64_config_rustflags() {
-  local config
+clean_host_config_rustflags() {
+  local config triple
   config="$(clean_cargo_config_path)" || return 1
   [ -n "$config" ] || return 0
-  awk '
-    /^\[target\.aarch64-apple-darwin\]$/ { in_target=1; next }
+  triple="$(clean_host_triple)" || return 1
+  awk -v want="[target.${triple}]" '
+    $0 == want { in_target=1; next }
     in_target && /^[[:space:]]*\[/ { in_target=0 }
     in_target && /^[[:space:]]*rustflags[[:space:]]*=/ {
       line=$0
       gsub(/[[:space:]]/, "", line)
       print line
+    }
+  ' "$config"
+}
+
+clean_cfg_keyed_trust_rustflags() {
+  # `[target.'cfg(...)']` stanzas cannot be evaluated here, so a Trust-only flag
+  # inside one cannot be proven inert on this host and cannot be neutralized by
+  # the host-triple replacement below. Report them so the caller fails closed.
+  local config
+  config="$(clean_cargo_config_path)" || return 1
+  [ -n "$config" ] || return 0
+  awk '
+    /^\[target\.[^]]*cfg\(/ { in_cfg=1; key=$0; next }
+    in_cfg && /^[[:space:]]*\[/ { in_cfg=0 }
+    in_cfg && /^[[:space:]]*rustflags[[:space:]]*=/ && /-Ztrust-verify/ {
+      print key " " $0
     }
   ' "$config"
 }
@@ -464,14 +695,22 @@ validate_clean_stock_rustflags() {
   #
 # A Clean config may already contain no Trust-only flag at all. That state
 # needs no override: preserve Cargo's stock-compatible config exactly.
-  local config
+  local config cfg_keyed
   local observed build_observed target_rows target_trust_rows build_trust_rows
   config="$(clean_cargo_config_path)" || return 1
   # A checkout with no repo-local Cargo config has no repo-local Trust-only
   # flag to neutralize and is already suitable for the stock lane.
   [ -n "$config" ] || return 0
-  observed="$(clean_aarch64_config_rustflags)" || return 1
+  observed="$(clean_host_config_rustflags)" || return 1
   build_observed="$(clean_build_config_rustflags)" || return 1
+  cfg_keyed="$(clean_cfg_keyed_trust_rustflags)" || return 1
+
+  # A cfg()-keyed Trust-only flag may or may not select on this host, and the
+  # host-triple RUSTFLAGS replacement below would not remove it either way.
+  if [ -n "$cfg_keyed" ]; then
+    echo "soundness_check.sh: refusing stock Clean cargo lane: Trust-only flag in a cfg()-keyed stanza that cannot be proven inert: $cfg_keyed" >&2
+    return 1
+  fi
   target_rows="$(printf '%s\n' "$observed" | awk 'NF { count += 1 } END { print count + 0 }')"
   target_trust_rows="$(printf '%s\n' "$observed" | awk '/-Ztrust-verify/ { count += 1 } END { print count + 0 }')"
   build_trust_rows="$(printf '%s\n' "$build_observed" | awk '/-Ztrust-verify/ { count += 1 } END { print count + 0 }')"
@@ -483,20 +722,17 @@ validate_clean_stock_rustflags() {
     return 1
   fi
 
-  # On Darwin/aarch64, Trust-only flags in other explicit target or rustdoc
-  # sections are inert for these cargo build and named-integration-test
-  # commands. Audit only the active target rustflags that global RUSTFLAGS
-  # replaces; current Clean also carries an inactive Linux/aarch64 stanza. On
-  # other hosts no replacement occurs, so Cargo retains their target policy
-  # and fails closed if it is incompatible with the stock toolchain.
+  # Trust-only flags in target stanzas for OTHER triples are inert here: Cargo
+  # selects at most the host-triple stanza. Audit only the active target
+  # rustflags that a global RUSTFLAGS value replaces.
   if [ "$target_trust_rows" -eq 0 ]; then
     return 0
   fi
 
   if [ "$target_trust_rows" -ne 1 ] || [ "$target_rows" -ne 1 ] || \
-     [ "$observed" != "$CLEAN_TRUST_AARCH64_CONFIG_RUSTFLAGS" ]; then
-    echo "soundness_check.sh: refusing stock Clean cargo lane: unaudited aarch64 rustflags: $observed" >&2
-    echo "  expected: $CLEAN_TRUST_AARCH64_CONFIG_RUSTFLAGS" >&2
+     [ "$observed" != "$CLEAN_TRUST_HOST_CONFIG_RUSTFLAGS" ]; then
+    echo "soundness_check.sh: refusing stock Clean cargo lane: unaudited $(clean_host_triple) rustflags: $observed" >&2
+    echo "  expected: $CLEAN_TRUST_HOST_CONFIG_RUSTFLAGS" >&2
     return 1
   fi
 }
@@ -504,17 +740,18 @@ validate_clean_stock_rustflags() {
 run_clean_cargo_bounded() {
   # run_clean_cargo_bounded <cargo-subcommand> [args...]
   #
-  # On arm64 Darwin a global RUSTFLAGS value is required: real Cargo appends a
-  # CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS value to the configured array,
-  # leaving the stock-incompatible `-Z` in place. The validation above makes
-  # this replacement exact and fail-closed. Other hosts do not select Clean's
-  # Trust-only stanza and retain their existing target/build flags unchanged.
+  # A global RUSTFLAGS value is required on any host whose triple stanza carries
+  # the Trust-only opt-out: real Cargo APPENDS a CARGO_TARGET_<TRIPLE>_RUSTFLAGS
+  # value to the configured array, leaving the stock-incompatible `-Z` in place,
+  # whereas a global value replaces the stanza outright. The validation above
+  # makes this replacement exact and fail-closed. Hosts whose triple stanza
+  # carries no Trust-only flag retain their existing target/build flags.
   validate_clean_stock_rustflags || return 2
-  if clean_stock_aarch64_override_required && \
-     [ "$(clean_aarch64_config_rustflags)" = "$CLEAN_TRUST_AARCH64_CONFIG_RUSTFLAGS" ]; then
+  if clean_stock_host_override_required && \
+     [ "$(clean_host_config_rustflags)" = "$CLEAN_TRUST_HOST_CONFIG_RUSTFLAGS" ]; then
     run_bounded "$CLEAN_DIR" \
       env CARGO_TARGET_DIR="$CLEAN_DIR/target" \
-      RUSTFLAGS="$CLEAN_STOCK_AARCH64_RUSTFLAGS" \
+      RUSTFLAGS="$CLEAN_STOCK_HOST_RUSTFLAGS" \
       cargo "$@"
   else
     run_bounded "$CLEAN_DIR" \
@@ -754,6 +991,203 @@ run_lean_formal_gate() {
   fi
 }
 
+run_wasm_oracle_gate() {
+  # run_wasm_oracle_gate <gate-label> <example-name> [example-args...]
+  #
+  # One wasm offline oracle, two legs:
+  #   emit — `cargo run --example <example>` builds the trust-ir corpus, runs
+  #          the trust-ir INTERPRETER over it (the operational semantics), and
+  #          compiles it trust-ir→wasm, writing <out>.wasm + <out>.json
+  #          expectations. Any compile_module error or interpreter failure is
+  #          a panic = nonzero rc = FAIL. Missing/empty artifacts on rc=0 are
+  #          a vacuity FAIL.
+  #   node — the shared `wasm_difftest.mjs` instantiates the emitted wasm
+  #          under node and replays every expectation bit-for-bit; ANY
+  #          divergence exits nonzero = FAIL (a real miscompile — this oracle
+  #          is how the gcd back-edge relooper bug surfaced).
+  # node absent on PATH SKIPs the node leg with a loud recorded notice (never
+  # a silent pass); the emit leg has no external runtime and ALWAYS runs.
+  local label="$1" example="$2"
+  shift 2
+  local out="${LOGDIR}/${example}"
+  local log="${LOGDIR}/${example}_emit.log"
+  local nodelog="${LOGDIR}/${example}_node.log"
+  local rc summary
+  run_bounded "$TRUST_CG_DIR" \
+    cargo run --locked -p trust-cg-codegen --example "$example" -- "$out" "$@" \
+    >"$log" 2>&1
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    if [ "$rc" -eq 124 ]; then
+      record "${label}: emit corpus" FAIL \
+        "TIMEOUT after ${SOUNDNESS_COMMAND_TIMEOUT_SECONDS}s — see $log"
+    elif grep -qE '^error(\[|:)' "$log"; then
+      record "${label}: emit corpus" FAIL "BUILD/COMPILE ERROR (rc=$rc) — see $log"
+    else
+      record "${label}: emit corpus" FAIL \
+        "rc=$rc (compile_module or interpreter refused the corpus) — see $log"
+    fi
+    return 1
+  fi
+  summary="$(grep -E '^wrote ' "$log" | tail -1)"
+  if [ -z "$summary" ] || [ ! -s "${out}.wasm" ] || [ ! -s "${out}.json" ]; then
+    record "${label}: emit corpus" FAIL \
+      "rc=0 but no 'wrote' line or ${out}.wasm/.json missing/empty (vacuous) — see $log"
+    return 1
+  fi
+  record "${label}: emit corpus" PASS "$summary"
+
+  if ! command -v node >/dev/null 2>&1; then
+    record "${label}: node oracle" SKIP \
+      "node not on PATH — the wasm-vs-interpreter differential DID NOT RUN; install Node.js"
+    return 0
+  fi
+  if [ ! -f "$WASM_DIFFTEST_MJS" ]; then
+    record "${label}: node oracle" FAIL "missing validator: $WASM_DIFFTEST_MJS"
+    return 1
+  fi
+  run_bounded "$TRUST_CG_DIR" \
+    node "$WASM_DIFFTEST_MJS" "${out}.wasm" "${out}.json" >"$nodelog" 2>&1
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    if [ "$rc" -eq 124 ]; then
+      record "${label}: node oracle" FAIL \
+        "TIMEOUT after ${SOUNDNESS_COMMAND_TIMEOUT_SECONDS}s — see $nodelog"
+    else
+      record "${label}: node oracle" FAIL \
+        "$(grep -E 'DIVERGE|MISSING|FAIL:' "$nodelog" | head -1) (rc=$rc) — see $nodelog"
+    fi
+    return 1
+  fi
+  summary="$(grep -E 'differential checks agree' "$nodelog" | tail -1)"
+  if [ -z "$summary" ]; then
+    record "${label}: node oracle" FAIL \
+      "rc=0 but NO agreement line (vacuous?) — see $nodelog"
+    return 1
+  fi
+  # Vacuity guard: zero executed checks must never read as agreement.
+  if printf '%s' "$summary" | grep -qE '^0/0 '; then
+    record "${label}: node oracle" FAIL "0 checks ran (vacuous) — see $nodelog"
+    return 1
+  fi
+  record "${label}: node oracle" PASS "$summary"
+  return 0
+}
+
+run_island_gate() {
+  # run_island_gate <gate-label> <example-name> [generator-args...]
+  #
+  # The ISLANDS' three-way differential. The generators author one spec in
+  # three spellings (trust-ir builder, an emitted rustc/LLVM twin SOURCE,
+  # interpreter-checked expectations) but a generator run only exercises two
+  # of them — it never compiles the twin and never RUNS either module. This
+  # gate closes the loop: emit, then `wasm_island_differential.mjs` compiles
+  # the emitted twin with rustc for wasm32, instantiates BOTH modules and
+  # replays every baked expectation against both. Any divergence between the
+  # two compilers or against the interpreter is a FAIL; an empty/torn
+  # manifest is a vacuity FAIL. node or rustc absent = loud SKIP.
+  local label="$1" example="$2"
+  shift 2
+  local out="${LOGDIR}/${example}_island"
+  local log="${LOGDIR}/${example}_island_emit.log"
+  local difflog="${LOGDIR}/${example}_island_diff.log"
+  local rc summary
+  mkdir -p "$out"
+  run_bounded "$TRUST_CG_DIR" \
+    cargo run --locked -p trust-cg-codegen --example "$example" -- "$@" "$out" \
+    >"$log" 2>&1
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    if [ "$rc" -eq 124 ]; then
+      record "${label}: emit island" FAIL \
+        "TIMEOUT after ${SOUNDNESS_COMMAND_TIMEOUT_SECONDS}s — see $log"
+    else
+      record "${label}: emit island" FAIL \
+        "rc=$rc (a generator guard, compile_module, or the interpreter refused) — see $log"
+    fi
+    return 1
+  fi
+  local wasm twin json
+  wasm="$(ls "$out"/*.wasm 2>/dev/null | head -1)"
+  twin="$(ls "$out"/*_twin.rs 2>/dev/null | head -1)"
+  json="$(ls "$out"/*expected.json 2>/dev/null | head -1)"
+  if [ ! -s "$wasm" ] || [ ! -s "$twin" ] || [ ! -s "$json" ]; then
+    record "${label}: emit island" FAIL \
+      "rc=0 but the wasm/twin/expectations trio is missing or empty (vacuous) — see $log"
+    return 1
+  fi
+  record "${label}: emit island" PASS "$(tail -1 "$log")"
+
+  if ! command -v node >/dev/null 2>&1; then
+    record "${label}: three-way differential" SKIP \
+      "node not on PATH — the island differential DID NOT RUN; install Node.js"
+    return 0
+  fi
+  if ! command -v rustc >/dev/null 2>&1; then
+    record "${label}: three-way differential" SKIP \
+      "rustc not on PATH — the twin could not be built; the differential DID NOT RUN"
+    return 0
+  fi
+  if [ ! -f "$WASM_ISLAND_MJS" ]; then
+    record "${label}: three-way differential" FAIL "missing runner: $WASM_ISLAND_MJS"
+    return 1
+  fi
+  run_bounded "$TRUST_CG_DIR" \
+    node "$WASM_ISLAND_MJS" "$wasm" "$twin" "$json" >"$difflog" 2>&1
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    if [ "$rc" -eq 124 ]; then
+      record "${label}: three-way differential" FAIL \
+        "TIMEOUT after ${SOUNDNESS_COMMAND_TIMEOUT_SECONDS}s — see $difflog"
+    else
+      record "${label}: three-way differential" FAIL \
+        "$(grep -E 'DIVERGE|FAIL:' "$difflog" | head -1) (rc=$rc) — see $difflog"
+    fi
+    return 1
+  fi
+  summary="$(grep -E 'island differential checks agree' "$difflog" | tail -1)"
+  if [ -z "$summary" ]; then
+    record "${label}: three-way differential" FAIL \
+      "rc=0 but NO agreement line (vacuous?) — see $difflog"
+    return 1
+  fi
+  record "${label}: three-way differential" PASS "$summary"
+  return 0
+}
+
+run_island_gates() {
+  run_island_gate "wasm canary island" wasm_canary_island
+  # P2: the island that reads a HOST's memory. Both modules are handed ONE
+  # imported memory object, so a twin that failed to import it (or an index
+  # space that shifted under it) shows up as divergence, not silence.
+  run_island_gate "wasm memhash island" wasm_memhash_island
+  if [ -n "$ISLAND_VT_TABLES" ] && [ -s "$ISLAND_VT_TABLES" ]; then
+    run_island_gate "wasm vt islands" wasm_vt_islands "$ISLAND_VT_TABLES"
+  else
+    record "wasm vt islands: three-way differential" SKIP \
+      "no aterm tables dump (set ISLAND_VT_TABLES=<tables.json>) — the vt/wcwidth differential DID NOT RUN"
+  fi
+}
+
+# Single-gate lane: run ONLY the wasm offline oracles and exit by their status
+# (same runners, same fail-closed/SKIP semantics as the full constellation).
+if [ "$MODE_RUN_WASM_ORACLES" -eq 1 ]; then
+  section "trust-cg wasm offline oracles (difftest + reducible-CFG fuzz)"
+  run_wasm_oracle_gate "wasm difftest" wasm_difftest
+  run_wasm_oracle_gate "wasm cfg-fuzz" wasm_cfg_fuzz "$WASM_CFG_FUZZ_FUNCS"
+  section "trust-cg wasm islands (three-way: trust-cg vs rustc/LLVM vs interpreter)"
+  run_island_gates
+  hr
+  printf 'wasm oracles: %d passed  %d failed  %d skipped\n' \
+    "$PASS_COUNT" "$FAIL_COUNT" "$SKIP_COUNT"
+  if [ "$SKIP_COUNT" -gt 0 ]; then
+    printf '%sNOTE: %d leg(s) SKIPPED (node missing) — the oracle did NOT fully run.%s\n' \
+      "$C_YEL" "$SKIP_COUNT" "$C_RST"
+  fi
+  [ "$FAIL_COUNT" -eq 0 ] || exit 1
+  exit 0
+fi
+
 # ----------------------------------------------------------------------------
 # Banner + preflight.
 # ----------------------------------------------------------------------------
@@ -853,16 +1287,20 @@ for key in trust_cg_rev clean_rev ay_rev; do
     PREFLIGHT_OK=0
   fi
 done
+CANDIDATE_TRUST_IR_REV="$(candidate_dependency_rev trust-ir)"
 CANDIDATE_CLEAN_REV="$(candidate_dependency_rev clean)"
 CANDIDATE_AY_REV="$(candidate_dependency_rev ay)"
-for row in "Clean:$CANDIDATE_CLEAN_REV" "AY:$CANDIDATE_AY_REV"; do
+for row in \
+  "TrustIR:$CANDIDATE_TRUST_IR_REV" \
+  "Clean:$CANDIDATE_CLEAN_REV" \
+  "AY:$CANDIDATE_AY_REV"; do
   label="${row%%:*}"
   value="${row#*:}"
   if printf '%s\n' "$value" | grep -Eq '^[0-9a-f]{40}$'; then
     record "preflight: candidate ${label} revision" PASS "$value"
   else
     record "preflight: candidate ${label} revision" FAIL \
-      "Cargo.lock must contain one coherent exact ${label} Git revision"
+      "all independently resolved Cargo locks must contain one coherent exact ${label} Git revision"
     PREFLIGHT_OK=0
   fi
 done
@@ -934,11 +1372,41 @@ for g in "${TRUST_CG_GATES[@]}"; do
   run_cargo_gate "$TRUST_CG_DIR" trust-cg-verify "$g"
 done
 
+# The wasm offline oracles: interpreter-vs-compiled-wasm differentials (the
+# relooper's execution oracle — per-instruction proofs cannot see CFG
+# structuring bugs). The fuzz budget is bounded + deterministic (fixed seed in
+# the example, WASM_CFG_FUZZ_FUNCS functions).
+section "trust-cg wasm offline oracles (difftest + reducible-CFG fuzz)"
+run_wasm_oracle_gate "wasm difftest" wasm_difftest
+run_wasm_oracle_gate "wasm cfg-fuzz" wasm_cfg_fuzz "$WASM_CFG_FUZZ_FUNCS"
+
+# The shipped islands: the SAME spec compiled by two compilers and executed
+# against the interpreter's expectations. This is the gate that makes the
+# islands' "differential-experimental" label repository evidence rather than
+# a deployment intention.
+section "trust-cg wasm islands (three-way: trust-cg vs rustc/LLVM vs interpreter)"
+run_island_gates
+
 section "Clean checkout: clean-check (B-def / LRAT-checker proofs)"
-build_clean_binary
-for f in "${CLEAN_LEAN[@]}"; do
-  run_clean_check "$f"
-done
+# The build's exit status GATES the checks. `$CLEAN_BIN` is a path into Clean's
+# target dir, so when the build fails a PREVIOUS binary is usually still sitting
+# there — and `run_clean_check`'s only precondition is that the path is
+# executable. Measured 2026-08-26: a failed build left a stale `clean` behind and
+# the three LRAT legs then ran against it and emitted Lean kernel type mismatches
+# ("rigid head/arity mismatch: List.rec vs Bool.rec"), which read exactly like
+# broken proofs. They were not: rebuilt correctly, the same three files check
+# 218/183/215 declarations with zero failures. Fail-closed either way, but attribute
+# it to the build rather than manufacturing a proof failure against the checkout.
+if build_clean_binary; then
+  for f in "${CLEAN_LEAN[@]}"; do
+    run_clean_check "$f"
+  done
+else
+  for f in "${CLEAN_LEAN[@]}"; do
+    record "clean-check ${f}" FAIL \
+      "BLOCKED: Clean binary was not rebuilt — not run against a possibly stale $CLEAN_BIN"
+  done
+fi
 
 section "Clean checkout: kernel diversity gate"
 run_cargo_gate "$CLEAN_DIR" clean-kernel micro_diversity_gate clean-stock
@@ -987,20 +1455,28 @@ fi
 # Summary.
 # ----------------------------------------------------------------------------
 section "SUMMARY"
-TOTAL=$((PASS_COUNT + FAIL_COUNT))
+TOTAL=$((PASS_COUNT + FAIL_COUNT + SKIP_COUNT))
 for i in "${!GATE_NAMES[@]}"; do
   st="${GATE_STATUS[$i]}"
   if [ "$st" = "PASS" ]; then
     printf '  %s[PASS]%s %s\n' "$C_GRN" "$C_RST" "${GATE_NAMES[$i]}"
+  elif [ "$st" = "SKIP" ]; then
+    printf '  %s[SKIP]%s %-46s %s\n' "$C_YEL" "$C_RST" "${GATE_NAMES[$i]}" "${GATE_DETAIL[$i]}"
   else
     printf '  %s[FAIL]%s %-46s %s\n' "$C_RED" "$C_RST" "${GATE_NAMES[$i]}" "${GATE_DETAIL[$i]}"
   fi
 done
 hr
-printf 'gates: %d total  %s%d passed%s  %s%d failed%s\n' \
+printf 'gates: %d total  %s%d passed%s  %s%d failed%s  %s%d skipped%s\n' \
   "$TOTAL" "$C_GRN" "$PASS_COUNT" "$C_RST" \
   "$( [ "$FAIL_COUNT" -gt 0 ] && printf '%s' "$C_RED" || printf '%s' "$C_GRN" )" \
-  "$FAIL_COUNT" "$C_RST"
+  "$FAIL_COUNT" "$C_RST" \
+  "$( [ "$SKIP_COUNT" -gt 0 ] && printf '%s' "$C_YEL" || printf '%s' "$C_GRN" )" \
+  "$SKIP_COUNT" "$C_RST"
+if [ "$SKIP_COUNT" -gt 0 ]; then
+  printf '%sNOTE: %d gate leg(s) SKIPPED (missing external runtime) — the constellation is NOT fully attested.%s\n' \
+    "$C_YEL" "$SKIP_COUNT" "$C_RST"
+fi
 
 OVERALL_RC=0
 if [ "$FAIL_COUNT" -gt 0 ] || [ "$PREFLIGHT_OK" -ne 1 ]; then

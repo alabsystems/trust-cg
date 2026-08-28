@@ -4905,8 +4905,7 @@ mod tests {
     #[test]
     fn coldsink_towers_shape_sinks_guards_and_preserves_spine() {
         let mut func = make_func("coldsink_towers", 7);
-        let [entry, hot1, guard1, join1, hot2, guard2, exit] =
-            [0, 1, 2, 3, 4, 5, 6].map(|i| BlockId(i));
+        let [entry, hot1, guard1, join1, hot2, guard2, exit] = [0, 1, 2, 3, 4, 5, 6].map(BlockId);
 
         add_cond_head(&mut func, entry, hot1, guard1);
         add_hot_arm(&mut func, hot1, join1);
@@ -4974,7 +4973,7 @@ mod tests {
     #[test]
     fn coldsink_rejects_load_bearing_arm() {
         let mut func = make_func("coldsink_load", 4);
-        let [entry, hot, arm, exit] = [0, 1, 2, 3].map(|i| BlockId(i));
+        let [entry, hot, arm, exit] = [0, 1, 2, 3].map(BlockId);
         add_cond_head(&mut func, entry, hot, arm);
         add_hot_arm(&mut func, hot, exit);
         // Arm: load + call + rejoin — call-bearing but reads memory.
@@ -5023,7 +5022,7 @@ mod tests {
     #[test]
     fn coldsink_rejects_call_bearing_sibling() {
         let mut func = make_func("coldsink_sibling", 4);
-        let [entry, other, arm, exit] = [0, 1, 2, 3].map(|i| BlockId(i));
+        let [entry, other, arm, exit] = [0, 1, 2, 3].map(BlockId);
         add_cond_head(&mut func, entry, other, arm);
         // Sibling arm also calls.
         add_inst(
@@ -5058,7 +5057,7 @@ mod tests {
     #[test]
     fn coldsink_rejects_in_loop_guard() {
         let mut func = make_func("coldsink_loop", 5);
-        let [entry, header, arm, latch, exit] = [0, 1, 2, 3, 4].map(|i| BlockId(i));
+        let [entry, header, arm, latch, exit] = [0, 1, 2, 3, 4].map(BlockId);
         // entry -> header; header cond {arm, latch}; arm -> latch (call-only);
         // latch -> {header, exit} — arm is a side arm strictly inside the loop.
         add_inst(
@@ -5087,7 +5086,7 @@ mod tests {
     #[test]
     fn coldsink_rejects_multi_pred_arm() {
         let mut func = make_func("coldsink_multipred", 5);
-        let [entry, mid, arm, hot, exit] = [0, 1, 2, 3, 4].map(|i| BlockId(i));
+        let [entry, mid, arm, hot, exit] = [0, 1, 2, 3, 4].map(BlockId);
         add_cond_head(&mut func, entry, mid, arm);
         add_cond_head(&mut func, mid, hot, arm);
         add_hot_arm(&mut func, hot, exit);
@@ -5108,7 +5107,7 @@ mod tests {
     #[test]
     fn coldsink_rejects_return_terminated_arm() {
         let mut func = make_func("coldsink_ret", 4);
-        let [entry, hot, arm, exit] = [0, 1, 2, 3].map(|i| BlockId(i));
+        let [entry, hot, arm, exit] = [0, 1, 2, 3].map(BlockId);
         add_cond_head(&mut func, entry, hot, arm);
         add_hot_arm(&mut func, hot, exit);
         add_inst(
@@ -5136,7 +5135,7 @@ mod tests {
     #[test]
     fn coldsink_recognizer_accepts_towers_guard_and_sink_orders() {
         let mut func = make_func("coldsink_accept", 4);
-        let [entry, hot, guard, exit] = [0, 1, 2, 3].map(|i| BlockId(i));
+        let [entry, hot, guard, exit] = [0, 1, 2, 3].map(BlockId);
         add_cond_head(&mut func, entry, hot, guard);
         add_hot_arm(&mut func, hot, exit);
         add_guard_body(&mut func, guard, exit);

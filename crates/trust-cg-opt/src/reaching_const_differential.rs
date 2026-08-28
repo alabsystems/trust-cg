@@ -38,6 +38,25 @@
 //! now declines every cross-block query when the reachable `preds` and `succs`
 //! edge sets disagree. The oracle mirrors that boundary before running its
 //! independent product semantics; in-block answers remain exact and available.
+//!
+//! That gate is what made the whole corpus assertable. Before it existed,
+//! `asym_pred_without_succ_mirror` (a pred entry with no succ mirror) made the
+//! analysis genuinely NONDETERMINISTIC: `compute_out` seeded its worklist from
+//! `HashSet` iteration order, transferred over `preds` and re-enqueued over
+//! `succs`, so a block with no succ mirror could never be revisited after its
+//! inputs changed and its `OUT` froze stale. The same query returned both
+//! `None` and `Some(7)` across processes — measured over 4000 repetitions while
+//! this corpus was being validated — and the runner could assert nothing about
+//! that case beyond "does not panic". It now has a single fail-closed answer
+//! and IS asserted, on every production path.
+//!
+//! `cfg_corpus::asymmetry` classifies the two malformed shapes independently of
+//! the oracle's own audit, over REACHABLE blocks only and with no `HashSet`
+//! anywhere, so it cannot inherit the iteration-order effect it exists to
+//! reason about. `structural_classification_matches_well_formed` pins that
+//! classification against each case's `well_formed` flag, so a corpus edit that
+//! quietly makes a "malformed" case well formed (or vice versa) fails loudly
+//! instead of turning the symmetry gate's coverage vacuous.
 
 // ===========================================================================
 // ORACLE HALF of the reaching-definitions differential harness.
@@ -891,7 +910,16 @@ pub(crate) mod cfg_corpus {
     ///   `(use_inst, vreg)` pair, on every run.
     /// * `false` — preds/succs are deliberately out of step. Cross-block
     ///   queries must fail closed before either dataflow engine runs; in-block
-    ///   answers remain exact.
+    ///   answers remain exact. [`asymmetry`] classifies HOW the two views
+    ///   disagree over reachable blocks, and [`order_sensitive`] flags the
+    ///   `StalePred` shape that used to make the analysis nondeterministic (the
+    ///   `compute_out` worklist was seeded from a `HashSet` iteration order,
+    ///   transferred over `preds` and re-enqueued over `succs`, so a pred edge
+    ///   with no succ mirror could freeze a stale `OUT`). The symmetry gate
+    ///   removed that hazard, so the runner now DOES assert cross-path and
+    ///   cross-run agreement on these; the classifiers remain as the
+    ///   independent witness that these shapes really are the ones the gate is
+    ///   meant to catch.
     pub(crate) struct Case {
         pub(crate) name: &'static str,
         pub(crate) func: MachFunction,
@@ -1622,6 +1650,16 @@ pub(crate) mod cfg_corpus {
     /// EXPECT `None` at U pos 0 for id 0: although D holds a GEN, the missing
     /// mirror means the executable edge views disagree. Cross-block analysis
     /// fails closed before choosing either view.
+    ///
+    /// Why declining is the right answer rather than an over-reaction: before
+    /// the gate this shape answered `Some(7)` deterministically — the GEN arm
+    /// of `compute_out` never reads `IN`, so dropping D's pred mirror only
+    /// discarded the (already dead) Uninit inflow — while a dominance-based
+    /// rewrite answers `None` on exactly the same function, because D acquires
+    /// no idom and loses its Euler-tour stamp. Two lawful implementations, two
+    /// different constants folded into the program: that silent divergence is
+    /// the miscompile class the preds/succs symmetry gate exists to prevent,
+    /// and this case is its tripwire.
     fn case_asym_succ_without_pred_mirror() -> Case {
         let mut f = new_func("asym_succ");
         let (e, d, u) = (f.entry, f.create_block(), f.create_block());
@@ -1647,6 +1685,16 @@ pub(crate) mod cfg_corpus {
     /// EXPECT all cross-block queries to decline before the asymmetric
     /// predecessor graph reaches the product solver. This used to expose
     /// worklist-order nondeterminism and remains a regression tripwire.
+    ///
+    /// The nondeterminism it used to expose, kept on record because it is what
+    /// the gate is priced against: `compute_out` seeded its worklist from a
+    /// `HashSet` iteration order, transferred over `preds` and re-enqueued over
+    /// `succs`, so `OUT[Z]` froze at `{}` when Z was popped before E (E never
+    /// re-enqueues Z, because Z is not in `E.succs`) and settled at `{Uninit}`
+    /// otherwise. The query at U pos 0 was `Some(7)` in the first order and
+    /// `None` in the second, on the SAME function state. [`order_sensitive`]
+    /// still reports this shape; the fail-closed gate, not the worklist, is
+    /// what makes the answer single-valued now.
     fn case_asym_pred_without_succ_mirror() -> Case {
         let mut f = new_func("asym_pred");
         let (e, d, u, z) = (
@@ -2021,6 +2069,96 @@ pub(crate) mod cfg_corpus {
             }
         }
         out
+    }
+
+    // ---------------------------------------------------------------------
+    // Structural classification
+    // ---------------------------------------------------------------------
+
+    /// Blocks reachable from `func.entry` over `succs`, as a dense flag vector.
+    /// Deliberately `Vec`-based: no `HashSet`, so this helper cannot inherit the
+    /// iteration-order nondeterminism it is used to reason about.
+    pub(crate) fn succ_reachable(func: &MachFunction) -> Vec<bool> {
+        let mut seen = vec![false; func.blocks.len()];
+        let mut work = vec![func.entry];
+        while let Some(b) = work.pop() {
+            let idx = b.0 as usize;
+            if seen[idx] {
+                continue;
+            }
+            seen[idx] = true;
+            for &s in &func.blocks[idx].succs {
+                if !seen[s.0 as usize] {
+                    work.push(s);
+                }
+            }
+        }
+        seen
+    }
+
+    /// How a case's `preds`/`succs` disagree, over REACHABLE blocks only
+    /// (unreachable edges are filtered by the analysis and cannot matter).
+    ///
+    /// This is the same predicate the production `cfg_symmetric` gate keys on,
+    /// computed a second, independent way. Anything other than
+    /// [`Asymmetry::Symmetric`] means production must decline every cross-block
+    /// query on the shape.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Asymmetry {
+        /// Every succ edge has its pred mirror and vice versa. This is the
+        /// symmetry gate (G1) a dominance-based rewrite must check.
+        Symmetric,
+        /// A succ edge with no pred mirror. The dataflow still converged
+        /// deterministically before the gate (the worklist is driven by
+        /// `succs`); it just transferred over fewer edges — which is exactly
+        /// why the divergence against a dominance-based rewrite was silent.
+        StaleSucc,
+        /// A pred entry with no succ mirror. ORDER-SENSITIVE: `compute_out`
+        /// re-enqueues over `succs`, so such a block can never be revisited
+        /// after its inputs change and its `OUT` can freeze stale.
+        StalePred,
+        /// Both of the above.
+        Both,
+    }
+
+    pub(crate) fn asymmetry(func: &MachFunction) -> Asymmetry {
+        let reach = succ_reachable(func);
+        let mut stale_succ = false;
+        let mut stale_pred = false;
+        for (i, block) in func.blocks.iter().enumerate() {
+            if !reach[i] {
+                continue;
+            }
+            let me = BlockId(i as u32);
+            for &s in &block.succs {
+                if !func.block(s).preds.contains(&me) {
+                    stale_succ = true;
+                }
+            }
+            for &p in &block.preds {
+                if !reach[p.0 as usize] {
+                    continue; // the analysis skips unreachable preds
+                }
+                if !func.block(p).succs.contains(&me) {
+                    stale_pred = true;
+                }
+            }
+        }
+        match (stale_succ, stale_pred) {
+            (false, false) => Asymmetry::Symmetric,
+            (true, false) => Asymmetry::StaleSucc,
+            (false, true) => Asymmetry::StalePred,
+            (true, true) => Asymmetry::Both,
+        }
+    }
+
+    /// True on the shapes where the CURRENT analysis would answer differently
+    /// on different runs of the SAME function state if it ran at all (see
+    /// [`Asymmetry::StalePred`]). The production symmetry gate declines these
+    /// before the worklist starts, which is what makes them assertable; this
+    /// predicate names the hazard the gate retires.
+    pub(crate) fn order_sensitive(func: &MachFunction) -> bool {
+        matches!(asymmetry(func), Asymmetry::StalePred | Asymmetry::Both)
     }
 
     // ---------------------------------------------------------------------
@@ -2409,6 +2547,56 @@ mod differential_runner {
                 b.iter().map(|c| c.func.insts.len()).collect::<Vec<_>>()
             ) || format!("{:?}", a[0].func.blocks) != format!("{:?}", b[0].func.blocks),
             "different seeds should produce different corpora"
+        );
+    }
+
+    /// The corpus' `well_formed` flag and the independent structural
+    /// classifier must never drift apart.
+    ///
+    /// `well_formed` is what the runner's failure messages report and what the
+    /// corpus docs promise; `cfg_corpus::asymmetry` recomputes the same
+    /// property from the CFG by a different route (dense `Vec` reachability,
+    /// containment rather than multiset equality, reachable blocks only). If a
+    /// corpus edit ever makes a "malformed" case well formed, the symmetry
+    /// gate's coverage goes vacuous without any other test noticing — so pin
+    /// the two against each other, and pin WHICH way each malformed case is
+    /// malformed.
+    #[test]
+    fn structural_classification_matches_well_formed() {
+        use super::cfg_corpus::Asymmetry;
+        for case in all_cases() {
+            let a = cfg_corpus::asymmetry(&case.func);
+            assert_eq!(
+                a == Asymmetry::Symmetric,
+                case.well_formed,
+                "case `{}`: well_formed={} but classifier says {:?}",
+                case.name,
+                case.well_formed,
+                a
+            );
+        }
+
+        let cases = cfg_corpus::corpus();
+        let by_name = |n: &str| {
+            cases
+                .iter()
+                .find(|c| c.name == n)
+                .unwrap_or_else(|| panic!("corpus lost case {n}"))
+        };
+        assert_eq!(
+            cfg_corpus::asymmetry(&by_name("asym_succ_without_pred_mirror").func),
+            Asymmetry::StaleSucc,
+            "CE-A must be the succ-without-pred-mirror shape"
+        );
+        assert!(
+            !cfg_corpus::order_sensitive(&by_name("asym_succ_without_pred_mirror").func),
+            "CE-A was deterministic even before the gate; that is what made its \
+             divergence from a dominance rewrite silent"
+        );
+        assert!(
+            cfg_corpus::order_sensitive(&by_name("asym_pred_without_succ_mirror").func),
+            "CE-B carries the stale-pred edge whose worklist-order hazard the \
+             symmetry gate retires"
         );
     }
 

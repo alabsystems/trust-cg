@@ -154,7 +154,7 @@ const TILE: i64 = 8;
 /// Compile-time kill switch: set `TCG_NO_MAC_REG_BLOCK` (any value) to disable
 /// the pass (run() is a no-op). Default ON at O2/O3.
 fn mrb_enabled() -> bool {
-    std::env::var_os("TCG_NO_MAC_REG_BLOCK").is_none()
+    crate::env_lock::var_os("TCG_NO_MAC_REG_BLOCK").is_none()
 }
 
 fn dumping() -> bool {
@@ -379,6 +379,17 @@ impl Recognized {
         else {
             bail!("no preheader->i-header branch");
         };
+        // IDEMPOTENCE: `apply` keeps the whole scalar nest as the FALLBACK of
+        // the register-blocked nest it builds, behind a guard block that is
+        // exactly `CmpRI n_reg, #N ; BCond NE -> i_header ; B entry`, and that
+        // guard becomes the scalar nest's new preheader. Without this bail the
+        // scalar nest was recognized again on the next fixpoint iteration and
+        // every iteration nested one more blocked copy (masked on the corpus
+        // only because mac-row-unroll had already unrolled the remainder j-loop
+        // to four stores, which the row recognizer refuses).
+        if preheader_is_reg_block_guard(func, preheader, i_header, inner.n_reg, inner.n_const) {
+            bail!("scalar fallback nest of an already register-blocked nest");
+        }
         // The unique non-body successor of the i-header is the nest exit.
         let exits: Vec<BlockId> = func
             .block(i_header)
@@ -782,6 +793,43 @@ fn base_stack_slot(
 
 /// Return `Some(child)` iff `child_header` is the UNIQUE loop whose parent is
 /// `parent_header` (i.e. the parent nests exactly one immediate child loop).
+/// Whether `preheader` is the guard block [`apply`] emits in front of the
+/// scalar fallback nest: `CmpRI n_reg, #n ; BCond NE -> i_header ; B <other>`.
+fn preheader_is_reg_block_guard(
+    func: &MachFunction,
+    preheader: BlockId,
+    i_header: BlockId,
+    n_reg: VReg,
+    n_const: i64,
+) -> bool {
+    let insts = &func.block(preheader).insts;
+    let (mut cmp, mut bne, mut b_other) = (false, false, false);
+    for &id in insts {
+        let inst = func.inst(id);
+        match inst.opcode {
+            AArch64Opcode::CmpRI
+                if inst.operands.len() == 2
+                    && vreg_of(&inst.operands[0]) == Some(n_reg)
+                    && imm_of(&inst.operands[1]) == Some(n_const) =>
+            {
+                cmp = true;
+            }
+            AArch64Opcode::BCond
+                if inst.operands.len() == 2
+                    && imm_of(&inst.operands[0]) == Some(CC_NE)
+                    && branch_targets(inst).first() == Some(&i_header) =>
+            {
+                bne = true;
+            }
+            AArch64Opcode::B if branch_targets(inst).first().is_some_and(|&t| t != i_header) => {
+                b_other = true;
+            }
+            _ => {}
+        }
+    }
+    cmp && bne && b_other
+}
+
 fn only_child(
     loops: &LoopAnalysis,
     parent_header: BlockId,

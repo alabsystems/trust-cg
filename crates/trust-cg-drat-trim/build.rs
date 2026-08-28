@@ -23,13 +23,24 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-fn main() {
-    let manifest_dir =
-        PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+// `main` returns `Result` so the panic-family lint set is empty in this file.
+// A build script's only caller is cargo, and `Termination for Result` prints
+// the error and exits non-zero, so every path that aborted the build before
+// still aborts it — with a strictly more specific message. Nothing here
+// degrades to a silent fallback.
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let manifest_dir = PathBuf::from(
+        env::var_os("CARGO_MANIFEST_DIR").ok_or("CARGO_MANIFEST_DIR is not set by cargo")?,
+    );
     let workspace_root = manifest_dir
         .parent()
         .and_then(|p| p.parent())
-        .expect("workspace root has two ancestors above CARGO_MANIFEST_DIR")
+        .ok_or_else(|| {
+            format!(
+                "workspace root needs two ancestors above CARGO_MANIFEST_DIR {}",
+                manifest_dir.display()
+            )
+        })?
         .to_path_buf();
     let src = workspace_root.join("third_party/vendor/drat-trim/drat-trim.c");
     assert!(
@@ -38,8 +49,15 @@ fn main() {
         src.display()
     );
 
-    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by cargo"));
-    let exe_name = if cfg!(windows) {
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").ok_or("OUT_DIR is not set by cargo")?);
+    // Build scripts run on the host, so `cfg!(windows)` describes the machine
+    // running Cargo rather than the checker we are producing. Use Cargo's
+    // target configuration so cross-checks embed a correctly named Windows
+    // executable too.
+    let target_os = env::var("CARGO_CFG_TARGET_OS")
+        .map_err(|e| format!("CARGO_CFG_TARGET_OS is not set by cargo: {e}"))?;
+    let target_is_windows = target_os == "windows";
+    let exe_name = if target_is_windows {
         "drat-trim.exe"
     } else {
         "drat-trim"
@@ -72,9 +90,9 @@ fn main() {
         let shim_include = out_dir.join("win-posix-shim");
         let shim_sys = shim_include.join("sys");
         fs::create_dir_all(&shim_sys)
-            .unwrap_or_else(|e| panic!("create win-posix-shim dir {}: {e}", shim_sys.display()));
+            .map_err(|e| format!("create win-posix-shim dir {}: {e}", shim_sys.display()))?;
         fs::write(shim_sys.join("time.h"), WIN_SYS_TIME_SHIM)
-            .unwrap_or_else(|e| panic!("write win-posix-shim sys/time.h: {e}"));
+            .map_err(|e| format!("write win-posix-shim sys/time.h: {e}"))?;
         cmd.arg(format!("-I{}", shim_include.display()))
             // drat-trim.c reads its proof file with the POSIX/GNU
             // `getc_unlocked`, which the MSVC CRT does not provide. Its
@@ -96,10 +114,16 @@ fn main() {
         // re-expose the POSIX surface with a feature macro instead of touching
         // the pristine vendored source — the same keep-the-source-verbatim
         // move as the MSVC `-D` redirect above.
-        cmd.arg("-std=c99")
-            .arg("-D_DEFAULT_SOURCE")
-            .arg("-O2")
-            .arg(&src);
+        cmd.arg("-std=c99").arg("-D_DEFAULT_SOURCE");
+        if target_is_windows {
+            // MinGW is GCC-like, so it takes this branch rather than the MSVC
+            // shim above, but its CRT does not export the POSIX/GNU
+            // `getc_unlocked` symbol. The checker is a single-threaded
+            // subprocess; `getc` has the same result and the extra stream lock
+            // cannot change proof acceptance.
+            cmd.arg("-Dgetc_unlocked=getc");
+        }
+        cmd.arg("-O2").arg(&src);
         // Apple's linker derives LC_UUID from content by default. Preserve it:
         // current macOS rejects linker-signed executables with no LC_UUID. The
         // stable basename plus normalized compiler options above make both the
@@ -109,7 +133,7 @@ fn main() {
 
     let status = cmd
         .status()
-        .unwrap_or_else(|e| panic!("invoke C compiler to build drat-trim: {e}"));
+        .map_err(|e| format!("invoke C compiler to build drat-trim: {e}"))?;
     assert!(
         status.success(),
         "compiling drat-trim failed: {:?} status={:?}",
@@ -125,6 +149,7 @@ fn main() {
     // (`UNTRACKED_TRUST_CODEGEN_ENV_PREFIXES` in rustc_driver_impl). This is a
     // build-time constant embedded into the crate, not a codegen control.
     println!("cargo:rustc-env=DRAT_TRIM_BUILT_EXE={}", exe_path.display());
+    Ok(())
 }
 
 /// Windows-only shim for POSIX `<sys/time.h>`, written to the include path

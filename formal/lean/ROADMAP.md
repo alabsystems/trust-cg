@@ -1,6 +1,6 @@
 # Lean proof-closure roadmap
 
-The v0.1.0 development builds, but it remains conditional and incomplete. Work
+The Lean development builds, but it remains conditional and incomplete. Work
 should reduce assumptions monotonically in roughly this order.
 
 1. Discharge the classified byte-memory, event, and bitvector helper gaps.

@@ -18,7 +18,7 @@
 //! expressions and can be checked for equivalence using either a mock
 //! solver (exhaustive/random testing) or a real SMT solver (ay).
 
-use crate::smt::{EvalEnv, FlatProg, SVal, SmtExpr, mask};
+use crate::smt::{BATCH_LANES, BatchScratch, BatchTape, EvalEnv, FlatProg, SVal, SmtExpr, mask};
 use crate::verify::VerificationResult;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -683,7 +683,7 @@ pub fn verify_by_evaluation_with_config(
 /// Keeping the name also makes the new key a strict REFINEMENT of the old
 /// one: every old entry can only SPLIT into finer entries, never merge —
 /// caching becomes strictly stricter, no gate is weakened.
-#[derive(PartialEq, Eq, Hash)]
+#[derive(PartialEq, Eq)]
 struct EvalMemoKey {
     /// The complete obligation, compared/hashed structurally.
     obligation: ProofObligation,
@@ -715,26 +715,66 @@ const EVAL_MEMO_SHARDS: usize = 16;
 /// verdict is memoized exactly as before (fail-closed verdicts repeat).
 type EvalMemoCell = std::sync::Arc<std::sync::OnceLock<VerificationResult>>;
 
+/// One memo shard: entries bucketed by [`memo_bucket_hash`]. Equality inside a
+/// bucket is the FULL content (`EvalMemoKey: Eq`), so the bucket hash is only
+/// a locator — colliding obligations (a reconstructed family sharing a name)
+/// share a bucket and are told apart by comparison, never by hash.
+type EvalMemoShard = HashMap<u64, Vec<(EvalMemoKey, EvalMemoCell)>>;
+
+/// The memo's locator hash: the obligation's NAME, its input names and
+/// widths, and the config knobs — never the expression trees. Hashing the
+/// trees walked every node of an up-to-800-op obligation on every lookup
+/// (twice: shard choice and map), on every instruction of every certificate
+/// walk; the name + inputs pin the bucket just as well, and content equality
+/// does the rest.
+fn memo_bucket_hash(
+    obligation: &ProofObligation,
+    sample_count: u64,
+    exhaustive_threshold: u32,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    obligation.name.hash(&mut hasher);
+    obligation.inputs.hash(&mut hasher);
+    obligation.fp_inputs.len().hash(&mut hasher);
+    obligation.preconditions.len().hash(&mut hasher);
+    sample_count.hash(&mut hasher);
+    exhaustive_threshold.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// The process-wide verdict memo shared by BOTH function verifiers
 /// (`x86_64_function_verifier::X86FunctionVerifier` and
 /// `function_verifier::FunctionVerifier`), sharded by key hash.
-fn eval_memo() -> &'static [std::sync::Mutex<HashMap<EvalMemoKey, EvalMemoCell>>; EVAL_MEMO_SHARDS]
-{
-    static MEMO: std::sync::OnceLock<
-        [std::sync::Mutex<HashMap<EvalMemoKey, EvalMemoCell>>; EVAL_MEMO_SHARDS],
-    > = std::sync::OnceLock::new();
+fn eval_memo() -> &'static [std::sync::Mutex<EvalMemoShard>; EVAL_MEMO_SHARDS] {
+    static MEMO: std::sync::OnceLock<[std::sync::Mutex<EvalMemoShard>; EVAL_MEMO_SHARDS]> =
+        std::sync::OnceLock::new();
     MEMO.get_or_init(|| std::array::from_fn(|_| std::sync::Mutex::new(HashMap::new())))
 }
 
 /// Shard for `key`, selected by the key's structural hash (computed OUTSIDE
 /// any lock).
-fn eval_memo_shard(
-    key: &EvalMemoKey,
-) -> &'static std::sync::Mutex<HashMap<EvalMemoKey, EvalMemoCell>> {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    key.hash(&mut hasher);
-    &eval_memo()[(hasher.finish() as usize) % EVAL_MEMO_SHARDS]
+fn eval_memo_shard(bucket: u64) -> &'static std::sync::Mutex<EvalMemoShard> {
+    &eval_memo()[(bucket as usize) % EVAL_MEMO_SHARDS]
+}
+
+/// Find the cell for `(obligation, config)` in `shard`'s bucket — full-content
+/// comparison, no clone. A stored key is a clone of the first obligation seen
+/// with that content, so it shares its `Arc` subtrees and the comparison takes
+/// `Arc`'s pointer-equality fast path for repeats of the same registry entry.
+fn memo_find(
+    shard: &EvalMemoShard,
+    bucket: u64,
+    obligation: &ProofObligation,
+    sample_count: u64,
+    exhaustive_threshold: u32,
+) -> Option<EvalMemoCell> {
+    shard.get(&bucket)?.iter().find_map(|(key, cell)| {
+        (key.sample_count == sample_count
+            && key.exhaustive_threshold == exhaustive_threshold
+            && key.obligation == *obligation)
+            .then(|| std::sync::Arc::clone(cell))
+    })
 }
 
 /// Discharge an obligation by evaluation, memoizing the verdict process-wide
@@ -777,22 +817,95 @@ pub fn memoized_verify_by_evaluation(
     {
         return VerificationResult::Valid;
     }
-    let key = EvalMemoKey {
-        obligation: obligation.clone(),
-        sample_count: config.sample_count,
-        exhaustive_threshold: config.exhaustive_threshold,
-    };
+    let bucket = memo_bucket_hash(obligation, config.sample_count, config.exhaustive_threshold);
     // Claim (or find) this key's compute-once cell under the shard lock; the
     // lock is held only for the map access, NEVER during the sweep.
     let cell: EvalMemoCell = {
-        let shard = eval_memo_shard(&key);
+        let shard = eval_memo_shard(bucket);
         let mut map = shard.lock().expect("shared eval memo poisoned");
-        std::sync::Arc::clone(map.entry(key).or_default())
+        match memo_find(
+            &map,
+            bucket,
+            obligation,
+            config.sample_count,
+            config.exhaustive_threshold,
+        ) {
+            Some(cell) => cell,
+            None => {
+                // First sight of this content: the one place the obligation is
+                // cloned into the memo.
+                let cell = EvalMemoCell::default();
+                map.entry(bucket).or_default().push((
+                    EvalMemoKey {
+                        obligation: obligation.clone(),
+                        sample_count: config.sample_count,
+                        exhaustive_threshold: config.exhaustive_threshold,
+                    },
+                    std::sync::Arc::clone(&cell),
+                ));
+                cell
+            }
+        }
     };
     // First thread to reach a new key computes; concurrent workers needing
     // the same verdict block here (no redundant sweep) and share the result.
-    cell.get_or_init(|| verify_by_evaluation_with_config(obligation, config))
-        .clone()
+    //
+    // TCG_TIME_SWEEP attribution (inert unless the var is set): the sweep lane
+    // is a FIXED per-binary cost — an empty `fn main() {}` and a 128-function
+    // program both pay ~75-110ms of it, because the work is per-OBLIGATION-KIND
+    // (each swept once per process and memoised) and not per certificate. That
+    // makes the per-obligation cost the only thing worth knowing, and until
+    // this print existed it was unobservable. Reports only keys that MISS the
+    // memo, since a hit costs nothing.
+    if !sweep_trace_enabled() {
+        return cell
+            .get_or_init(|| verify_by_evaluation_with_config(obligation, config))
+            .clone();
+    }
+    let mut computed_ms = None;
+    let verdict = cell
+        .get_or_init(|| {
+            let t = std::time::Instant::now();
+            let v = verify_by_evaluation_with_config(obligation, config);
+            computed_ms = Some(t.elapsed().as_secs_f64() * 1000.0);
+            v
+        })
+        .clone();
+    if let Some(ms) = computed_ms {
+        // TCG_SWEEP_BT=<substring>: print the backtrace of the FIRST miss whose
+        // name contains it, to find which discharge site owns a kind.
+        if let Some(want) = std::env::var_os("TCG_SWEEP_BT") {
+            if obligation.name.contains(&*want.to_string_lossy()) {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    eprintln!(
+                        "TCG_SWEEP_BT {}\n{}",
+                        obligation.name,
+                        std::backtrace::Backtrace::force_capture()
+                    );
+                });
+            }
+        }
+        let co = CompiledObligation::try_new(obligation);
+        let compiled = co.is_some();
+        let ops = co.as_ref().map(CompiledObligation::op_count).unwrap_or(0);
+        let thread = std::thread::current();
+        eprintln!(
+            "TCG_TIME_SWEEP {ms:8.2}ms thread={} compiled={compiled} ops={ops} inputs={} width={width} \
+             cat={:?} {}",
+            thread.name().unwrap_or("?"),
+            obligation.inputs.len(),
+            obligation.category,
+            obligation.name,
+        );
+    }
+    verdict
+}
+
+/// Whether `TCG_TIME_SWEEP` per-obligation attribution is on. Read once.
+fn sweep_trace_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("TCG_TIME_SWEEP").is_some())
 }
 
 /// PROOF-4 B1: discharge a FIXED `ProofDatabase` registry obligation,
@@ -914,18 +1027,20 @@ pub(crate) fn eval_memo_contains(
     obligation: &ProofObligation,
     config: &VerificationConfig,
 ) -> bool {
-    let key = EvalMemoKey {
-        obligation: obligation.clone(),
-        sample_count: config.sample_count,
-        exhaustive_threshold: config.exhaustive_threshold,
-    };
-    eval_memo_shard(&key)
+    let bucket = memo_bucket_hash(obligation, config.sample_count, config.exhaustive_threshold);
+    let map = eval_memo_shard(bucket)
         .lock()
-        .expect("shared eval memo poisoned")
-        .get(&key)
-        // An entry only counts once its verdict is COMPUTED (a claimed but
-        // in-flight cell is not a memoized verdict yet).
-        .is_some_and(|cell| cell.get().is_some())
+        .expect("shared eval memo poisoned");
+    memo_find(
+        &map,
+        bucket,
+        obligation,
+        config.sample_count,
+        config.exhaustive_threshold,
+    )
+    // An entry only counts once its verdict is COMPUTED (a claimed but
+    // in-flight cell is not a memoized verdict yet).
+    .is_some_and(|cell| cell.get().is_some())
 }
 
 /// Random-sampling verification for obligations with any number of inputs.
@@ -937,15 +1052,7 @@ fn verify_random_multi(
     compiled: Option<&CompiledObligation>,
     trials: u64,
 ) -> VerificationResult {
-    let mut rng_state: u64 = {
-        let mut h: u64 = 0xcafe_babe_dead_beef;
-        for byte in obligation.name.bytes() {
-            h = h
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(byte as u64);
-        }
-        h
-    };
+    let rng_state = sample_seed(&obligation.name);
 
     // Reuse ONE env across every sample: the keys (input names) are inserted
     // once, then only the VALUES are updated in place each iteration. This avoids
@@ -976,16 +1083,27 @@ fn verify_random_multi(
         }
     }
 
-    // Random trials
-    for _ in 0..trials {
-        fill_env_multi(&mut env, &obligation.inputs, &mut rng_state);
-        match check_single_point(obligation, compiled, &env, &mut scratch) {
-            PointCheck::Counterexample(result) => return result,
-            PointCheck::Equal | PointCheck::PreconditionUnmet => {}
-        }
+    // Random trials: the SAME sample sequence the sequential loop always drew,
+    // split into ordered chunks across the current rayon pool (or run whole on
+    // this thread when there is no pool) — see `fan_out_chunks`.
+    let (chunks, per) = if compiled.is_some() {
+        sample_chunking(trials)
+    } else {
+        (1, trials)
+    };
+    if chunks <= 1 {
+        return random_chunk_multi(obligation, compiled, rng_state, 0, trials, &env)
+            .unwrap_or(VerificationResult::Valid);
     }
-
-    VerificationResult::Valid
+    let job = {
+        let ob = Arc::new(obligation.clone());
+        let co = compiled.map(|c| Arc::new(c.clone()));
+        let env = Arc::new(env);
+        Arc::new(move |start, count| {
+            random_chunk_multi(&ob, co.as_deref(), rng_state, start, count, &env)
+        })
+    };
+    fan_out_chunks(trials, chunks, per, job).unwrap_or(VerificationResult::Valid)
 }
 
 /// Exhaustive verification for small bit-widths.
@@ -1053,15 +1171,7 @@ fn verify_random(
 ) -> VerificationResult {
     // Simple pseudo-random: use a deterministic but well-distributed sequence.
     // We use a linear congruential generator seeded from the rule name hash.
-    let mut rng_state: u64 = {
-        let mut h: u64 = 0xcafe_babe_dead_beef;
-        for byte in obligation.name.bytes() {
-            h = h
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(byte as u64);
-        }
-        h
-    };
+    let rng_state = sample_seed(&obligation.name);
 
     let mask_val = mask(u64::MAX, width);
 
@@ -1108,24 +1218,493 @@ fn verify_random(
         }
     }
 
-    for _ in 0..trials {
-        rng_state = rng_state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        let a_val = mask(rng_state, width);
-        rng_state = rng_state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        let b_val = mask(rng_state, width);
+    // Same sample sequence as ever, in ordered chunks across the current pool
+    // (see `fan_out_chunks`); each sample draws twice from the LCG.
+    let (chunks, per) = if compiled.is_some() {
+        sample_chunking(trials)
+    } else {
+        (1, trials)
+    };
+    if chunks <= 1 {
+        return random_chunk_2(obligation, compiled, width, rng_state, 0, trials, &env)
+            .unwrap_or(VerificationResult::Valid);
+    }
+    let job = {
+        let ob = Arc::new(obligation.clone());
+        let co = compiled.map(|c| Arc::new(c.clone()));
+        let env = Arc::new(env);
+        Arc::new(move |start, count| {
+            random_chunk_2(&ob, co.as_deref(), width, rng_state, start, count, &env)
+        })
+    };
+    fan_out_chunks(trials, chunks, per, job).unwrap_or(VerificationResult::Valid)
+}
 
-        fill_env_2(&mut env, &obligation.inputs, a_val, Some(b_val), width);
-        match check_single_point(obligation, compiled, &env, &mut scratch) {
-            PointCheck::Counterexample(result) => return result,
-            PointCheck::Equal | PointCheck::PreconditionUnmet => {}
+// ---------------------------------------------------------------------------
+// Chunked random sampling
+// ---------------------------------------------------------------------------
+//
+// A 100k-sample sweep is one obligation KIND's whole cost, and the sweep
+// pre-warm (trust-cg-codegen `compile_module`) hands each kind to one worker of
+// a wide pool. That made the pool's critical path the slowest single kind —
+// measured at 9-13ms per compile round on the beat-llvm corpus, with 17-19
+// workers idle behind it once their smaller kinds finished. The samples of one
+// kind are independent, so the sequence is split into contiguous chunks that
+// the SAME pool runs concurrently. What must not change, and does not:
+//
+// * The samples. The sampling RNG is an LCG, i.e. an affine map, so
+//   `sample_lcg_jump` puts a chunk at exactly the state the sequential loop
+//   would have reached (O(log n), no iteration). Chunk `i` therefore draws
+//   precisely samples `[i·per, (i+1)·per)` of the original sequence.
+// * The verdict AND the reported counterexample. Chunks are ordered; the first
+//   `Some` in chunk order is the globally-first counterexample, exactly what
+//   the sequential loop's early return produced.
+// * `DEFAULT_SAMPLE_COUNT` and the certificate it is stamped into. The count
+//   of samples drawn is unchanged; only which thread draws them differs.
+// * The recursive evaluator's stack. Only compiled (flat-tape) obligations are
+//   spread; an uncompiled obligation keeps the caller's thread and stack.
+// * The global rayon pool, which is NEVER used: with no enclosing pool the
+//   caller's thread runs the whole sequence (an unbounded global pool was the
+//   sched_yield regression of 2026-08).
+
+/// The sampling LCG's seed for an obligation: a hash of its NAME, so a sweep
+/// is reproducible from the certificate alone. Shared by both sample loops.
+fn sample_seed(name: &str) -> u64 {
+    let mut h: u64 = 0xcafe_babe_dead_beef;
+    for byte in name.bytes() {
+        h = h.wrapping_mul(SAMPLE_LCG_MUL).wrapping_add(byte as u64);
+    }
+    h
+}
+
+/// Multiplier of the sampling LCG — the constant `fill_env_multi` and the
+/// 2-input loop have always used.
+const SAMPLE_LCG_MUL: u64 = 6364136223846793005;
+/// Increment of the sampling LCG.
+const SAMPLE_LCG_INC: u64 = 1442695040888963407;
+
+/// One step of the sampling LCG.
+#[inline]
+fn sample_lcg_step(state: u64) -> u64 {
+    state
+        .wrapping_mul(SAMPLE_LCG_MUL)
+        .wrapping_add(SAMPLE_LCG_INC)
+}
+
+/// The LCG state after `n` steps from `state`, in O(log n).
+///
+/// The step is the affine map `f(x) = a·x + c (mod 2^64)`, so `f^n` is itself
+/// affine, `A·x + C`, with `(A, C)` from binary exponentiation of affine maps:
+/// `(a, c)² = (a², a·c + c)`, and `(a, c)∘(A, C) = (a·A, a·C + c)`. Every
+/// power of `f` commutes with every other, so composition order is free.
+fn sample_lcg_jump(state: u64, n: u64) -> u64 {
+    let (mut acc_a, mut acc_c) = (1u64, 0u64);
+    let (mut a, mut c) = (SAMPLE_LCG_MUL, SAMPLE_LCG_INC);
+    let mut n = n;
+    while n > 0 {
+        if n & 1 == 1 {
+            acc_c = a.wrapping_mul(acc_c).wrapping_add(c);
+            acc_a = a.wrapping_mul(acc_a);
+        }
+        c = a.wrapping_mul(c).wrapping_add(c);
+        a = a.wrapping_mul(a);
+        n >>= 1;
+    }
+    acc_a.wrapping_mul(state).wrapping_add(acc_c)
+}
+
+/// Smallest chunk worth handing to another worker: below this the per-chunk
+/// setup (an env clone, a scratch tape, a rayon task) is not paid back.
+const MIN_SAMPLE_CHUNK: u64 = 4096;
+
+/// How `trials` random samples are split: `(chunks, per_chunk)`.
+///
+/// `chunks == 1` means the caller's thread runs the whole sequence. That is the
+/// case whenever this is NOT running on a rayon pool worker
+/// (`current_thread_index() == None` — the global pool is never used), the
+/// pool has a single worker (the bridge's certificate-walk pool), or there is
+/// too little work to split. On the sweep pre-warm's wide pool each obligation
+/// becomes up to `2 × threads` chunks, so the pool's critical path stops being
+/// one obligation's whole loop on one thread.
+/// The process-wide pool that runs sample-chunk helpers for EVERY sweep,
+/// whichever thread owns the sweep — the certificate walk's single verifier
+/// worker included. Registered by the compiler when it builds its sweep pool
+/// and cleared when it releases it; with none registered, a sweep fans out
+/// on the caller's own pool (if it is on one with ≥ 2 workers) or runs whole.
+static SWEEP_HELPER_POOL: std::sync::OnceLock<
+    std::sync::Mutex<Option<std::sync::Arc<rayon::ThreadPool>>>,
+> = std::sync::OnceLock::new();
+
+pub fn set_sweep_helper_pool(pool: Option<std::sync::Arc<rayon::ThreadPool>>) {
+    *SWEEP_HELPER_POOL
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = pool;
+}
+
+fn sweep_helper_pool() -> Option<std::sync::Arc<rayon::ThreadPool>> {
+    SWEEP_HELPER_POOL
+        .get()?
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// Where a sweep's chunk helpers would run and how wide that is: the
+/// registered helper pool, else the caller's own pool. `None` = run whole.
+fn sweep_helper_width() -> Option<(Option<std::sync::Arc<rayon::ThreadPool>>, u64)> {
+    if let Some(pool) = sweep_helper_pool() {
+        let threads = pool.current_num_threads() as u64;
+        return (threads >= 2).then_some((Some(pool), threads));
+    }
+    rayon::current_thread_index()?;
+    let threads = rayon::current_num_threads() as u64;
+    (threads >= 2).then_some((None, threads))
+}
+
+fn sample_chunking(trials: u64) -> (u64, u64) {
+    if trials < 2 * MIN_SAMPLE_CHUNK {
+        return (1, trials);
+    }
+    let Some((_, threads)) = sweep_helper_width() else {
+        return (1, trials);
+    };
+    let chunks = (trials / MIN_SAMPLE_CHUNK).min(threads * 2).max(1);
+    (chunks, trials.div_ceil(chunks))
+}
+
+/// Fan `chunks` chunks of the sample sequence out across the CURRENT rayon
+/// pool and return the FIRST counterexample in sequence order (chunks are
+/// ordered; a counterexample in chunk `i` precedes every sample of `i+1`).
+///
+/// The calling worker is inside a memo cell's compute-once closure
+/// (`memoized_verify_by_evaluation`), and other workers that reach that cell
+/// BLOCK on it. So the caller must never enter a rayon wait here: rayon's
+/// `join`/`collect`/`scope` make a waiting worker execute OTHER queued jobs,
+/// and a job that blocks on this very cell — or on a peer's cell whose owner
+/// stole a job blocking on ours — hangs the compile (reproduced with gdb, two
+/// callers of one uncached kind on a 2-worker pool). Instead:
+///
+/// * helpers are fire-and-forget `rayon::spawn`s (onto the current worker's
+///   pool) that pull chunk indices from a shared counter until it is
+///   exhausted;
+/// * the caller pulls from the SAME counter, so it is never idle while chunks
+///   remain and needs no helper to make progress;
+/// * when the counter is exhausted it waits — on a plain condvar, not a rayon
+///   latch — only for helpers that have already STARTED (a helper counts
+///   itself in on entry), each of which is pure computation and finishes. A
+///   helper that starts later finds the counter exhausted and exits. So the
+///   caller never runs anyone else's job while holding a cell, and its wait
+///   is bounded by one chunk per running helper.
+fn fan_out_chunks(
+    trials: u64,
+    chunks: u64,
+    per: u64,
+    job: Arc<dyn Fn(u64, u64) -> Option<VerificationResult> + Send + Sync>,
+) -> Option<VerificationResult> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    type Job = dyn Fn(u64, u64) -> Option<VerificationResult> + Send + Sync;
+    struct Shared {
+        next: AtomicU64,
+        results: std::sync::Mutex<Vec<Option<VerificationResult>>>,
+        in_flight: std::sync::Mutex<usize>,
+        drained: std::sync::Condvar,
+    }
+    /// Pull and run chunks until the counter is exhausted; returns how many
+    /// this caller ran.
+    fn pull(shared: &Shared, job: &Job, trials: u64, chunks: u64, per: u64) -> u64 {
+        let mut ran = 0;
+        loop {
+            let i = shared.next.fetch_add(1, Ordering::Relaxed);
+            if i >= chunks {
+                return ran;
+            }
+            let start = i * per;
+            let count = trials.saturating_sub(start).min(per);
+            if let Some(result) = job(start, count) {
+                shared
+                    .results
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)[i as usize] = Some(result);
+            }
+            ran += 1;
         }
     }
+    let shared = Arc::new(Shared {
+        next: AtomicU64::new(0),
+        results: std::sync::Mutex::new(vec![None; chunks as usize]),
+        in_flight: std::sync::Mutex::new(0),
+        drained: std::sync::Condvar::new(),
+    });
+    let (helper_pool, threads) = sweep_helper_width().unwrap_or((None, 1));
+    let helpers = (threads as usize).saturating_sub(1).min(chunks as usize);
+    for _ in 0..helpers {
+        let shared = Arc::clone(&shared);
+        let job = Arc::clone(&job);
+        let task = move || {
+            *shared
+                .in_flight
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+            let _ = pull(&shared, &*job, trials, chunks, per);
+            let mut n = shared
+                .in_flight
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *n -= 1;
+            if *n == 0 {
+                shared.drained.notify_all();
+            }
+        };
+        match &helper_pool {
+            Some(pool) => pool.spawn(task),
+            None => rayon::spawn(task),
+        }
+    }
+    let owner_ran = pull(&shared, &*job, trials, chunks, per);
+    {
+        let mut n = shared
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *n > 0 {
+            n = shared
+                .drained
+                .wait(n)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+    if sweep_trace_enabled() {
+        // How much of this sweep the pool actually shared: chunks claimed
+        // before the owner started pulling went to helpers that had already
+        // started; the owner then raced the rest.
+        eprintln!("TCG_FANOUT chunks={chunks} helpers_spawned={helpers} owner_ran={owner_ran}");
+    }
+    let results = std::mem::take(
+        &mut *shared
+            .results
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    results.into_iter().flatten().next()
+}
 
-    VerificationResult::Valid
+/// The lanes of one batch that FAIL: precondition met (`EvalResult::as_bool`
+/// of every precondition), sides not `semantically_equal`. Bit `l` = lane `l`.
+/// Exactly `check_single_point`'s decision per lane, on the batched tapes:
+/// equal iff neither side is Poison, both roots have the same sort, and the
+/// values agree. A failing lane is always re-checked by the scalar
+/// `check_single_point` (which also renders the counterexample text), so a
+/// spurious failure here costs one scalar evaluation and changes nothing.
+fn check_batch(
+    cb: &CompiledBatch,
+    inputs: &[[u64; BATCH_LANES]],
+    scratch: &mut BatchScratch,
+) -> u8 {
+    let mut met: u8 = u8::MAX;
+    for pc in &cb.preconds {
+        let root = pc.eval_batch(inputs, scratch);
+        for l in 0..BATCH_LANES {
+            if !root.lane_bool(l) {
+                met &= !(1u8 << l);
+            }
+        }
+        if met == 0 {
+            return 0;
+        }
+    }
+    let t = cb.trust_ir.eval_batch(inputs, scratch);
+    let a = cb.aarch64.eval_batch(inputs, scratch);
+    // `EvalResult == EvalResult`: `Bv` and `Bv128` are different variants and
+    // never equal, so the sorts must match too.
+    let same_sort = t.sort == a.sort;
+    let mut fail: u8 = 0;
+    for l in 0..BATCH_LANES {
+        let bit = 1u8 << l;
+        if met & bit == 0 {
+            continue;
+        }
+        let equal =
+            t.poison & bit == 0 && a.poison & bit == 0 && same_sort && t.lanes[l] == a.lanes[l];
+        if !equal {
+            fail |= bit;
+        }
+    }
+    fail
+}
+
+/// Lane buffers for a batch, one per `EvalEnv` SLOT — a slot per DISTINCT
+/// input name in first-occurrence order, which is the env the scalar loop
+/// fills (`EvalEnv::insert` dedups by name, so a repeated name overwrites its
+/// slot and the LAST draw wins) and what `FlatOp::Var` indexes. Returns the
+/// buffers and `slot_of[k]`, the slot input `k` writes. Buffers per input
+/// INDEX would sweep a different sample whenever a name repeats. (A repeat
+/// followed by a NEW name, `[a, a, b]`, is a latent panic in the compiled
+/// scalar sweep itself — `FlatOp::Var` numbers by first position in `inputs`,
+/// the env by distinct name — and no registry obligation has that shape.)
+fn batch_lanes(inputs: &[(String, u32)]) -> (Vec<[u64; BATCH_LANES]>, Vec<usize>) {
+    let mut names: Vec<&str> = Vec::with_capacity(inputs.len());
+    let mut slot_of = Vec::with_capacity(inputs.len());
+    for (name, _) in inputs {
+        let slot = match names.iter().position(|n| n == name) {
+            Some(slot) => slot,
+            None => {
+                names.push(name);
+                names.len() - 1
+            }
+        };
+        slot_of.push(slot);
+    }
+    (vec![[0u64; BATCH_LANES]; names.len()], slot_of)
+}
+
+/// Set a reused env's values to lane `l` of `lanes` (the values the scalar
+/// fill functions would have written, so the counterexample text is the same).
+fn fill_env_from_lanes(
+    env: &mut EvalEnv,
+    inputs: &[(String, u32)],
+    lanes: &[[u64; BATCH_LANES]],
+    slot_of: &[usize],
+    l: usize,
+) {
+    for (k, (name, _)) in inputs.iter().enumerate() {
+        if let Some(slot) = env.get_mut(name) {
+            *slot = lanes[slot_of[k]][l];
+        }
+    }
+}
+
+/// Chunk `[start, start + count)` of the 2-input shared-width sample sequence.
+/// `seed` is the LCG state before sample 0; every sample draws twice.
+fn random_chunk_2(
+    obligation: &ProofObligation,
+    compiled: Option<&CompiledObligation>,
+    width: u32,
+    seed: u64,
+    start: u64,
+    count: u64,
+    env_template: &EvalEnv,
+) -> Option<VerificationResult> {
+    let mut rng_state = sample_lcg_jump(seed, start.wrapping_mul(2));
+    let mut env = env_template.clone();
+    let mut scratch: Vec<SVal> = Vec::new();
+    if let Some(cb) = compiled.and_then(|c| c.batch.as_ref()) {
+        // Batched: the same draws in the same order, `BATCH_LANES` samples per
+        // evaluation; a failing lane is confirmed (and rendered) by the scalar
+        // check on the identical env. `fill_env_2` masks both values with the
+        // shared width — as does `mask(rng, width)` — so lane == env value.
+        let (mut lanes, slot_of) = batch_lanes(&obligation.inputs);
+        let mut bscratch = BatchScratch::default();
+        let mut done = 0u64;
+        while done < count {
+            let n = (count - done).min(BATCH_LANES as u64) as usize;
+            for l in 0..n {
+                rng_state = sample_lcg_step(rng_state);
+                let a_val = mask(rng_state, width);
+                rng_state = sample_lcg_step(rng_state);
+                let b_val = mask(rng_state, width);
+                // In `fill_env_2` order: input 0 then input 1 (last write wins).
+                if let Some(&slot) = slot_of.first() {
+                    lanes[slot][l] = a_val;
+                }
+                if let Some(&slot) = slot_of.get(1) {
+                    lanes[slot][l] = b_val;
+                }
+            }
+            let live: u8 = if n == BATCH_LANES {
+                u8::MAX
+            } else {
+                (1u8 << n) - 1
+            };
+            let mut fail = check_batch(cb, &lanes, &mut bscratch) & live;
+            while fail != 0 {
+                let l = fail.trailing_zeros() as usize;
+                fail &= fail - 1;
+                fill_env_from_lanes(&mut env, &obligation.inputs, &lanes, &slot_of, l);
+                if let PointCheck::Counterexample(result) =
+                    check_single_point(obligation, compiled, &env, &mut scratch)
+                {
+                    return Some(result);
+                }
+            }
+            done += n as u64;
+        }
+        return None;
+    }
+    for _ in 0..count {
+        rng_state = sample_lcg_step(rng_state);
+        let a_val = mask(rng_state, width);
+        rng_state = sample_lcg_step(rng_state);
+        let b_val = mask(rng_state, width);
+        fill_env_2(&mut env, &obligation.inputs, a_val, Some(b_val), width);
+        if let PointCheck::Counterexample(result) =
+            check_single_point(obligation, compiled, &env, &mut scratch)
+        {
+            return Some(result);
+        }
+    }
+    None
+}
+
+/// Chunk `[start, start + count)` of the multi-input sample sequence; every
+/// sample draws once per input (`fill_env_multi`).
+fn random_chunk_multi(
+    obligation: &ProofObligation,
+    compiled: Option<&CompiledObligation>,
+    seed: u64,
+    start: u64,
+    count: u64,
+    env_template: &EvalEnv,
+) -> Option<VerificationResult> {
+    let draws = obligation.inputs.len() as u64;
+    let mut rng_state = sample_lcg_jump(seed, start.wrapping_mul(draws));
+    let mut env = env_template.clone();
+    let mut scratch: Vec<SVal> = Vec::new();
+    if let Some(cb) = compiled.and_then(|c| c.batch.as_ref()) {
+        // Batched twin of the loop below: one draw per input per sample, masked
+        // to that input's width exactly as `fill_env_multi` does.
+        let (mut lanes, slot_of) = batch_lanes(&obligation.inputs);
+        let mut bscratch = BatchScratch::default();
+        let mut done = 0u64;
+        while done < count {
+            let n = (count - done).min(BATCH_LANES as u64) as usize;
+            for l in 0..n {
+                // In `fill_env_multi` order: one draw per input; a repeated
+                // name's slot keeps the last write.
+                for (k, (_, w)) in obligation.inputs.iter().enumerate() {
+                    rng_state = sample_lcg_step(rng_state);
+                    lanes[slot_of[k]][l] = mask(rng_state, *w);
+                }
+            }
+            let live: u8 = if n == BATCH_LANES {
+                u8::MAX
+            } else {
+                (1u8 << n) - 1
+            };
+            let mut fail = check_batch(cb, &lanes, &mut bscratch) & live;
+            while fail != 0 {
+                let l = fail.trailing_zeros() as usize;
+                fail &= fail - 1;
+                fill_env_from_lanes(&mut env, &obligation.inputs, &lanes, &slot_of, l);
+                if let PointCheck::Counterexample(result) =
+                    check_single_point(obligation, compiled, &env, &mut scratch)
+                {
+                    return Some(result);
+                }
+            }
+            done += n as u64;
+        }
+        return None;
+    }
+    for _ in 0..count {
+        fill_env_multi(&mut env, &obligation.inputs, &mut rng_state);
+        if let PointCheck::Counterexample(result) =
+            check_single_point(obligation, compiled, &env, &mut scratch)
+        {
+            return Some(result);
+        }
+    }
+    None
 }
 
 /// Update a REUSED env's values for the (≤2)-input shared-width sampling path
@@ -1230,13 +1809,34 @@ fn preconditions_hold(obligation: &ProofObligation, env: &EvalEnv) -> bool {
 /// never change a verdict, only compute the same one faster (proven by
 /// `flatprog_matches_interpreter_differential_fuzz` and
 /// `compiled_fast_path_matches_interpreter_on_full_db`).
+#[derive(Clone)]
 struct CompiledObligation {
     trust_ir: FlatProg,
     aarch64: FlatProg,
     preconds: Vec<FlatProg>,
+    /// The lane-batched twin of the three tapes, when every one of them is in
+    /// `BatchProg`'s u64 subset. `None` keeps the sample loop on the scalar
+    /// tapes above. See `check_batch`.
+    batch: Option<CompiledBatch>,
+}
+
+/// The three tapes of a [`CompiledObligation`] as [`BatchTape`]s (narrow or
+/// wide lane-batched evaluators).
+#[derive(Clone)]
+struct CompiledBatch {
+    trust_ir: BatchTape,
+    aarch64: BatchTape,
+    preconds: Vec<BatchTape>,
 }
 
 impl CompiledObligation {
+    /// Total tape nodes across all three programs — the per-sample work.
+    fn op_count(&self) -> usize {
+        self.trust_ir.op_count()
+            + self.aarch64.op_count()
+            + self.preconds.iter().map(FlatProg::op_count).sum::<usize>()
+    }
+
     fn try_new(obligation: &ProofObligation) -> Option<Self> {
         let trust_ir = FlatProg::compile(&obligation.trust_ir_expr, &obligation.inputs)?;
         let aarch64 = FlatProg::compile(&obligation.aarch64_expr, &obligation.inputs)?;
@@ -1244,11 +1844,51 @@ impl CompiledObligation {
         for pre in &obligation.preconditions {
             preconds.push(FlatProg::compile(pre, &obligation.inputs)?);
         }
+        let batch = (|| {
+            Some(CompiledBatch {
+                trust_ir: BatchTape::from_flat(&trust_ir)?,
+                aarch64: BatchTape::from_flat(&aarch64)?,
+                preconds: preconds
+                    .iter()
+                    .map(BatchTape::from_flat)
+                    .collect::<Option<Vec<_>>>()?,
+            })
+        })();
         Some(Self {
             trust_ir,
             aarch64,
             preconds,
+            batch,
         })
+    }
+}
+
+#[cfg(test)]
+impl CompiledObligation {
+    /// The same tapes with the batched twin withheld: the scalar sample loop,
+    /// for pitting the batched path against it.
+    fn try_new_scalar_only(obligation: &ProofObligation) -> Option<Self> {
+        let mut co = Self::try_new(obligation)?;
+        co.batch = None;
+        Some(co)
+    }
+}
+
+/// `verify_by_evaluation_with_config` with a caller-supplied compiled form
+/// (test seam for scalar-vs-batched comparisons).
+#[cfg(test)]
+fn verify_by_evaluation_with_compiled(
+    obligation: &ProofObligation,
+    config: &VerificationConfig,
+    compiled: Option<&CompiledObligation>,
+) -> VerificationResult {
+    let width = obligation.inputs.first().map(|(_, w)| *w).unwrap_or(32);
+    if obligation.inputs.len() > 2 {
+        verify_random_multi(obligation, compiled, config.sample_count)
+    } else if width <= config.exhaustive_threshold {
+        verify_exhaustive(obligation, compiled, width)
+    } else {
+        verify_random(obligation, compiled, width, config.sample_count)
     }
 }
 
@@ -4462,31 +5102,36 @@ fn minmax_obligation_kind(name: &str) -> Option<FpMinMaxKind> {
 /// Proof names follow the convention `Fcmp_{CondCode}_{Size} -> FCMP+CSET`.
 /// This function extracts the condition code and maps it to the corresponding
 /// `FloatCC` variant.
-fn parse_float_cc_from_name(name: &str) -> trust_cg_lower::instructions::FloatCC {
+/// The FCMP condition an FP obligation's NAME encodes, or `None` for a name
+/// this evaluator does not understand — which the caller turns into an
+/// `Unknown` verdict (fail-closed), never a panic: the evaluator runs inside
+/// a process-wide memo cell, and a panic there takes the compile down.
+/// Two spellings exist in the registry: the aarch64/x86 `Fcmp_<CC>_...`
+/// (`Eq NE LT LE GT GE Ord Uno UEQ UNE ULT ULE UGT UGE`) and the wasm
+/// `FCmp_<cc>_...` (`OEq ONe OLt OLe OGt OGe UEq UNe ULt ULe UGt UGe`).
+fn parse_float_cc_from_name(name: &str) -> Option<trust_cg_lower::instructions::FloatCC> {
     use trust_cg_lower::instructions::FloatCC;
-    // Extract the condition code between "Fcmp_" and "_F"
-    if let Some(rest) = name.strip_prefix("Fcmp_") {
-        let cond_str = rest.split('_').next().unwrap_or("");
-        match cond_str {
-            "Eq" => FloatCC::Equal,
-            "NE" => FloatCC::NotEqual,
-            "LT" => FloatCC::LessThan,
-            "LE" => FloatCC::LessThanOrEqual,
-            "GT" => FloatCC::GreaterThan,
-            "GE" => FloatCC::GreaterThanOrEqual,
-            "Ord" => FloatCC::Ordered,
-            "Uno" => FloatCC::Unordered,
-            "UEQ" => FloatCC::UnorderedEqual,
-            "UNE" => FloatCC::UnorderedNotEqual,
-            "ULT" => FloatCC::UnorderedLessThan,
-            "ULE" => FloatCC::UnorderedLessThanOrEqual,
-            "UGT" => FloatCC::UnorderedGreaterThan,
-            "UGE" => FloatCC::UnorderedGreaterThanOrEqual,
-            other => panic!("Unknown FloatCC condition in proof name: {}", other),
-        }
-    } else {
-        panic!("FCMP proof name does not start with 'Fcmp_': {}", name);
-    }
+    let rest = name
+        .strip_prefix("Fcmp_")
+        .or_else(|| name.strip_prefix("FCmp_"))?;
+    let cond_str = rest.split('_').next().unwrap_or("");
+    Some(match cond_str {
+        "Eq" | "OEq" => FloatCC::Equal,
+        "NE" | "ONe" | "Ne" => FloatCC::NotEqual,
+        "LT" | "OLt" | "Lt" => FloatCC::LessThan,
+        "LE" | "OLe" | "Le" => FloatCC::LessThanOrEqual,
+        "GT" | "OGt" | "Gt" => FloatCC::GreaterThan,
+        "GE" | "OGe" | "Ge" => FloatCC::GreaterThanOrEqual,
+        "Ord" => FloatCC::Ordered,
+        "Uno" | "Unord" => FloatCC::Unordered,
+        "UEQ" | "UEq" => FloatCC::UnorderedEqual,
+        "UNE" | "UNe" => FloatCC::UnorderedNotEqual,
+        "ULT" | "ULt" => FloatCC::UnorderedLessThan,
+        "ULE" | "ULe" => FloatCC::UnorderedLessThanOrEqual,
+        "UGT" | "UGt" => FloatCC::UnorderedGreaterThan,
+        "UGE" | "UGe" => FloatCC::UnorderedGreaterThanOrEqual,
+        _ => return None,
+    })
 }
 
 /// Verify a floating-point proof obligation by concrete evaluation with
@@ -4707,7 +5352,14 @@ pub fn verify_fp_by_evaluation(obligation: &ProofObligation) -> VerificationResu
         // because FCMP expression trees contain multiple FPConst(0.0)
         // placeholders for both operands that cannot be structurally
         // distinguished during tree walking.
-        let cond = parse_float_cc_from_name(&obligation.name);
+        let Some(cond) = parse_float_cc_from_name(&obligation.name) else {
+            return VerificationResult::Unknown {
+                reason: format!(
+                    "FCMP obligation name `{}` encodes no condition this evaluator knows",
+                    obligation.name
+                ),
+            };
+        };
         if is_f32 {
             for &a_val in &f32_test_values {
                 for &b_val in &f32_test_values {
@@ -5419,10 +6071,11 @@ pub fn all_comparison_proofs_i32() -> Vec<ProofObligation> {
         proof_icmp_sgt_i32(),
         proof_icmp_sle_i32(),
         proof_icmp_ult_i32(),
-        // #62 retraction (group b): Icmp_UGE_I32 -> CMP+CSET_HS was the ONLY
-        // degenerate predicate in this family (bvuge coincides structurally with
-        // CSET_HS). The CSet opcode is reconstruction-credited (CSet -> cmp), and
-        // the 9 genuine sibling predicates cover the family; UGE is removed.
+        // #62 (group b) retracted Icmp_UGE_I32 -> CMP+CSET_HS as degenerate while
+        // the model spelled C as `bvuge(Rn, Rm)`. C is now the adder carry-out
+        // (nzcv.rs), so the obligation is a genuine theorem; pinned non-degenerate
+        // by `uge_proofs_are_no_longer_degenerate`.
+        proof_icmp_uge_i32(),
         proof_icmp_ugt_i32(),
         proof_icmp_ule_i32(),
     ]
@@ -5562,7 +6215,8 @@ pub fn all_comparison_proofs_i64() -> Vec<ProofObligation> {
         proof_icmp_sgt_i64(),
         proof_icmp_sle_i64(),
         proof_icmp_ult_i64(),
-        // #62 retraction (group b): Icmp_UGE_I64 -> CMP+CSET_HS degenerate (see i32).
+        // #62 retraction lifted (see i32): C is the adder carry-out now.
+        proof_icmp_uge_i64(),
         proof_icmp_ugt_i64(),
         proof_icmp_ule_i64(),
     ]
@@ -5742,9 +6396,9 @@ pub fn all_branch_proofs_i32() -> Vec<ProofObligation> {
         proof_condbr_sgt_i32(),
         proof_condbr_sle_i32(),
         proof_condbr_ult_i32(),
-        // #62 retraction (group b): CondBr_UGE_I32 -> CMP+B.HS degenerate (the
-        // only degenerate predicate; Bcc opcode is reconstruction-credited via
-        // condbr; 9 genuine sibling predicates cover the family).
+        // #62 (group b) retracted CondBr_UGE_I32 -> CMP+B.HS as degenerate while C
+        // was spelled `bvuge`; lifted with the adder carry-out model (nzcv.rs).
+        proof_condbr_uge_i32(),
         proof_condbr_ugt_i32(),
         proof_condbr_ule_i32(),
     ]
@@ -5879,7 +6533,8 @@ pub fn all_branch_proofs_i64() -> Vec<ProofObligation> {
         proof_condbr_sgt_i64(),
         proof_condbr_sle_i64(),
         proof_condbr_ult_i64(),
-        // #62 retraction (group b): CondBr_UGE_I64 -> CMP+B.HS degenerate (see i32).
+        // #62 retraction lifted (see i32): C is the adder carry-out now.
+        proof_condbr_uge_i64(),
         proof_condbr_ugt_i64(),
         proof_condbr_ule_i64(),
     ]
@@ -6902,6 +7557,126 @@ pub fn eor_ror_shift_wrong_controls() -> Vec<ProofObligation> {
 }
 
 // ---------------------------------------------------------------------------
+// Standalone ROR-immediate (rotate recognizer) lowering proofs
+// ---------------------------------------------------------------------------
+//
+// `rotate_idiom` folds the frontend rotate blend `(v << r) | (v >>u (w-r))`
+// into the single `RorRI(v, k)` with `k = w - r`. When the following EOR does
+// not fold (the xorshift state update on b1_mispredict / m1_call_chain feeds a
+// non-EOR consumer), the RorRI ships STANDALONE — the EorRRShift family only
+// constrains the fused form — so it needs its own value obligations.
+//
+// FAITHFULNESS / NON-DEGENERACY: the same mechanism as the EOR-ROR family.
+//   * SOURCE  = the frontend ROTL blend (`encode_rotl_source`, r = w - k,
+//               shl half first), and
+//   * MACHINE = the ROR shifted operand (`shifted_reg_operand` Ror #k,
+//               lshr half first).
+// With r = w - k the two shifted halves are IDENTICAL but appear in the
+// OPPOSITE OR order, so `trust_ir_expr != aarch64_expr` (genuine, not X==X)
+// while the values coincide (OR commutes). The three NEGATIVE controls
+// (`ror_immediate_wrong_controls`) each perturb the MACHINE side and REFUTE:
+//   (1) WRONG-AMOUNT — ROR #(k+1) instead of #k,
+//   (2) WRONG-KIND   — LSR #k (drops the wrapped-around high half),
+//   (3) WRONG-DIRECTION — ROL #k (rotate-left instead of rotate-right).
+
+/// One standalone ROR-immediate obligation at register `size`, rotate amount
+/// `k` (the ROR amount, in `[1, width)`). SOURCE = frontend ROTL blend
+/// (`r = width - k`); MACHINE = the ROR shifted operand. Positive: the two are
+/// provably equal.
+pub fn proof_ror_immediate(size: trust_cg_ir::cc::OperandSize, k: u32) -> ProofObligation {
+    use crate::aarch64_semantics::{RegShiftKind, encode_rotl_source, shifted_reg_operand};
+    let width = crate::aarch64_semantics::operand_size_bits(size);
+    debug_assert!(k >= 1 && k < width);
+    let v = SmtExpr::var("v", width);
+    let source = encode_rotl_source(size, v.clone(), width - k);
+    let machine = shifted_reg_operand(RegShiftKind::Ror, v, k, width);
+    ProofObligation {
+        machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
+        name: format!(
+            "RorRI_I{width} k={k} -> ROR #{k} ({width}-bit): \
+             frontend rotate blend == ROR shifted operand"
+        ),
+        trust_ir_expr: source,
+        aarch64_expr: machine,
+        inputs: vec![("v".to_string(), width)],
+        preconditions: vec![],
+        fp_inputs: vec![],
+        category: Some(crate::lowering_proof::TransvalCheckKind::InstructionLowering),
+    }
+}
+
+/// The FAITHFUL standalone ROR-immediate obligations across representative
+/// amounts at W and X (boundaries 1 and w-1, the xorshift amounts, mid-range).
+/// Registered into the proof DB (via [`all_bitwise_shift_proofs`]); the
+/// function verifier binds a concrete `RorRI` per destination width to the
+/// `rorri_i32` / `rorri_i64` names, and the coverage gate demands BOTH widths
+/// discharge (see `aarch64_width_polymorphic_proofs`).
+pub fn all_ror_immediate_proofs() -> Vec<ProofObligation> {
+    use trust_cg_ir::cc::OperandSize;
+    let mut proofs = Vec::new();
+    for k in [1u32, 7, 16, 25, 31] {
+        proofs.push(proof_ror_immediate(OperandSize::S32, k));
+    }
+    for k in [1u32, 13, 32, 51, 63] {
+        proofs.push(proof_ror_immediate(OperandSize::S64, k));
+    }
+    proofs
+}
+
+/// NEGATIVE CONTROLS for the standalone ROR-immediate obligations — each MUST
+/// refute (a wrong rotate encoding must be caught, so the positives are not
+/// vacuous). Built at both W and X: wrong-amount, wrong-kind (ROR-vs-LSR), and
+/// wrong-direction (ROR-vs-ROL).
+pub fn ror_immediate_wrong_controls() -> Vec<ProofObligation> {
+    use crate::aarch64_semantics::{RegShiftKind, encode_rotl_source, shifted_reg_operand};
+    use trust_cg_ir::cc::OperandSize;
+
+    let mut controls = Vec::new();
+    for size in [OperandSize::S32, OperandSize::S64] {
+        let width = crate::aarch64_semantics::operand_size_bits(size);
+        let k = 25u32.min(width - 1);
+        let v = SmtExpr::var("v", width);
+        let source = || encode_rotl_source(size, v.clone(), width - k);
+        let control = |name: String, machine: SmtExpr| ProofObligation {
+            machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
+            name,
+            trust_ir_expr: source(),
+            aarch64_expr: machine,
+            inputs: vec![("v".to_string(), width)],
+            preconditions: vec![],
+            fp_inputs: vec![],
+            category: Some(crate::lowering_proof::TransvalCheckKind::InstructionLowering),
+        };
+
+        // (1) WRONG-AMOUNT: MACHINE rotates by k+1 (still in range) — the
+        // halves misalign, so it diverges from the ROR-by-k source.
+        controls.push(control(
+            format!(
+                "WRONG (rorri_i{width}): ROR #{} instead of #{k} must REFUTE",
+                k + 1
+            ),
+            shifted_reg_operand(RegShiftKind::Ror, v.clone(), k + 1, width),
+        ));
+
+        // (2) WRONG-KIND: MACHINE uses LSR #k — a plain logical shift drops
+        // the wrapped-around high half.
+        controls.push(control(
+            format!("WRONG (rorri_i{width}): shift kind LSR instead of ROR must REFUTE"),
+            shifted_reg_operand(RegShiftKind::Lsr, v.clone(), k, width),
+        ));
+
+        // (3) WRONG-DIRECTION: MACHINE rotates LEFT by k (ROR by w-k) — the
+        // classic k vs w-k confusion the recognizer's `k = w - r` derivation
+        // could get backwards.
+        controls.push(control(
+            format!("WRONG (rorri_i{width}): rotate-left #{k} instead of rotate-right must REFUTE"),
+            shifted_reg_operand(RegShiftKind::Ror, v.clone(), width - k, width),
+        ));
+    }
+    controls
+}
+
+// ---------------------------------------------------------------------------
 // ADD/SUB with an LSL-shifted source (shift-add/sub fusion peephole) proofs
 // ---------------------------------------------------------------------------
 //
@@ -7419,6 +8194,12 @@ pub fn all_bitwise_shift_proofs() -> Vec<ProofObligation> {
     // genuine (not X==X); the coverage gate credits `EorRRShift` through the
     // `eor_ror_shift_i32` / `eor_ror_shift_i64` names.
     .chain(all_eor_ror_shift_proofs())
+    // Standalone ROR-immediate (the rotate recognizer's unfused form): the
+    // FAITHFUL rotate obligations, W+X, several amounts. Same opposite-OR-order
+    // non-degeneracy mechanism as the EOR-ROR family above; the function
+    // verifier binds `RorRI` per destination width through the `rorri_i32` /
+    // `rorri_i64` names and the coverage gate demands both widths.
+    .chain(all_ror_immediate_proofs())
     // ADD/SUB with an LSL-shifted source (shift-add/sub fusion peephole): the
     // FAITHFUL ring obligations, W+X, several amounts (10 ADD + 10 SUB = 20).
     // STRUCTURALLY DISTINCT (source = base +/- src*2^k via bvmul, machine =
@@ -8868,6 +9649,35 @@ mod tests {
         assert_valid(&proof_icmp_uge_i32());
     }
 
+    /// The four UGE obligations retracted by #62 are back in the registry, and
+    /// they are theorems, not `X == X`: the machine side never spells the spec
+    /// predicate (`bvuge`/`bvult`), and the two sides are structurally different.
+    #[test]
+    fn uge_proofs_are_no_longer_degenerate() {
+        for ob in [
+            proof_icmp_uge_i32(),
+            proof_icmp_uge_i64(),
+            proof_condbr_uge_i32(),
+            proof_condbr_uge_i64(),
+        ] {
+            let machine = format!("{:?}", ob.aarch64_expr);
+            assert!(
+                !machine.contains("BvUge") && !machine.contains("BvUlt"),
+                "{}: machine side spells the spec predicate: {machine}",
+                ob.name
+            );
+            assert_ne!(ob.trust_ir_expr, ob.aarch64_expr, "{}: X == X", ob.name);
+            assert!(
+                crate::proof_database::ProofDatabase::new()
+                    .all()
+                    .iter()
+                    .any(|p| p.obligation.name == ob.name),
+                "{} is not registered",
+                ob.name
+            );
+        }
+    }
+
     #[test]
     fn test_proof_icmp_ugt_i32() {
         assert_valid(&proof_icmp_ugt_i32());
@@ -9794,11 +10604,12 @@ mod tests {
         let proofs = all_bitwise_shift_proofs();
         assert_eq!(
             proofs.len(),
-            62,
-            "Expected 62 bitwise proofs (22 base + the 10 EOR-ROR shifted-register \
-             obligations + the 20 ADD/SUB-LSL shifted-register obligations, 10 ADD + \
-             10 SUB, + the 10 ADD-LSR shifted-register obligations; 22 = 34 minus the \
-             12 degenerate scalar shift Ishl/Ushr/Sshr X==X retracted in #62), got {}",
+            72,
+            "Expected 72 bitwise proofs (22 base + the 10 EOR-ROR shifted-register \
+             obligations + the 10 standalone ROR-immediate obligations + the 20 \
+             ADD/SUB-LSL shifted-register obligations, 10 ADD + 10 SUB, + the 10 \
+             ADD-LSR shifted-register obligations; 22 = 34 minus the 12 degenerate \
+             scalar shift Ishl/Ushr/Sshr X==X retracted in #62), got {}",
             proofs.len()
         );
     }
@@ -9922,6 +10733,46 @@ mod tests {
         }
     }
 
+    /// The FAITHFUL standalone ROR-immediate obligations: all genuine
+    /// (structurally distinct, NOT X==X) and all discharge Valid under the
+    /// in-house evaluator.
+    #[test]
+    fn test_ror_immediate_proofs_valid_and_genuine() {
+        let proofs = all_ror_immediate_proofs();
+        assert_eq!(proofs.len(), 10, "5 amounts x {{W,X}}");
+        for obligation in &proofs {
+            assert!(
+                obligation.is_genuinely_proven(),
+                "ROR-immediate proof '{}' is DEGENERATE (X==X)",
+                obligation.name
+            );
+            assert_valid(obligation);
+        }
+    }
+
+    /// NON-VACUITY: every wrong-encoding control (wrong-amount, wrong-kind
+    /// ROR-vs-LSR, wrong-direction ROR-vs-ROL) must REFUTE under the in-house
+    /// evaluator.
+    #[test]
+    fn test_ror_immediate_controls_refute() {
+        let controls = ror_immediate_wrong_controls();
+        assert_eq!(controls.len(), 6, "3 controls x {{W,X}}");
+        for obligation in &controls {
+            assert!(
+                obligation.is_genuinely_proven(),
+                "ROR-immediate control '{}' is degenerate",
+                obligation.name
+            );
+            let result = verify_by_evaluation(obligation);
+            assert!(
+                !matches!(result, VerificationResult::Valid),
+                "ROR-immediate NEGATIVE control '{}' was VALID — a wrong rotate \
+                 encoding must refute, so the positive obligation is vacuous",
+                obligation.name
+            );
+        }
+    }
+
     /// The FAITHFUL FCSEL obligations: all genuine (structurally distinct, NOT
     /// X==X) and all discharge Valid under the in-house evaluator.
     #[test]
@@ -10019,5 +10870,560 @@ mod tests {
             VerificationResult::Invalid { .. } => {} // expected
             other => panic!("Expected Invalid for wrong load offset, got {:?}", other),
         }
+    }
+}
+
+#[cfg(test)]
+mod chunked_sampling_tests {
+    use super::*;
+
+    /// `sample_lcg_jump(seed, n)` is exactly `n` sequential steps, across the
+    /// chunk starts the splitter actually produces (and a few awkward ones).
+    #[test]
+    fn lcg_jump_matches_sequential_stepping() {
+        let seeds = [
+            0u64,
+            1,
+            0xcafe_babe_dead_beef,
+            u64::MAX,
+            0x9E37_79B9_7F4A_7C15,
+        ];
+        let ns = [
+            0u64, 1, 2, 3, 7, 8, 100, 4095, 4096, 4097, 8192, 12_500, 25_000, 99_999, 100_000,
+            200_000, 300_003, 1_000_003,
+        ];
+        for &seed in &seeds {
+            let mut state = seed;
+            let mut stepped = 0u64;
+            for &n in &ns {
+                while stepped < n {
+                    state = sample_lcg_step(state);
+                    stepped += 1;
+                }
+                assert_eq!(sample_lcg_jump(seed, n), state, "seed={seed:#x} n={n}");
+            }
+        }
+    }
+
+    /// Outside any pool, or on a single-worker pool, nothing is chunked. Inside
+    /// a pool the chunks tile `[0, trials)` exactly once, in order.
+    #[test]
+    fn chunking_only_inside_a_pool_and_tiles_exactly() {
+        // The helper-pool test registers a process-wide pool; hold its lock so
+        // "no pool" here really means no pool.
+        let _guard = HELPER_POOL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(sample_chunking(100_000), (1, 100_000));
+        assert_eq!(sample_chunking(8_191), (1, 8_191));
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            for trials in [8_192u64, 100_000, 100_001, 123_457] {
+                let (chunks, per) = sample_chunking(trials);
+                assert!((2..=8).contains(&chunks), "trials={trials} chunks={chunks}");
+                let mut covered = 0u64;
+                for i in 0..chunks {
+                    let start = i * per;
+                    let count = trials.saturating_sub(start).min(per);
+                    assert_eq!(
+                        start,
+                        covered,
+                        "chunk {i} does not start where {} ended",
+                        i.wrapping_sub(1)
+                    );
+                    covered += count;
+                }
+                assert_eq!(covered, trials);
+            }
+            assert_eq!(
+                sample_chunking(8_191),
+                (1, 8_191),
+                "too little work must stay whole"
+            );
+        });
+        let one = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        one.install(|| assert_eq!(sample_chunking(100_000), (1, 100_000)));
+    }
+
+    fn v(name: &str) -> Arc<SmtExpr> {
+        Arc::new(SmtExpr::Var {
+            name: name.to_string(),
+            width: 64,
+        })
+    }
+    fn k(value: u64) -> Arc<SmtExpr> {
+        Arc::new(SmtExpr::BvConst { value, width: 64 })
+    }
+    /// `a`, except at each `hit` value where it is `a + 1`: wrong at exactly
+    /// those inputs and nowhere else.
+    fn wrong_at(hits: &[u64]) -> SmtExpr {
+        let mut expr = SmtExpr::Var {
+            name: "a".to_string(),
+            width: 64,
+        };
+        for &h in hits.iter().rev() {
+            expr = SmtExpr::Ite {
+                cond: Arc::new(SmtExpr::Eq {
+                    lhs: v("a"),
+                    rhs: k(h),
+                }),
+                then_expr: Arc::new(SmtExpr::BvAdd {
+                    lhs: v("a"),
+                    rhs: k(1),
+                    width: 64,
+                }),
+                else_expr: Arc::new(expr),
+            };
+        }
+        expr
+    }
+    fn obligation(name: &str, inputs: &[&str], hits: &[u64]) -> ProofObligation {
+        ProofObligation {
+            machine_side_provenance: MachineSideProvenance::StaticDb,
+            name: name.to_string(),
+            trust_ir_expr: SmtExpr::Var {
+                name: "a".to_string(),
+                width: 64,
+            },
+            aarch64_expr: wrong_at(hits),
+            inputs: inputs.iter().map(|n| (n.to_string(), 64)).collect(),
+            preconditions: vec![],
+            fp_inputs: vec![],
+            category: None,
+        }
+    }
+    /// The value of input `a` (the first draw) at sample index `k` of an
+    /// obligation with `draws` inputs — what the sequential loop draws there.
+    fn a_at(name: &str, draws: u64, k: u64) -> u64 {
+        let value = mask(sample_lcg_jump(sample_seed(name), draws * k + 1), 64);
+        let edges = [0, 1, u64::MAX, u64::MAX - 1, 1u64 << 63, (1u64 << 63) - 1];
+        assert!(
+            !edges.contains(&value),
+            "sample {k} of `{name}` collides with an edge case"
+        );
+        value
+    }
+    fn sequential(ob: &ProofObligation) -> String {
+        assert!(rayon::current_thread_index().is_none());
+        format!(
+            "{:?}",
+            verify_by_evaluation_with_config(ob, &VerificationConfig::default())
+        )
+    }
+    fn chunked(ob: &ProofObligation) -> String {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            assert_eq!(sample_chunking(DEFAULT_SAMPLE_COUNT).0, 8);
+            format!(
+                "{:?}",
+                verify_by_evaluation_with_config(ob, &VerificationConfig::default())
+            )
+        })
+    }
+
+    /// 2-input path: the only wrong input is sample 77,777 — deep inside chunk
+    /// 6 of 8. The chunked sweep must find it, and report the very same
+    /// counterexample text as the sequential sweep.
+    #[test]
+    fn two_input_counterexample_in_a_late_chunk_is_identical() {
+        let name = "chunk-test: hit deep in chunk 6";
+        let ob = obligation(name, &["a", "b"], &[a_at(name, 2, 77_777)]);
+        let s = sequential(&ob);
+        assert!(s.starts_with("Invalid"), "{s}");
+        assert_eq!(chunked(&ob), s);
+    }
+
+    /// Multi-input path (3 draws per sample): same shape, hit at sample 91,234
+    /// in the last chunk. Exercises the `draws × k` jump arithmetic.
+    #[test]
+    fn multi_input_counterexample_in_the_last_chunk_is_identical() {
+        let name = "chunk-test: multi-input hit in chunk 7";
+        let ob = obligation(name, &["a", "b", "c"], &[a_at(name, 3, 91_234)]);
+        let s = sequential(&ob);
+        assert!(s.starts_with("Invalid"), "{s}");
+        assert_eq!(chunked(&ob), s);
+    }
+
+    /// Two wrong inputs, in chunks 2 and 7. Whichever chunk finishes first, the
+    /// reported counterexample is the EARLIER sample — the sequential answer.
+    #[test]
+    fn earliest_counterexample_wins_regardless_of_chunk_finish_order() {
+        let name = "chunk-test: hits in chunks 2 and 7";
+        let first = a_at(name, 2, 30_001);
+        let second = a_at(name, 2, 90_005);
+        let both = obligation(name, &["a", "b"], &[first, second]);
+        let only_first = obligation(name, &["a", "b"], &[first]);
+        let only_second = obligation(name, &["a", "b"], &[second]);
+        let s = sequential(&both);
+        assert_eq!(
+            s,
+            sequential(&only_first),
+            "sequential reports the earlier hit"
+        );
+        assert_ne!(s, sequential(&only_second));
+        for _ in 0..8 {
+            assert_eq!(chunked(&both), s);
+        }
+    }
+
+    /// A repeated input NAME: the env has one slot per name and the LAST draw
+    /// wins (`[a, a]` → `a` holds each sample's second draw; `[a, b, a]` → the
+    /// third). The batched lanes must sweep exactly that, and did not (they
+    /// were per input index) — found by adversarial review.
+    #[test]
+    fn repeated_input_names_sweep_the_env_the_scalar_loop_fills() {
+        let scalar = |ob: &ProofObligation| {
+            let co = CompiledObligation::try_new_scalar_only(ob);
+            format!(
+                "{:?}",
+                verify_by_evaluation_with_compiled(ob, &VerificationConfig::default(), co.as_ref())
+            )
+        };
+        let name = "chunk-test: repeated name a,a";
+        let hit = mask(sample_lcg_jump(sample_seed(name), 2 * 4_321 + 2), 64);
+        let ob = obligation(name, &["a", "a"], &[hit]);
+        let s = scalar(&ob);
+        assert!(s.starts_with("Invalid"), "{s}");
+        assert_eq!(chunked(&ob), s);
+
+        let name = "chunk-test: repeated name a,b,a";
+        let hit = mask(sample_lcg_jump(sample_seed(name), 3 * 9_876 + 3), 64);
+        let ob = obligation(name, &["a", "b", "a"], &[hit]);
+        let s = scalar(&ob);
+        assert!(s.starts_with("Invalid"), "{s}");
+        assert_eq!(chunked(&ob), s);
+    }
+
+    fn valid_but_not_identical(name: &str) -> ProofObligation {
+        // `a` vs `a + 0`: Valid, but not identical-sided, so the
+        // trust_ir == aarch64 short-circuit does not fire and the sweep runs.
+        let mut ob = obligation(name, &["a", "b"], &[]);
+        ob.aarch64_expr = SmtExpr::BvAdd {
+            lhs: v("a"),
+            rhs: k(0),
+            width: 64,
+        };
+        assert!(CompiledObligation::try_new(&ob).is_some());
+        ob
+    }
+
+    /// Two callers of ONE uncached kind on a 2-worker pool, the second while
+    /// the first is mid-sweep: the second blocks on the memo cell; the first
+    /// must finish without ever executing the second's job. The `collect()`
+    /// fan-out hung here 3/3 (gdb: the sweeping worker re-entered its own
+    /// cell) — found by adversarial review.
+    #[test]
+    fn same_key_second_caller_does_not_deadlock_the_chunked_sweep() {
+        for iter in 0..3 {
+            let ob = Arc::new(valid_but_not_identical(&format!(
+                "chunk-test: deadlock {} {iter}",
+                std::process::id()
+            )));
+            let pool = Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(2)
+                    .build()
+                    .unwrap(),
+            );
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            for i in 0..2 {
+                let (ob, pool, tx) = (Arc::clone(&ob), Arc::clone(&pool), tx.clone());
+                std::thread::spawn(move || {
+                    let cfg = VerificationConfig::with_sample_count(1_000_000);
+                    let r = pool.install(|| memoized_verify_by_evaluation(&ob, &cfg));
+                    assert_eq!(format!("{r:?}"), "Valid");
+                    let _ = tx.send(());
+                });
+                if i == 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(40));
+                }
+            }
+            for _ in 0..2 {
+                rx.recv_timeout(std::time::Duration::from_secs(60))
+                    .unwrap_or_else(|_| panic!("iteration {iter}: the chunked sweep deadlocked"));
+            }
+        }
+    }
+
+    /// The production shape as first shipped (a plain `par_iter` of discharges;
+    /// production now bounds the owners, which only makes this easier): the
+    /// init-time speculative sweep and the first CGU's pre-warm are two
+    /// installs on ONE pool with overlapping kinds.
+    #[test]
+    fn overlapping_prewarm_installs_on_one_pool_do_not_deadlock() {
+        use rayon::prelude::*;
+        for iter in 0..4 {
+            let kinds: Arc<Vec<ProofObligation>> = Arc::new(
+                (0..13)
+                    .map(|j| {
+                        valid_but_not_identical(&format!(
+                            "chunk-test: prewarm {} {iter} {j}",
+                            std::process::id()
+                        ))
+                    })
+                    .collect(),
+            );
+            let pool = Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(8)
+                    .build()
+                    .unwrap(),
+            );
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            for i in 0..2 {
+                let (kinds, pool, tx) = (Arc::clone(&kinds), Arc::clone(&pool), tx.clone());
+                std::thread::spawn(move || {
+                    let cfg = VerificationConfig::with_sample_count(400_000);
+                    pool.install(|| {
+                        kinds.par_iter().for_each(|ob| {
+                            assert_eq!(
+                                format!("{:?}", memoized_verify_by_evaluation(ob, &cfg)),
+                                "Valid"
+                            );
+                        })
+                    });
+                    let _ = tx.send(());
+                });
+                if i == 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(15));
+                }
+            }
+            for _ in 0..2 {
+                rx.recv_timeout(std::time::Duration::from_secs(60))
+                    .unwrap_or_else(|_| {
+                        panic!("iteration {iter}: overlapping pre-warms deadlocked")
+                    });
+            }
+        }
+    }
+
+    /// With a helper pool registered, a sweep owned by a PLAIN thread (the
+    /// certificate walk's shape: the verifier pool has one worker) is chunked
+    /// onto that pool and stays verdict- and text-identical; and the two
+    /// deadlock shapes hold with owners on one-worker pools and helpers on
+    /// the registered pool.
+    #[test]
+    fn registered_helper_pool_serves_sweeps_from_any_thread() {
+        let _guard = HELPER_POOL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let helpers = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(4)
+                .build()
+                .unwrap(),
+        );
+        set_sweep_helper_pool(Some(Arc::clone(&helpers)));
+        // Chunked from a plain thread now.
+        assert_eq!(sample_chunking(DEFAULT_SAMPLE_COUNT).0, 8);
+        let name = "chunk-test: helper pool, plain owner";
+        let ob = obligation(name, &["a", "b"], &[a_at(name, 2, 77_777)]);
+        let s = format!(
+            "{:?}",
+            verify_by_evaluation_with_config(&ob, &VerificationConfig::default())
+        );
+        set_sweep_helper_pool(None);
+        assert!(s.starts_with("Invalid"), "{s}");
+        assert_eq!(sequential(&ob), s);
+        // Owners on a ONE-worker pool (the walk), helpers on the registered pool,
+        // two callers of one uncached kind.
+        set_sweep_helper_pool(Some(Arc::clone(&helpers)));
+        for iter in 0..3 {
+            let ob = Arc::new(valid_but_not_identical(&format!(
+                "chunk-test: helper-pool deadlock {} {iter}",
+                std::process::id()
+            )));
+            let walk = Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(1)
+                    .build()
+                    .unwrap(),
+            );
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            for i in 0..2 {
+                let (ob, walk, tx) = (Arc::clone(&ob), Arc::clone(&walk), tx.clone());
+                std::thread::spawn(move || {
+                    let cfg = VerificationConfig::with_sample_count(1_000_000);
+                    let r = walk.install(|| memoized_verify_by_evaluation(&ob, &cfg));
+                    assert_eq!(format!("{r:?}"), "Valid");
+                    let _ = tx.send(());
+                });
+                if i == 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(40));
+                }
+            }
+            for _ in 0..2 {
+                rx.recv_timeout(std::time::Duration::from_secs(60))
+                    .unwrap_or_else(|_| panic!("iteration {iter}: helper-pool sweep deadlocked"));
+            }
+        }
+        set_sweep_helper_pool(None);
+    }
+
+    static HELPER_POOL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// `[a, a, b]`: a repeated name followed by a NEW one. The env has two
+    /// slots; `Var(b)` numbered by position in `inputs` read slot 2 and panicked
+    /// in the compiled scalar sweep. Both evaluators now number by distinct
+    /// name and must agree — and the sweep must not panic.
+    #[test]
+    fn repeated_name_followed_by_a_new_name_does_not_read_past_the_env() {
+        let scalar = |ob: &ProofObligation| {
+            let co = CompiledObligation::try_new_scalar_only(ob);
+            assert!(co.is_some(), "must take the compiled path");
+            format!(
+                "{:?}",
+                verify_by_evaluation_with_compiled(ob, &VerificationConfig::default(), co.as_ref())
+            )
+        };
+        // trust_ir = a, aarch64 = ite(a == K, a + 1, a); with [a, a, b] the
+        // scalar loop draws a, a, b per sample and `a` keeps its SECOND draw.
+        let name = "chunk-test: repeated name a,a,b";
+        let hit = mask(sample_lcg_jump(sample_seed(name), 3 * 5_555 + 2), 64);
+        let ob = obligation(name, &["a", "a", "b"], &[hit]);
+        let s = scalar(&ob);
+        assert!(s.starts_with("Invalid"), "{s}");
+        assert_eq!(chunked(&ob), s);
+        // And a tape that actually reads `b` after the repeat: b == b is Valid.
+        let mut uses_b = obligation("chunk-test: a,a,b reads b", &["a", "a", "b"], &[]);
+        uses_b.trust_ir_expr = SmtExpr::Var {
+            name: "b".to_string(),
+            width: 64,
+        };
+        uses_b.aarch64_expr = SmtExpr::BvAdd {
+            lhs: Arc::new(SmtExpr::Var {
+                name: "b".to_string(),
+                width: 64,
+            }),
+            rhs: k(0),
+            width: 64,
+        };
+        assert_eq!(scalar(&uses_b), "Valid");
+        assert_eq!(chunked(&uses_b), "Valid");
+    }
+
+    /// A correct obligation is Valid both ways (no false counterexample from a
+    /// mis-seeded chunk).
+    #[test]
+    fn valid_obligation_is_valid_both_ways() {
+        let ob = obligation("chunk-test: nothing wrong", &["a", "b"], &[]);
+        assert_eq!(sequential(&ob), "Valid");
+        assert_eq!(chunked(&ob), "Valid");
+    }
+
+    /// Every obligation in the fixed registry: verdict and counterexample text
+    /// identical between a one-thread sweep and a pooled, chunked sweep.
+    #[test]
+    fn whole_registry_verdicts_identical_sequential_vs_chunked() {
+        let db = crate::proof_database::ProofDatabase::new();
+        let config = VerificationConfig::with_sample_count(20_000);
+        // The integer sample paths are what chunking touches. FP-only
+        // obligations (`inputs` empty) take `verify_fp_by_evaluation`, which is
+        // untouched here — and one registry entry (`FCmp_OEq_f32 -> wasm`)
+        // panics its name parser (it expects an `Fcmp_` prefix), so sweeping it
+        // directly is not a test of this change.
+        let integer: Vec<&ProofObligation> = db
+            .all()
+            .iter()
+            .map(|cp| &cp.obligation)
+            .filter(|ob| !ob.inputs.is_empty())
+            .collect();
+        // The sequential side runs the SCALAR tapes only; the pooled side runs
+        // whatever `try_new` produces (the batched twin, for every obligation
+        // in its subset). So this pins chunking AND batching at once.
+        let seq: Vec<String> = integer
+            .iter()
+            .map(|ob| {
+                let scalar = CompiledObligation::try_new_scalar_only(ob);
+                format!(
+                    "{:?}",
+                    verify_by_evaluation_with_compiled(ob, &config, scalar.as_ref())
+                )
+            })
+            .collect();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(6)
+            .build()
+            .unwrap();
+        let par: Vec<String> = pool.install(|| {
+            use rayon::prelude::*;
+            integer
+                .par_iter()
+                .map(|ob| format!("{:?}", verify_by_evaluation_with_config(ob, &config)))
+                .collect()
+        });
+        assert_eq!(seq.len(), par.len());
+        assert!(
+            seq.len() >= 50,
+            "registry unexpectedly small: {}",
+            seq.len()
+        );
+        for (i, (s, p)) in seq.iter().zip(&par).enumerate() {
+            assert_eq!(
+                s, p,
+                "registry obligation #{i} `{}` differs",
+                integer[i].name
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod fp_name_parser_tests {
+    use super::*;
+
+    /// Every FCMP obligation in the fixed registry — both the `Fcmp_` and the
+    /// wasm `FCmp_` spelling — names a condition the FP evaluator knows.
+    #[test]
+    fn every_registry_fcmp_name_parses() {
+        let db = crate::proof_database::ProofDatabase::new();
+        let mut seen = 0;
+        for cp in db.all() {
+            let name = &cp.obligation.name;
+            if name.starts_with("Fcmp_") || name.starts_with("FCmp_") {
+                seen += 1;
+                assert!(
+                    parse_float_cc_from_name(name).is_some(),
+                    "unparsed FCMP name `{name}`"
+                );
+            }
+        }
+        assert!(
+            seen >= 20,
+            "expected both spellings in the registry, saw {seen}"
+        );
+        assert!(parse_float_cc_from_name("FCmp_Bogus_f32 -> wasm").is_none());
+        assert!(parse_float_cc_from_name("Fadd_F32 -> FADD").is_none());
+    }
+
+    /// The evaluator must return a verdict — never panic — for EVERY registry
+    /// obligation, FP ones included (`FCmp_OEq_f32 -> wasm` used to panic the
+    /// name parser). A panic inside the process-wide memo cell would take a
+    /// compile down; an unknown name is an `Unknown` verdict instead.
+    #[test]
+    fn evaluator_returns_a_verdict_for_every_registry_obligation() {
+        let db = crate::proof_database::ProofDatabase::new();
+        let config = VerificationConfig::with_sample_count(2_000);
+        let mut fp = 0;
+        for cp in db.all() {
+            let ob = &cp.obligation;
+            if ob.inputs.is_empty() {
+                fp += 1;
+            }
+            let _ = verify_by_evaluation_with_config(ob, &config);
+        }
+        assert!(
+            fp >= 20,
+            "expected FP-only obligations in the registry, saw {fp}"
+        );
     }
 }

@@ -1,12 +1,20 @@
 #!/bin/sh
 #
-# Exact anonymous-clone validation for the v0.1.0 publication candidate.
+# Exact anonymous-clone validation for the publication candidate.
 
 set -eu
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "${SCRIPT_DIR}/.." && pwd)
 cd "${REPO_ROOT}"
+
+# Release validation includes generated, memory-intensive integration targets.
+# Run libtest serially by default while preserving an explicit caller override.
+: "${RUST_TEST_THREADS:=1}"
+export RUST_TEST_THREADS
+
+python3 -B scripts/check_trust_default_authority.py --root .
+python3 -B -m unittest discover -s scripts/tests -p 'test_*.py'
 
 expected_rustc='rustc 1.97.1 (8bab26f4f 2026-07-14)'
 expected_cargo='cargo 1.97.1 (c980f4866 2026-06-30)'
@@ -65,14 +73,14 @@ tcg_solver_present() {
 if tcg_solver_present; then
     cargo test --locked --workspace --all-features \
         --exclude trust-cg-codegen --no-fail-fast -- \
-        --test-threads=1
+        --test-threads="${RUST_TEST_THREADS}"
 else
     echo "run_public_release_checks: NO AY SOLVER FOUND -- skipping the" >&2
     echo "  trust-cg-verify CEGIS lane. This release is verified MODULO CEGIS." >&2
     echo "  Set TCG_SOLVER_PATH or place \`ay\` on PATH to run it." >&2
     cargo test --locked --workspace --all-features \
         --exclude trust-cg-codegen --exclude trust-cg-verify --no-fail-fast -- \
-        --test-threads=1
+        --test-threads="${RUST_TEST_THREADS}"
 fi
 scripts/run_public_release_codegen_tests.sh --release
 
@@ -83,7 +91,8 @@ scripts/run_full_test_matrix.sh --check-rustc-backend-env
     cd crates/rustc-codegen-trust-cg
     CARGO_TARGET_DIR=../../target/rustc-codegen-trust-cg-nightly-2026-04-20 \
         rustup run nightly-2026-04-20 cargo test --release --locked \
-            --all-features --all-targets --no-fail-fast -- --test-threads=1
+            --all-features --all-targets --no-fail-fast -- \
+            --test-threads="${RUST_TEST_THREADS}"
     # No doctest lane: the backend is crate-type ["dylib"] only (the
     # rustc_codegen_cranelift convention), and cargo hard-errors on
     # `cargo test --doc` for a package with no doctestable lib target

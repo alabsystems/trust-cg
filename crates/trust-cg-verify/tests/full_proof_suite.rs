@@ -555,13 +555,13 @@ fn full_proof_suite_known_category_counts() {
     let fp = db.count_by_category(ProofCategory::FloatingPoint);
     assert!(fp >= 38, "FloatingPoint: expected >= 38, got {}", fp);
 
-    // Comparison: 9 genuine conditions x 2 widths = 18 (the degenerate UGE/HS
-    // pair was retracted in #62; reconstruction credits the CSet opcode).
-    assert_eq!(db.count_by_category(ProofCategory::Comparison), 18);
+    // Comparison: 10 conditions x 2 widths = 20. The UGE/HS pair #62 retracted
+    // as degenerate is genuine again now that nzcv.rs derives the C flag from the
+    // adder carry-out instead of spelling it `bvuge`.
+    assert_eq!(db.count_by_category(ProofCategory::Comparison), 20);
 
-    // Branch: 9 genuine conditions x 2 widths = 18 (the degenerate UGE/B.HS pair
-    // was retracted in #62; reconstruction credits the Bcc opcode).
-    assert_eq!(db.count_by_category(ProofCategory::Branch), 18);
+    // Branch: 10 conditions x 2 widths = 20 (same UGE/B.HS return as above).
+    assert_eq!(db.count_by_category(ProofCategory::Branch), 20);
 
     // Peephole: historic baseline 18 (9 rules x 2 widths). Relaxed to floor so
     // new peephole patterns don't break this suite (#418). Matches the

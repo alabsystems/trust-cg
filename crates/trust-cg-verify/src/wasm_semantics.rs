@@ -783,6 +783,8 @@ fn addr_plus(addr: &SmtExpr, k: u64) -> SmtExpr {
 }
 
 /// Store an `n_bytes`-wide value `val` at `addr` into `mem`, little-endian.
+/// Only the LOW `n_bytes` of `val` are written — that truncation IS the
+/// `iN.storeM` semantics (spec §4.4.7 `t.store N`: `wrap_{|t|,N}` first).
 fn store_bytes(mem: SmtExpr, addr: &SmtExpr, val: &SmtExpr, n_bytes: u32) -> SmtExpr {
     let mut m = mem;
     for i in 0..n_bytes {
@@ -837,4 +839,316 @@ pub fn encode_load_i64(mem: SmtExpr, addr: SmtExpr) -> SmtExpr {
 /// non-overlap of distinct elements) validates the stride the backend emits.
 pub fn encode_gep_element(base: SmtExpr, index: SmtExpr, elem_size_bytes: u32) -> SmtExpr {
     base.bvadd(index.bvmul(SmtExpr::bv_const(u64::from(elem_size_bytes), 32)))
+}
+
+// ===========================================================================
+// P3 VALUE DOMAIN — sub-word / FP linear memory, the narrow-width invariant,
+// and the sign-extension operators
+// ===========================================================================
+//
+// Reference: WebAssembly Core Specification, Release 2.0 — §5.4.4 (Memory
+// Instructions: the 0x28..=0x40 opcode block) and §5.4.6 (Numeric Instructions:
+// the 0xc0..=0xc4 sign-extension operators). The opcode BYTES below are fixed by
+// that table; every entry cites its byte inline. The verifier decodes the REAL
+// emitted byte through these tables and rebuilds the machine side from the
+// decode, so a one-bit opcode slip (`i32.load8_s` 0x2c where `i32.load8_u` 0x2d
+// was intended) decodes to a DIFFERENT extension and REFUTES.
+//
+// These decoders are keyed on the raw `u8` rather than on `trust_cg_ir::
+// WasmOpcode`: that enum does not (yet) carry the sub-word / FP memory variants,
+// and the spec byte is the authority regardless of which enum mirrors it.
+
+/// The EXTENSION a wasm LOAD applies to the bytes it read before pushing the
+/// result on the value stack.
+///
+/// This is the ONE bit that separates `i32.load8_u` (0x2d) from `i32.load8_s`
+/// (0x2c), so it is exactly where a wrong opcode byte hides — and exactly what
+/// the reconstructed load obligation is built to refute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WasmLoadExtend {
+    /// Access width == result width: the bytes ARE the value (`iN.load`,
+    /// `fN.load`). No extension.
+    None,
+    /// ZERO-extend the `access_bits`-wide access to the result width (`..._u`).
+    Zero,
+    /// SIGN-extend the `access_bits`-wide access to the result width (`..._s`).
+    Sign,
+}
+
+/// Load or store — the direction of a wasm linear-memory access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WasmMemDirection {
+    /// `t.load` / `t.loadN_sx` — pops an address, pushes a `value_bits` value.
+    Load(WasmLoadExtend),
+    /// `t.store` / `t.storeN` — pops an address and a value, writes
+    /// `access_bits` bits (the value TRUNCATED to that width).
+    Store,
+}
+
+/// A wasm linear-memory access decoded from its opcode byte (spec §5.4.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WasmMemOp {
+    /// The spec mnemonic (`"i32.load8_u"`), for report rows and proof names.
+    pub mnemonic: &'static str,
+    /// The single opcode byte that encodes this access.
+    pub byte: u8,
+    /// Load (with its extension) or store.
+    pub direction: WasmMemDirection,
+    /// Bits actually touched in linear memory (8, 16, 32 or 64) — the access
+    /// width the `N` in `loadN`/`storeN` names, or the full width when absent.
+    pub access_bits: u32,
+    /// Width of the value on the value stack (32 for `i32`/`f32`, 64 for
+    /// `i64`/`f64`).
+    pub value_bits: u32,
+    /// True for the `f32`/`f64` forms. At the VALUE level an FP access is
+    /// bit-identical to the same-width integer access (wasm does NOT canonicalize
+    /// NaN on load/store), so the int/FP pair is deliberately NOT refutable by a
+    /// value obligation — the discriminator is the wasm TYPE, checked by module
+    /// validation. Recorded here so the audit row can say that out loud.
+    pub is_fp: bool,
+}
+
+impl WasmMemOp {
+    /// Bytes touched in linear memory by this access.
+    pub fn access_bytes(self) -> u32 {
+        self.access_bits / 8
+    }
+
+    /// True for a load.
+    pub fn is_load(self) -> bool {
+        matches!(self.direction, WasmMemDirection::Load(_))
+    }
+
+    /// The load's extension, or `None` for a store.
+    pub fn extend(self) -> Option<WasmLoadExtend> {
+        match self.direction {
+            WasmMemDirection::Load(e) => Some(e),
+            WasmMemDirection::Store => None,
+        }
+    }
+}
+
+/// Decode a wasm linear-memory opcode byte (spec §5.4.4, 0x28..=0x3e).
+///
+/// `None` for every non-memory byte AND for `memory.size` (0x3f) / `memory.grow`
+/// (0x40) — those are memory-META instructions, not accesses; they decode through
+/// [`decode_memory_meta`] and are honestly DEFERRED (the memory model here has no
+/// page-count component). Fails closed on anything else.
+pub fn decode_mem_op(op_byte: u8) -> Option<WasmMemOp> {
+    use WasmLoadExtend::{None as NoExt, Sign, Zero};
+    use WasmMemDirection::{Load, Store};
+    let op = |mnemonic, byte, direction, access_bits, value_bits, is_fp| WasmMemOp {
+        mnemonic,
+        byte,
+        direction,
+        access_bits,
+        value_bits,
+        is_fp,
+    };
+    Some(match op_byte {
+        // ---- full-width loads ----
+        0x28 => op("i32.load", 0x28, Load(NoExt), 32, 32, false),
+        0x29 => op("i64.load", 0x29, Load(NoExt), 64, 64, false),
+        0x2a => op("f32.load", 0x2a, Load(NoExt), 32, 32, true),
+        0x2b => op("f64.load", 0x2b, Load(NoExt), 64, 64, true),
+        // ---- sub-word loads into i32 (extension is the low bit of the pair) ----
+        0x2c => op("i32.load8_s", 0x2c, Load(Sign), 8, 32, false),
+        0x2d => op("i32.load8_u", 0x2d, Load(Zero), 8, 32, false),
+        0x2e => op("i32.load16_s", 0x2e, Load(Sign), 16, 32, false),
+        0x2f => op("i32.load16_u", 0x2f, Load(Zero), 16, 32, false),
+        // ---- sub-word loads into i64 ----
+        0x30 => op("i64.load8_s", 0x30, Load(Sign), 8, 64, false),
+        0x31 => op("i64.load8_u", 0x31, Load(Zero), 8, 64, false),
+        0x32 => op("i64.load16_s", 0x32, Load(Sign), 16, 64, false),
+        0x33 => op("i64.load16_u", 0x33, Load(Zero), 16, 64, false),
+        0x34 => op("i64.load32_s", 0x34, Load(Sign), 32, 64, false),
+        0x35 => op("i64.load32_u", 0x35, Load(Zero), 32, 64, false),
+        // ---- full-width stores ----
+        0x36 => op("i32.store", 0x36, Store, 32, 32, false),
+        0x37 => op("i64.store", 0x37, Store, 64, 64, false),
+        0x38 => op("f32.store", 0x38, Store, 32, 32, true),
+        0x39 => op("f64.store", 0x39, Store, 64, 64, true),
+        // ---- narrowing stores (the value is wrapped to the access width) ----
+        0x3a => op("i32.store8", 0x3a, Store, 8, 32, false),
+        0x3b => op("i32.store16", 0x3b, Store, 16, 32, false),
+        0x3c => op("i64.store8", 0x3c, Store, 8, 64, false),
+        0x3d => op("i64.store16", 0x3d, Store, 16, 64, false),
+        0x3e => op("i64.store32", 0x3e, Store, 32, 64, false),
+        _ => return None,
+    })
+}
+
+/// The memory-META instructions (spec §5.4.4): `memory.size` (0x3f) and
+/// `memory.grow` (0x40). Decoded so they are VISIBLE to the audit rather than
+/// falling off the table; their obligations are honestly DEFERRED because the
+/// linear-memory model here is an unbounded byte array with NO page-count
+/// component (see `wasm_value_domain::WASM_VALUE_DOMAIN_DEFERRALS`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WasmMemoryMetaOp {
+    /// `memory.size` (0x3f 0x00) — pushes the current size in 64 KiB pages.
+    Size,
+    /// `memory.grow` (0x40 0x00) — pops a page delta, grows the memory, pushes
+    /// the PREVIOUS size, or -1 if the growth was refused.
+    Grow,
+}
+
+/// Decode `memory.size` (0x3f) / `memory.grow` (0x40). `None` otherwise.
+pub fn decode_memory_meta(op_byte: u8) -> Option<WasmMemoryMetaOp> {
+    Some(match op_byte {
+        0x3f => WasmMemoryMetaOp::Size,
+        0x40 => WasmMemoryMetaOp::Grow,
+        _ => return None,
+    })
+}
+
+/// A wasm SIGN-EXTENSION operator (spec §5.4.6, 0xc0..=0xc4) — the single-opcode
+/// form of the narrow-width re-normalization an `i32`/`i64`-carried `i8`/`i16`/
+/// `i32` value needs after a wrapping arithmetic op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WasmSignExtendOp {
+    /// The spec mnemonic (`"i32.extend8_s"`).
+    pub mnemonic: &'static str,
+    /// The single opcode byte.
+    pub byte: u8,
+    /// The narrow width being sign-extended FROM (8, 16 or 32).
+    pub from_bits: u32,
+    /// The carrier width (32 for the `i32.*` forms, 64 for the `i64.*` forms).
+    pub value_bits: u32,
+}
+
+/// Decode a wasm sign-extension operator byte (0xc0..=0xc4). `None` otherwise.
+pub fn decode_sign_extend(op_byte: u8) -> Option<WasmSignExtendOp> {
+    let op = |mnemonic, byte, from_bits, value_bits| WasmSignExtendOp {
+        mnemonic,
+        byte,
+        from_bits,
+        value_bits,
+    };
+    Some(match op_byte {
+        0xc0 => op("i32.extend8_s", 0xc0, 8, 32),
+        0xc1 => op("i32.extend16_s", 0xc1, 16, 32),
+        0xc2 => op("i64.extend8_s", 0xc2, 8, 64),
+        0xc3 => op("i64.extend16_s", 0xc3, 16, 64),
+        0xc4 => op("i64.extend32_s", 0xc4, 32, 64),
+        _ => return None,
+    })
+}
+
+// --- P3 memory encoders (generalized from the i32/i64 pair above) ------------
+
+/// Write the LOW `n_bytes` of `val` at `addr`, little-endian — the machine model
+/// of `iN.store` / `iN.storeM` / `fN.store`. The truncation to `n_bytes` is the
+/// storeM semantics, not an approximation.
+pub fn encode_store_n(mem: SmtExpr, addr: SmtExpr, val: SmtExpr, n_bytes: u32) -> SmtExpr {
+    store_bytes(mem, &addr, &val, n_bytes)
+}
+
+/// Read `n_bytes` at `addr`, little-endian, as an `n_bytes * 8`-bit value — the
+/// RAW access, before any load extension.
+pub fn encode_load_n(mem: SmtExpr, addr: SmtExpr, n_bytes: u32) -> SmtExpr {
+    load_bytes(&mem, &addr, n_bytes)
+}
+
+/// The machine model of a decoded wasm LOAD: read `op.access_bits` bits
+/// little-endian at `addr`, then apply the decoded EXTENSION up to
+/// `op.value_bits`.
+///
+/// `None` (fail closed) if `op` is a store, or if the widths are inconsistent
+/// (`access_bits > value_bits`) — a malformed decode is never silently modeled.
+pub fn encode_mem_load(mem: SmtExpr, addr: SmtExpr, op: WasmMemOp) -> Option<SmtExpr> {
+    let extend = op.extend()?;
+    if op.access_bits > op.value_bits {
+        return None;
+    }
+    let raw = encode_load_n(mem, addr, op.access_bytes());
+    let extra = op.value_bits - op.access_bits;
+    Some(match extend {
+        WasmLoadExtend::None => {
+            if extra != 0 {
+                return None;
+            }
+            raw
+        }
+        WasmLoadExtend::Zero => {
+            if extra == 0 {
+                return None;
+            }
+            raw.zero_ext(extra)
+        }
+        WasmLoadExtend::Sign => {
+            if extra == 0 {
+                return None;
+            }
+            raw.sign_ext(extra)
+        }
+    })
+}
+
+/// The machine model of a decoded wasm STORE: write the low `op.access_bits` of
+/// `val` at `addr`, little-endian. `None` (fail closed) if `op` is a load.
+pub fn encode_mem_store(
+    mem: SmtExpr,
+    addr: SmtExpr,
+    val: SmtExpr,
+    op: WasmMemOp,
+) -> Option<SmtExpr> {
+    if op.is_load() {
+        return None;
+    }
+    Some(encode_store_n(mem, addr, val, op.access_bytes()))
+}
+
+// --- Narrow-width (i32/i64-carried u8/u16/i8/i16) normalization --------------
+//
+// wasm has no value type narrower than `i32`, so a trust-ir `U8`/`I8`/`U16`/`I16`
+// is CARRIED in an `i32` (and a narrow `i64`-domain value in an `i64`). The
+// carrier only represents the narrow value faithfully while it satisfies the
+// WIDTH INVARIANT — `x == zext_n(x[n-1:0])` for an unsigned narrow type,
+// `x == sext_n(x[n-1:0])` for a signed one. wasm's wrapping arithmetic does not
+// preserve that invariant, so the backend must RE-NORMALIZE after every narrow
+// op. These are the two normalization sequences a wasm backend can emit.
+
+/// UNSIGNED narrow re-normalization: `x & (2^n - 1)`, emitted as
+/// `i32.const 2^n-1; iN.and` (0x71 / 0x83). Establishes the `u8`/`u16` width
+/// invariant on the carrier.
+pub fn encode_narrow_mask_u(x: SmtExpr, n: u32) -> SmtExpr {
+    let width = x.bv_width();
+    let mask = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+    x.bvand(SmtExpr::bv_const(mask, width))
+}
+
+/// SIGNED narrow re-normalization WITHOUT the 0xc0-block operators:
+/// `(x << (W - n)) >>s (W - n)`, emitted as `i32.const W-n; iN.shl; i32.const
+/// W-n; iN.shr_s` (0x74/0x75 for i32, 0x86/0x87 for i64). Built from the
+/// FAITHFUL amount-MASKED wasm shift encoders — the constant amount `W - n` is
+/// below the width so the mask is the identity, but modeling it through the real
+/// encoder keeps the machine side honest.
+pub fn encode_narrow_shift_sext(x: SmtExpr, n: u32) -> SmtExpr {
+    let width = x.bv_width();
+    let amount = SmtExpr::bv_const(u64::from(width - n), width);
+    let shifted = encode_shl(x, amount.clone(), width);
+    encode_shr_s(shifted, amount, width)
+}
+
+/// SIGNED narrow re-normalization via the single-opcode form
+/// `iN.extendM_s` (0xc0..=0xc4): `sext(x[m-1:0])` back to the carrier width.
+pub fn encode_sign_extend_in_place(x: SmtExpr, from_bits: u32) -> SmtExpr {
+    let width = x.bv_width();
+    x.extract(from_bits - 1, 0).sign_ext(width - from_bits)
+}
+
+/// The UNSIGNED narrow width invariant as a Bool: `x == zext_n(x[n-1:0])`, i.e.
+/// the carrier's bits above `n` are all zero.
+pub fn narrow_invariant_u(x: SmtExpr, n: u32) -> SmtExpr {
+    let width = x.bv_width();
+    let low = x.clone().extract(n - 1, 0).zero_ext(width - n);
+    x.eq_expr(low)
+}
+
+/// The SIGNED narrow width invariant as a Bool: `x == sext_n(x[n-1:0])`, i.e.
+/// the carrier's bits above `n` all replicate bit `n-1`.
+pub fn narrow_invariant_s(x: SmtExpr, n: u32) -> SmtExpr {
+    let width = x.bv_width();
+    let low = x.clone().extract(n - 1, 0).sign_ext(width - n);
+    x.eq_expr(low)
 }

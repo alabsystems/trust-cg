@@ -60,23 +60,12 @@ use trust_cg_verify::proof_certificate::{
 use trust_cg_verify::verify::VerificationStrength;
 
 #[cfg(feature = "verify")]
-pub(crate) const PROOF_VERIFIER_STACK_SIZE: usize = 32 * 1024 * 1024;
-
-#[cfg(feature = "verify")]
 pub(crate) fn run_on_proof_verifier_stack<R, F>(name: &str, f: F) -> R
 where
     R: Send,
     F: FnOnce() -> R + Send,
 {
-    std::thread::scope(|scope| {
-        std::thread::Builder::new()
-            .name(name.to_string())
-            .stack_size(PROOF_VERIFIER_STACK_SIZE)
-            .spawn_scoped(scope, f)
-            .expect("failed to spawn proof verifier thread")
-            .join()
-            .expect("proof verifier thread panicked")
-    })
+    trust_cg_verify::resource_limits::run_on_proof_verifier_stack(name, f)
 }
 
 // ---------------------------------------------------------------------------

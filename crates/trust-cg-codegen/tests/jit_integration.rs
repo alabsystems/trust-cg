@@ -58,7 +58,11 @@ fn build_add() -> MachFunction {
     let add_id = func.push_inst(add);
     func.append_inst(entry, add_id);
 
-    let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+    // The AArch64 CFG-authority gate requires a `Ret` to carry EXACTLY the ABI
+    // return-register implicit-use alias set — the same set production isel
+    // attaches via `AppleAArch64ABI::required_return_pregs`. A bare `Ret` is
+    // malformed IR, not a shorthand.
+    let ret = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
     let ret_id = func.push_inst(ret);
     func.append_inst(entry, ret_id);
 
@@ -84,7 +88,7 @@ fn build_sub() -> MachFunction {
     let sub_id = func.push_inst(sub);
     func.append_inst(entry, sub_id);
 
-    let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+    let ret = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
     let ret_id = func.push_inst(ret);
     func.append_inst(entry, ret_id);
 
@@ -110,7 +114,7 @@ fn build_mul() -> MachFunction {
     let mul_id = func.push_inst(mul);
     func.append_inst(entry, mul_id);
 
-    let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+    let ret = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
     let ret_id = func.push_inst(ret);
     func.append_inst(entry, ret_id);
 
@@ -132,7 +136,7 @@ fn build_return_const() -> MachFunction {
     let mov_id = func.push_inst(mov);
     func.append_inst(entry, mov_id);
 
-    let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+    let ret = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
     let ret_id = func.push_inst(ret);
     func.append_inst(entry, ret_id);
 
@@ -154,7 +158,7 @@ fn build_negate() -> MachFunction {
     let neg_id = func.push_inst(neg);
     func.append_inst(entry, neg_id);
 
-    let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+    let ret = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
     let ret_id = func.push_inst(ret);
     func.append_inst(entry, ret_id);
 
@@ -169,7 +173,7 @@ fn build_identity() -> MachFunction {
     let mut func = MachFunction::new("identity".to_string(), sig);
     let entry = func.entry;
 
-    let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+    let ret = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
     let ret_id = func.push_inst(ret);
     func.append_inst(entry, ret_id);
 
@@ -272,7 +276,7 @@ fn build_factorial() -> MachFunction {
     func.append_inst(bb_done, mov_result_id);
 
     // RET
-    let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+    let ret = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
     let ret_id = func.push_inst(ret);
     func.append_inst(bb_done, ret_id);
 
@@ -329,7 +333,7 @@ fn build_caller(caller_name: &str, callee_name: &str) -> MachFunction {
     func.append_inst(entry, ldp_id);
 
     // RET
-    let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+    let ret = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
     let ret_id = func.push_inst(ret);
     func.append_inst(entry, ret_id);
 
@@ -389,7 +393,7 @@ fn build_large_filler_function(name: &str, filler_count: usize) -> MachFunction 
         func.append_inst(entry, filler_id);
     }
 
-    let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+    let ret = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
     let ret_id = func.push_inst(ret);
     func.append_inst(entry, ret_id);
 
@@ -1061,7 +1065,7 @@ fn build_extern_caller(callee_symbol: &str) -> MachFunction {
     func.append_inst(entry, ldp_id);
 
     // RET
-    let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+    let ret = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
     let ret_id = func.push_inst(ret);
     func.append_inst(entry, ret_id);
 
@@ -3653,7 +3657,7 @@ fn test_jit_shared_veneer() {
         );
         let ldp_id = func.push_inst(ldp);
         func.append_inst(entry, ldp_id);
-        let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+        let ret = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
         let ret_id = func.push_inst(ret);
         func.append_inst(entry, ret_id);
         func
@@ -3693,7 +3697,7 @@ fn test_jit_shared_veneer() {
         );
         let ldp_id = func.push_inst(ldp);
         func.append_inst(entry, ldp_id);
-        let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+        let ret = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
         let ret_id = func.push_inst(ret);
         func.append_inst(entry, ret_id);
         func
@@ -4273,7 +4277,7 @@ fn build_two_arg_extern_caller(caller_name: &str, callee_symbol: &str) -> MachFu
     func.append_inst(entry, ldp_id);
 
     // RET
-    let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+    let ret = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
     let ret_id = func.push_inst(ret);
     func.append_inst(entry, ret_id);
 
@@ -4323,7 +4327,7 @@ fn build_ptr_i64_extern_caller(caller_name: &str, callee_symbol: &str) -> MachFu
     func.append_inst(entry, ldp_id);
 
     // RET
-    let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+    let ret = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
     let ret_id = func.push_inst(ret);
     func.append_inst(entry, ret_id);
 
@@ -4422,7 +4426,7 @@ fn build_call_writer_then_reload(callee_symbol: &str) -> MachFunction {
     let align_pad_id = func.push_inst(align_pad);
     func.append_inst(entry, align_pad_id);
 
-    let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+    let ret = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
     let ret_id = func.push_inst(ret);
     func.append_inst(entry, ret_id);
 

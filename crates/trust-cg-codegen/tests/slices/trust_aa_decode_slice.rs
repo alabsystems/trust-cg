@@ -1224,9 +1224,7 @@ fn decode_conditional_select(word: u32) -> Result<Instruction, DecErr> {
 
 fn decode_fp_scalar(word: u32) -> Result<Instruction, DecErr> {
     let ftype = bits(word, 22, 2) as u8;
-    if let Err(e) = validate_fp_ftype(word, ftype) {
-        return Err(e);
-    }
+    validate_fp_ftype(word, ftype)?;
 
     if bits(word, 10, 3) == 0b100 {
         return decode_fp_immediate(word, ftype);
@@ -1258,9 +1256,7 @@ fn decode_fp_scalar(word: u32) -> Result<Instruction, DecErr> {
             })),
             0b0001 => {
                 let dst_ftype = bits(word, 15, 2) as u8;
-                if let Err(e) = validate_fp_ftype(word, dst_ftype) {
-                    return Err(e);
-                }
+                validate_fp_ftype(word, dst_ftype)?;
                 Ok(Instruction::FpPrecisionConvert(FpPrecisionConvert {
                     src_ftype: ftype,
                     dst_ftype,
@@ -1417,9 +1413,7 @@ fn decode_neon_three_same(word: u32) -> Result<Instruction, DecErr> {
         | (true, 0b10001)
         | (false, 0b00110)
         | (false, 0b00111) => {
-            if let Err(e) = validate_neon_vector_arrangement(word, q, size) {
-                return Err(e);
-            }
+            validate_neon_vector_arrangement(word, q, size)?;
             return Ok(Instruction::NeonIntVec3Same(NeonIntVec3Same {
                 q,
                 u,
@@ -1457,9 +1451,7 @@ fn decode_neon_three_same(word: u32) -> Result<Instruction, DecErr> {
         | (false, true, 0b110101)
         | (true, false, 0b110111)
         | (true, false, 0b111111) => {
-            if let Err(e) = validate_neon_fp_arrangement(word, q, sz) {
-                return Err(e);
-            }
+            validate_neon_fp_arrangement(word, q, sz)?;
             Ok(Instruction::NeonFpVec3Same(NeonFpVec3Same {
                 q,
                 u,
@@ -1491,10 +1483,7 @@ fn decode_neon_modified_immediate(word: u32) -> Result<Instruction, DecErr> {
 fn decode_neon_dup_element(word: u32) -> Result<Instruction, DecErr> {
     let q = bit(word, 30);
     let imm5 = bits(word, 16, 5) as u8;
-    let (element_size, lane) = match decode_neon_element_imm5(word, imm5) {
-        Ok(value) => value,
-        Err(e) => return Err(e),
-    };
+    let (element_size, lane) = decode_neon_element_imm5(word, imm5)?;
 
     if !q && matches!(element_size, NeonElementSize::D) {
         return Err(DecErr::Unallocated);
@@ -1513,10 +1502,7 @@ fn decode_neon_dup_general(word: u32) -> Result<Instruction, DecErr> {
     let q = bit(word, 30);
     let imm5 = bits(word, 16, 5) as u8;
     let opcode = bits(word, 11, 4);
-    let (element_size, lane) = match decode_neon_element_imm5(word, imm5) {
-        Ok(value) => value,
-        Err(e) => return Err(e),
-    };
+    let (element_size, lane) = decode_neon_element_imm5(word, imm5)?;
 
     if opcode == 0b0011 {
         if !q {
@@ -1554,9 +1540,7 @@ fn decode_neon_ldst_single_post_imm(word: u32) -> Result<Instruction, DecErr> {
 
     let q = bit(word, 30);
     let size = bits(word, 10, 2) as u8;
-    if let Err(e) = validate_neon_vector_arrangement(word, q, size) {
-        return Err(e);
-    }
+    validate_neon_vector_arrangement(word, q, size)?;
 
     Ok(Instruction::NeonLdStSinglePostImm(NeonLdStSinglePostImm {
         q,

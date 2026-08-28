@@ -248,6 +248,142 @@ fn run(func: &mut MachFunction) -> (bool, usize) {
 // POSITIVE
 // ---------------------------------------------------------------------------
 
+/// The bridge's TOP-TESTED `for i in 0..N { a[i] = v }` shape (v2_memfill's
+/// main: header holds the continue test, body stores, latch writes the iv
+/// back) — the shape on which the pass re-fired on its own remainder. The
+/// rotated `build_fill` shape happens not to re-fire, so it cannot pin the
+/// guard; this one does.
+/// ```text
+/// bb0:    x10 = 0; w3 = val; B header
+/// header: cmp x10, N; b.lt body; B exit
+/// body:   x20 = x0 + x10; strb w3, [x20]; x11 = x10 + 1; B latch
+/// latch:  x10 = x11 + 0; B header
+/// exit:   ret
+/// ```
+fn build_fill_top_tested(n: i64) -> MachFunction {
+    let mut func = MachFunction::new("k".to_string(), Signature::new(vec![], vec![]));
+    let bb0 = func.entry;
+    let header = func.create_block();
+    let body = func.create_block();
+    let latch = func.create_block();
+    let exit = func.create_block();
+    let push = |func: &mut MachFunction, blk: BlockId, op, ops| {
+        let id = func.push_inst(MachInst::new(op, ops));
+        func.append_inst(blk, id);
+    };
+    use AArch64Opcode::*;
+    push(&mut func, bb0, Movz, vec![w(3), i(0x5a)]);
+    push(&mut func, bb0, Movz, vec![x(10), i(0)]);
+    push(&mut func, bb0, B, vec![bl(header)]);
+    push(&mut func, header, CmpRI, vec![x(10), i(n)]);
+    push(&mut func, header, BCond, vec![i(CC_LT), bl(body)]);
+    push(&mut func, header, B, vec![bl(exit)]);
+    push(&mut func, body, AddRR, vec![x(20), x(0), x(10)]);
+    push(&mut func, body, StrbRI, vec![w(3), x(20), i(0)]);
+    push(&mut func, body, AddRI, vec![x(11), x(10), i(1)]);
+    push(&mut func, body, B, vec![bl(latch)]);
+    push(&mut func, latch, AddRI, vec![x(10), x(11), i(0)]);
+    push(&mut func, latch, B, vec![bl(header)]);
+    push(&mut func, exit, Ret, vec![]);
+    func.add_edge(bb0, header);
+    func.add_edge(header, body);
+    func.add_edge(header, exit);
+    func.add_edge(body, latch);
+    func.add_edge(latch, header);
+    func
+}
+
+/// The pass must be IDEMPOTENT: `apply` keeps the scalar loop as the remainder
+/// of the vector loop (same iv, advanced in place), and before the guard in
+/// `recognize` that remainder was recognized AGAIN on every fixpoint iteration
+/// (v2_memfill: +8 instructions per iteration, never converging). A second
+/// run must change nothing.
+fn assert_idempotent(mut func: MachFunction, label: &str) {
+    let (changed, fired) = run(&mut func);
+    assert!(changed && fired == 1, "{label}: first run should vectorize");
+    let (insts, blocks) = (func.insts.len(), func.blocks.len());
+    for again in 2..=4 {
+        let (changed, fired) = run(&mut func);
+        assert!(
+            !changed && fired == 0,
+            "{label}: run {again} re-vectorized the remainder loop"
+        );
+        assert_eq!(
+            func.insts.len(),
+            insts,
+            "{label}: run {again} added instructions"
+        );
+        assert_eq!(
+            func.blocks.len(),
+            blocks,
+            "{label}: run {again} added blocks"
+        );
+    }
+}
+
+/// Through the REAL O3 fixpoint (`run_to_fixpoint(.., 4)`, the pipeline the
+/// bridge runs): the loop must converge — a non-idempotent vectorizer keeps
+/// re-vectorizing its own remainder after cfg-simplify/gvn clean up, so the
+/// fixpoint hits the 4-iteration cap and the function GROWS (v2_memfill
+/// +8 / p7_sieve +44 instructions per iteration before the guards).
+#[test]
+fn o3_fixpoint_converges_without_regrowth() {
+    use crate::pipeline::{OptLevel, OptimizationPipeline};
+    let mut func = build_fill_top_tested(8192);
+    let mut pm = OptimizationPipeline::new(OptLevel::O3).build_pass_manager();
+    let stats = pm.run_to_fixpoint(&mut func, 4);
+    assert!(
+        stats.iterations < 4,
+        "byte fill: O3 fixpoint hit the iteration cap ({} iterations) — a pass keeps re-firing",
+        stats.iterations
+    );
+    // No nested vector loops: a single vectorized copy of the loop.
+    let vector_headers = func
+        .blocks
+        .iter()
+        .flat_map(|b| b.insts.iter())
+        .filter(|&&id| matches!(func.inst(id).opcode, AArch64Opcode::NeonMovi))
+        .count();
+    assert!(
+        vector_headers <= 8,
+        "byte fill: {vector_headers} NeonMovi — nested vector loops"
+    );
+}
+
+#[test]
+fn second_run_is_a_no_op_runtime_bound() {
+    assert_idempotent(
+        build_fill(Cfg {
+            elem_size: 1,
+            bound: BoundK::Runtime,
+            val: Val::Invariant,
+            variant: Variant::Good,
+        }),
+        "runtime-bound byte fill",
+    );
+}
+
+#[test]
+fn second_run_is_a_no_op_top_tested() {
+    assert_idempotent(
+        build_fill_top_tested(8192),
+        "top-tested byte fill (v2_memfill shape)",
+    );
+}
+
+#[test]
+fn second_run_is_a_no_op_const_bound() {
+    assert_idempotent(
+        build_fill(Cfg {
+            elem_size: 4,
+            bound: BoundK::Const(4096),
+            val: Val::Invariant,
+            variant: Variant::Good,
+        }),
+        "const-bound u32 fill",
+    );
+}
+
 #[test]
 fn fires_on_byte_fill_helper_shape() {
     let mut func = build_fill(Cfg {

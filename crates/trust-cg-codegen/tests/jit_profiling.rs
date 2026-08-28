@@ -50,7 +50,11 @@ fn build_return_const(name: &str, value: u16) -> MachFunction {
     let mov_id = func.push_inst(mov);
     func.append_inst(entry, mov_id);
 
-    let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+    // The signature returns [I64], which the Apple AArch64 ABI classifies as
+    // ArgLocation::Reg(X0). `RET` must therefore carry exactly {X0} as its
+    // implicit-use alias set, matching what production ISel annotates via
+    // `AppleAArch64ABI::required_return_pregs(&sig_returns)`.
+    let ret = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
     let ret_id = func.push_inst(ret);
     func.append_inst(entry, ret_id);
 

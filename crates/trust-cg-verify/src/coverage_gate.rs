@@ -50,6 +50,16 @@
 //! default `Statistical(N)` strength is deterministic regression sampling, not a
 //! formal proof. Formal/solver-backed strength is reported separately.
 //!
+//! Not every [`GateArch`] is keyed on an opcode enum. The WebAssembly lane also
+//! inventories three MODULE-level evidence families whose unit has no enum
+//! variant to hang a row on — [`GateArch::WasmValueDomain`] (keyed on the spec
+//! opcode BYTE), [`GateArch::WasmCfgStructural`] (keyed on the anti-tautology
+//! mutant), and [`GateArch::WasmAbi`] (keyed on the family's own obligations,
+//! structural checks and byte-mutation guards). They obey exactly the same
+//! rules: credit needs live discharge, and a family that cannot honestly speak
+//! registers a NAMED DEFERRAL that stays RED IN the denominator rather than
+//! being allowlisted out or given a weak obligation.
+//!
 //! # Example
 //!
 //! ```rust,no_run
@@ -131,6 +141,47 @@ pub enum GateArch {
     RiscV,
     /// WebAssembly backend (`WasmOpcode`) — the 4th backend, a STACK MACHINE.
     Wasm,
+    /// WebAssembly P3 **VALUE DOMAIN** — the sub-word / FP linear-memory
+    /// accesses (spec §5.4.4, bytes 0x28..=0x40), the sign-extension operators
+    /// (§5.4.6, 0xc0..=0xc4), and the named deferrals (`br_table`,
+    /// `memory.size`/`memory.grow`, data segments).
+    ///
+    /// A SEPARATE arch rather than more [`GateArch::Wasm`] rows because this
+    /// inventory is keyed on the SPEC OPCODE BYTE: `trust_cg_ir::WasmOpcode`
+    /// enumerates only the two full-width integer load/store pairs, so the
+    /// sub-word and FP accesses have no enum variant to hang a row on. Keying on
+    /// the byte is not a workaround — the byte is what the backend emits and
+    /// what the verifier decodes, and it keeps the P3 surface COUNTED from the
+    /// moment the obligations exist instead of waiting on an enum to catch up.
+    /// When `WasmOpcode` grows the variants these rows merge into
+    /// [`GateArch::Wasm`] unchanged.
+    WasmValueDomain,
+    /// WebAssembly P4 **CFG STRUCTURAL** family (`crate::wasm_cfg_proofs`) — the
+    /// per-compile necessary condition on the relooper's output: label liveness,
+    /// branch operand discipline, `br_table` uniformity, join heights and types,
+    /// bracket structure, and function-label arity.
+    ///
+    /// A SEPARATE arch for the same reason [`GateArch::WasmValueDomain`] is one:
+    /// the unit is not a `WasmOpcode` variant but a MODULE-level property, so
+    /// there is no enum row to hang it on. The credit unit here is the family's
+    /// ANTI-TAUTOLOGY MUTANT — a deliberately-wrong module the checker must
+    /// refute — plus the reference module the checker must accept. The seven
+    /// invariant STATEMENTS are listed as excluded rows pointing at those mutant
+    /// rows, so a statement is never counted as its own evidence, and the five
+    /// named deferrals (relooper bisimulation first among them) plus the two
+    /// measured blind spots stay RED IN the denominator.
+    WasmCfgStructural,
+    /// WebAssembly P4 **MEMORY / CALL-ABI** families (`crate::wasm_abi_proofs`) —
+    /// shadow-stack frame refinement (family 2) and the call / table ABI
+    /// discipline (family 3), over a corpus of REAL emitted module bytes.
+    ///
+    /// Rows are the family's own units: one per reconstructed SMT frame
+    /// obligation, one per decidable structural check over the decoded module,
+    /// one per anti-tautology byte-mutation guard, one per fail-closed refusal,
+    /// and one per named deferral. The nine deferrals — five of which are the
+    /// HOST's under `crates/trust-cg-codegen/src/wasm/OWNERSHIP.md` — stay RED IN
+    /// the denominator, never allowlisted out.
+    WasmAbi,
 }
 
 impl std::fmt::Display for GateArch {
@@ -140,6 +191,9 @@ impl std::fmt::Display for GateArch {
             GateArch::X86_64 => f.write_str("x86_64"),
             GateArch::RiscV => f.write_str("riscv"),
             GateArch::Wasm => f.write_str("wasm"),
+            GateArch::WasmValueDomain => f.write_str("wasm-value-domain"),
+            GateArch::WasmCfgStructural => f.write_str("wasm-cfg-structural"),
+            GateArch::WasmAbi => f.write_str("wasm-abi"),
         }
     }
 }
@@ -433,6 +487,9 @@ impl CoverageGate {
                 .iter()
                 .map(|&op| self.audit_wasm(op))
                 .collect(),
+            GateArch::WasmValueDomain => self.audit_wasm_value_domain_rows(),
+            GateArch::WasmCfgStructural => self.audit_wasm_cfg_rows(),
+            GateArch::WasmAbi => self.audit_wasm_abi_rows(),
         };
         CoverageReport { arch, rows }
     }
@@ -744,6 +801,30 @@ impl CoverageGate {
                         ),
                     };
                 }
+                // P4: the two scalar CONSTANT forms are credited by a different
+                // path than reconstruction, because reconstruction cannot help
+                // them — `const == const` is a self-equality. Their evidence is
+                // an INDEPENDENT spec-derived signed-LEB decode of the REAL
+                // emitted immediate (plus a canonical-length check, since the
+                // spec admits padded encodings a decode-only check cannot see).
+                if matches!(opcode, WasmOpcode::I32Const | WasmOpcode::I64Const)
+                    && crate::wasm_encoding_proofs::const_immediate_discharges_valid(
+                        opcode.opcode_byte(),
+                    )
+                {
+                    return OpcodeAuditRow {
+                        opcode_display: display,
+                        class: OpcodeClass::EmittableNeedsProof,
+                        finding: None,
+                        note: "RECONSTRUCTED by DECODING the real emitted signed-LEB128 \
+                               immediate with an INDEPENDENT spec-derived sN decoder \
+                               (wasm_encoding_proofs): every captured immediate decodes to \
+                               its intended constant AT CANONICAL LENGTH, and every mutation \
+                               of those bytes REFUTES. Says nothing about whether the \
+                               LOWERING chose the right constant."
+                            .to_string(),
+                    };
+                }
                 // Reconstruction did NOT credit this op. If it is a known value-
                 // bearing op we are HONESTLY DEFERRING (the native evaluator cannot
                 // faithfully model it), surface it as a `DeferredUnfaithfulModel`
@@ -769,6 +850,295 @@ impl CoverageGate {
                 }
             }
         }
+    }
+
+    // -- WebAssembly P3 value domain (byte-keyed) --------------------------
+
+    /// Rows for [`GateArch::WasmValueDomain`]: the 28 credited P3 opcode bytes
+    /// in spec order, then the 4 named deferrals.
+    fn audit_wasm_value_domain_rows(&self) -> Vec<OpcodeAuditRow> {
+        let mut rows: Vec<OpcodeAuditRow> = crate::wasm_value_domain::all_wasm_value_domain_bytes()
+            .into_iter()
+            .map(|byte| self.audit_wasm_value_domain_byte(byte))
+            .collect();
+        rows.extend(
+            crate::wasm_value_domain::WASM_VALUE_DOMAIN_DEFERRALS
+                .iter()
+                .map(wasm_value_domain_deferral_row),
+        );
+        rows
+    }
+
+    /// Audit ONE P3 value-domain opcode byte.
+    ///
+    /// Credit is the same rule the other backends use — the machine side must be
+    /// RECONSTRUCTED from the real opcode byte and discharge `Valid` — with one
+    /// tightening: a P3 byte must clear EVERY obligation in its set, not one of
+    /// them. A store's value obligation alone cannot see a too-wide store, so
+    /// crediting on a partial set would credit exactly the slip the pair exists
+    /// to catch. There is no static-DB fallback: a byte whose set does not fully
+    /// discharge is reported RED, never quietly covered.
+    fn audit_wasm_value_domain_byte(&self, byte: u8) -> OpcodeAuditRow {
+        use crate::wasm_value_domain as vd;
+
+        let mnemonic = vd::value_domain_mnemonic(byte).unwrap_or("<not a P3 opcode>");
+        let display = format!("wasm::{mnemonic} (0x{byte:02x})");
+        let obligations = vd::obligations_for_byte(byte);
+        if obligations.is_empty() {
+            return OpcodeAuditRow {
+                opcode_display: display,
+                class: OpcodeClass::EmittableNeedsProof,
+                finding: Some(CoverageFinding::NoProofMapping),
+                note: "no P3 obligation is built for this byte — uncredited debt, not silent \
+                       trust"
+                    .to_string(),
+            };
+        }
+        if vd::value_domain_discharges_valid(byte, &self.config) {
+            let fp_note = match crate::wasm_semantics::decode_mem_op(byte) {
+                Some(op) if op.is_fp => {
+                    " NOTE: an f32/f64 access is bit-identical to the same-width integer access \
+                     (wasm does not canonicalize NaN on load/store), so an int/FP opcode swap is \
+                     NOT value-refutable — that discriminator is the wasm TYPE, checked by module \
+                     validation."
+                }
+                _ => "",
+            };
+            return OpcodeAuditRow {
+                opcode_display: display,
+                class: OpcodeClass::EmittableNeedsProof,
+                finding: None,
+                note: format!(
+                    "RECONSTRUCTED from the real 0x{byte:02x} opcode byte over a symbolic \
+                     byte-addressed memory — all {} obligation(s) evaluate Valid [reconstruction] \
+                     (default evaluator acceptance is regression evidence, NOT a formal \
+                     proof).{fp_note}",
+                    obligations.len()
+                ),
+            };
+        }
+        OpcodeAuditRow {
+            opcode_display: display,
+            class: OpcodeClass::EmittableNeedsProof,
+            finding: Some(CoverageFinding::ProofNotDischarged {
+                proof_name: obligations
+                    .first()
+                    .map(|ob| ob.name.clone())
+                    .unwrap_or_default(),
+                detail: "at least one obligation in the byte's set did not discharge Valid"
+                    .to_string(),
+            }),
+            note: "P3 value-domain byte did not fully reconstruct-discharge Valid".to_string(),
+        }
+    }
+
+    // -- WebAssembly P4 family 1: the CFG structural invariant -------------
+
+    /// Rows for [`GateArch::WasmCfgStructural`], in this order: the reference
+    /// module the checker must ACCEPT, the anti-tautology mutants it must
+    /// REFUTE, the mutants it is measured NOT to catch, the five named
+    /// deferrals, and finally the seven invariant STATEMENTS.
+    ///
+    /// The credit unit is deliberately the MUTANT, not the invariant. An
+    /// invariant is a sentence; what makes it evidence is a wrong module it
+    /// rejects, and only some of the seven have one in the family's own
+    /// no-argument battery (there is no `br_table` in the hand-encoded reference
+    /// module, for instance — the real corpus lives in the family's gate test,
+    /// which needs the backend this crate cannot depend on). Crediting all seven
+    /// off one battery would hand a statement the evidence of its neighbours, so
+    /// the statements are listed as EXCLUDED rows that name the mutant rows
+    /// carrying their teeth, and the mutant rows carry the credit.
+    fn audit_wasm_cfg_rows(&self) -> Vec<OpcodeAuditRow> {
+        use crate::wasm_cfg_proofs as cfg;
+
+        let mut rows = Vec::new();
+
+        // (1) The checker RUNS on a real module and accepts it. Without this row
+        //     a checker that refused everything would look perfect: every mutant
+        //     would be "refuted" and nothing would be credited for being right.
+        let verdict = cfg::check_module_structure(&cfg::correct_merge_nest_module());
+        let display = "wasm-cfg::reference module `merge_nest` HOLDS".to_string();
+        rows.push(match verdict.report() {
+            Some(report) => {
+                let t = report.totals();
+                OpcodeAuditRow {
+                    opcode_display: display,
+                    class: OpcodeClass::EmittableNeedsProof,
+                    finding: None,
+                    note: format!(
+                        "the structural invariant HOLDS on the family's hand-encoded merge-nest \
+                         module: {} function(s), {} instruction(s) given a typing rule, {} branch \
+                         label(s) resolved against the rebuilt control stack, {} join(s) height- \
+                         and type-checked, {} scope(s) matched. A NECESSARY CONDITION on the \
+                         structuring — not a bisimulation (see the RED headline deferral below)",
+                        t.functions,
+                        t.instructions,
+                        t.branch_labels_resolved,
+                        t.joins_checked,
+                        t.scopes_matched
+                    ),
+                }
+            }
+            None => OpcodeAuditRow {
+                opcode_display: display,
+                class: OpcodeClass::EmittableNeedsProof,
+                finding: Some(CoverageFinding::ProofNotDischarged {
+                    proof_name: "wasm_cfg_proofs::correct_merge_nest_module".to_string(),
+                    detail: verdict.to_string(),
+                }),
+                note: format!(
+                    "the checker did NOT accept its own reference module: {verdict}. An \
+                     inconclusive verdict is debt, not credit"
+                ),
+            },
+        });
+
+        // (2)/(3) The anti-tautology battery, reported exactly as it ran.
+        //
+        // `MutantOutcome` carries the name and the verdict but not the mutant's
+        // prose, and a deferral's `reason` must be `&'static`; `all_cfg_mutants`
+        // is the only place that prose lives, so it is looked up BY NAME rather
+        // than by position. A name with no match yields no prose instead of the
+        // wrong prose.
+        let descriptions: Vec<(&'static str, &'static str)> = cfg::all_cfg_mutants()
+            .iter()
+            .map(|m| (m.name, m.description))
+            .collect();
+        for outcome in cfg::run_cfg_mutants() {
+            let description = descriptions
+                .iter()
+                .find(|(name, _)| *name == outcome.name)
+                .map(|(_, d)| *d)
+                .unwrap_or("(no description registered for this mutant)");
+            rows.push(wasm_cfg_mutant_row(&outcome, description));
+        }
+
+        // (4) The named deferrals — RED IN the denominator, headline first.
+        rows.extend(cfg::WASM_CFG_DEFERRALS.iter().map(wasm_cfg_deferral_row));
+
+        // (5) The invariant statements, excluded with their evidence boundary.
+        rows.extend(cfg::WASM_CFG_INVARIANTS.iter().map(wasm_cfg_invariant_row));
+
+        rows
+    }
+
+    // -- WebAssembly P4 families 2/3: the memory / call ABI ----------------
+
+    /// Rows for [`GateArch::WasmAbi`], in this order: per fixture, the frame
+    /// obligations and structural checks the family states over REAL emitted
+    /// bytes, then any fail-closed refusal; then the anti-tautology guards; then
+    /// the nine named deferrals.
+    ///
+    /// Credit follows the same rule as every other family here — an SMT
+    /// obligation must be `Reconstructed`-provenanced AND discharge `Valid`, a
+    /// structural check must hold, a `MustRefute` guard must actually refute.
+    /// A refusal earns NO credit and is a RED row: a function the family could
+    /// not recognize is uncredited debt, never a silent skip.
+    fn audit_wasm_abi_rows(&self) -> Vec<OpcodeAuditRow> {
+        use crate::wasm_abi_proofs as abi;
+
+        let mut rows = Vec::new();
+        let report = abi::wasm_abi_family_report();
+
+        for error in &report.errors {
+            rows.push(OpcodeAuditRow {
+                opcode_display: format!("wasm-abi::UNMODELED FIXTURE ({error})"),
+                class: OpcodeClass::EmittableNeedsProof,
+                finding: Some(CoverageFinding::NoProofMapping),
+                note: "a corpus fixture could not be modeled at all, so it contributes no \
+                       obligation — uncredited debt, not silent trust"
+                    .to_string(),
+            });
+        }
+
+        for (fixture, evidence) in &report.per_fixture {
+            for ob in &evidence.obligations {
+                let display = format!("wasm-abi::{fixture}::{}", ob.name);
+                let reconstructed = ob.is_reconstructed();
+                let result = verify_by_evaluation_with_config(ob, &self.config);
+                if reconstructed && matches!(result, VerificationResult::Valid) {
+                    rows.push(OpcodeAuditRow {
+                        opcode_display: display,
+                        class: OpcodeClass::EmittableNeedsProof,
+                        finding: None,
+                        note: "RECONSTRUCTED from the REAL emitted frame arithmetic (the \
+                               prologue/alloca/epilogue instructions decoded out of the module \
+                               bytes) against the frame the trust-ir independently intends — \
+                               evaluates Valid [reconstruction] (default evaluator acceptance is \
+                               regression evidence, NOT a formal proof)"
+                            .to_string(),
+                    });
+                } else {
+                    rows.push(OpcodeAuditRow {
+                        opcode_display: display,
+                        class: OpcodeClass::EmittableNeedsProof,
+                        finding: Some(CoverageFinding::ProofNotDischarged {
+                            proof_name: ob.name.clone(),
+                            detail: if reconstructed {
+                                format!("{result:?}")
+                            } else {
+                                "obligation is not Reconstructed-provenanced, so it cannot earn \
+                                 reconstruction credit"
+                                    .to_string()
+                            },
+                        }),
+                        note: "wasm ABI frame obligation did not reconstruct-discharge Valid"
+                            .to_string(),
+                    });
+                }
+            }
+
+            for check in &evidence.structural {
+                let display = format!("wasm-abi::{fixture}::{}", check.name);
+                if check.ok {
+                    rows.push(OpcodeAuditRow {
+                        opcode_display: display,
+                        class: OpcodeClass::EmittableNeedsProof,
+                        finding: None,
+                        note: format!(
+                            "DECIDABLE structural equality between the DECODED real module and \
+                             the trust-ir's independently derived intent: {}. Settled by decoding, \
+                             not by a solver; its teeth are the byte-mutation guards below",
+                            check.detail
+                        ),
+                    });
+                } else {
+                    rows.push(OpcodeAuditRow {
+                        opcode_display: display,
+                        class: OpcodeClass::EmittableNeedsProof,
+                        finding: Some(CoverageFinding::ProofNotDischarged {
+                            proof_name: check.name.clone(),
+                            detail: check.detail.clone(),
+                        }),
+                        note: format!(
+                            "structural check FAILED on real emitted bytes: {}",
+                            check.detail
+                        ),
+                    });
+                }
+            }
+
+            for refusal in &evidence.refusals {
+                rows.push(OpcodeAuditRow {
+                    opcode_display: format!("wasm-abi::{fixture}::REFUSED ({refusal})"),
+                    class: OpcodeClass::EmittableNeedsProof,
+                    finding: Some(CoverageFinding::NoProofMapping),
+                    note: "the family could not recognize this emission and built NO obligation \
+                           for it — fail closed, so no credit"
+                        .to_string(),
+                });
+            }
+        }
+
+        // The anti-tautology guards: mutate the REAL bytes and require a failure.
+        for outcome in abi::all_wasm_abi_guards(&self.config) {
+            rows.push(wasm_abi_guard_row(outcome));
+        }
+
+        // The nine named deferrals — RED IN the denominator.
+        rows.extend(abi::WASM_ABI_DEFERRALS.iter().map(wasm_abi_deferral_row));
+
+        rows
     }
 
     // -- shared proof lookup + discharge ----------------------------------
@@ -1243,9 +1613,11 @@ pub fn classify_aarch64(opcode: AArch64Opcode) -> OpcodeClass {
         // Emitted at BOTH register widths; the width-polymorphic gate requires the
         // w32 AND w64 proofs (see `aarch64_width_polymorphic_proofs`).
         O::Ubfm | O::Sbfm => EmittableNeedsProof,
-        // BFM (bitfield INSERT — read-modify-write), ROR-immediate, and scalar
-        // RBIT (a SWAR bit-reversal
-        // butterfly) still lack a faithful per-opcode obligation.
+        // BFM (bitfield INSERT — read-modify-write) and scalar RBIT (a SWAR
+        // bit-reversal butterfly) still lack a faithful per-opcode obligation.
+        // ROR-immediate is credited by the per-instruction EXTR-alias
+        // reconstruction lane, including its baked immediate and register
+        // width; malformed shapes and the #0 move alias fail closed.
         O::Bfm | O::RorRI | O::Rbit => EmittableNeedsProof,
         // RECONSTRUCTION (task #63 Step 4): ORN/BIC are now CREDITED via OPERAND
         // RECONSTRUCTION. BIC rebuilds to `Rn & ~Rm` (trust_ir BandNot) and ORN to
@@ -1319,7 +1691,9 @@ pub fn classify_aarch64(opcode: AArch64Opcode) -> OpcodeClass {
         // the 8-aligned GOT slot G+A) — the ELF TLS sibling of LdrGot/LdrTlvp
         // above. In the production Certified object inventory the emitted TLS
         // rows promote through the same fail-closed composition as the ordinary
-        // eight: their dedicated value-proof lane plus the exact per-object ELF
+        // eight: the aarch64_elf_tls_reloc_proofs value lane (the ABI range
+        // constraints ride inside the obligations as preconditions, each with a
+        // paired drop-refutes negative control) plus the exact per-object ELF
         // reparse binding.
         O::LdrGottprel => EmittableNeedsProof,
         // LDRSW Xt,[Xn,Xm,LSL#2] (the jump-table scaled table-entry load) is
@@ -2049,6 +2423,17 @@ pub fn classify_x86(opcode: X86Opcode) -> OpcodeClass {
         // the same `x86_reconstruct_effective_address` half, and the access
         // WIDTH is fixed by the opcode (8) exactly as it is for MovRM8/MovMR8.
         O::MovRM8Sib | O::MovMR8Sib => EmittableNeedsProof,
+        // Memory-destination RMW ALU (XOR/ADD [mem], r64, base+disp and SIB
+        // forms). Covered by Phase-2 reconstruction credit: the
+        // `X86SourceOp::MemRmw` obligation composes the MemStore shape
+        // (address half + stored-value half) with the MemAlu shape (the real
+        // machine ALU encoder over a load of the same EA), on the shared
+        // `x86_reconstruct_effective_address` — a wrong base/index/scale/disp,
+        // a wrong ALU op, a dropped/wrong source, or a degenerate plain store
+        // all REFUTE. Nothing emits these opcodes yet (Stage 1: proofs +
+        // plumbing only; the Stage-2 fusion peephole is admission-gated on
+        // this very reconstruction discharging Valid).
+        O::XorMR | O::AddMR | O::XorMRSib | O::AddMRSib => EmittableNeedsProof,
         // Scalar-FP SIB loads: the COMPOSITION of the two proofs directly above.
         // The effective address is reconstructed by the same shared
         // `x86_reconstruct_effective_address` that proves MovRMSib (SOURCE = the
@@ -2314,6 +2699,13 @@ pub fn classify_x86(opcode: X86Opcode) -> OpcodeClass {
         | O::Psrad
         | O::Psllq
         | O::Psrlq
+        // PUNPCKLQDQ was PROMOTED OUT of the red-debt block above: it now maps
+        // (via `x86_opcode_to_source_op`) to the `X86SourceOp::PackLowQwords`
+        // RECONSTRUCTION — machine `encode_punpcklqdq` vs the independent
+        // `V2I64PackLanes` spec on the same operands' low lanes, credited
+        // non-degenerate by Reconstructed provenance (the PSADBW rule). Do NOT
+        // re-add it to the red-debt list.
+        | O::Punpcklqdq
         | O::Andpd
         | O::Andps => EmittableNeedsProof,
 
@@ -2338,14 +2730,13 @@ pub fn classify_x86(opcode: X86Opcode) -> OpcodeClass {
         //     is exactly a same-width i64x2 lane op on the qword lanes' low
         //     dwords, now backed by a refutable static-DB proof (see the
         //     EmittableNeedsProof arm above). Do NOT re-add it here.
-        // The ten actively emitted forms stay IN the denominator as explicit RED
+        // The nine actively emitted forms stay IN the denominator as explicit RED
         // debt. PINSR*/PEXTR* are split out below because the current pipeline
         // never selects them.
         O::Pshufd
         | O::Pmovmskb
         | O::MovdqaRR
         | O::Punpckldq
-        | O::Punpcklqdq
         | O::Ptest
         | O::Pblendvb
         | O::Punpcklbw
@@ -2566,10 +2957,12 @@ pub fn classify_riscv(opcode: RiscVOpcode) -> OpcodeClass {
 ///     their correctness is the relooper / memory-model / call-ABI argument, NOT
 ///     a per-instruction VALUE equivalence, so they are OUT of the denominator.
 ///     `nop`/`unreachable` are `PseudoOrTrap` (no value obligation, like x86 UD2).
-///   * Emitted scalar constants (`i32.const` / `i64.const`) are value
-///     materialization and remain denominator-bearing RED until the real LEB
-///     immediate is independently decoded and checked. Reserved, never-selected
-///     `v128.const` remains explicitly excluded.
+///   * Emitted scalar constants are value materialization and stay IN the
+///     denominator. `i32.const`/`i64.const` are credited by the INDEPENDENT
+///     spec-derived signed-LEB decode of the real emitted immediate;
+///     `f32.const`/`f64.const` carry a raw IEEE-754 payload that decoder does not
+///     reach, so they are denominator-bearing RED named deferrals. Reserved,
+///     never-selected `v128.const` remains explicitly excluded.
 ///   * Float/int conversions, reinterpret bitcasts, and popcnt are reconstructed
 ///     value ops and remain in the denominator.
 ///   * `f*.min`/`f*.max` are `FailClosedAllowlisted` as NEVER-SELECTED: the wasm
@@ -2720,6 +3113,13 @@ pub fn classify_wasm(opcode: WasmOpcode) -> OpcodeClass {
         // independent LEB-immediate decoding, const==const would be degenerate,
         // so they remain explicit RED denominator rows.
         O::I32Const | O::I64Const => EmittableNeedsProof,
+        // The FLOAT constants are emitted by the same `Const` lowering arm
+        // (`lower.rs` pushes 0x43/0x44 followed by the raw little-endian IEEE-754
+        // payload), so they are value materialization exactly as the integer
+        // constants are and belong IN this denominator. They are RED there: their
+        // immediates are not LEB128, so P4's signed-LEB decoder does not reach
+        // them — see `wasm_deferred_value_op_reason`.
+        O::F32Const | O::F64Const => EmittableNeedsProof,
         O::V128Const => FailClosedAllowlisted {
             reason: "v128.const is reserved in the opcode surface but never selected by the \
                      current wasm lowerer (V128 values are rejected); not in the emitted set",
@@ -2735,9 +3135,11 @@ pub fn classify_wasm(opcode: WasmOpcode) -> OpcodeClass {
 
         // ---- Linear memory load / store: memory-model family ----
         O::I32Load | O::I64Load | O::I32Store | O::I64Store => FailClosedAllowlisted {
-            reason: "linear-memory load/store — covered by the wasm memory-model family \
-                         (byte-addressed little-endian array theory, wasm_memory_proofs), not a \
-                         per-instruction dataflow value equivalence",
+            reason: "linear-memory load/store — covered elsewhere: the wasm memory-model family \
+                         (byte-addressed little-endian array theory, wasm_memory_proofs) plus the \
+                         per-opcode P3 value-domain inventory (GateArch::WasmValueDomain, which \
+                         audits opcode bytes 0x28/0x29/0x36/0x37 among the full 0x28..=0x3e \
+                         block), not a per-instruction dataflow value equivalence",
         },
         O::V128Load | O::V128Store => FailClosedAllowlisted {
             reason: "v128 memory access is reserved in the opcode surface but never selected by \
@@ -2882,15 +3284,63 @@ pub fn riscv_deferred_value_op_reason(opcode: RiscVOpcode) -> Option<&'static st
 /// HONESTY: these opcodes are value-bearing and stay IN the value-equivalence
 /// denominator (RED), NOT allowlisted-out. A future reconstruction that faithfully
 /// models them moves them from `DeferredUnfaithfulModel`-RED to covered. The two
-/// emitted scalar constant forms are currently deferred because the gate has no
-/// independent LEB immediate decoder; float/int conversions and lane-wise SIMD
-/// are now faithfully reconstructed.
+/// FLOAT constant forms are the only rows in this table today; the two INTEGER
+/// constant forms left it when P4's independent signed-LEB decoder landed, and
+/// float/int conversions and lane-wise SIMD are faithfully reconstructed.
+///
+/// P4 CLOSED THE TWO CONSTANT ROWS. `I32Const`/`I64Const` were deferred for
+/// exactly one reason — the gate had no INDEPENDENT signed-LEB decoder, so
+/// `const == const` was a degenerate self-equality. `wasm_encoding_proofs`
+/// now carries a decoder written from the spec's inductive `sN` production
+/// (not the encoder's accumulate loop, which would agree with a buggy
+/// encoder by construction), and the obligation decodes the REAL emitted
+/// immediate and pins its CANONICAL LENGTH as well — the spec admits padded
+/// encodings, so `0x80 0x00` is a legal `i32.const 0` that a decode-only
+/// check cannot see. They are credited here and absent from this table.
+///
+/// What crediting them does NOT say, so the row cannot be over-read: nothing
+/// about whether the LOWERING chose the right constant — a wrong value
+/// encodes and decodes perfectly — and nothing about stack discipline.
+///
+/// THE FLOAT CONSTANTS ARE NOW NAMED HERE, not invisible. P3 gave the encoder
+/// `f32.const` (0x43) and `f64.const` (0x44) and `lower.rs` emits both, but
+/// [`WasmOpcode`] carried no variant for either, so they were outside this
+/// denominator entirely — and a table cannot defer what it cannot name. An
+/// opcode the mirror does not carry is INVISIBLE to the gate rather than RED in
+/// it, which is the weaker of the two states. The mirror now carries them and
+/// they are deferred BY NAME below, RED in the denominator, with the true
+/// reason: their immediates are raw IEEE-754 payloads, not LEB128, so P4's
+/// spec-derived signed-LEB decoder does not reach them and no independent
+/// float-payload decode obligation exists yet.
 pub fn wasm_deferred_value_op_reason(opcode: WasmOpcode) -> Option<&'static str> {
     use WasmOpcode as O;
     match opcode {
-        O::I32Const | O::I64Const => Some(
-            "emitted scalar constant materialization has no independent signed-LEB immediate \
-             decode/value obligation; const==const would be a degenerate self-equality",
+        // The two FLOAT constant forms. `i32.const`/`i64.const` left this table
+        // when `wasm_encoding_proofs` gained a spec-derived `sN` decoder that
+        // reads the REAL emitted immediate and pins its canonical length; that
+        // decoder is a LEB128 decoder and the float constants carry no LEB128.
+        // Their immediate is a fixed-width little-endian IEEE-754 bit pattern
+        // (4 bytes for 0x43, 8 for 0x44), which needs its own independent
+        // payload decode — one that separates a wrong byte ORDER, a wrong
+        // WIDTH, and a NaN payload the encoder must not canonicalize. Nothing
+        // in the gate states that today, and `const == const` would be the same
+        // degenerate self-equality the integer rows were RED for. So they stay
+        // RED, IN the denominator, rather than credited or allowlisted out.
+        O::F32Const => Some(
+            "f32.const (0x43) is actively emitted for FP constant materialization, but its \
+             immediate is a RAW 4-byte little-endian IEEE-754 payload rather than a LEB128, so \
+             the P4 spec-derived signed-LEB decoder that credits i32.const/i64.const does not \
+             reach it; no independent float-payload decode obligation (wrong byte order / wrong \
+             width / NaN-payload preservation) exists yet, and const==const would be a degenerate \
+             self-equality",
+        ),
+        O::F64Const => Some(
+            "f64.const (0x44) is actively emitted for FP constant materialization, but its \
+             immediate is a RAW 8-byte little-endian IEEE-754 payload rather than a LEB128, so \
+             the P4 spec-derived signed-LEB decoder that credits i32.const/i64.const does not \
+             reach it; no independent float-payload decode obligation (wrong byte order / wrong \
+             width / NaN-payload preservation) exists yet, and const==const would be a degenerate \
+             self-equality",
         ),
         // The float<->int CONVERSIONS (int->FP convert ×8, saturating FP->int
         // trunc_sat ×8) are NO LONGER deferred: the native evaluator now FAITHFULLY
@@ -2912,6 +3362,270 @@ pub fn wasm_deferred_value_op_reason(opcode: WasmOpcode) -> Option<&'static str>
     }
 }
 
+/// Classify a P3 value-domain opcode byte. `None` for a byte that is NOT on the
+/// P3 surface at all — the caller enumerates the surface, so `None` here means
+/// the enumeration and the classifier disagree (a wiring bug), never a silently
+/// skipped opcode.
+///
+/// Every P3 byte is `EmittableNeedsProof`: the credited ones because they carry
+/// discharging reconstructions, the deferred ones because their debt stays IN
+/// the denominator as a named [`CoverageFinding::DeferredUnfaithfulModel`] row.
+/// NOTHING on this surface is allowlisted out — `br_table`, `memory.size`,
+/// `memory.grow` and data segments are emitted (or about to be) and owe evidence.
+pub fn classify_wasm_value_domain(byte: u8) -> Option<OpcodeClass> {
+    if crate::wasm_semantics::decode_mem_op(byte).is_some()
+        || crate::wasm_semantics::decode_sign_extend(byte).is_some()
+        || crate::wasm_value_domain::value_domain_deferral(byte).is_some()
+    {
+        return Some(OpcodeClass::EmittableNeedsProof);
+    }
+    None
+}
+
+/// The audit row for one NAMED P3 deferral.
+///
+/// Deliberately `EmittableNeedsProof` + [`CoverageFinding::DeferredUnfaithfulModel`]:
+/// RED, IN the denominator, carrying the deferral's own reason. These are NOT
+/// `FailClosedAllowlisted` — that variant requires "covered elsewhere" to be
+/// TRUE, and for `br_table` the relooper argument has not been extended to the
+/// n-way edge, while `memory.size`/`memory.grow` and data segments have no gate
+/// at all yet. Saying "covered elsewhere" would be a claim the repo cannot back.
+fn wasm_value_domain_deferral_row(
+    deferral: &'static crate::wasm_value_domain::WasmValueDomainDeferral,
+) -> OpcodeAuditRow {
+    OpcodeAuditRow {
+        opcode_display: format!("wasm::{}", deferral.name),
+        class: OpcodeClass::EmittableNeedsProof,
+        finding: Some(CoverageFinding::DeferredUnfaithfulModel {
+            reason: deferral.reason,
+        }),
+        note: format!(
+            "HONESTLY DEFERRED (RED in denominator); owed by: {} — {}",
+            deferral.family, deferral.reason
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WebAssembly P4 family 1 (CFG structural) — row builders
+// ---------------------------------------------------------------------------
+
+/// The audit row for one CFG anti-tautology mutant.
+///
+/// A `MustBeRefuted` mutant is the family's TEETH: it is credited only when the
+/// checker actually refuted it, and a mutant that slips through is a
+/// [`CoverageFinding::ProofNotDischarged`] RED row, because an invariant a wrong
+/// module satisfies proves nothing.
+///
+/// A `KnownBlindSpot` mutant is NEVER credit. It is the executable measurement
+/// of a named deferral, so it is RED with the mutant's own description as its
+/// reason. That leaves the same gap counted twice — once here as a measurement,
+/// once below as the named property — which understates coverage rather than
+/// overstating it, the only direction this gate is allowed to err in.
+fn wasm_cfg_mutant_row(
+    outcome: &crate::wasm_cfg_proofs::MutantOutcome,
+    description: &'static str,
+) -> OpcodeAuditRow {
+    use crate::wasm_cfg_proofs::MutantExpectation;
+
+    let display = format!("wasm-cfg::mutant `{}`", outcome.name);
+    match outcome.expectation {
+        MutantExpectation::MustBeRefuted if outcome.as_expected => OpcodeAuditRow {
+            opcode_display: display,
+            class: OpcodeClass::EmittableNeedsProof,
+            finding: None,
+            note: format!(
+                "REFUTED by the structural checker over the mutated module's own bytes — {}. \
+                 The refutation is the evidence the matching invariant is not vacuous: {}",
+                description, outcome.verdict
+            ),
+        },
+        MutantExpectation::MustBeRefuted => OpcodeAuditRow {
+            opcode_display: display,
+            class: OpcodeClass::EmittableNeedsProof,
+            finding: Some(CoverageFinding::ProofNotDischarged {
+                proof_name: outcome.name.to_string(),
+                detail: format!(
+                    "the checker did NOT refute a module it must reject: {}",
+                    outcome.verdict
+                ),
+            }),
+            note: format!(
+                "VACUOUS: {description}. An invariant a deliberately-wrong module still satisfies \
+                 is not evidence"
+            ),
+        },
+        MutantExpectation::KnownBlindSpot => OpcodeAuditRow {
+            opcode_display: display,
+            class: OpcodeClass::EmittableNeedsProof,
+            finding: Some(CoverageFinding::DeferredUnfaithfulModel {
+                reason: description,
+            }),
+            note: format!(
+                "HONESTLY DEFERRED (RED in denominator): a DECLARED BLIND SPOT, run and reported \
+                 rather than omitted. Observed: {} (declared outcome {}). It is the executable \
+                 measurement of a named deferral listed separately below, so this gap is counted \
+                 twice — understating coverage, never overstating it",
+                outcome.verdict,
+                if outcome.as_expected {
+                    "matched"
+                } else {
+                    "DRIFTED — the family's own gate test owns that failure"
+                }
+            ),
+        },
+    }
+}
+
+/// The audit row for one NAMED CFG deferral.
+///
+/// Deliberately `EmittableNeedsProof` plus [`CoverageFinding::DeferredUnfaithfulModel`]:
+/// RED, IN the denominator. The first entry is the family's own headline —
+/// relooper BISIMULATION — kept RED on purpose, so nothing in this audit can be
+/// read as proving the relooper correct.
+fn wasm_cfg_deferral_row(
+    deferral: &'static crate::wasm_cfg_proofs::WasmCfgDeferral,
+) -> OpcodeAuditRow {
+    OpcodeAuditRow {
+        opcode_display: format!("wasm-cfg::{}", deferral.name),
+        class: OpcodeClass::EmittableNeedsProof,
+        finding: Some(CoverageFinding::DeferredUnfaithfulModel {
+            reason: deferral.reason,
+        }),
+        note: format!(
+            "HONESTLY DEFERRED (RED in denominator); owed by: {} — {}",
+            deferral.family, deferral.reason
+        ),
+    }
+}
+
+/// The audit row for one CFG invariant STATEMENT.
+///
+/// Excluded from the denominator on purpose, under the variant's case (b): the
+/// statement's evidence is the mutant rows in this same audit, and counting the
+/// sentence as well as the refutation that gives it teeth would credit one piece
+/// of evidence twice. The row exists so the statement — and, load-bearingly, its
+/// own `does_not_cover` clause — is visible in the audit log rather than only in
+/// the source.
+fn wasm_cfg_invariant_row(
+    invariant: &'static crate::wasm_cfg_proofs::CfgInvariantRow,
+) -> OpcodeAuditRow {
+    OpcodeAuditRow {
+        opcode_display: format!("wasm-cfg::{}", invariant.id),
+        class: OpcodeClass::FailClosedAllowlisted {
+            reason: "invariant STATEMENT — covered elsewhere IN THIS SAME AUDIT: its evidence is \
+                     the anti-tautology mutant rows above, which are what make it non-vacuous. \
+                     Counting the sentence as well as the refutation would credit one piece of \
+                     evidence twice, and the family's no-argument battery does not exercise every \
+                     statement (there is no br_table in the reference module), so a blanket credit \
+                     would hand one statement its neighbours' teeth",
+        },
+        finding: None,
+        note: format!(
+            "STATEMENT: {} | REFUTES: {} | DOES NOT COVER: {}",
+            invariant.statement, invariant.refutes, invariant.does_not_cover
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WebAssembly P4 families 2/3 (memory / call ABI) — row builders
+// ---------------------------------------------------------------------------
+
+/// The audit row for one ABI anti-tautology guard.
+///
+/// Same contract as the CFG mutants: a `MustRefute` guard earns credit only by
+/// actually refuting, and a `KnownBlind` one is RED with the reason taken from
+/// the [`crate::wasm_abi_proofs::WASM_ABI_DEFERRALS`] entry that owns it.
+fn wasm_abi_guard_row(
+    outcome: Result<crate::wasm_abi_proofs::GuardOutcome, String>,
+) -> OpcodeAuditRow {
+    use crate::wasm_abi_proofs::{GuardExpectation, WASM_ABI_DEFERRALS};
+
+    let outcome = match outcome {
+        Ok(o) => o,
+        Err(why) => {
+            return OpcodeAuditRow {
+                opcode_display: "wasm-abi::guard COULD NOT RUN".to_string(),
+                class: OpcodeClass::EmittableNeedsProof,
+                finding: Some(CoverageFinding::ProofNotDischarged {
+                    proof_name: "wasm ABI anti-tautology guard".to_string(),
+                    detail: why.clone(),
+                }),
+                note: format!("a guard could not be applied at all, so it proves nothing: {why}"),
+            };
+        }
+    };
+
+    let display = format!("wasm-abi::guard `{}`", outcome.name);
+    match outcome.expectation {
+        GuardExpectation::MustRefute if outcome.refuted => OpcodeAuditRow {
+            opcode_display: display,
+            class: OpcodeClass::EmittableNeedsProof,
+            finding: None,
+            note: format!(
+                "REFUTED: the mutation of the fixture's REAL emitted bytes was caught — {}. This \
+                 is what makes the matching obligations and structural checks non-vacuous",
+                outcome.detail
+            ),
+        },
+        GuardExpectation::MustRefute => OpcodeAuditRow {
+            opcode_display: display,
+            class: OpcodeClass::EmittableNeedsProof,
+            finding: Some(CoverageFinding::ProofNotDischarged {
+                proof_name: outcome.name.to_string(),
+                detail: format!("the mutation was NOT caught: {}", outcome.detail),
+            }),
+            note: "VACUOUS: a byte mutation the family must catch went through unrefuted"
+                .to_string(),
+        },
+        GuardExpectation::KnownBlind { deferral } => {
+            let reason = WASM_ABI_DEFERRALS
+                .iter()
+                .find(|d| d.name == deferral)
+                .map(|d| d.reason)
+                .unwrap_or(
+                    "a declared blind spot whose owning deferral is not in WASM_ABI_DEFERRALS — a \
+                     wiring gap in the family's own bookkeeping, reported RED rather than hidden",
+                );
+            OpcodeAuditRow {
+                opcode_display: display,
+                class: OpcodeClass::EmittableNeedsProof,
+                finding: Some(CoverageFinding::DeferredUnfaithfulModel { reason }),
+                note: format!(
+                    "HONESTLY DEFERRED (RED in denominator): a DECLARED BLIND SPOT owned by the \
+                     `{deferral}` deferral, run and reported as NOT refuted rather than omitted. \
+                     Observed: {}. Counted here AND as its named deferral below — the same gap \
+                     twice, which understates coverage rather than overstating it",
+                    outcome.detail
+                ),
+            }
+        }
+    }
+}
+
+/// The audit row for one NAMED memory / call-ABI deferral.
+///
+/// `EmittableNeedsProof` plus [`CoverageFinding::DeferredUnfaithfulModel`]: RED,
+/// IN the denominator. Five of the nine are the HOST's under
+/// `crates/trust-cg-codegen/src/wasm/OWNERSHIP.md`; being someone else's
+/// obligation is a reason to name an owner, not a reason to leave the row out.
+fn wasm_abi_deferral_row(
+    deferral: &'static crate::wasm_abi_proofs::WasmAbiDeferral,
+) -> OpcodeAuditRow {
+    OpcodeAuditRow {
+        opcode_display: format!("wasm-abi::{}", deferral.name),
+        class: OpcodeClass::EmittableNeedsProof,
+        finding: Some(CoverageFinding::DeferredUnfaithfulModel {
+            reason: deferral.reason,
+        }),
+        note: format!(
+            "HONESTLY DEFERRED (RED in denominator); owed by: {} ({}) — {}",
+            deferral.owner, deferral.citation, deferral.reason
+        ),
+    }
+}
+
 /// For a value-bearing AArch64 opcode that is `EmittableNeedsProof` but is
 /// HONESTLY DEFERRED (its faithful obligations are not registered yet), return
 /// the TRUE auditable reason it is left RED. Returns `None` for everything else.
@@ -2927,6 +3641,22 @@ pub fn wasm_deferred_value_op_reason(opcode: WasmOpcode) -> Option<&'static str>
 pub fn aarch64_deferred_value_op_reason(opcode: AArch64Opcode) -> Option<&'static str> {
     use AArch64Opcode as O;
     match opcode {
+        // TST LEFT this table when its COMPLETE opcode-wide authority landed.
+        //
+        // The per-CONDITION standalone NZCV obligations (one per width and
+        // N/Z-derived or composite-C condition) are CONSUMER VIEWS: the
+        // function verifier binds each concrete TST to the obligation of the
+        // consuming instruction's condition code. On their own they could NOT
+        // clear this row -- for exactly the reason MOVK below is still RED,
+        // crediting one condition's theorem opcode-wide would be the unfaithful
+        // inheritance #62 retracted.
+        //
+        // What promotes TST is the WHOLE-INSTRUCTION packed-NZCV theorem
+        // (`cmp_combine_proofs::proof_tst_packed_nzcv`), which pins all four
+        // flags at once and is registered at BOTH emitted widths. This gate
+        // demands both of them through `aarch64_width_polymorphic_proofs`
+        // above, so a single-width or partial-flag model still fails closed
+        // here; nothing is credited from a single condition-code observation.
         O::LdrRI
         | O::LdrbRI
         | O::LdrhRI
@@ -2987,10 +3717,6 @@ pub fn aarch64_deferred_value_op_reason(opcode: AArch64Opcode) -> Option<&'stati
         O::Bfm => Some(
             "emitted bitfield insert is read-modify-write and has no faithful BFM decode/value \
              obligation; UBFM/SBFM extract evidence does not cover insertion",
-        ),
-        O::RorRI => Some(
-            "emitted rotate-immediate lacks a faithful opcode-and-immediate reconstruction or \
-             width-complete registered obligation",
         ),
         O::Rbit => Some(
             "emitted scalar bit reversal lacks a faithful SWAR/decode value obligation; the \
@@ -3367,6 +4093,18 @@ pub fn aarch64_width_polymorphic_proofs(opcode: AArch64Opcode) -> Option<&'stati
                 p(BWS, "eor_ror_shift_i32", 32),
                 p(BWS, "eor_ror_shift_i64", 64),
             ];
+            Some(PS)
+        }
+        // Standalone ROR-immediate (the rotate recognizer's unfused form) is
+        // emitted at BOTH register widths under one opcode; both widths'
+        // rotate obligations must discharge. Bound to `all_ror_immediate_proofs`
+        // (SOURCE = frontend rotate blend, MACHINE = ROR shifted operand,
+        // structurally distinct / provably equal; wrong-amount / ROR-vs-LSR /
+        // rotate-direction controls refute). The function verifier additionally
+        // binds each concrete instruction per destination width and rejects
+        // out-of-range amounts.
+        AArch64Opcode::RorRI => {
+            const PS: &[WidthProof] = &[p(BWS, "rorri_i32", 32), p(BWS, "rorri_i64", 64)];
             Some(PS)
         }
         // ADD/SUB with an LSL-shifted source (ADD/SUB Rd, Rn, Rm, LSL #k) are each
@@ -4501,6 +5239,12 @@ pub const ALL_X86_OPCODES: &[X86Opcode] = {
         Nop,
         NopMulti,
         Ud2,
+        // Memory-destination RMW ALU (appended with the enum, kept last to
+        // mirror discriminant order)
+        XorMR,
+        AddMR,
+        XorMRSib,
+        AddMRSib,
     ]
 };
 
@@ -4740,6 +5484,8 @@ pub const ALL_WASM_OPCODES: &[WasmOpcode] = {
         // Constants
         I32Const,
         I64Const,
+        F32Const,
+        F64Const,
         // Locals / globals
         LocalGet,
         LocalSet,

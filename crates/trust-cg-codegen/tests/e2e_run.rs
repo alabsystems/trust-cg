@@ -293,7 +293,7 @@ fn build_return_const_function() -> MachFunction {
     let mov_id = func.push_inst(mov);
     func.append_inst(entry, mov_id);
 
-    let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+    let ret = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
     let ret_id = func.push_inst(ret);
     func.append_inst(entry, ret_id);
 
@@ -319,7 +319,7 @@ fn build_sub_function() -> MachFunction {
     let sub_id = func.push_inst(sub);
     func.append_inst(entry, sub_id);
 
-    let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+    let ret = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
     let ret_id = func.push_inst(ret);
     func.append_inst(entry, ret_id);
 
@@ -388,7 +388,7 @@ fn build_max_function() -> MachFunction {
     func.append_inst(bb1, mov_id);
 
     // bb2: RET
-    let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+    let ret = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
     let ret_id = func.push_inst(ret);
     func.append_inst(bb2, ret_id);
 
@@ -515,7 +515,7 @@ fn build_factorial_function() -> MachFunction {
     func.append_inst(bb_done, mov_result_id);
 
     // RET
-    let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+    let ret = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
     let ret_id = func.push_inst(ret);
     func.append_inst(bb_done, ret_id);
 
@@ -904,7 +904,7 @@ fn test_e2e_stack_store_reload() {
     func.append_inst(entry, ldr_id);
 
     // RET (epilogue will replace this)
-    let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+    let ret = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
     let ret_id = func.push_inst(ret);
     func.append_inst(entry, ret_id);
 
@@ -1032,7 +1032,7 @@ fn test_e2e_callee_saved_spill() {
     func.append_inst(entry, add_id);
 
     // RET
-    let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+    let ret = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
     let ret_id = func.push_inst(ret);
     func.append_inst(entry, ret_id);
 
@@ -1165,7 +1165,7 @@ fn test_e2e_stack_slots_with_callee_saved() {
     func.append_inst(entry, add_id);
 
     // RET
-    let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+    let ret = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
     let ret_id = func.push_inst(ret);
     func.append_inst(entry, ret_id);
 
@@ -1509,7 +1509,7 @@ fn test_e2e_stack_slots_all_opt_levels() {
         func.append_inst(entry, mov_id);
 
         // RET
-        let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+        let ret = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
         let ret_id = func.push_inst(ret);
         func.append_inst(entry, ret_id);
 
@@ -1737,7 +1737,7 @@ fn build_sum_1_to_n_function() -> MachFunction {
     func.append_inst(bb_done, mov_result_id);
 
     // RET
-    let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+    let ret = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
     let ret_id = func.push_inst(ret);
     func.append_inst(bb_done, ret_id);
 

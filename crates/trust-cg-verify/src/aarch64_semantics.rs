@@ -879,6 +879,41 @@ pub fn shifted_reg_operand(kind: RegShiftKind, rm: SmtExpr, amount: u32, width: 
     }
 }
 
+/// Encode the source-level rotate-right idiom at an immediate amount.
+///
+/// This is the shift/OR definition used by the frontend and the rotate-idiom
+/// pass, written with the wrapped left-shifted half first:
+/// `(rn << (width - amount)) | (rn >> amount)`. Keep this separate from
+/// [`encode_ror_imm_extr`] so the reconstructed proof compares independently
+/// constructed source and architectural expressions. The immediate-zero
+/// identity alias is deliberately outside this proof lane: the code generator
+/// emits it as a GPR move and that alias needs its own non-degenerate copy
+/// proof.
+pub fn encode_ror_imm_source(size: OperandSize, rn: SmtExpr, amount: u32) -> SmtExpr {
+    let width = operand_size_bits(size);
+    debug_assert_eq!(rn.bv_width(), width);
+    debug_assert!((1..width).contains(&amount));
+    let hi = rn
+        .clone()
+        .bvshl(SmtExpr::bv_const(u64::from(width - amount), width));
+    let lo = rn.bvlshr(SmtExpr::bv_const(u64::from(amount), width));
+    hi.bvor(lo)
+}
+
+/// Encode `ROR Rd, Rn, #amount` through its architectural `EXTR` alias.
+///
+/// The encoder emits `EXTR Rd, Rn, Rn, #amount`; concatenating the two copies
+/// of `Rn` and extracting `width` bits starting at `amount` is the direct EXTR
+/// decode. This is intentionally structurally distinct from the source-side
+/// shift/OR rotate in [`encode_ror_imm_source`], while a wrong EXTR immediate
+/// or operand wiring changes the value and therefore refutes the obligation.
+pub fn encode_ror_imm_extr(size: OperandSize, rn: SmtExpr, amount: u32) -> SmtExpr {
+    let width = operand_size_bits(size);
+    debug_assert_eq!(rn.bv_width(), width);
+    debug_assert!((1..width).contains(&amount));
+    rn.clone().concat(rn).extract(amount + width - 1, amount)
+}
+
 /// Encode `EOR Rd, Rn, Rm, <kind> #amount` — bitwise exclusive-OR with a
 /// register-shifted second source. Semantics: `Rd = Rn ^ shift(Rm, kind, amount)`.
 /// Reference: ARM DDI 0487, C6.2.87 EOR (shifted register).
@@ -911,6 +946,20 @@ pub fn encode_eor_rotl_source(size: OperandSize, rn: SmtExpr, rm: SmtExpr, r: u3
     let hi = rm.clone().bvshl(SmtExpr::bv_const(u64::from(r), width));
     let lo = rm.bvlshr(SmtExpr::bv_const(u64::from(width - r), width));
     rn.bvxor(hi.bvor(lo))
+}
+
+/// Encode the BARE frontend rotate idiom `ROTL(v, r) = (v << r) | (v >>u
+/// (width - r))` — what `rotate_idiom` recognizes before folding it into a
+/// standalone `RorRI(v, k)` with `k = width - r`. This is the SOURCE side of
+/// the standalone ROR-immediate obligation; written with the shifted halves in
+/// the OPPOSITE OR order from [`shifted_reg_operand`]'s `Ror` (the MACHINE
+/// side) so the two sides are STRUCTURALLY DISTINCT (non-degenerate:
+/// `is_genuinely_proven`) yet provably equal. `r` in `[1, width)`.
+pub fn encode_rotl_source(size: OperandSize, rm: SmtExpr, r: u32) -> SmtExpr {
+    let width = operand_size_bits(size);
+    let hi = rm.clone().bvshl(SmtExpr::bv_const(u64::from(r), width));
+    let lo = rm.bvlshr(SmtExpr::bv_const(u64::from(width - r), width));
+    hi.bvor(lo)
 }
 
 /// Encode `ADD Rd, Rn, Rm, <kind> #amount` — add with a register-shifted second

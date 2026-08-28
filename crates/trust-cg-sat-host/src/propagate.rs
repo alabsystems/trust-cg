@@ -2933,13 +2933,13 @@ mod empty_lemma_bug_scaffold {
     use super::*;
     use std::ffi::CString;
     use std::io::Write;
-    use std::mem::MaybeUninit;
     use std::path::Path;
     use std::sync::atomic::Ordering;
 
     use tempfile::NamedTempFile;
 
     use super::test_support::SOLVER_LOCK;
+    use crate::OwnedMicroSatSolver;
 
     fn solver_lock() -> std::sync::MutexGuard<'static, ()> {
         SOLVER_LOCK.lock().expect("solver lock not poisoned")
@@ -2956,19 +2956,14 @@ mod empty_lemma_bug_scaffold {
         file.flush().expect("flush cnf");
         let path = file.path().to_path_buf();
         let c_path = CString::new(path.to_string_lossy().into_owned()).expect("path to CString");
-        let mut solver: MaybeUninit<sys::solver> = MaybeUninit::uninit();
-        // SAFETY: `parse` runs `initCDCL` and populates every field of
-        // `*solver` before returning. Passing an uninitialised solver
-        // matches MicroSAT's own `main`.
+        // SAFETY: the helper writes a well-formed DIMACS file and keeps it
+        // open for the duration of parse.
+        let (mut solver, parse_rc) = unsafe { OwnedMicroSatSolver::parse(c_path.as_c_str()) };
         let rc = unsafe {
-            let parse_rc = sys::parse(
-                solver.as_mut_ptr(),
-                c_path.as_ptr() as *mut std::os::raw::c_char,
-            );
             if parse_rc == sys::UNSAT {
                 sys::UNSAT
             } else {
-                sys::solve(solver.as_mut_ptr())
+                solver.solve()
             }
         };
 
@@ -3066,18 +3061,14 @@ p cnf 6 9
             let path = file.path().to_path_buf();
             let c_path =
                 CString::new(path.to_string_lossy().into_owned()).expect("path to CString");
-            let mut solver: MaybeUninit<sys::solver> = MaybeUninit::uninit();
             let t = Instant::now();
-            // SAFETY: same as `solve_with_adf_on`.
+            // SAFETY: same as `solve_with_adf_on`; the fixture is well-formed.
+            let (mut solver, parse_rc) = unsafe { OwnedMicroSatSolver::parse(c_path.as_c_str()) };
             let rc_native = unsafe {
-                let parse_rc = sys::parse(
-                    solver.as_mut_ptr(),
-                    c_path.as_ptr() as *mut std::os::raw::c_char,
-                );
                 if parse_rc == sys::UNSAT {
                     sys::UNSAT
                 } else {
-                    sys::solve(solver.as_mut_ptr())
+                    solver.solve()
                 }
             };
             native_total += t.elapsed();

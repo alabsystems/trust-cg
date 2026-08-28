@@ -2670,6 +2670,16 @@ struct LowerCtx {
 }
 
 fn apply(func: &mut MachFunction, rec: &Recognized) -> bool {
+    // IDEMPOTENCE: never vectorize the remainder loop of a loop this pass
+    // already vectorized (see `crate::vector_remainder`).
+    if crate::vector_remainder::iv_is_vector_advanced_upstream(
+        func,
+        &std::collections::HashSet::new(),
+        rec.preheader,
+        rec.iv,
+    ) {
+        return false;
+    }
     // Per-width parameters: i32 = `.4S` + sxtw guard; i64 = `.2D` + precheck +
     // unsigned guard (see the module docs' i64 section).
     let (vf, elem_bytes, arr_code, elem_code, const_class) = if rec.is_i64 {
@@ -5391,5 +5401,113 @@ mod tests {
             "pre-split use of select dest must BAIL"
         );
         assert_eq!(pass.fired(), 0);
+    }
+
+    /// IDEMPOTENCE (the neon-bytesum / neon-fill bug class of 2026-08-27: a
+    /// vectorizer that keeps the scalar loop as the remainder and then
+    /// recognizes that remainder again on the next fixpoint iteration). After
+    /// the first firing, further runs must change nothing.
+    #[test]
+    fn second_run_is_a_no_op() {
+        let mut func = build_map_loop_reverse(3);
+        assert!(NeonMapPass::new().run(&mut func), "first run must fire");
+        let (insts, blocks) = (func.insts.len(), func.blocks.len());
+        for again in 2..=4 {
+            assert!(
+                !NeonMapPass::new().run(&mut func),
+                "run {again}: re-fired on its own output"
+            );
+            assert_eq!(func.insts.len(), insts, "run {again} added instructions");
+            assert_eq!(func.blocks.len(), blocks, "run {again} added blocks");
+        }
+    }
+
+    /// Same, on the FORWARD regime-(A) map (`build_map_loop(0)` with the
+    /// no-alias authority its firing test uses).
+    #[test]
+    fn second_run_is_a_no_op_forward() {
+        let mut func = build_map_loop(0);
+        func.noalias_params = vec![0, 2, 10];
+        assert!(NeonMapPass::new().run(&mut func), "first run must fire");
+        let (insts, blocks) = (func.insts.len(), func.blocks.len());
+        for again in 2..=4 {
+            assert!(
+                !NeonMapPass::new().run(&mut func),
+                "run {again}: re-fired on its own output"
+            );
+            assert_eq!(func.insts.len(), insts, "run {again} added instructions");
+            assert_eq!(func.blocks.len(), blocks, "run {again} added blocks");
+        }
+    }
+
+    /// IDEMPOTENCE over every firing shape the builders offer (the primary
+    /// `second_run_is_a_no_op` covers one; today's bug class hid in shapes
+    /// the primary test did not exercise).
+    #[test]
+    fn second_run_is_a_no_op_for_every_firing_variant() {
+        let cases: Vec<(&str, Box<dyn Fn() -> MachFunction>)> = vec![
+            (
+                "two-input-add",
+                Box::new(|| {
+                    let mut f = build_map_loop(0);
+                    f.noalias_params = vec![0, 2, 10];
+                    f
+                }),
+            ),
+            (
+                "in-place-noalias",
+                Box::new(|| {
+                    let mut f = build_map_loop(1);
+                    f.noalias_params = vec![0, 2];
+                    f
+                }),
+            ),
+            ("in-place-regime-a", Box::new(|| build_map_loop(3))),
+            (
+                "reverse-two-input",
+                Box::new(|| {
+                    let mut f = build_map_loop_reverse(0);
+                    f.noalias_params = vec![0, 2, 10];
+                    f
+                }),
+            ),
+            ("reverse-in-place", Box::new(|| build_map_loop_reverse(3))),
+            (
+                "rotated-reverse-double",
+                Box::new(|| build_map_loop_rotated_reverse(3, false)),
+            ),
+            (
+                "matmul-row",
+                Box::new(|| {
+                    let mut f = build_matmul_inner(0, 1);
+                    f.noalias_params = vec![0, 1];
+                    f
+                }),
+            ),
+        ];
+        for (label, build) in cases {
+            let mut func = build();
+            assert!(
+                NeonMapPass::new().run(&mut func),
+                "{label}: first run must fire"
+            );
+            let (insts, blocks) = (func.insts.len(), func.blocks.len());
+            for again in 2..=4 {
+                assert!(
+                    !NeonMapPass::new().run(&mut func),
+                    "{label}: run {again} re-fired on its own output"
+                );
+                assert_eq!(
+                    func.insts.len(),
+                    insts,
+                    "{label}: run {again} added instructions"
+                );
+                assert_eq!(
+                    func.blocks.len(),
+                    blocks,
+                    "{label}: run {again} added blocks"
+                );
+            }
+        }
     }
 }

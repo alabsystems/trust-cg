@@ -1,6 +1,6 @@
 # Lean soundness boundary
 
-The Lean development provides conditional, model-level evidence. v0.1.0 does
+The Lean development provides conditional, model-level evidence. It does
 not claim that it proves the complete Rust compiler, all accepted trust-ir, all
 emitted bytes, or real hardware execution end to end.
 

@@ -19,6 +19,44 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(unix)]
+unsafe extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+}
+
+/// SIGKILL the process group whose leader is `pgid`, via the raw syscall.
+///
+/// This replaced `Command::new("kill").args(["-KILL", "-<pid>"])`, and the
+/// reason is not stylistic. util-linux `kill` does NOT treat a leading `-` on
+/// the second argument as "process group"; it tries to parse it as a SIGNAL
+/// spec, and on failure falls through to a target of `-1`. Observed under
+/// strace on this host:
+///
+/// ```text
+/// execve("/usr/bin/kill", ["/usr/bin/kill", "-0", "-1071243"]) = 0
+/// kill(-1, 0)                                                = 0
+/// ```
+///
+/// `kill(-1, SIGKILL)` is "every process this user can signal". Each time the
+/// timeout path below fired it took down the desktop session, every terminal,
+/// and the harness running the tests — four times over one day before the
+/// strace above was captured. `ay_bridge.rs` never had the bug because it
+/// already calls the syscall directly; this mirrors that.
+///
+/// The `> 1` guard is belt-and-braces: a raw syscall with `-1` or `-0` would
+/// be exactly as catastrophic, so no value that could reach them is accepted.
+#[cfg(unix)]
+pub fn kill_process_group(pgid: u32) {
+    if pgid > 1 && pgid <= i32::MAX as u32 {
+        let pgid = pgid as i32;
+        // SAFETY: `kill(2)` with a negative pid signals a process group; the
+        // guard above excludes -1 (all processes) and 0 (caller's own group).
+        unsafe {
+            let _ = kill(-pgid, 9);
+        }
+    }
+}
+
 const DEFAULT_TEST_TIMEOUT_SECS: u64 = 1500;
 const DEFAULT_CODEGEN_PROBE_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_CODEGEN_ROSETTA_PROBE_TIMEOUT_SECS: u64 = 5;
@@ -203,10 +241,7 @@ pub fn command_output_with_timeout(
 
         if start.elapsed() >= timeout {
             #[cfg(unix)]
-            {
-                let group = format!("-{}", child_id);
-                let _ = Command::new("kill").args(["-KILL", &group]).status();
-            }
+            kill_process_group(child_id);
             let _ = child.kill();
             let status = child.wait().unwrap_or_else(|_| ExitStatus::from_raw(9));
             let stdout = fs::read(&stdout_path).unwrap_or_default();
@@ -284,8 +319,7 @@ pub fn run_executable_with_timeout(
             }
 
             if start.elapsed() >= timeout {
-                let group = format!("-{}", child_id);
-                let _ = Command::new("kill").args(["-KILL", &group]).status();
+                kill_process_group(child_id);
                 let _ = child.try_wait();
                 let stdout = fs::read(&stdout_path).unwrap_or_default();
                 let mut stderr = fs::read(&stderr_path).unwrap_or_default();

@@ -1,8 +1,8 @@
 # trust-cg Lean development
 
 This directory contains a Lean 4 model and a conditional forward-refinement
-development for selected trust-cg paths. It is supporting research evidence for
-v0.1.0, not an end-to-end proof of the Rust compiler or every emitted binary.
+development for selected trust-cg paths. It is supporting research evidence,
+not an end-to-end proof of the Rust compiler or every emitted binary.
 
 ## What the capstone says
 

@@ -1,7 +1,7 @@
 #!/bin/sh
 #
 # Fail-closed public-release gate for the generated Clean-kernel codegen
-# capstones merged into the v0.1.0 candidate.
+# capstones merged into the publication candidate.
 #
 # These JIT-heavy tests must not share a libtest process: accumulated JIT state
 # has previously made an otherwise-correct aggregate run unreliable.  Pin the
@@ -64,6 +64,12 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "${SCRIPT_DIR}/.." && pwd)
 RUN_WITH_TIMEOUT="${SCRIPT_DIR}/run_with_timeout.py"
 cd "${REPO_ROOT}"
+
+# Each selected JIT-heavy test already runs in its own Cargo process. Keep the
+# complement and inventory lanes serial in libtest too unless a caller opts in
+# to a different thread count.
+: "${RUST_TEST_THREADS:=1}"
+export RUST_TEST_THREADS
 
 if ! command -v cargo >/dev/null 2>&1; then
     echo "run_public_release_codegen_tests: cargo not found on PATH" >&2
@@ -199,7 +205,8 @@ run_target() {
             run_cargo_with_timeout 600 \
                 test --locked -p trust-cg-codegen --all-features \
                 --test "${target}" -- \
-                    --exact "${test_name}" --include-ignored --test-threads=1
+                    --exact "${test_name}" --include-ignored \
+                    --test-threads="${RUST_TEST_THREADS}"
         done
     fi
 }
@@ -398,7 +405,7 @@ run_complement() {
 
     set -- test --locked -p trust-cg-codegen --all-features \
         --lib --bins --examples --tests \
-        --no-fail-fast -- --exact --test-threads=1
+        --no-fail-fast -- --exact --test-threads="${RUST_TEST_THREADS}"
     for test_name in $(policy_test_names); do
         set -- "$@" --skip "${test_name}"
     done
@@ -432,7 +439,7 @@ run_complement() {
     echo ">>> public-release codegen doctests"
     run_cargo_with_timeout 3600 \
         test --locked -p trust-cg-codegen --all-features --doc -- \
-            --test-threads=1
+            --test-threads="${RUST_TEST_THREADS}"
     echo "Public-release codegen complement: PASS"
 }
 

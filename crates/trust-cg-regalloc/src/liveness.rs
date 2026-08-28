@@ -301,6 +301,46 @@ pub fn number_insts(func: &MachFunction) -> BTreeMap<InstId, u32> {
     inst_numbering
 }
 
+/// Epoch-stamped dense `vreg id -> u32` scratch map for the per-block passes
+/// of `compute_live_intervals` step 3: `clear` is O(1) (bump the epoch) and
+/// `insert` / `get` are O(1) array accesses instead of a fresh
+/// `BTreeMap<u32, u32>` per block per pass. Observationally identical to the
+/// maps it replaces: they were only ever `insert`ed and `get` — no iteration,
+/// no length, no removal — so nothing depends on the representation.
+struct DenseScratch {
+    val: Vec<u32>,
+    stamp: Vec<u32>,
+    epoch: u32,
+}
+
+impl DenseScratch {
+    fn new(n: usize) -> Self {
+        Self {
+            val: vec![0; n],
+            stamp: vec![0; n],
+            epoch: 0,
+        }
+    }
+
+    #[inline]
+    fn clear(&mut self) {
+        self.epoch += 1;
+    }
+
+    #[inline]
+    fn insert(&mut self, id: u32, v: u32) {
+        let i = id as usize;
+        self.val[i] = v;
+        self.stamp[i] = self.epoch;
+    }
+
+    #[inline]
+    fn get(&self, id: u32) -> Option<u32> {
+        let i = id as usize;
+        (self.stamp[i] == self.epoch).then(|| self.val[i])
+    }
+}
+
 pub fn compute_live_intervals(func: &MachFunction) -> LivenessResult {
     let mut inst_loop_depths: Vec<u32> = Vec::new();
     let vreg_classes = collect_vreg_classes(func);
@@ -321,6 +361,9 @@ pub fn compute_live_intervals(func: &MachFunction) -> LivenessResult {
     // every use/def paid O(log n) + btree-node churn per access, a top
     // core-pipeline cost. Output is identical (same keys, same sorted order).
     let mut interval_vec: Vec<Option<LiveInterval>> = (0..n_vregs).map(|_| None).collect();
+    // One dense scratch map for the three per-block passes of step 3 (see
+    // `DenseScratch`); cleared in O(1) before each pass.
+    let mut scratch = DenseScratch::new(n_vregs);
 
     // Step 1: Number instructions linearly across all blocks. `inst_num_vec`
     // (dense, indexed by `InstId.0` which already indexes `func.insts`) backs
@@ -429,12 +472,12 @@ pub fn compute_live_intervals(func: &MachFunction) -> LivenessResult {
         // First pass: record the LAST definition of each vreg in this block.
         // Live-out intervals should extend from that last local def (if any)
         // to block_end.
-        let mut last_defs_in_block: BTreeMap<u32, u32> = BTreeMap::new(); // vreg_id -> def position
+        scratch.clear(); // vreg_id -> def position
         for &inst_id in &block.insts {
             let inst = &func.insts[inst_id.0 as usize];
             let idx = inst_num_vec[inst_id.0 as usize];
             for vreg in inst.vreg_defs() {
-                last_defs_in_block.insert(vreg.id, idx);
+                scratch.insert(vreg.id, idx);
             }
         }
 
@@ -446,7 +489,7 @@ pub fn compute_live_intervals(func: &MachFunction) -> LivenessResult {
                     class: vreg_class_for_id(vreg_id, &vreg_classes),
                 })
             });
-            if let Some(&def_pos) = last_defs_in_block.get(&vreg_id) {
+            if let Some(def_pos) = scratch.get(vreg_id) {
                 // Defined in this block and live-out: [def_pos, block_end).
                 interval.add_range(def_pos, block_end);
             } else {
@@ -469,18 +512,18 @@ pub fn compute_live_intervals(func: &MachFunction) -> LivenessResult {
         // rustc::default-hash-types, and deterministic iteration is a
         // reproducibility bonus; u32-keyed lookups here are not hot enough
         // for the constant-factor difference to matter.
-        let mut last_use_end_in_block: BTreeMap<u32, u32> = BTreeMap::new();
+        scratch.clear(); // vreg_id -> end of its last use in the block
         for &inst_id in &block.insts {
             let idx = inst_num_vec[inst_id.0 as usize];
             for vreg in func.insts[inst_id.0 as usize].vreg_uses() {
-                last_use_end_in_block.insert(vreg.id, idx + 1);
+                scratch.insert(vreg.id, idx + 1);
             }
         }
         for vreg_id in live_in[bi].iter() {
             if live_out[bi].contains(vreg_id) {
                 continue; // Already handled above.
             }
-            if let Some(&last_use_end) = last_use_end_in_block.get(&vreg_id)
+            if let Some(last_use_end) = scratch.get(vreg_id)
                 && last_use_end > block_start
             {
                 let interval = interval_vec[vreg_id as usize].get_or_insert_with(|| {
@@ -501,7 +544,7 @@ pub fn compute_live_intervals(func: &MachFunction) -> LivenessResult {
         // block. Otherwise in-place updates like `v0 = add v0, v1` appear dead
         // between the original def and the use, which is the weighted-stack-arg
         // failure from issue #300/#306 combined.
-        let mut reaching_defs: BTreeMap<u32, u32> = BTreeMap::new();
+        scratch.clear(); // vreg_id -> position of its reaching in-block def
         for &inst_id in &block.insts {
             let inst = &func.insts[inst_id.0 as usize];
             let idx = inst_num_vec[inst_id.0 as usize];
@@ -516,7 +559,7 @@ pub fn compute_live_intervals(func: &MachFunction) -> LivenessResult {
                 // live-in) through this use. This ensures that a vreg
                 // defined at D and used at U gets a continuous range
                 // [D, U+1), not two point ranges with a hole.
-                if let Some(&def_pos) = reaching_defs.get(&vreg.id) {
+                if let Some(def_pos) = scratch.get(vreg.id) {
                     interval.add_range(def_pos, idx + 1);
                 } else {
                     // Live-in: extend from block_start to this use.
@@ -531,7 +574,7 @@ pub fn compute_live_intervals(func: &MachFunction) -> LivenessResult {
                 interval.def_positions.push(idx);
                 // Ensure at minimum a point range for the def.
                 interval.add_range(idx, idx + 1);
-                reaching_defs.insert(vreg.id, idx);
+                scratch.insert(vreg.id, idx);
             }
         }
     }

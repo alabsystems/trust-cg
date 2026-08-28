@@ -23,6 +23,7 @@
 // the wrong opcode/wiring, the machine side built from the REAL instruction
 // would diverge from the intended-source side exactly as modeled here.
 
+use trust_cg_ir::aarch64_regs::{WZR, XZR};
 use trust_cg_ir::types::InstId;
 use trust_cg_ir::{
     AArch64Opcode, MachFunction, MachInst, MachOperand, RegClass, Signature, SpecialReg, VReg,
@@ -536,26 +537,44 @@ fn injected_swapped_operands_on_orn_refutes() {
 
 #[test]
 fn orn_with_zero_register_reconstructs_as_bnot() {
-    // `ORN Rd, WZR, Rm` is the MVN alias = ~Rm. The reconstructor recognizes the
-    // zero rn slot and builds the UNARY Bnot semantics (one source input).
-    let inst = MachInst::new(
-        AArch64Opcode::OrnRR,
-        vec![vreg32(0), MachOperand::Special(SpecialReg::WZR), vreg32(2)],
-    );
-    let ob = reconstruct_alu_obligation(&inst).expect("ORN-as-MVN must reconstruct");
-    assert!(ob.is_reconstructed());
-    assert!(ob.name.contains("Bnot"), "must model Bnot, got {}", ob.name);
-    assert_eq!(ob.inputs.len(), 1, "MVN is unary — one source input");
-    match &ob.machine_side_provenance {
-        MachineSideProvenance::Reconstructed { arity, .. } => {
-            assert_eq!(*arity, 1, "MVN reconstructs with unary arity")
+    // `ORN Rd, WZR/XZR, Rm` is the MVN alias = ~Rm. Isel emits the physical
+    // PReg form, while hand-built/test instructions may use SpecialReg; both
+    // must select the same UNARY Bnot semantics (one source input).
+    for inst in [
+        MachInst::new(
+            AArch64Opcode::OrnRR,
+            vec![vreg32(0), MachOperand::Special(SpecialReg::WZR), vreg32(2)],
+        ),
+        MachInst::new(
+            AArch64Opcode::OrnRR,
+            vec![vreg32(0), MachOperand::PReg(WZR), vreg32(2)],
+        ),
+        MachInst::new(
+            AArch64Opcode::OrnRR,
+            vec![vreg64(0), MachOperand::PReg(XZR), vreg64(2)],
+        ),
+    ] {
+        let ob = reconstruct_alu_obligation(&inst).expect("ORN-as-MVN must reconstruct");
+        assert!(ob.is_reconstructed());
+        assert!(ob.name.contains("Bnot"), "must model Bnot, got {}", ob.name);
+        assert_eq!(ob.inputs.len(), 1, "MVN is unary — one source input");
+        match &ob.machine_side_provenance {
+            MachineSideProvenance::Reconstructed { arity, .. } => {
+                assert_eq!(*arity, 1, "MVN reconstructs with unary arity")
+            }
+            other => panic!("expected Reconstructed, got {other:?}"),
         }
-        other => panic!("expected Reconstructed, got {other:?}"),
+        assert!(matches!(
+            verify_by_evaluation(&ob),
+            VerificationResult::Valid
+        ));
     }
-    assert!(matches!(
-        verify_by_evaluation(&ob),
-        VerificationResult::Valid
-    ));
+
+    let wrong_width = MachInst::new(
+        AArch64Opcode::OrnRR,
+        vec![vreg32(0), MachOperand::PReg(XZR), vreg32(2)],
+    );
+    assert!(reconstruct_alu_obligation(&wrong_width).is_none());
 }
 
 // ---- EXTENDS: Sxt* / Uxt* (unary, width-changing) ----

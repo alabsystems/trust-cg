@@ -33,8 +33,16 @@
 //       the coverage-error list, not on silence.
 //   (e) The 4 headline coverage numbers are pinned exactly. Every uncovered row
 //       must be an explicit `DeferredUnfaithfulModel`, never a wiring gap.
-//       AArch64 is 155/248 with 93 explicit model gaps; x86-64 is 163/192
-//       with 29; RISC-V is 14/17 with 3; wasm is 109/111 with 2.
+//       AArch64 is 156/248 with 92 explicit model gaps; x86-64 is 167/196
+//       with 29; RISC-V is 14/17 with 3; wasm is 111/113 with 2 (the two
+//       INTEGER constant rows closed by P4's independent LEB decoder; the two
+//       FLOAT constant rows joined the mirror with the same work and are named
+//       RED deferrals, because a raw IEEE-754 payload is not a LEB128). The
+//       wasm P3 VALUE-DOMAIN sub-inventory is pinned alongside them at 28/32
+//       with 4 named deferrals, the CFG-STRUCTURAL family at its mutant/
+//       deferral split, and the memory/call-ABI family at its own; each is a
+//       sub-inventory of the wasm backend, not a fifth backend, so none of them
+//       changes the four headlines.
 
 use std::collections::HashSet;
 
@@ -235,13 +243,24 @@ fn meta_b_every_opcode_is_classified_total_classifier() {
 // 100% headlines rest on `is_reconstructed() && Valid`, not on X==X.
 #[test]
 fn meta_c_every_credit_is_genuine_never_static_degenerate() {
+    // The flag is whether RECONSTRUCTION is a credit path for the arch at all.
+    // It is for every opcode-keyed inventory and for the wasm ABI family, whose
+    // frame obligations rebuild their machine side from the emitted prologue /
+    // alloca / epilogue bytes. It is NOT for the wasm CFG-structural family:
+    // that family's credit unit is a REFUTATION of a deliberately-wrong module,
+    // not a rebuilt expression, so demanding a reconstruction credit there would
+    // demand a credit path it deliberately does not have. The no-DEGENERATE
+    // clause still applies to it — it applies to every arch.
     let archs = [
-        GateArch::AArch64,
-        GateArch::X86_64,
-        GateArch::RiscV,
-        GateArch::Wasm,
+        (GateArch::AArch64, true),
+        (GateArch::X86_64, true),
+        (GateArch::RiscV, true),
+        (GateArch::Wasm, true),
+        (GateArch::WasmValueDomain, true),
+        (GateArch::WasmAbi, true),
+        (GateArch::WasmCfgStructural, false),
     ];
-    for arch in archs {
+    for (arch, expects_reconstruction_credit) in archs {
         let report = on_large_stack(move || CoverageGate::new().audit(arch));
         let mut reconstruction_credits = 0usize;
         for row in &report.rows {
@@ -274,11 +293,20 @@ fn meta_c_every_credit_is_genuine_never_static_degenerate() {
         // of reconstruction + genuine DB discharge. In every backend the genuine
         // emittable surface is reconstruction-dominated, so there must be at least
         // one reconstruction credit (the credit path is exercised, not dead).
-        assert!(
-            reconstruction_credits > 0,
-            "{arch}: NOT A SINGLE covered row was credited via reconstruction — the \
-             `is_reconstructed() && Valid` credit path is dead, so the headline cannot rest on it",
-        );
+        if expects_reconstruction_credit {
+            assert!(
+                reconstruction_credits > 0,
+                "{arch}: NOT A SINGLE covered row was credited via reconstruction — the \
+                 `is_reconstructed() && Valid` credit path is dead, so the headline cannot rest \
+                 on it",
+            );
+        } else {
+            assert_eq!(
+                reconstruction_credits, 0,
+                "{arch}: declared as having no reconstruction credit path, yet a row claims one \
+                 — the declaration and the audit have drifted apart",
+            );
+        }
     }
 }
 
@@ -510,21 +538,69 @@ fn meta_e_headline_coverage_is_pinned_and_honest() {
     // emittable. Publication re-audit then withdrew opcode-wide MOVN/MOVK
     // credit. The publication audit then restored all emitted value/effect
     // forms to the denominator, yielding 145/238. Six subsequently added
-    // volatile load/store forms leave 93 explicit RED rows at 151/244;
-    // EorRRLsl/EorRRLsr add two reconstructed shifted-source forms, yielding
-    // 153/246. Umull then leaves the deferred set (faithful single-form
-    // zext64*zext64 widening obligation, proof_umull_rr), yielding 154/246;
-    // complete packed-NZCV TST authority then yields 155/246 with 91 RED rows.
-    // StrbRO/StrhRO add two honest memory-effect gaps to the audited universe,
-    // producing the current 155/248 with 93 RED rows.
+    // volatile load/store forms are explicit RED rows, yielding 151/244 with
+    // 93 RED rows. EorRRLsl/EorRRLsr (the p1_xorshift shifted-source EOR
+    // fusion, bd5acdc6) then added two reconstructed shifted-source forms —
+    // +2 emittable, +2 covered, RED rows unchanged — yielding 153/246.
+    // Umull then leaves the deferred set (faithful single-form zext64*zext64
+    // widening obligation, proof_umull_rr), yielding 154/246; complete
+    // packed-NZCV TST authority then yields 155/246 with 91 RED rows.
+    // RorRI (emitted STANDALONE by the rotate recognizer when the EOR does
+    // not fuse) then leaves the deferred set on BOTH counts its old deferred
+    // reason named — its faithful width-complete W+X rotate obligations
+    // (all_ror_immediate_proofs) AND its width- and immediate-sensitive,
+    // operand-sensitive per-instruction EXTR-alias reconstruction — yielding
+    // 156/246 with 90 RED rows. Both sources of that credit must stay wired.
+    // StrbRO/StrhRO finally add two honest memory-effect gaps to the audited
+    // universe — +2 emittable, +0 covered — producing the current 156/248
+    // with 92 RED rows. The ordering of those last two moves is immaterial:
+    // taking StrbRO/StrhRO first gives 155/248 with 93 RED rows, and RorRI's
+    // discharge then lands on the same 156/248 inventory with 92 RED rows.
     let pins = [
-        // EorRRLsl/EorRRLsr reached 153/246; the independent UMULL widening
-        // theorem and the width-complete packed-NZCV TST theorem each remove
-        // one RED row, yielding 155/246 before the two narrow register-offset
-        // store rows extend the current denominator to 248.
-        (GateArch::AArch64, 248usize, 155usize),
+        // Both development lines independently reached 153/246 via
+        // EorRRLsl/EorRRLsr (the same work committed twice). The union then
+        // takes THREE distinct newly-covered rows — the independent UMULL
+        // widening theorem and the width-complete packed-NZCV TST theorem, plus
+        // the RorRI rotate obligations — and TWO new RED denominator rows
+        // (the narrow register-offset stores StrbRO/StrhRO): 248 emittable,
+        // 156 covered, 92 explicit model gaps. RorRI is ONE opcode and moves
+        // ONE row: both lines promoted the SAME row (one line crediting the
+        // width-complete W+X rotate obligations, the other the EXTR-alias
+        // reconstruction), so the union is 156/248 with 92 RED, NOT 157/248
+        // with 91.
+        (GateArch::AArch64, 248usize, 156usize),
         (GateArch::RiscV, 17usize, 14usize),
-        (GateArch::Wasm, 111usize, 109usize),
+        // P4 closed the two INTEGER scalar-constant rows with an independent LEB
+        // decode, and put the two FLOAT constant forms into the mirror as named
+        // RED deferrals (a raw IEEE-754 payload is not a LEB128, so that decoder
+        // does not reach them). 111 covered of 113.
+        (GateArch::Wasm, 113usize, 111usize),
+        // The wasm P3 VALUE-DOMAIN sub-inventory (GateArch::WasmValueDomain) is
+        // keyed on the SPEC OPCODE BYTE rather than on a `WasmOpcode` variant,
+        // because that enum carries only the two full-width integer load/store
+        // pairs. 32 rows: 28 credited bytes (14 loads 0x28..=0x35, 9 stores
+        // 0x36..=0x3e, 5 sign-extension operators 0xc0..=0xc4), each
+        // reconstruction-credited from its real byte, plus 4 NAMED deferrals
+        // (br_table, memory.size, memory.grow, data segments) held RED IN the
+        // denominator. It is pinned here so the same honest-RED discipline the
+        // four backends carry applies to the P3 surface too.
+        (GateArch::WasmValueDomain, 32usize, 28usize),
+        // The P4 CFG-STRUCTURAL family (GateArch::WasmCfgStructural). 13 rows in
+        // the denominator: the reference module the checker must ACCEPT, the 7
+        // anti-tautology mutants, and the 5 named deferrals. 6 covered (the
+        // reference module + the 5 must-refute mutants); 7 RED (the 2 measured
+        // blind spots + the 5 deferrals, the relooper BISIMULATION first among
+        // them). The 7 invariant STATEMENTS are excluded rows — their teeth are
+        // the mutant rows, and counting the sentence too would credit one piece
+        // of evidence twice.
+        (GateArch::WasmCfgStructural, 13usize, 6usize),
+        // The P4 MEMORY / CALL-ABI families (GateArch::WasmAbi). 128 rows, all
+        // in the denominator: 22 reconstructed frame obligations + 80 decidable
+        // structural checks + 17 anti-tautology guards + 9 named deferrals. 118
+        // covered; 10 RED (the 1 declared blind guard + the 9 deferrals, five of
+        // which are the HOST's under wasm/OWNERSHIP.md — being someone else's
+        // obligation is a reason to name an owner, not to drop the row).
+        (GateArch::WasmAbi, 128usize, 118usize),
         // 149 -> 151 (OPT-7): MovRMSib/MovMRSib SIB memory MOVs flip
         // FailClosedAllowlisted -> EmittableNeedsProof, covered by the same
         // reconstructed Load_I64/Store_I64 effective-address proofs as MovRM/MovMR.
@@ -544,7 +620,12 @@ fn meta_e_headline_coverage_is_pinned_and_honest() {
         // reconciled with the old 158/158 pin. Publication audit then restored
         // 13 emitted former exclusions and 16 volatile memory forms to the
         // denominator as named RED debt.)
-        (GateArch::X86_64, 192usize, 163usize),
+        // 163/192 -> 167/196 (RMW Stage 1): the memory-destination RMW ALU
+        // quartet XorMR/AddMR/XorMRSib/AddMRSib -> EmittableNeedsProof,
+        // covered by the MemRmw reconstruction (MemStore ∘ MemAlu composition
+        // over the shared independent EA encoders; wrong EA / Add-for-Xor /
+        // dropped-src / plain-store REFUTE). Nothing emits the quartet yet.
+        (GateArch::X86_64, 196usize, 167usize),
     ];
     for (arch, emittable_pin, covered_pin) in pins {
         let report = on_large_stack(move || CoverageGate::new().audit(arch));
@@ -606,6 +687,14 @@ fn meta_headline_denominator_is_nonvacuous() {
         (GateArch::AArch64, 40usize),
         (GateArch::RiscV, 10usize),
         (GateArch::Wasm, 80usize),
+        (GateArch::WasmValueDomain, 20usize),
+        // The two P4 families. The CFG floor is small BY CONSTRUCTION — its
+        // denominator is a battery of mutants plus five deferrals, not an opcode
+        // table — so the floor states only that the battery is non-empty and the
+        // deferrals are counted, which is what makes its 6/13 a real ratio
+        // rather than a vacuous one.
+        (GateArch::WasmCfgStructural, 10usize),
+        (GateArch::WasmAbi, 50usize),
         (GateArch::X86_64, 100usize),
     ] {
         let report = on_large_stack(move || CoverageGate::new().audit(arch));

@@ -259,6 +259,11 @@ impl AllIdsReaching {
             ids_in_block.sort_unstable();
             for &id in &ids_in_block {
                 let positions = &per_block[&id];
+                // `ReachingCtx::new` creates a `positions` vec only via
+                // `per_block.entry(id).or_default()` immediately followed by
+                // the `positions.push(pos)` guarded on `last() != Some(&pos)`,
+                // which always fires on a fresh (empty) vec — so no key of
+                // `per_block` can map to an empty vec.
                 let last_pos = *positions.last().expect("non-empty by construction");
                 let site_bit = site_insts.len();
                 site_insts.push(func.block(b).insts[last_pos]);
@@ -275,6 +280,9 @@ impl AllIdsReaching {
         let mut id_list: Vec<u32> = per_id.keys().copied().collect();
         id_list.sort_unstable();
         for id in id_list {
+            // `id_list` is `per_id.keys()` copied one statement above; the only
+            // thing done to it since is `sort_unstable`, and `per_id` itself is
+            // untouched, so every `id` is still a key.
             per_id.get_mut(&id).expect("just listed").0 = next_bit;
             next_bit += 1;
         }
@@ -310,6 +318,10 @@ impl AllIdsReaching {
             in_sets.insert(b, vec![0; words]);
         }
         {
+            // `in_sets` was just seeded with one entry per member of
+            // `reachable_sorted` = `ctx.reachable`, and `reachable_blocks`
+            // starts its worklist at `func.entry` and inserts every popped
+            // block — so the entry is in the set unconditionally.
             let entry_in = in_sets.get_mut(&func.entry).expect("entry is reachable");
             for (_, &(uninit_bit, _)) in per_id.iter() {
                 entry_in[uninit_bit / 64] |= 1u64 << (uninit_bit % 64);
@@ -335,6 +347,10 @@ impl AllIdsReaching {
                         continue;
                     }
                     // OUT[p] = (IN[p] & !kill[p]) | gen[p], computed on the fly.
+                    // The `!ctx.reachable.contains(&p) { continue }` guard three
+                    // lines up, plus the seeding loop that gave every member of
+                    // `reachable_sorted` an `in_sets` entry (and never removes
+                    // one).
                     let pin = in_sets.get(&p).expect("reachable => present");
                     let pkill = kill.get(&p).unwrap_or(&empty);
                     let pgen = gen_masks.get(&p).unwrap_or(&empty);
@@ -342,6 +358,9 @@ impl AllIdsReaching {
                         out_buf[w] |= (pin[w] & !pkill[w]) | pgen[w];
                     }
                 }
+                // `b` is iterating `reachable_sorted`, the very list the
+                // seeding loop above inserted into `in_sets`; nothing removes
+                // from `in_sets` in this fixpoint.
                 let cur = in_sets.get_mut(&b).expect("reachable => present");
                 let mut grew = false;
                 for w in 0..words {
@@ -1325,6 +1344,9 @@ fn reachable_cfg_is_symmetric(func: &MachFunction, reachable: &HashSet<BlockId>)
 
 /// GEN + the OUT fixpoint for one vreg id, retained as the independent one-shot
 /// path against which the all-ids product solution is checked.
+///
+/// Depends only on `id` and the function state — NOT on the use site — which is
+/// what lets a single solve serve every use of that id.
 fn compute_out(
     func: &MachFunction,
     ctx: Option<&ReachingCtx>,
@@ -1436,7 +1458,9 @@ fn compute_out_from_worklist(
     out
 }
 
-/// `IN[use_block]` assembled from a completed one-id OUT fixpoint.
+/// `IN[use_block]` assembled from a completed one-id OUT fixpoint. Cheap: one
+/// pass over the block's predecessors, which is why sharing the fixpoint across
+/// use sites is worth doing.
 fn assemble_in(
     func: &MachFunction,
     reachable: &HashSet<BlockId>,

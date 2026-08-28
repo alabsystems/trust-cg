@@ -889,19 +889,21 @@ fn build_dag_for_insts(func: &MachFunction, inst_ids: &[InstId]) -> ScheduleDAG 
                 // Pre-regalloc the region is
                 //     LdrRI [v9, x29, IncomingArg(8)]   ; dead
                 //     Uxtw  [PReg(x0), v10]             ; the return value
-                //     Ret   [PReg(x30)]                 ; does NOT list x0
-                // Without this edge the dead load may be scheduled after the
-                // `Uxtw`, and regalloc — seeing no later reader of x0, because
-                // `Ret` does not name it — hands the dead load x0. Emitted:
+                //     Ret   [PReg(x30)] + implicit use x0
+                // Historically `Ret` omitted x0, so without this edge the dead
+                // load could be scheduled after the `Uxtw`, and regalloc —
+                // seeing no later reader of x0, because `Ret` did not name it —
+                // handed the dead load x0. Emitted:
                 // `mov w0,w1 ; ldr x0,[x29,#24] ; ret`, i.e. the function
                 // returns its LAST parameter. LLVM 1000, trust-cg 1009 at
                 // O1/O2/O3, and the proofs-on lane did NOT fail closed on it.
                 //
-                // The deeper defect is that `Ret` does not declare the return
-                // register as a use; fixing that is the general repair and
-                // would also cover any future consumer that reasons about
-                // live-out. This edge closes the scheduling half conservatively
-                // in the meantime.
+                // The general repair has since LANDED, and it is the one
+                // that also covers any other consumer reasoning about live-out:
+                // `Ret` now declares its ABI return registers as implicit uses,
+                // and regalloc reserves each producer-to-return physical span.
+                // Keep this direct scheduler edge as defense in depth and to
+                // preserve the canonical adjacent return-setup shape.
                 for &def_idx in &vreg_defs {
                     if def_idx < idx {
                         add_edge(def_idx, idx, &mut edges);
@@ -1352,6 +1354,13 @@ struct ReadySet {
     netp: Vec<i32>,
 }
 
+/// `ReadySet`'s pressure ordering key. A free function rather than a method so
+/// it can be built while `ReadySet::pressure` is mutably borrowed (see
+/// [`ReadySet::insert_ready`]).
+fn pressure_key(netp: &[i32], prio: &[u32], i: usize) -> (i32, core::cmp::Reverse<u32>, usize) {
+    (netp[i], core::cmp::Reverse(prio[i]), i)
+}
+
 impl ReadySet {
     fn new(prio: Vec<u32>, netp: Option<Vec<i32>>) -> Self {
         let n = prio.len();
@@ -1369,16 +1378,14 @@ impl ReadySet {
         (core::cmp::Reverse(self.prio[i]), i)
     }
 
-    fn pressure_key(&self, i: usize) -> (i32, core::cmp::Reverse<u32>, usize) {
-        (self.netp[i], core::cmp::Reverse(self.prio[i]), i)
-    }
-
     fn insert_ready(&mut self, i: usize) {
         let nk = self.normal_key(i);
         self.normal.insert(nk);
-        if self.pressure.is_some() {
-            let pk = self.pressure_key(i);
-            self.pressure.as_mut().expect("checked").insert(pk);
+        // Field-disjoint borrow: the key is built from `netp`/`prio` while
+        // `pressure` is held mutably, so the set is reached WITHOUT a second
+        // lookup — no `is_some()`-then-unwrap pair to keep in agreement.
+        if let Some(pressure) = self.pressure.as_mut() {
+            pressure.insert(pressure_key(&self.netp, &self.prio, i));
         }
         self.slot[i] = ReadySlot::Ready;
     }
@@ -1386,9 +1393,8 @@ impl ReadySet {
     fn remove_ready(&mut self, i: usize) {
         let nk = self.normal_key(i);
         self.normal.remove(&nk);
-        if self.pressure.is_some() {
-            let pk = self.pressure_key(i);
-            self.pressure.as_mut().expect("checked").remove(&pk);
+        if let Some(pressure) = self.pressure.as_mut() {
+            pressure.remove(&pressure_key(&self.netp, &self.prio, i));
         }
     }
 

@@ -318,6 +318,20 @@ impl Recognized {
             bail!("iv class not Gpr64 (iv={:?})", iv.class);
         }
 
+        // IDEMPOTENCE: `apply` keeps the scalar loop as the remainder of the
+        // vector loop it builds, advancing the SAME iv by `block_elems` in the
+        // vector latch and branching from the vector exit into the scalar
+        // header, so that exit becomes the scalar loop's new preheader. Without
+        // this guard the remainder loop was recognized again on every fixpoint
+        // iteration and each iteration nested one more zero-trip vector loop
+        // (v2_memfill: +8 instructions per iteration, never converging). An iv
+        // that is advanced by more than one within a few blocks upstream of the
+        // preheader is exactly that remainder shape.
+        if crate::vector_remainder::iv_is_vector_advanced_upstream(func, &loop_insts, preheader, iv)
+        {
+            bail!("remainder loop of an already-vectorized loop");
+        }
+
         // Store shape: `base[iv*elem_size] = value`, elem_size == store width.
         let Some((base, elem_size, value_reg)) = store_info(func, &def, &loop_insts, iv, store_id)
         else {
@@ -975,6 +989,9 @@ fn apply(func: &mut MachFunction, rec: &Recognized) -> bool {
     let main_bound = alloc(func, RegClass::Gpr64);
     match rec.bound {
         Bound::Runtime(n) => {
+            // `pv` was created at the top of `apply` under exactly this
+            // discriminant (`matches!(rec.bound, Bound::Runtime(_)).then(..)`)
+            // and `rec` is a shared ref, so `rec.bound` cannot have changed.
             let pv = pv.expect("runtime bound -> precheck block");
             emit(
                 func,

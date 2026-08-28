@@ -33,7 +33,6 @@
 
 use std::ffi::CString;
 use std::fs;
-use std::mem::MaybeUninit;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
@@ -41,7 +40,7 @@ use std::sync::Mutex;
 use trust_cg_sat_host::drat_recorder::{
     disable_drat_output, enable_drat_output, flush_drat_output,
 };
-use trust_cg_sat_host::sys;
+use trust_cg_sat_host::{OwnedMicroSatSolver, sys};
 use trust_cg_verify::lowering_proof::{
     ProofObligation, proof_band_i8, proof_bor_i8, proof_bxor_i8, proof_iadd_i8, proof_isub_i8,
     proof_neg_i8,
@@ -145,22 +144,14 @@ fn pin_fixture(name: &str, actual: &[u8]) {
 /// Returns the MicroSAT result code (`sys::SAT` / `sys::UNSAT`).
 fn run_microsat(cnf_path: &Path) -> i32 {
     let c_path = CString::new(cnf_path.to_string_lossy().into_owned()).expect("cnf path");
-    let mut solver: MaybeUninit<sys::solver> = MaybeUninit::uninit();
-    // SAFETY: `parse` is the upstream entry point and itself calls `initCDCL`,
-    // which initialises every solver field it reads — the same construction
-    // MicroSAT's own `main` uses (mirrors trust-cg-sat-host's tests).
-    let parse_rc = unsafe {
-        sys::parse(
-            solver.as_mut_ptr(),
-            c_path.as_ptr() as *mut std::os::raw::c_char,
-        )
-    };
+    // SAFETY: the test emits a well-formed DIMACS file at `cnf_path`.
+    let (mut solver, parse_rc) = unsafe { OwnedMicroSatSolver::parse(c_path.as_c_str()) };
     if parse_rc == sys::UNSAT {
         return sys::UNSAT;
     }
     // SAFETY: `parse` returned without UNSAT, so the solver state is
     // initialised; calling `solve` matches the upstream usage.
-    unsafe { sys::solve(solver.as_mut_ptr()) }
+    unsafe { solver.solve() }
 }
 
 /// Full positive chain for one rule: blast → provenance self-check →

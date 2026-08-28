@@ -4753,6 +4753,73 @@ fn runtime_partial_unroll_enabled() -> bool {
     std::env::var_os("TCG_RUNTIME_PARTIAL_UNROLL").is_some()
 }
 
+/// Kill switch for the PROFILE-GATED runtime partial unroll: set
+/// `TCG_NO_PGO_RUNTIME_PARTIAL` (any value) to keep the tier off even where a
+/// profile marks the loop header hot, for PGO effect attribution A/B runs.
+/// Inert without a profile.
+fn pgo_runtime_partial_enabled() -> bool {
+    std::env::var_os("TCG_NO_PGO_RUNTIME_PARTIAL").is_none()
+}
+
+/// May the runtime-trip tier fire on this loop?
+///
+/// The corpus measurement (see [`runtime_partial_unroll_enabled`]) found the
+/// tier's losers share one shape: the unrolled loop is NOT HOT, so the code
+/// growth buys nothing and costs fetch. This is the gate that acts on that.
+///
+/// Two ways in, and they are deliberately different in kind:
+///
+/// * `TCG_RUNTIME_PARTIAL_UNROLL` — the unconditional opt-in. Unchanged, so
+///   every A/B number already recorded for the tier still reproduces exactly.
+/// * A profile that classifies the loop hot. This requires BOTH the header
+///   block AND its enclosing function to be hot — see below.
+///
+/// # Why the function-level check is not redundant
+///
+/// `BlockHotness` is normalized WITHIN its function:
+/// `function_count = call_count.max(max_block_count)`
+/// (`pgo::profile_use::block_hotness`). So the hottest block of a function that
+/// runs twice in the whole program still classes `Hot` — every function has a
+/// hottest block. Gating on the block alone would therefore admit exactly the
+/// case this gate exists to reject: a loop that is locally prominent but
+/// globally irrelevant, where the code growth is pure fetch cost. Requiring
+/// `ProfileHotness::function` to be hot as well re-imposes the module-wide
+/// comparison, since that one IS normalized against `max_function_count`.
+///
+/// WITHOUT a profile this returns false, so an ordinary non-PGO `-O2` compile
+/// is byte-identical to before. That is the honest scope of this gate: it does
+/// not make the tier default-on everywhere, it makes it default-on exactly
+/// where hotness is *known* rather than guessed.
+///
+/// A STATIC gate was investigated and is not available: `trust-cg-opt` has no
+/// block-frequency or branch-probability analysis, `NaturalLoop::depth` is NEST
+/// depth rather than frequency, and `MachBlock::loop_depth` is still 0 at this
+/// seam because `populate_loop_depths` runs post-allocation on the regalloc
+/// function type. Body size and nesting depth were both measured directly as
+/// proxies and neither separated the winners from the losers.
+fn runtime_partial_unroll_allowed(
+    func: &MachFunction,
+    header: BlockId,
+    hotness: Option<&ProfileHotness>,
+) -> bool {
+    if runtime_partial_unroll_enabled() {
+        return true;
+    }
+    if !pgo_runtime_partial_enabled() {
+        return false;
+    }
+    let Some(hotness) = hotness else {
+        return false;
+    };
+    let header_hot = hotness
+        .block(&func.name, header)
+        .is_some_and(|block| block.class.is_hot());
+    let function_hot = hotness
+        .function(&func.name)
+        .is_some_and(|function| function.class.is_hot());
+    header_hot && function_hot
+}
+
 /// Runtime-trip partial unroll: the factor. Unlike the constant tier there is no
 /// trip count to pick against, so this is a fixed factor bounded by code growth.
 ///
@@ -5538,11 +5605,12 @@ fn partial_unroll_apply(
 #[derive(Debug, Clone, Default)]
 pub struct PartialUnroll {
     fired: usize,
+    hotness: Option<ProfileHotness>,
 }
 
 impl PartialUnroll {
-    pub fn new() -> Self {
-        Self { fired: 0 }
+    pub fn new(hotness: Option<ProfileHotness>) -> Self {
+        Self { fired: 0, hotness }
     }
 
     /// Loops partially unrolled in the last `run`.
@@ -5560,6 +5628,11 @@ impl PartialUnroll {
         if !partial_unroll_enabled() || loop_analysis.is_empty() {
             return false;
         }
+        // Disjoint borrow: `fired` is written once per firing while `hotness` is
+        // read at every runtime-tier gate. Splitting the struct here keeps both
+        // live at once without cloning the whole per-function profile map on
+        // every function the pass visits.
+        let Self { fired, hotness } = self;
         let dump = std::env::var_os("TRUST_CG_DUMP_PARTIAL").is_some();
         let all_loops: Vec<NaturalLoop> = loop_analysis.all_loops().cloned().collect();
         let innermost: Vec<&NaturalLoop> = all_loops
@@ -5610,11 +5683,12 @@ impl PartialUnroll {
             // no trip count to choose a factor against, so the factor is fixed
             // and the only gate is body size and the function's growth budget.
             if let Some(_rb) = pl.runtime {
-                if !runtime_partial_unroll_enabled() {
+                if !runtime_partial_unroll_allowed(func, pl.header, hotness.as_ref()) {
                     if dump {
                         eprintln!(
                             "[partial-unroll] {}: header={:?} body={} RUNTIME-BOUND \
-                             (tier off; set TCG_RUNTIME_PARTIAL_UNROLL=1)",
+                             (tier off; needs a profile marking the header hot, or \
+                             TCG_RUNTIME_PARTIAL_UNROLL=1)",
                             func.name,
                             pl.header,
                             pl.body_len()
@@ -5719,7 +5793,7 @@ impl PartialUnroll {
                 None => partial_unroll_apply(func, &lp, &pl, k, provenance.as_deref_mut()),
             };
             if applied {
-                self.fired += 1;
+                *fired += 1;
                 changed = true;
             }
         }
@@ -8531,6 +8605,124 @@ mod tests {
             .find(|&p| p != PL_LATCH && p != BlockId(0))
     }
 
+    /// A loop whose trip count is NOT statically provable, so it reaches the
+    /// RUNTIME-bounded tier rather than the constant one.
+    ///
+    /// `make_symbolic_diff_loop` on its own has a provable trip count of 2 (the
+    /// symbolic base cancels between init and bound), so it never gets that
+    /// far. Swapping the exit test to a signed-less-than makes the base stop
+    /// cancelling — the same mutation
+    /// `test_copy_based_symbolic_relational_refused` uses to push the constant
+    /// tier into failing closed.
+    fn make_runtime_bound_loop() -> MachFunction {
+        let mut func = make_copy_counted_loop(0, 1, 4096);
+        // The recognized shape hoists the bound into the preheader as
+        // `v11 = Movz #limit`. Replacing that with a copy of an incoming
+        // physical register makes the bound a RUNTIME value, so the trip count
+        // stops being statically provable and the loop lands in the
+        // runtime-bounded tier instead of the constant one.
+        let preheader = BlockId(0);
+        let bound_def = *func
+            .block(preheader)
+            .insts
+            .iter()
+            .find(|&&id| {
+                matches!(func.inst(id).opcode, AArch64Opcode::Movz)
+                    && func.inst(id).operands.first() == Some(&vreg(11))
+            })
+            .expect("fixture must hoist the bound as `v11 = Movz #limit`");
+        *func.inst_mut(bound_def) = MachInst::new(
+            AArch64Opcode::Copy,
+            vec![vreg(11), MachOperand::PReg(PReg::new(3))],
+        );
+        func
+    }
+
+    /// Profile marking EVERY block of `function_name` with `hits`, so a test
+    /// need not know which `BlockId` the recognizer picks as the header.
+    fn profile_marking_all_blocks(
+        func: &MachFunction,
+        function_name: &str,
+        hits: u64,
+        function_count: u64,
+    ) -> ProfileHotness {
+        let mut profile = ProfData::new(0x396);
+        let mut function = FunctionProfile::new(function_name);
+        function.call_count = function_count;
+        for id in 0..func.num_blocks() as u32 {
+            function.blocks.push(BlockProfile::new(id, hits));
+        }
+        profile.functions.push(function);
+        ProfileHotness::from_profile(&profile)
+    }
+
+    /// The runtime tier fires only where a profile says the loop is hot, and is
+    /// inert without one. This is what lets it default ON under PGO while an
+    /// ordinary `-O2` build stays byte-identical.
+    #[test]
+    fn runtime_partial_unroll_needs_a_profile_that_says_hot() {
+        // No profile at all: the tier must stay off.
+        let mut func = make_runtime_bound_loop();
+        let hot = profile_marking_all_blocks(&func, "copyloop", 1_000, 1_000);
+        assert!(
+            !PartialUnroll::new(None).run(&mut make_runtime_bound_loop()),
+            "with no profile the runtime tier must not fire"
+        );
+        // A profile marking the loop hot: the tier is allowed in.
+        let fired_hot = PartialUnroll::new(Some(hot)).run(&mut func);
+
+        // A profile marking it COLD must not re-enable it.
+        let mut cold_func = make_runtime_bound_loop();
+        let cold = profile_marking_all_blocks(&cold_func, "copyloop", 1, 1_000_000);
+        assert!(
+            !PartialUnroll::new(Some(cold)).run(&mut cold_func),
+            "a cold profile must leave the runtime tier off"
+        );
+        // The hot arm is the one that distinguishes the gate from a constant
+        // `false`; assert last so a recognizer change reads as this failing
+        // rather than the cold arm silently passing for the wrong reason.
+        assert!(
+            fired_hot,
+            "a profile marking the loop hot must admit the runtime tier"
+        );
+    }
+
+    /// `BlockHotness` is normalized WITHIN its function, so the hottest block of
+    /// a function that runs almost never still classes `Hot`. Gating on the
+    /// block alone would admit exactly the locally-prominent, globally-irrelevant
+    /// loop this gate exists to reject.
+    #[test]
+    fn runtime_partial_unroll_rejects_a_hot_block_in_a_cold_function() {
+        let mut func = make_runtime_bound_loop();
+        // Every block is the hottest block of its own function (hits ==
+        // call_count => block class Hot), but the function itself is a rounding
+        // error against the module's hottest.
+        let mut profile = ProfData::new(0x396);
+        let mut cold_fn = FunctionProfile::new("copyloop");
+        cold_fn.call_count = 4;
+        for id in 0..func.num_blocks() as u32 {
+            cold_fn.blocks.push(BlockProfile::new(id, 4));
+        }
+        profile.functions.push(cold_fn);
+        // A second, genuinely hot function sets `max_function_count`.
+        let mut hot_fn = FunctionProfile::new("the_real_hot_one");
+        hot_fn.call_count = 10_000_000;
+        hot_fn.blocks.push(BlockProfile::new(0, 10_000_000));
+        profile.functions.push(hot_fn);
+        let hotness = ProfileHotness::from_profile(&profile);
+
+        assert!(
+            hotness
+                .block("copyloop", BlockId(1))
+                .is_some_and(|b| b.class.is_hot()),
+            "precondition: the block IS locally hot, which is the trap"
+        );
+        assert!(
+            !PartialUnroll::new(Some(hotness)).run(&mut func),
+            "a hot block inside a cold function must NOT admit the runtime tier"
+        );
+    }
+
     /// THE remainder-correctness pin. For every trip count in a sweep that
     /// deliberately includes 0, 1, primes and every `N mod K` residue, a fired
     /// partial unroll must satisfy `N = r + q*K` EXACTLY: `r` peeled iterations,
@@ -8544,7 +8736,7 @@ mod tests {
         let mut fired = 0usize;
         for n in trips {
             let mut func = make_copy_counted_loop(0, 1, n);
-            let mut pass = PartialUnroll::new();
+            let mut pass = PartialUnroll::new(None);
             let changed = pass.run(&mut func);
             if !changed {
                 assert!(
@@ -8595,7 +8787,7 @@ mod tests {
         for n in 0..PARTIAL_MIN_TRIP as i64 {
             let mut func = make_copy_counted_loop(0, 1, n);
             let before = func.num_blocks();
-            let mut pass = PartialUnroll::new();
+            let mut pass = PartialUnroll::new(None);
             assert!(!pass.run(&mut func), "trip {n} must not partially unroll");
             assert_eq!(func.num_blocks(), before, "trip {n} must be untouched");
             assert!(func.block(PL_LATCH).succs.contains(&PL_HEADER));
@@ -8607,7 +8799,7 @@ mod tests {
     fn test_partial_unroll_non_unit_and_negative_step() {
         // step 2, bound 50 -> trip 25 (odd, so a peel is forced).
         let mut func = make_copy_counted_loop(0, 2, 50);
-        let mut pass = PartialUnroll::new();
+        let mut pass = PartialUnroll::new(None);
         assert!(pass.run(&mut func), "step-2 loop should partially unroll");
         let k = block_work(&func, PL_HEADER) as i64;
         let r = peel_block(&func).map_or(0, |p| block_work(&func, p) as i64);
@@ -8615,7 +8807,7 @@ mod tests {
 
         // step -1 counting down from 37 to 0 -> trip 37 (prime).
         let mut func = make_copy_counted_loop(37, -1, 0);
-        let mut pass = PartialUnroll::new();
+        let mut pass = PartialUnroll::new(None);
         assert!(pass.run(&mut func), "down-counting loop should unroll");
         let k = block_work(&func, PL_HEADER) as i64;
         let r = peel_block(&func).map_or(0, |p| block_work(&func, p) as i64);
@@ -8643,7 +8835,7 @@ mod tests {
             .insts
             .retain(|&i| i != cset && i != cmpri);
 
-        let mut pass = PartialUnroll::new();
+        let mut pass = PartialUnroll::new(None);
         assert!(pass.run(&mut func), "folded dialect should be recognized");
         let k = block_work(&func, PL_HEADER) as i64;
         let r = peel_block(&func).map_or(0, |p| block_work(&func, p) as i64);
@@ -8657,7 +8849,7 @@ mod tests {
         let mut func = make_copy_counted_loop(0, 1, 100);
         let call = func.push_inst(MachInst::new(AArch64Opcode::Bl, vec![]));
         func.block_mut(PL_HEADER).insts.insert(0, call);
-        let mut pass = PartialUnroll::new();
+        let mut pass = PartialUnroll::new(None);
         assert!(!pass.run(&mut func), "a call in the body must fail closed");
     }
 
@@ -8669,14 +8861,14 @@ mod tests {
         let mut func = make_copy_counted_loop(0, 1, 100);
         let trap = func.push_inst(MachInst::new(AArch64Opcode::TrapNullIfZero, vec![vreg(1)]));
         func.block_mut(PL_HEADER).insts.insert(0, trap);
-        let mut pass = PartialUnroll::new();
+        let mut pass = PartialUnroll::new(None);
         assert!(!pass.run(&mut func), "a trap pseudo must fail closed");
 
         // Same for the latch's carry chain.
         let mut func = make_copy_counted_loop(0, 1, 100);
         let trap = func.push_inst(MachInst::new(AArch64Opcode::TrapNullIfZero, vec![vreg(1)]));
         func.block_mut(PL_LATCH).insts.insert(0, trap);
-        let mut pass = PartialUnroll::new();
+        let mut pass = PartialUnroll::new(None);
         assert!(
             !pass.run(&mut func),
             "a trap pseudo in the carry must fail closed"
@@ -8694,7 +8886,7 @@ mod tests {
         ));
         // Splice between the CSet and the CmpRI cond,#0.
         func.block_mut(PL_HEADER).insts.insert(4, extra);
-        let mut pass = PartialUnroll::new();
+        let mut pass = PartialUnroll::new(None);
         assert!(
             !pass.run(&mut func),
             "a non-suffix control must fail closed"
@@ -8713,7 +8905,7 @@ mod tests {
             ));
             func.block_mut(PL_HEADER).insts.insert(0, filler);
         }
-        let mut pass = PartialUnroll::new();
+        let mut pass = PartialUnroll::new(None);
         assert!(!pass.run(&mut func), "an oversized body must be declined");
     }
 
@@ -8757,7 +8949,7 @@ mod tests {
             .take(5)
             .map(|&i| func.inst(i).opcode)
             .collect();
-        let mut pass = PartialUnroll::new();
+        let mut pass = PartialUnroll::new(None);
         assert!(pass.run(&mut func));
         let control_after: Vec<AArch64Opcode> = func
             .block(PL_HEADER)
@@ -8924,5 +9116,44 @@ mod tests {
         let mut pass = CallUnroll::new();
         assert!(pass.run(&mut func), "folded dialect must be recognized");
         assert_eq!(count_body_work(&func), 8);
+    }
+
+    /// IDEMPOTENCE / CONVERGENCE: unrolling replaces the loop, so a second run
+    /// on the result must change nothing (the 2026-08-27 vectorizer bug class
+    /// was exactly a pass re-firing on its own output every fixpoint
+    /// iteration).
+    #[test]
+    fn second_run_is_a_no_op_for_every_firing_shape() {
+        let cases: Vec<(&str, Box<dyn Fn() -> MachFunction>)> = vec![
+            ("counting-2", Box::new(|| make_counting_loop(2))),
+            ("counting-4", Box::new(|| make_counting_loop(4))),
+            (
+                "bounded-early-exit-3",
+                Box::new(|| make_bounded_early_exit_loop(3)),
+            ),
+        ];
+        for (label, build) in cases {
+            let mut func = build();
+            let mut pass = LoopUnroll::default();
+            assert!(pass.run(&mut func), "{label}: first run must fire");
+            let (insts, blocks) = (func.insts.len(), func.blocks.len());
+            for again in 2..=4 {
+                let mut pass = LoopUnroll::default();
+                assert!(
+                    !pass.run(&mut func),
+                    "{label}: run {again} re-fired on its own output"
+                );
+                assert_eq!(
+                    func.insts.len(),
+                    insts,
+                    "{label}: run {again} added instructions"
+                );
+                assert_eq!(
+                    func.blocks.len(),
+                    blocks,
+                    "{label}: run {again} added blocks"
+                );
+            }
+        }
     }
 }

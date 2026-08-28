@@ -1840,6 +1840,24 @@ impl<'a> FrameIndexEliminator<'a> {
         if slot_idx < self.slot_offsets.len() {
             let fp_offset = self.slot_offsets[slot_idx] as i64;
             if self.layout.uses_frame_pointer {
+                // Deep frames: FP-relative offsets below -256 lose single-
+                // instruction reach (LDUR window) and go through scratch
+                // materialization (2-5 insts per access). The same slot seen
+                // from SP is a *positive* offset with unsigned scaled-imm
+                // reach in one instruction. The prologue establishes
+                // FP = entry_SP - 16 (FP/LR at the top of the callee-saved
+                // area) and SP_final = entry_SP - total_frame_size, so
+                // FP - SP = total_frame_size - 16 and SP is static afterwards
+                // unless the function has dynamic stack allocation. Prefer
+                // the SP form exactly when the FP form would need scratch
+                // help and the SP form is in direct reach. Small offsets keep
+                // the FP form (identical output to before this preference).
+                if !self.layout.has_dynamic_alloc && is_large_offset(fp_offset) {
+                    let sp_offset = fp_offset + self.layout.total_frame_size as i64 - 16;
+                    if !is_large_offset(sp_offset) {
+                        return (SP, sp_offset);
+                    }
+                }
                 (X29, fp_offset)
             } else {
                 // SP-relative: FP offset + callee_saved_area + sp_adjustment
@@ -3491,17 +3509,23 @@ fn blocks_in_any_loop(func: &MachFunction, dom: &BlockDom) -> std::collections::
 /// Does this instruction force a frame (touches a callee-saved register, makes a
 /// call, or reads a stack slot / frame pointer)? Runs post-`eliminate_frame_indices`,
 /// so stack-slot accesses appear as `MemOp { base: X29, .. }` — or, for a far slot
-/// re-based by [`FrameIndexEliminator::resolve_slot_operand_for_inst`], as
-/// `MemOp { base: SP, .. }`.
+/// re-based by [`FrameIndexEliminator::resolve_slot_operand_for_inst`], or one the
+/// deep-slot SP preference in [`FrameIndexEliminator::resolve_slot_operand`] moved,
+/// as `MemOp { base: SP, .. }` / `Special(SP)` address arithmetic.
 ///
 /// **An SP-based `MemOp` forces a frame too.** Both bases name a frame byte only
 /// AFTER the prologue has run: the prologue moves SP (callee-save pre-index +
 /// the locals `sub`), so an SP-relative slot access sunk ABOVE a shrunk prologue
 /// would address the CALLER's stack. Any function whose guard region touches a
 /// frame slot on either base must therefore keep its whole-function prologue.
-/// (Before the re-base existed, `resolve_slot_operand` only produced an SP base
-/// in frames with no frame pointer, which shrink-wrapping already declines — so
-/// this closes the hole the moment SP bases can appear in an FP frame.)
+/// (Before the re-base and the deep-slot preference existed, `resolve_slot_operand`
+/// only produced an SP base in frames with no frame pointer, which shrink-wrapping
+/// already declines — so this closes the hole the moment SP bases can appear in an
+/// FP frame.)
+///
+/// Treating SP as frame-forcing is purely conservative — it can only decline or
+/// constrain a shrink-wrap plan, and outgoing-arg SP stores sit next to calls,
+/// which force a frame already.
 fn inst_needs_frame(inst: &MachInst) -> bool {
     // A real call (a tail call never returns and is handled as leaf, but we
     // decline tail-call functions from shrink-wrapping entirely, so treat it as
@@ -3513,7 +3537,10 @@ fn inst_needs_frame(inst: &MachInst) -> bool {
         return true;
     }
     let preg_forces = |p: PReg| -> bool {
-        callee_saved_gpr_index(p).is_some() || callee_saved_fpr_index(p).is_some() || p == X29
+        callee_saved_gpr_index(p).is_some()
+            || callee_saved_fpr_index(p).is_some()
+            || p == X29
+            || p == SP
     };
     for op in &inst.operands {
         match op {
@@ -3868,18 +3895,20 @@ fn emit_shrink_wrapped(func: &mut MachFunction, layout: &FrameLayout, plan: &Shr
     new_insts.extend(old);
     func.blocks[s].insts = new_insts;
 
-    // Frame-dominated returns: full epilogue (with ret) replacing the ret.
+    // Frame-dominated returns: insert cleanup before the original return. The
+    // return carries signature-authenticated implicit ABI sink metadata, so it
+    // must retain both its instruction identity and all of its fields.
     for &rb in &plan.frame_return_blocks {
         let b = rb.0 as usize;
         let old = std::mem::take(&mut func.blocks[b].insts);
         let mut new_insts = Vec::with_capacity(old.len() + layout.callee_saved_pairs.len() + 2);
         for &inst_id in &old {
             if func.insts[inst_id.0 as usize].is_return() {
-                for ei in emit_epilogue(layout) {
+                for ei in emit_epilogue_before_tail_branch(layout) {
                     let id = func.push_inst(ei);
                     new_insts.push(id);
                 }
-                // original ret dropped (emit_epilogue supplies its own ret)
+                new_insts.push(inst_id);
             } else {
                 new_insts.push(inst_id);
             }
@@ -4047,22 +4076,16 @@ fn insert_prologue_epilogue_impl(
                         func.blocks[fail_block.0 as usize].preds.push(this_block);
                     }
                 }
-                // Generate epilogue instructions fresh (avoids cloning a template).
-                // The normal epilogue includes its own RET, so return lowering
-                // drops the original. Tail branches need the same cleanup but
-                // keep their final branch to the callee.
-                let epilogue = if is_tail_branch {
-                    emit_epilogue_before_tail_branch(layout)
-                } else {
-                    emit_epilogue(layout)
-                };
+                // Generate cleanup instructions fresh, then retain the original
+                // exit instruction. In particular, a return's implicit ABI
+                // sink set is signature-authenticated before register
+                // allocation and must survive frame insertion unchanged.
+                let epilogue = emit_epilogue_before_tail_branch(layout);
                 for epi_inst in epilogue {
                     let id = func.push_inst(epi_inst);
                     new_insts.push(id);
                 }
-                if is_tail_branch {
-                    new_insts.push(inst_id);
-                }
+                new_insts.push(inst_id);
             } else {
                 new_insts.push(inst_id);
             }
@@ -4210,6 +4233,47 @@ mod tests {
 
     fn leaf_guard_layout(func: &MachFunction) -> FrameLayout {
         compute_frame_layout(func, 0, false)
+    }
+
+    #[test]
+    fn shrinkwrap_declines_sp_form_slot_access_outside_saved_region() {
+        // Regression: the deep-slot SP preference resolves a slot access to
+        // MemOp { base: SP, .. }, which the shrink-wrap frame predicate used
+        // to treat as frame-clean. On the bare leaf path the prologue never
+        // runs, so the access would execute with SP = entry_SP and touch the
+        // CALLER's frame. The predicate must classify SP-based slot forms as
+        // frame-forcing so this plan is declined.
+        let mut func = make_leaf_guard_func();
+        func.alloc_stack_slot(StackSlot::new(8192, 16));
+        let ldr = func.push_inst(MachInst::new(
+            AArch64Opcode::LdrRI,
+            vec![MachOperand::PReg(X0), MachOperand::FrameIndex(FrameIdx(0))],
+        ));
+        let ret_block = BlockId(2);
+        func.blocks[ret_block.0 as usize].insts.insert(0, ldr);
+
+        let layout = leaf_guard_layout(&func);
+        assert!(layout.uses_frame_pointer && !layout.has_dynamic_alloc);
+        eliminate_frame_indices(&mut func, &layout);
+
+        // The fixture must still exercise the SP form (deep slot, in-reach
+        // positive SP offset) or this test stops guarding the interaction.
+        let first = func.blocks[ret_block.0 as usize].insts[0];
+        match &func.inst(first).operands[1] {
+            MachOperand::MemOp { base, offset } => {
+                assert_eq!(*base, SP, "fixture must take the SP form");
+                assert!((0..=AARCH64_MAX_IMM_OFFSET).contains(offset));
+            }
+            other => panic!("expected resolved MemOp, got {other:?}"),
+        }
+        assert!(
+            inst_needs_frame(func.inst(first)),
+            "SP-form slot access must be frame-forcing"
+        );
+        assert!(
+            compute_shrink_wrap_plan(&func, &layout).is_none(),
+            "plan with a frame access outside the saved region must be declined"
+        );
     }
 
     #[test]
@@ -5516,12 +5580,15 @@ mod tests {
 
     #[test]
     fn test_insert_prologue_epilogue() {
+        static RETURN_USES: [PReg; 1] = [X0];
+
         // Create a simple function and insert prologue/epilogue.
         let func_insts = vec![
             MachInst::new(AArch64Opcode::Nop, vec![]),
-            MachInst::new(AArch64Opcode::Ret, vec![]),
+            MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&RETURN_USES),
         ];
         let mut func = make_func("insert_test", func_insts);
+        let original_ret_id = func.blocks[0].insts[1];
         let layout = compute_frame_layout(&func, 0, false);
 
         insert_prologue_epilogue(&mut func, &layout).unwrap();
@@ -5536,9 +5603,12 @@ mod tests {
         // First instruction should be STP pre-index (prologue start).
         assert_eq!(func.inst(entry_insts[0]).opcode, AArch64Opcode::StpPreIndex);
 
-        // Last instruction should be RET (from epilogue).
+        // The original authenticated RET remains last; frame insertion must
+        // not replace it with a fresh bare RET and lose its ABI sink metadata.
         let last_id = *entry_insts.last().unwrap();
+        assert_eq!(last_id, original_ret_id);
         assert_eq!(func.inst(last_id).opcode, AArch64Opcode::Ret);
+        assert_eq!(func.inst(last_id).implicit_uses, RETURN_USES);
     }
 
     #[test]
@@ -6692,6 +6762,118 @@ mod tests {
     }
 
     #[test]
+    fn frame_slot_beyond_ldur_window_prefers_sp_form() {
+        // A slot at the BOTTOM of a deep frame is far from FP (needs scratch
+        // materialization) but right above SP (one-instruction positive
+        // offset). The eliminator must take the SP form: no materialization,
+        // MemOp base = SP, offset = fp_offset + total_frame_size - 16.
+        let mut func = make_func(
+            "sp_pref",
+            vec![
+                MachInst::new(
+                    AArch64Opcode::LdrRI,
+                    vec![
+                        MachOperand::PReg(PReg::new(0)),
+                        MachOperand::FrameIndex(FrameIdx(0)),
+                    ],
+                ),
+                MachInst::new(AArch64Opcode::Ret, vec![]),
+            ],
+        );
+        func.alloc_stack_slot(StackSlot::new(8192, 16));
+
+        let layout = compute_frame_layout(&func, 0, false);
+        let fp_offset = stack_slot_frame_offsets(&func, &layout)[0].unwrap() as i64;
+        assert!(
+            is_large_offset(fp_offset),
+            "fixture must be outside the FP window, got {fp_offset}"
+        );
+        let fie = FrameIndexEliminator::new(&layout, &func);
+        let stats = fie.run(&mut func);
+
+        assert_eq!(stats.eliminated_count, 1);
+        assert_eq!(stats.large_offset_count, 0, "SP form needs no scratch");
+        let block_insts = &func.blocks[0].insts;
+        assert_eq!(block_insts.len(), 2, "no materialization instructions");
+        match &func.inst(block_insts[0]).operands[1] {
+            MachOperand::MemOp { base, offset } => {
+                assert_eq!(*base, SP);
+                let expected = fp_offset + layout.total_frame_size as i64 - 16;
+                assert_eq!(*offset, expected);
+                assert!((0..=AARCH64_MAX_IMM_OFFSET).contains(offset));
+            }
+            other => panic!("expected MemOp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sp_form_offset_accounts_for_callee_saved_area() {
+        // With an extra callee-saved pair the CSA is 32, so FP - SP is
+        // total_frame_size - 16, NOT sp_adjustment() (= total - CSA). Using
+        // sp_adjustment here would address 16 bytes below the slot.
+        let mut func = make_func(
+            "sp_pref_csa",
+            vec![
+                // Touch X19 so the layout gains an extra callee-saved pair.
+                MachInst::new(
+                    AArch64Opcode::MovR,
+                    vec![MachOperand::PReg(X19), MachOperand::PReg(X19)],
+                ),
+                MachInst::new(
+                    AArch64Opcode::LdrRI,
+                    vec![MachOperand::PReg(X19), MachOperand::FrameIndex(FrameIdx(0))],
+                ),
+                MachInst::new(AArch64Opcode::Ret, vec![]),
+            ],
+        );
+        func.alloc_stack_slot(StackSlot::new(8192, 16));
+
+        let layout = compute_frame_layout(&func, 0, false);
+        assert!(
+            layout.callee_saved_area_size > 16,
+            "fixture needs an extra callee-saved pair, got CSA {}",
+            layout.callee_saved_area_size
+        );
+        let fp_offset = stack_slot_frame_offsets(&func, &layout)[0].unwrap() as i64;
+        let fie = FrameIndexEliminator::new(&layout, &func);
+        let (base, offset) = fie.resolve_slot_operand(0);
+        assert_eq!(base, SP);
+        assert_eq!(offset, fp_offset + layout.total_frame_size as i64 - 16);
+        assert_ne!(
+            offset,
+            fp_offset + layout.sp_adjustment() as i64,
+            "CSA > 16 must make the two formulas disagree for this fixture"
+        );
+    }
+
+    #[test]
+    fn sp_form_disabled_under_dynamic_alloc() {
+        // Dynamic stack allocation moves SP mid-function; the SP preference
+        // must switch off and keep the FP-relative form.
+        let mut func = make_func(
+            "sp_pref_dyn",
+            vec![
+                MachInst::new(
+                    AArch64Opcode::LdrRI,
+                    vec![
+                        MachOperand::PReg(PReg::new(0)),
+                        MachOperand::FrameIndex(FrameIdx(0)),
+                    ],
+                ),
+                MachInst::new(AArch64Opcode::Ret, vec![]),
+            ],
+        );
+        func.alloc_stack_slot(StackSlot::new(8192, 16));
+
+        let mut layout = compute_frame_layout(&func, 0, false);
+        layout.has_dynamic_alloc = true;
+        let fie = FrameIndexEliminator::new(&layout, &func);
+        let (base, offset) = fie.resolve_slot_operand(0);
+        assert_eq!(base, X29, "dynamic alloc must keep the FP base");
+        assert!(offset < 0);
+    }
+
+    #[test]
     fn test_fie_large_frame() {
         // Function with many stack slots so that offsets exceed 4096.
         // Create a function with a very large stack frame.
@@ -7059,6 +7241,7 @@ mod tests {
         );
         func.alloc_stack_slot(StackSlot::new(512, 16));
 
+        func.alloc_stack_slot(StackSlot::new(8192, 16)); // padding below: keep the accessed slot outside the SP positive window too
         let layout = compute_frame_layout(&func, 0, false);
         eliminate_frame_indices(&mut func, &layout);
 

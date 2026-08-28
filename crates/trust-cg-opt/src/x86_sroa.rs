@@ -606,6 +606,11 @@ fn group_roots_by_slot(roots: &[(u32, Site)]) -> Vec<(u32, Vec<Site>)> {
         }
         by_slot.entry(*slot).or_default().push(*site);
     }
+    // `order` holds each slot exactly once (pushed only under
+    // `!by_slot.contains_key`) and every slot pushed there was inserted into
+    // `by_slot` on the next line, so each `remove` hits its own live entry.
+    // (Deliberately NOT a `filter_map`: dropping a group here would silently
+    // skip SROA for a slot rather than surface the bookkeeping bug.)
     order
         .into_iter()
         .map(|s| (s, by_slot.remove(&s).unwrap()))

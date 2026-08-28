@@ -29,6 +29,18 @@ pub const TRUST_COMPILE_ARTIFACT_CACHE_SCHEMA_VERSION: u32 = 1;
 pub const COMPILE_ARTIFACT_PROFILE_USE_DISABLED_SHA256: &str =
     "sha256:32150b595f3c492559bde18e8bd7e11a59a7a61de3de4032f30db8a7c1571674";
 
+/// TrustIR revision identity used by unchecked production cache partitions.
+///
+/// Proof-authoritative partitions require an explicit source-lock identity instead.
+pub const COMPILE_ARTIFACT_DEFAULT_TRUST_IR_IDENTITY: &str =
+    "trust_ir:036e1ea8a3994b0eeb826c88e6116cf076560aea";
+
+/// AY revision identity used by unchecked production cache partitions.
+///
+/// Proof-authoritative partitions require an explicit source-lock identity instead.
+pub const COMPILE_ARTIFACT_DEFAULT_AY_IDENTITY: &str =
+    "ay:419bc211ca4b95c04e0c63896389a2d1ad54dc32";
+
 /// Maximum manifest size accepted when replaying a local compile artifact cache entry.
 pub const COMPILE_ARTIFACT_CACHE_MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 
@@ -534,11 +546,11 @@ impl CompileArtifactDependencyIdentity {
             ),
             env_or_default(
                 "TRUST_CG_COMPILE_ARTIFACT_TRUST_IR_IDENTITY",
-                "trust_ir:470508d6a67b07fddda99fcdd43750977a21e0a0",
+                COMPILE_ARTIFACT_DEFAULT_TRUST_IR_IDENTITY,
             ),
             env_or_default(
                 "TRUST_CG_COMPILE_ARTIFACT_AY_IDENTITY",
-                "ay:d7738f34110cfe0dcd6dba313ed2195faad85569",
+                COMPILE_ARTIFACT_DEFAULT_AY_IDENTITY,
             ),
             env_or_default(
                 "TRUST_CG_COMPILE_ARTIFACT_RUSTC_IDENTITY",
@@ -1582,6 +1594,44 @@ fn pinned_tool_identity(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unchecked_default_dependency_identities_match_manifest_pins() {
+        let trust_ir_revision = COMPILE_ARTIFACT_DEFAULT_TRUST_IR_IDENTITY
+            .strip_prefix("trust_ir:")
+            .expect("TrustIR cache identity must use the trust_ir:<revision> form");
+        let ay_revision = COMPILE_ARTIFACT_DEFAULT_AY_IDENTITY
+            .strip_prefix("ay:")
+            .expect("AY cache identity must use the ay:<revision> form");
+
+        let root_manifest = include_str!("../../../Cargo.toml");
+        let trust_ir_revision_field = format!("rev = \"{trust_ir_revision}\"");
+        let trust_ir_rows = root_manifest
+            .lines()
+            .filter(|line| {
+                line.contains("https://github.com/alabsystems/trust-ir.git")
+                    && line.contains(&trust_ir_revision_field)
+            })
+            .count();
+        assert_eq!(
+            trust_ir_rows, 2,
+            "unchecked TrustIR cache identity must match both root manifest pins"
+        );
+
+        let regalloc_manifest = include_str!("../../trust-cg-regalloc/Cargo.toml");
+        let ay_revision_field = format!("rev = \"{ay_revision}\"");
+        let ay_rows = regalloc_manifest
+            .lines()
+            .filter(|line| {
+                line.contains("https://github.com/alabsystems/ay.git")
+                    && line.contains(&ay_revision_field)
+            })
+            .count();
+        assert_eq!(
+            ay_rows, 2,
+            "unchecked AY cache identity must match both regalloc manifest pins"
+        );
+    }
 
     fn identity(mode: &str) -> CompileArtifactDependencyIdentity {
         CompileArtifactDependencyIdentity::new(

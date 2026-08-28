@@ -133,6 +133,11 @@ fi
 : "${RUST_MIN_STACK:=67108864}"
 export RUST_MIN_STACK
 
+# Keep the large-stack proof and generated-code tests from running concurrently
+# by default. An explicit caller setting still wins.
+: "${RUST_TEST_THREADS:=1}"
+export RUST_TEST_THREADS
+
 # --- BENCH-10 measurement (bench) stage --------------------------------------
 # Wire the BENCH measurement gates into the existing local-gate cadence (the
 # project's no-GitHub-CI stance, SOUNDNESS_CHECK.md): every plain full-matrix
