@@ -4215,6 +4215,10 @@ mod tests {
     #[test]
     fn test_gpu_map_add_candidate_verified() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "test_gpu_map_add_candidate_verified",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         // GPU map ADD candidate should be SMT-verified: encode_parallel_map
@@ -4278,6 +4282,10 @@ mod tests {
     #[test]
     fn test_gpu_map_mul_candidate_verified() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "test_gpu_map_mul_candidate_verified",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         // GPU map MUL candidate should be verified.
@@ -4301,6 +4309,10 @@ mod tests {
     #[test]
     fn test_gpu_reduce_add_candidate_verified() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "test_gpu_reduce_add_candidate_verified",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         // GPU reduce ADD candidate should be verified: encode_parallel_reduce
@@ -4326,6 +4338,10 @@ mod tests {
     #[test]
     fn test_gpu_reduce_mul_candidate_verified() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "test_gpu_reduce_mul_candidate_verified",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         let verified =
@@ -4365,6 +4381,10 @@ mod tests {
     #[test]
     fn test_gpu_map_neg_candidate_verified() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "test_gpu_map_neg_candidate_verified",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         let verified = verify_gpu_candidate(&SmtExpr::var("x", 32), GpuSynthOp::Map, "NEG", 32, 4);
@@ -4472,6 +4492,10 @@ mod tests {
     #[test]
     fn test_engine_gpu_candidate_marked_verified() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "test_engine_gpu_candidate_marked_verified",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         // When GPU candidates are generated with sufficient element count,
@@ -4533,6 +4557,10 @@ mod tests {
     #[test]
     fn test_verified_targets_includes_gpu_ane() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "test_verified_targets_includes_gpu_ane",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         // The verified_targets() method should include GPU/ANE targets
@@ -4595,6 +4623,10 @@ mod tests {
     #[test]
     fn test_gpu_reduce_and_candidate_verified() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "test_gpu_reduce_and_candidate_verified",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         // Verify reduce AND (bitwise ops should also work).
@@ -4625,6 +4657,10 @@ mod tests {
     #[test]
     fn test_gpu_map_and_candidate_verified() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "test_gpu_map_and_candidate_verified",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         let verified = verify_gpu_candidate(&SmtExpr::var("x", 32), GpuSynthOp::Map, "AND", 32, 4);
@@ -4647,6 +4683,10 @@ mod tests {
     #[test]
     fn test_gpu_map_or_candidate_verified() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "test_gpu_map_or_candidate_verified",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         let verified = verify_gpu_candidate(&SmtExpr::var("x", 32), GpuSynthOp::Map, "OR", 32, 4);
@@ -4669,6 +4709,10 @@ mod tests {
     #[test]
     fn test_gpu_map_xor_candidate_verified() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "test_gpu_map_xor_candidate_verified",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         let verified = verify_gpu_candidate(&SmtExpr::var("x", 32), GpuSynthOp::Map, "XOR", 32, 4);
@@ -4691,6 +4735,10 @@ mod tests {
     #[test]
     fn test_gpu_map_shl_candidate_verified() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "test_gpu_map_shl_candidate_verified",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         let verified = verify_gpu_candidate(&SmtExpr::var("x", 32), GpuSynthOp::Map, "SHL", 32, 4);
@@ -4713,6 +4761,10 @@ mod tests {
     #[test]
     fn test_gpu_map_sub_candidate_verified() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "test_gpu_map_sub_candidate_verified",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         let verified = verify_gpu_candidate(&SmtExpr::var("x", 32), GpuSynthOp::Map, "SUB", 32, 4);
@@ -4737,6 +4789,10 @@ mod tests {
     #[test]
     fn test_gpu_reduce_or_candidate_verified() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "test_gpu_reduce_or_candidate_verified",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         let verified =
@@ -4760,6 +4816,10 @@ mod tests {
     #[test]
     fn test_gpu_reduce_xor_candidate_verified() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "test_gpu_reduce_xor_candidate_verified",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         let verified =
@@ -4785,6 +4845,10 @@ mod tests {
     #[test]
     fn test_gpu_mapreduce_add_candidate_verified() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "test_gpu_mapreduce_add_candidate_verified",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         let verified =
@@ -4809,6 +4873,10 @@ mod tests {
     #[test]
     fn test_gpu_mapreduce_mul_candidate_verified() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "test_gpu_mapreduce_mul_candidate_verified",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         let verified =
@@ -4835,6 +4903,10 @@ mod tests {
     #[test]
     fn test_gpu_map_add_8_elements() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "test_gpu_map_add_8_elements",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         // Verify with 8 elements (capped to 4 internally for tractability)
@@ -4858,6 +4930,10 @@ mod tests {
     #[test]
     fn test_gpu_reduce_add_16_elements() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "test_gpu_reduce_add_16_elements",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         // Verify with 16 elements (capped to 4 internally)
@@ -4884,6 +4960,10 @@ mod tests {
     #[test]
     fn test_gpu_map_add_8bit() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "test_gpu_map_add_8bit",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         let verified = verify_gpu_candidate(&SmtExpr::var("x", 8), GpuSynthOp::Map, "ADD", 8, 4);
@@ -4903,6 +4983,10 @@ mod tests {
     #[test]
     fn test_gpu_map_add_16bit() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "test_gpu_map_add_16bit",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         let verified = verify_gpu_candidate(&SmtExpr::var("x", 16), GpuSynthOp::Map, "ADD", 16, 4);
@@ -4922,6 +5006,10 @@ mod tests {
     #[test]
     fn test_gpu_reduce_mul_8bit() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "test_gpu_reduce_mul_8bit",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         let verified = verify_gpu_candidate(&SmtExpr::var("x", 8), GpuSynthOp::Reduce, "MUL", 8, 4);
@@ -4943,6 +5031,10 @@ mod tests {
     #[test]
     fn test_gpu_map_empty_array() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "test_gpu_map_empty_array",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         // 0-element map should trivially pass (no work to verify).
@@ -4963,6 +5055,10 @@ mod tests {
     #[test]
     fn test_gpu_reduce_empty_array() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "test_gpu_reduce_empty_array",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         // 0-element reduce returns identity, should pass.
@@ -4977,6 +5073,10 @@ mod tests {
     #[test]
     fn test_gpu_map_single_element() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "test_gpu_map_single_element",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         let verified = verify_gpu_candidate(&SmtExpr::var("x", 32), GpuSynthOp::Map, "ADD", 32, 1);
@@ -4996,6 +5096,10 @@ mod tests {
     #[test]
     fn test_gpu_reduce_single_element() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "test_gpu_reduce_single_element",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         let verified =

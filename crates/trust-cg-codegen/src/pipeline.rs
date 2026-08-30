@@ -109,6 +109,10 @@ use trust_cg_lower::{
 use crate::coreml_emitter::{
     CoreMLEmitError, CoreMLEmitter, MilProgram, validate_ane_compatibility,
 };
+use crate::target::{
+    AArch64IsaFeature, AArch64IsaProfile, AArch64MachineCodeEvidence, AArch64TargetMachine,
+    OutputTargetFeatures, Target, TargetMachine, TargetSpec,
+};
 
 /// Synthetic trust_ir variable namespace emitted by trust-cg-lower for fixed scalar
 /// alloca debug locals. The low bits are the LIR/MachIR stack slot index.
@@ -134,6 +138,11 @@ pub enum PipelineError {
     RegAlloc(String),
     #[error("optimization invariant violation in `{function}`: {detail}")]
     OptimizationInvariantViolation { function: String, detail: String },
+    #[error("CEGIS search for `{function}` did not complete: {completion:?}")]
+    CegisIncomplete {
+        function: String,
+        completion: trust_cg_verify::CegisSearchCompletion,
+    },
     #[error("encoding failed: {0}")]
     Encoding(String),
     #[error("ELF reparse gate: {0}")]
@@ -150,6 +159,32 @@ pub enum PipelineError {
     Aarch64FormalArgCopyHazard(String),
     #[error("AArch64 call-argument repair failed closed: {0}")]
     Aarch64CallArgRepair(String),
+    #[error(
+        "AArch64 function `{function}` contains LSE opcode {opcode:?}, but resolved ISA profile `{profile}` does not admit LSE"
+    )]
+    Aarch64LseNotAdmitted {
+        function: String,
+        opcode: IrOpcode,
+        profile: String,
+    },
+    #[error(
+        "AArch64 function `{function}` contains DotProd opcode {opcode:?}, but resolved ISA profile `{profile}` does not admit DotProd"
+    )]
+    Aarch64DotProdNotAdmitted {
+        function: String,
+        opcode: IrOpcode,
+        profile: String,
+    },
+    #[error(
+        "AArch64 function `{function}` contains FEAT_FP16 data-processing opcode {opcode:?}, but resolved ISA profile `{profile}` does not admit FP16"
+    )]
+    Aarch64Fp16NotAdmitted {
+        function: String,
+        opcode: IrOpcode,
+        profile: String,
+    },
+    #[error("AArch64 target-machine contract rejected function `{function}`: {detail}")]
+    Aarch64TargetMachineContract { function: String, detail: String },
     #[error("malformed AArch64 machine function `{function}`: {detail}")]
     MalformedAarch64Function { function: String, detail: String },
     #[error(
@@ -717,6 +752,10 @@ pub struct PreparationMetrics {
     /// a frame with no unwind entry stops phase-1 unwinding dead). `None` only
     /// for metrics not produced by the real preparation path.
     pub frame_layout: Option<crate::frame::FrameLayout>,
+    /// Optional-ISA evidence derived from the function's final post-RA machine
+    /// stream. A successful production preparation always sets this field;
+    /// `None` remains the compatibility default for manually-built metrics.
+    pub aarch64_machine_code: Option<AArch64MachineCodeEvidence>,
 }
 
 /// Structured bounded-fsym summary for one function prepared by the pipeline.
@@ -1182,6 +1221,7 @@ fn build_source_line_entries(
 
 #[cfg(feature = "verify")]
 pub use trust_cg_verify::CegisPassStats;
+pub use trust_cg_verify::CegisRunOutcome;
 
 #[cfg(not(feature = "verify"))]
 #[derive(Debug, Clone, Default)]
@@ -1195,6 +1235,13 @@ pub struct CegisPassStats {
     pub rejected: u64,
     pub budget_exhausted: u64,
     pub solver_calls: u64,
+}
+
+/// Statistics and typed terminal state from an enabled CEGIS invocation.
+#[derive(Debug, Clone)]
+pub struct CegisPassRun {
+    pub outcome: CegisRunOutcome,
+    pub stats: CegisPassStats,
 }
 
 // ---------------------------------------------------------------------------
@@ -2111,7 +2158,7 @@ fn pair_value_scratch(class: RegClass, base_scratch: PReg) -> Result<PReg, Pipel
 }
 
 fn classify_operand_positions(inst: &IrMachInst) -> (Vec<usize>, Vec<usize>) {
-    if opcode_has_lse_atomic_operand_roles(inst.opcode)
+    if aarch64_opcode_requires_lse(inst.opcode)
         || opcode_has_explicit_writeback_operand_roles(inst.opcode)
     {
         return (
@@ -2130,8 +2177,142 @@ fn classify_operand_positions(inst: &IrMachInst) -> (Vec<usize>, Vec<usize>) {
     }
 }
 
-fn opcode_has_lse_atomic_operand_roles(opcode: IrOpcode) -> bool {
+pub(crate) fn aarch64_opcode_requires_lse(opcode: IrOpcode) -> bool {
     is_lse_rmw(opcode) || is_lse_cas(opcode)
+}
+
+pub(crate) fn aarch64_opcode_requires_dotprod(opcode: IrOpcode) -> bool {
+    opcode == IrOpcode::NeonUdotV
+}
+
+/// Whether one machine instruction uses an H register in an operation that
+/// requires FEAT_FP16 scalar data processing.
+///
+/// Base AArch64 can transport half-precision bit patterns through scalar
+/// loads/stores, the portable full-vector ORR copy alias, and H↔S/D FCVT.
+/// Copy-lowered identity NOPs are non-encoding and therefore require no ISA
+/// feature even though they retain their original H-register operands.
+/// Other scalar H-register forms (arithmetic, compare, integer conversion, and
+/// FMOV) require FEAT_FP16.
+/// Checking actual register classes is necessary because those operations
+/// share opcodes with their baseline S/D forms.
+pub(crate) fn aarch64_inst_requires_fp16(inst: &IrMachInst) -> bool {
+    let uses_fpr16 = inst.operands.iter().any(|operand| match operand {
+        IrOperand::VReg(reg) => reg.class == RegClass::Fpr16,
+        IrOperand::PReg(reg) => preg_class(*reg) == RegClass::Fpr16,
+        _ => false,
+    });
+    if !uses_fpr16 {
+        return false;
+    }
+
+    !matches!(
+        inst.opcode,
+        IrOpcode::Nop
+            | IrOpcode::Copy
+            | IrOpcode::NeonOrrV
+            | IrOpcode::LdrRI
+            | IrOpcode::StrRI
+            | IrOpcode::LdrRO
+            | IrOpcode::StrRO
+            | IrOpcode::VolatileLdrRI
+            | IrOpcode::VolatileStrRI
+            | IrOpcode::FcvtHS
+            | IrOpcode::FcvtHD
+            | IrOpcode::FcvtSH
+            | IrOpcode::FcvtDH
+    )
+}
+
+fn aarch64_target_machine_contract_error(
+    function: &str,
+    error: impl std::fmt::Display,
+) -> PipelineError {
+    PipelineError::Aarch64TargetMachineContract {
+        function: function.to_owned(),
+        detail: error.to_string(),
+    }
+}
+
+fn observe_aarch64_output_feature(
+    function: &str,
+    opcode: IrOpcode,
+    feature: AArch64IsaFeature,
+    target_machine: Option<&AArch64TargetMachine>,
+    required: &mut OutputTargetFeatures<AArch64IsaFeature>,
+) -> Result<(), PipelineError> {
+    // The target machine is immutable for this walk. Once one instruction has
+    // established and admitted a feature, later instructions in the same
+    // family add no information and need no repeated domain/subset work.
+    if required.requires(feature) {
+        return Ok(());
+    }
+    *required = required
+        .require(feature)
+        .map_err(|error| aarch64_target_machine_contract_error(function, error))?;
+
+    let Some(target_machine) = target_machine else {
+        return Ok(());
+    };
+    if target_machine.admitted_features().admits(feature) {
+        return Ok(());
+    }
+
+    let profile = AArch64IsaProfile::from(target_machine.admitted_features()).canonical_name();
+    Err(match feature {
+        AArch64IsaFeature::Lse => PipelineError::Aarch64LseNotAdmitted {
+            function: function.to_owned(),
+            opcode,
+            profile,
+        },
+        AArch64IsaFeature::DotProd => PipelineError::Aarch64DotProdNotAdmitted {
+            function: function.to_owned(),
+            opcode,
+            profile,
+        },
+        AArch64IsaFeature::Fp16 => PipelineError::Aarch64Fp16NotAdmitted {
+            function: function.to_owned(),
+            opcode,
+            profile,
+        },
+    })
+}
+
+fn observe_aarch64_inst_isa_requirements(
+    function: &str,
+    inst: &IrMachInst,
+    target_machine: Option<&AArch64TargetMachine>,
+    required: &mut OutputTargetFeatures<AArch64IsaFeature>,
+) -> Result<(), PipelineError> {
+    let opcode = inst.opcode;
+    if aarch64_opcode_requires_lse(opcode) {
+        observe_aarch64_output_feature(
+            function,
+            opcode,
+            AArch64IsaFeature::Lse,
+            target_machine,
+            required,
+        )?;
+    }
+    if aarch64_opcode_requires_dotprod(opcode) {
+        observe_aarch64_output_feature(
+            function,
+            opcode,
+            AArch64IsaFeature::DotProd,
+            target_machine,
+            required,
+        )?;
+    }
+    if aarch64_inst_requires_fp16(inst) {
+        observe_aarch64_output_feature(
+            function,
+            opcode,
+            AArch64IsaFeature::Fp16,
+            target_machine,
+            required,
+        )?;
+    }
+    Ok(())
 }
 
 fn opcode_has_explicit_writeback_operand_roles(opcode: IrOpcode) -> bool {
@@ -2154,9 +2335,7 @@ fn opcode_uses_all_operands_for_regalloc(
     opcode: IrOpcode,
     flags: trust_cg_ir::inst::InstFlags,
 ) -> bool {
-    if opcode_has_lse_atomic_operand_roles(opcode)
-        || opcode_has_explicit_writeback_operand_roles(opcode)
-    {
+    if aarch64_opcode_requires_lse(opcode) || opcode_has_explicit_writeback_operand_roles(opcode) {
         return false;
     }
 
@@ -8183,7 +8362,8 @@ enum AArch64CfgValidationStage {
 fn validate_aarch64_mach_function_impl(
     func: &IrMachFunction,
     cfg_stage: AArch64CfgValidationStage,
-) -> Result<(), PipelineError> {
+    target_machine: Option<&AArch64TargetMachine>,
+) -> Result<OutputTargetFeatures<AArch64IsaFeature>, PipelineError> {
     let malformed = |detail: String| PipelineError::MalformedAarch64Function {
         function: func.name.clone(),
         detail,
@@ -8191,6 +8371,7 @@ fn validate_aarch64_mach_function_impl(
     let block_count = func.blocks.len();
     let valid_block = |block_id: BlockId| (block_id.0 as usize) < block_count;
     let required_return_pregs = aarch64_required_return_pregs(&func.signature);
+    let mut required_features = OutputTargetFeatures::NONE;
 
     if func.eh_metadata.has_eh_info() {
         crate::exception_handling::required_personality_symbol(
@@ -8265,6 +8446,21 @@ fn validate_aarch64_mach_function_impl(
                     "instruction {:?} is linked from more than one block position",
                     inst_id
                 )));
+            }
+
+            // Capability derivation shares this already-mandatory structural
+            // walk. Only laid-out blocks contribute emitted instructions;
+            // unreachable arena shells are structurally checked but are not
+            // machine-output requirements. Pipeline callers pass their
+            // captured target machine so ordinary compilation does not pay for
+            // a second whole-function scan.
+            if seen.contains(&block_id) {
+                observe_aarch64_inst_isa_requirements(
+                    &func.name,
+                    inst,
+                    target_machine,
+                    &mut required_features,
+                )?;
             }
 
             if inst.opcode == IrOpcode::TailCall {
@@ -8496,36 +8692,57 @@ fn validate_aarch64_mach_function_impl(
         }
     }
 
-    Ok(())
+    if let Some(target_machine) = target_machine {
+        target_machine
+            .validate_output_features(required_features)
+            .map_err(|error| aarch64_target_machine_contract_error(&func.name, error))?;
+    }
+
+    Ok(required_features)
 }
 
 pub(crate) fn validate_aarch64_mach_function(func: &IrMachFunction) -> Result<(), PipelineError> {
-    validate_aarch64_mach_function_impl(func, AArch64CfgValidationStage::SymbolicAuthority)
+    validate_aarch64_mach_function_impl(func, AArch64CfgValidationStage::SymbolicAuthority, None)
+        .map(|_| ())
 }
 
 pub(crate) fn validate_aarch64_mach_function_totality(
     func: &IrMachFunction,
 ) -> Result<(), PipelineError> {
-    validate_aarch64_mach_function_impl(func, AArch64CfgValidationStage::ResolvedEncoding)
+    validate_aarch64_mach_function_impl(func, AArch64CfgValidationStage::ResolvedEncoding, None)
+        .map(|_| ())
 }
 
 pub(crate) fn enforce_aarch64_post_regalloc_resolved(
     func: &IrMachFunction,
 ) -> Result<(), PipelineError> {
-    enforce_aarch64_post_regalloc_impl(func, AArch64CfgValidationStage::ResolvedEncoding)
+    enforce_aarch64_post_regalloc_impl(func, AArch64CfgValidationStage::ResolvedEncoding, None)
+        .map(|_| ())
+}
+
+fn enforce_aarch64_post_regalloc_resolved_for_target_machine(
+    func: &IrMachFunction,
+    target_machine: &AArch64TargetMachine,
+) -> Result<OutputTargetFeatures<AArch64IsaFeature>, PipelineError> {
+    enforce_aarch64_post_regalloc_impl(
+        func,
+        AArch64CfgValidationStage::ResolvedEncoding,
+        Some(target_machine),
+    )
 }
 
 fn enforce_aarch64_post_regalloc_impl(
     func: &IrMachFunction,
     cfg_stage: AArch64CfgValidationStage,
-) -> Result<(), PipelineError> {
+    target_machine: Option<&AArch64TargetMachine>,
+) -> Result<OutputTargetFeatures<AArch64IsaFeature>, PipelineError> {
     use trust_cg_verify::post_ra_reaching_def as prd;
     use trust_cg_verify::post_ra_spill_slots as pss;
     use trust_cg_verify::post_regalloc_recheck as prr;
 
     // The verifier below indexes both arenas. Keep the total boundary check
     // first so malformed public input is always a typed error, never a panic.
-    validate_aarch64_mach_function_impl(func, cfg_stage)?;
+    let required_features = validate_aarch64_mach_function_impl(func, cfg_stage, target_machine)?;
     if cfg_stage == AArch64CfgValidationStage::ResolvedEncoding
         && !func.blocks.iter().any(|block| {
             block.insts.iter().any(|inst_id| {
@@ -8547,7 +8764,11 @@ fn enforce_aarch64_post_regalloc_impl(
         // stream. Preserve exact CFG rejection there; totality-only validation
         // is reserved for streams that actually contain resolved/internal
         // immediate branches and are reconstructed below.
-        validate_aarch64_mach_function_impl(func, AArch64CfgValidationStage::SymbolicAuthority)?;
+        validate_aarch64_mach_function_impl(
+            func,
+            AArch64CfgValidationStage::SymbolicAuthority,
+            None,
+        )?;
     }
     let mut derived_cfg_func = None;
     if cfg_stage == AArch64CfgValidationStage::ResolvedEncoding {
@@ -8608,7 +8829,7 @@ fn enforce_aarch64_post_regalloc_impl(
             violation.detail
         )));
     }
-    Ok(())
+    Ok(required_features)
 }
 
 fn encode_function_with_fixups_and_blocks_impl(
@@ -10246,6 +10467,46 @@ pub struct ModuleEmission {
     pub object: Vec<u8>,
     /// One entry per emitted function, in emission order.
     pub text_extents: Vec<TextFunctionExtent>,
+}
+
+/// A whole-module AArch64 emission paired with its validated ISA requirements.
+///
+/// Construction stays private so safe callers cannot accidentally associate
+/// requirements derived from one module with another module's bytes. Use the
+/// evidence-returning [`Pipeline`] emission APIs to obtain this value.
+#[derive(Debug, Clone)]
+pub struct AArch64ModuleEmission {
+    emission: ModuleEmission,
+    machine_code: AArch64MachineCodeEvidence,
+}
+
+impl AArch64ModuleEmission {
+    fn new(emission: ModuleEmission, machine_code: AArch64MachineCodeEvidence) -> Self {
+        Self {
+            emission,
+            machine_code,
+        }
+    }
+
+    /// Object bytes and exact per-function text layout produced by the emitter.
+    pub const fn emission(&self) -> &ModuleEmission {
+        &self.emission
+    }
+
+    /// Validated union of optional ISA features required by the module.
+    pub const fn machine_code(&self) -> AArch64MachineCodeEvidence {
+        self.machine_code
+    }
+
+    /// Consume the evidence-bearing result and return its legacy emission.
+    pub fn into_emission(self) -> ModuleEmission {
+        self.emission
+    }
+
+    /// Consume the result into its object/layout and target-feature evidence.
+    pub fn into_parts(self) -> (ModuleEmission, AArch64MachineCodeEvidence) {
+        (self.emission, self.machine_code)
+    }
 }
 
 fn add_module_symbols_for_fixups(
@@ -12074,6 +12335,10 @@ pub fn generate_lsda_for_function(func: &IrMachFunction) -> Result<Option<Vec<u8
 /// Orchestrates all phases from trust_ir input through to Mach-O .o emission.
 pub struct Pipeline {
     pub config: PipelineConfig,
+    /// Resolved machine-code capability contract. Kept out of the public
+    /// configuration record so adding a target capability cannot break every
+    /// downstream `PipelineConfig { .. }` literal.
+    aarch64_target_machine: AArch64TargetMachine,
     profile_use: Option<trust_cg_opt::pgo::ProfData>,
     /// AOT PGO profile-generate sink. When `Some`, `prepare_function_*`
     /// injects per-block counter increments (against the module-level
@@ -12086,6 +12351,8 @@ pub struct Pipeline {
     cegis_cache: Arc<dyn trust_cg_opt::CacheBackend>,
     #[cfg(not(feature = "verify"))]
     cegis_warning_emitted: AtomicBool,
+    #[cfg(all(test, feature = "verify"))]
+    cegis_test_incomplete_after_first_commit: bool,
 }
 
 fn trust_cg_pass_disabled(name: &str) -> bool {
@@ -13219,18 +13486,24 @@ struct PipelinePhaseLog {
     lines: Vec<String>,
 }
 
-impl Drop for PipelinePhaseLog {
-    fn drop(&mut self) {
+impl PipelinePhaseLog {
+    fn flush(&mut self) {
         if self.lines.is_empty() {
             return;
         }
         use std::io::Write;
         let stderr = std::io::stderr();
         let mut out = stderr.lock();
-        for line in &self.lines {
+        for line in self.lines.drain(..) {
             let _ = writeln!(out, "{line}");
         }
         let _ = out.flush();
+    }
+}
+
+impl Drop for PipelinePhaseLog {
+    fn drop(&mut self) {
+        self.flush();
     }
 }
 
@@ -13241,6 +13514,19 @@ thread_local! {
 
 fn pipeline_phase_record(line: String) {
     PIPELINE_PHASE_LOG.with(|log| log.borrow_mut().lines.push(line));
+}
+
+/// Flush optimization-pass and pipeline timings accumulated by the calling
+/// thread.
+///
+/// Reusable compiler worker threads call this at a task boundary because their
+/// thread-local destructors do not run until the process exits.
+#[doc(hidden)]
+pub fn flush_current_thread_timing_logs() {
+    trust_cg_opt::pass_manager::flush_current_thread_pass_time_log();
+    if trust_cg_time_pipeline_enabled() {
+        PIPELINE_PHASE_LOG.with(|log| log.borrow_mut().flush());
+    }
 }
 
 /// RAII phase timer: records on scope EXIT.
@@ -13317,11 +13603,42 @@ fn log_pipeline_phase_end(func: &IrMachFunction, phase: &str, start: Option<Inst
     ));
 }
 
+fn build_aarch64_target_machine(
+    target: TargetSpec,
+    profile: AArch64IsaProfile,
+) -> AArch64TargetMachine {
+    TargetMachine::try_new(target, profile.into()).expect(
+        "Pipeline must pair an AArch64 target identity with the static AArch64 feature domain",
+    )
+}
+
 impl Pipeline {
     /// Create a new pipeline with the given configuration.
     pub fn new(config: PipelineConfig) -> Self {
+        let (aarch64_target, aarch64_isa_profile) = if config.target_triple.is_empty() {
+            // Empty is the file's longstanding legacy Apple/Mach-O target.
+            (
+                TargetSpec::parse("aarch64-apple-darwin")
+                    .expect("the built-in legacy AArch64 target triple must remain valid"),
+                AArch64IsaProfile::APPLE_ARM64,
+            )
+        } else {
+            let parsed = TargetSpec::parse(&config.target_triple)
+                .ok()
+                .filter(|target| target.architecture == Target::Aarch64);
+            (
+                parsed.unwrap_or_else(|| TargetSpec::unknown_for_architecture(Target::Aarch64)),
+                parsed
+                    .map(AArch64IsaProfile::for_aot_target)
+                    .unwrap_or(AArch64IsaProfile::BASELINE),
+            )
+        };
         Self {
             config,
+            aarch64_target_machine: build_aarch64_target_machine(
+                aarch64_target,
+                aarch64_isa_profile,
+            ),
             profile_use: None,
             profile_generate_sink: None,
             certified_pass_execution: false,
@@ -13331,7 +13648,92 @@ impl Pipeline {
             cegis_cache: Arc::new(trust_cg_opt::InMemoryCache::new()),
             #[cfg(not(feature = "verify"))]
             cegis_warning_emitted: AtomicBool::new(false),
+            #[cfg(all(test, feature = "verify"))]
+            cegis_test_incomplete_after_first_commit: false,
         }
+    }
+
+    #[cfg(all(test, feature = "verify"))]
+    fn with_cegis_test_incomplete_after_first_commit(mut self) -> Self {
+        self.cegis_test_incomplete_after_first_commit = true;
+        self
+    }
+
+    /// Resolved AArch64 ISA profile governing this pipeline's emitted bytes.
+    ///
+    /// Artifact owners should bind [`AArch64IsaProfile::feature_bits`] into their
+    /// cache/provenance identity rather than re-deriving target capabilities.
+    pub const fn aarch64_isa_profile(&self) -> AArch64IsaProfile {
+        AArch64IsaProfile::from_admitted_target_features(
+            self.aarch64_target_machine.admitted_features(),
+        )
+    }
+
+    /// Immutable target identity and typed optional-ISA admission captured by
+    /// this AArch64 pipeline.
+    pub const fn aarch64_target_machine(&self) -> &AArch64TargetMachine {
+        &self.aarch64_target_machine
+    }
+
+    /// Bind the already-resolved AArch64 capability profile used by lowering,
+    /// optimization, encoding, publication, and artifact identity.
+    ///
+    /// This is deliberately an additive builder rather than a public config
+    /// field: target-feature growth does not create source breaks for generic
+    /// compiler clients. Explicit generic/unrecognized targets fail closed;
+    /// the legacy empty target retains its historical Apple arm64 contract.
+    pub fn with_aarch64_isa_profile(mut self, profile: AArch64IsaProfile) -> Self {
+        self.aarch64_target_machine =
+            build_aarch64_target_machine(*self.aarch64_target_machine.identity(), profile);
+        self
+    }
+
+    fn aarch64_required_features(
+        &self,
+        func: &IrMachFunction,
+    ) -> Result<OutputTargetFeatures<AArch64IsaFeature>, PipelineError> {
+        let mut required_features = OutputTargetFeatures::NONE;
+        for &block_id in &func.block_order {
+            for &inst_id in &func.block(block_id).insts {
+                observe_aarch64_inst_isa_requirements(
+                    &func.name,
+                    func.inst(inst_id),
+                    Some(&self.aarch64_target_machine),
+                    &mut required_features,
+                )?;
+            }
+        }
+        self.aarch64_target_machine
+            .validate_output_features(required_features)
+            .map_err(|error| aarch64_target_machine_contract_error(&func.name, error))?;
+        Ok(required_features)
+    }
+
+    fn aarch64_module_machine_code_evidence(
+        &self,
+        functions: &[IrMachFunction],
+    ) -> Result<AArch64MachineCodeEvidence, PipelineError> {
+        let mut required_features = OutputTargetFeatures::NONE;
+        for func in functions {
+            required_features = required_features.union(self.aarch64_required_features(func)?);
+        }
+        AArch64MachineCodeEvidence::try_new(&self.aarch64_target_machine, required_features)
+            .map_err(|error| aarch64_target_machine_contract_error("<module>", error))
+    }
+
+    /// Validate structure and optional-ISA admission in the same mandatory
+    /// instruction walk. This is the normal compilation boundary; the
+    /// scan-only helper remains for module emitters that consume already
+    /// validated/prepared functions through legacy APIs.
+    fn validate_aarch64_mach_function_for_profile(
+        &self,
+        func: &IrMachFunction,
+    ) -> Result<OutputTargetFeatures<AArch64IsaFeature>, PipelineError> {
+        validate_aarch64_mach_function_impl(
+            func,
+            AArch64CfgValidationStage::SymbolicAuthority,
+            Some(&self.aarch64_target_machine),
+        )
     }
 
     /// Report what proof evidence this pipeline configuration actually
@@ -13495,16 +13897,27 @@ impl Pipeline {
     /// Returns the per-run pass statistics when the pass actually executed.
     /// Returns `None` when the pass is disabled or unavailable.
     pub fn run_cegis_superopt(&self, func: &mut IrMachFunction) -> Option<CegisPassStats> {
+        self.run_cegis_superopt_with_outcome(func)
+            .map(|run| run.stats)
+    }
+
+    /// Run CEGIS and retain its typed completion state alongside statistics.
+    ///
+    /// Unlike the legacy stats-only API, this lets compiler services reject an
+    /// incomplete wall-clock search instead of confusing rollback with an
+    /// ordinary no-op.
+    pub fn run_cegis_superopt_with_outcome(
+        &self,
+        func: &mut IrMachFunction,
+    ) -> Option<CegisPassRun> {
         #[cfg(feature = "verify")]
         {
-            use trust_cg_opt::pass_manager::MachinePass;
-
             let budget_sec = self.config.cegis_superopt_budget_sec?;
             if budget_sec == 0 {
                 return None;
             }
 
-            let mut pass =
+            let pass =
                 trust_cg_verify::CegisSuperoptPass::new(trust_cg_verify::CegisSuperoptConfig {
                     budget_sec,
                     per_query_ms: 5_000,
@@ -13512,11 +13925,32 @@ impl Pipeline {
                     cpu: String::new(),
                     features: Vec::new(),
                     opt_level: self.cegis_opt_level(),
+                    search_schedule:
+                        trust_cg_verify::CegisSearchScheduleIdentity::current_execution(),
                     cache: Some(self.cegis_cache.clone()),
                     trace: None,
                 });
-            let _ = pass.run(func);
-            Some(pass.stats().clone())
+            #[cfg(all(test, feature = "verify"))]
+            let mut pass = if self.cegis_test_incomplete_after_first_commit {
+                pass.with_test_hooks(trust_cg_verify::cegis_pass::CegisSuperoptTestHooks {
+                    verifier_result: Some(trust_cg_verify::CegisResult::Equivalent {
+                        proof_hash: 0x486,
+                        iterations: 1,
+                    }),
+                    ..Default::default()
+                })
+                .with_test_incomplete_after_first_commit()
+            } else {
+                pass
+            };
+            #[cfg(not(all(test, feature = "verify")))]
+            let mut pass = pass;
+
+            let outcome = pass.run_with_outcome(func);
+            Some(CegisPassRun {
+                outcome,
+                stats: pass.stats().clone(),
+            })
         }
 
         #[cfg(not(feature = "verify"))]
@@ -13527,6 +13961,23 @@ impl Pipeline {
             }
             None
         }
+    }
+
+    fn run_cegis_superopt_checked(
+        &self,
+        func: &mut IrMachFunction,
+    ) -> Result<Option<CegisPassStats>, PipelineError> {
+        let function = func.name.clone();
+        let Some(run) = self.run_cegis_superopt_with_outcome(func) else {
+            return Ok(None);
+        };
+        if let Some(completion) = run.outcome.incomplete_reason() {
+            return Err(PipelineError::CegisIncomplete {
+                function,
+                completion,
+            });
+        }
+        Ok(Some(run.stats))
     }
 
     /// AArch64 fall-through branch-layout optimization (EXEC-SPEED).
@@ -13568,9 +14019,17 @@ impl Pipeline {
     /// Re-derive final AArch64 stream structure after every post-RA rewrite.
     /// This is a correctness gate, so its production mode is unconditionally
     /// Enforce and any violation aborts before encoding.
-    fn recheck_aarch64_post_regalloc(&self, func: &IrMachFunction) -> Result<(), PipelineError> {
+    fn recheck_aarch64_post_regalloc(
+        &self,
+        func: &IrMachFunction,
+    ) -> Result<AArch64MachineCodeEvidence, PipelineError> {
         let _phase = PhaseGuard::new(func, "post-ra-recheck");
-        enforce_aarch64_post_regalloc_resolved(func)
+        let required_features = enforce_aarch64_post_regalloc_resolved_for_target_machine(
+            func,
+            &self.aarch64_target_machine,
+        )?;
+        AArch64MachineCodeEvidence::try_new(&self.aarch64_target_machine, required_features)
+            .map_err(|error| aarch64_target_machine_contract_error(&func.name, error))
     }
 
     /// Compile a trust_ir function through the full pipeline, producing target
@@ -13630,7 +14089,6 @@ impl Pipeline {
             proof_optimization_metadata,
             provenance.as_mut(),
         )?;
-
         // Sentinel S1: reconcile the snapshot against the optimized function (mark eliminated vs
         // trapped), run the shadow kernel, and check guard-count conservation. Zero behavior
         // change: never fails the compile, output gated by TRUST_CG_GUARD_SHADOW.
@@ -13780,7 +14238,7 @@ impl Pipeline {
         ir_func: &mut IrMachFunction,
     ) -> Result<(Vec<u8>, trust_cg_opt::PassStats), PipelineError> {
         reject_unsupported_aarch64_object_format(&self.config.target_triple)?;
-        validate_aarch64_mach_function(ir_func)?;
+        self.validate_aarch64_mach_function_for_profile(ir_func)?;
 
         // Phase 3: Optimization
         let optimization_stats = self.run_optimization_checked(ir_func)?;
@@ -13941,10 +14399,28 @@ impl Pipeline {
         &self,
         inputs: &[(trust_cg_lower::Function, trust_cg_lower::ProofContext)],
     ) -> Vec<Result<IrMachFunction, PipelineError>> {
+        self.prepare_functions_parallel_with_metrics(inputs)
+            .into_iter()
+            .map(|result| result.map(|(func, _metrics)| func))
+            .collect()
+    }
+
+    /// Batch variant of [`prepare_function_with_metrics`](Self::prepare_function_with_metrics).
+    ///
+    /// Results remain in input order and retain each function's final typed
+    /// AArch64 machine-code evidence. This lets manual batch consumers publish
+    /// the same target/required-feature facts as single-function callers
+    /// without serializing preparation or rescanning the prepared stream.
+    /// [`prepare_functions_parallel`](Self::prepare_functions_parallel)
+    /// delegates here and drops only the metrics for source compatibility.
+    pub fn prepare_functions_parallel_with_metrics(
+        &self,
+        inputs: &[(trust_cg_lower::Function, trust_cg_lower::ProofContext)],
+    ) -> Vec<Result<(IrMachFunction, PreparationMetrics), PipelineError>> {
         let prepare_serially = || {
             inputs
                 .iter()
-                .map(|(func, proof_ctx)| self.prepare_function_with_proofs(func, Some(proof_ctx)))
+                .map(|(func, proof_ctx)| self.prepare_function_with_metrics(func, Some(proof_ctx)))
                 .collect()
         };
 
@@ -13970,7 +14446,7 @@ impl Pipeline {
         pool.install(|| {
             inputs
                 .par_iter()
-                .map(|(func, proof_ctx)| self.prepare_function_with_proofs(func, Some(proof_ctx)))
+                .map(|(func, proof_ctx)| self.prepare_function_with_metrics(func, Some(proof_ctx)))
                 .collect()
         })
     }
@@ -14246,7 +14722,7 @@ impl Pipeline {
         let phase_timer = log_pipeline_phase_start(&ir_func, "branch-resolution");
         let branch_resolution_start = Instant::now();
         resolve_branches_after_authority(&mut ir_func)?;
-        self.recheck_aarch64_post_regalloc(&ir_func)?;
+        metrics.aarch64_machine_code = Some(self.recheck_aarch64_post_regalloc(&ir_func)?);
         metrics.timings.branch_resolution = Some(branch_resolution_start.elapsed());
         log_pipeline_phase_end(&ir_func, "branch-resolution", phase_timer);
 
@@ -14270,7 +14746,7 @@ impl Pipeline {
     /// accepting an `IrMachFunction` directly. The returned function is ready
     /// for [`compile_module`](Self::compile_module).
     pub fn prepare_ir_function(&self, ir_func: &mut IrMachFunction) -> Result<(), PipelineError> {
-        validate_aarch64_mach_function(ir_func)?;
+        self.validate_aarch64_mach_function_for_profile(ir_func)?;
 
         // Phase 3: Optimization
         self.run_optimization_checked(ir_func)?;
@@ -14313,7 +14789,7 @@ impl Pipeline {
     /// encoding and emission phases in isolation.
     pub fn encode_and_emit(&self, ir_func: &mut IrMachFunction) -> Result<Vec<u8>, PipelineError> {
         reject_unsupported_aarch64_object_format(&self.config.target_triple)?;
-        validate_aarch64_mach_function(ir_func)?;
+        self.validate_aarch64_mach_function_for_profile(ir_func)?;
 
         // Phase 7: Frame Lowering
         let frame_layout = self.run_frame_lowering(ir_func)?;
@@ -14446,6 +14922,7 @@ impl Pipeline {
 
         reject_unsupported_aarch64_object_format(&self.config.target_triple)?;
         validate_aarch64_object_globals(globals)?;
+        let _machine_code = self.aarch64_module_machine_code_evidence(functions)?;
         let object_name = object_name.into();
 
         if let Some(func) = functions.iter().find(|func| func.eh_metadata.has_eh_info()) {
@@ -14658,6 +15135,29 @@ impl Pipeline {
         frame_layouts: &[Option<crate::frame::FrameLayout>],
         bindings: &[FunctionSymbolBinding],
     ) -> Result<ModuleEmission, PipelineError> {
+        self.compile_module_emission_with_target_evidence(
+            functions,
+            globals,
+            frame_layouts,
+            bindings,
+        )
+        .map(AArch64ModuleEmission::into_emission)
+    }
+
+    /// Emit a whole-module object while retaining the validated union of
+    /// optional AArch64 features required by its machine-code functions.
+    ///
+    /// Feature derivation reuses the admission walk required by module
+    /// emission; it does not rescan the machine functions. The legacy
+    /// [`compile_module_emission`](Self::compile_module_emission) delegates here
+    /// and drops only the evidence result.
+    pub fn compile_module_emission_with_target_evidence(
+        &self,
+        functions: &[IrMachFunction],
+        globals: &[ObjectGlobal],
+        frame_layouts: &[Option<crate::frame::FrameLayout>],
+        bindings: &[FunctionSymbolBinding],
+    ) -> Result<AArch64ModuleEmission, PipelineError> {
         use crate::macho::fixup::FixupList;
 
         if !bindings.is_empty() && bindings.len() != functions.len() {
@@ -14671,6 +15171,7 @@ impl Pipeline {
 
         reject_unsupported_aarch64_object_format(&self.config.target_triple)?;
         validate_aarch64_object_globals(globals)?;
+        let machine_code = self.aarch64_module_machine_code_evidence(functions)?;
 
         // Symbol-address data relocations (vtable / `static FNS: [fn(); N]`
         // slots) are emitted for the Mach-O writer below via
@@ -14770,10 +15271,13 @@ impl Pipeline {
             frame_layouts,
             aarch64_module_text_align_log2(functions),
         )? {
-            return Ok(ModuleEmission {
-                object: obj,
-                text_extents,
-            });
+            return Ok(AArch64ModuleEmission::new(
+                ModuleEmission {
+                    object: obj,
+                    text_extents,
+                },
+                machine_code,
+            ));
         }
         reject_unsupported_aarch64_object_format(&self.config.target_triple)?;
 
@@ -14787,10 +15291,13 @@ impl Pipeline {
             functions,
             bindings,
         )?;
-        Ok(ModuleEmission {
-            object,
-            text_extents,
-        })
+        Ok(AArch64ModuleEmission::new(
+            ModuleEmission {
+                object,
+                text_extents,
+            },
+            machine_code,
+        ))
     }
 
     /// Compile multiple pre-built IR functions into a single Mach-O .o file,
@@ -14828,22 +15335,50 @@ impl Pipeline {
         globals: &[ObjectGlobal],
         frame_layouts: &[Option<crate::frame::FrameLayout>],
     ) -> Result<Vec<u8>, PipelineError> {
+        self.compile_module_parallel_emission_with_target_evidence(
+            functions,
+            globals,
+            frame_layouts,
+        )
+        .map(|emission| emission.into_emission().object)
+    }
+
+    /// Parallel whole-module emission retaining exact text layout and the
+    /// validated union of required optional AArch64 features.
+    ///
+    /// Results preserve function input order. The bytes are identical to
+    /// [`compile_module_parallel_with_globals_and_layouts`](Self::compile_module_parallel_with_globals_and_layouts),
+    /// which delegates here and drops only layout/evidence metadata.
+    pub fn compile_module_parallel_emission_with_target_evidence(
+        &self,
+        functions: &[IrMachFunction],
+        globals: &[ObjectGlobal],
+        frame_layouts: &[Option<crate::frame::FrameLayout>],
+    ) -> Result<AArch64ModuleEmission, PipelineError> {
         use crate::macho::fixup::FixupList;
         use rayon::prelude::*;
 
+        let Some(worker_count) = crate::resource_limits::worker_count_for_items(functions.len())
+        else {
+            // Not enough to justify parallel overhead. Delegate to the richer
+            // sequential core so validation and feature derivation still occur
+            // exactly once.
+            return self.compile_module_emission_with_target_evidence(
+                functions,
+                globals,
+                frame_layouts,
+                &[],
+            );
+        };
+
         reject_unsupported_aarch64_object_format(&self.config.target_triple)?;
         validate_aarch64_object_globals(globals)?;
+        let machine_code = self.aarch64_module_machine_code_evidence(functions)?;
 
         // Symbol-address data relocations are emitted by the Mach-O writer via
         // `add_global_data_section` (`ARM64_RELOC_UNSIGNED`); the ELF path still
         // fails closed in `emit_target_elf_or_reject_fixups`. See the sequential
         // `compile_module_with_globals_and_layouts` for the rationale.
-
-        let Some(worker_count) = crate::resource_limits::worker_count_for_items(functions.len())
-        else {
-            // Not enough to justify parallel overhead; fall back to sequential.
-            return self.compile_module_with_globals_and_layouts(functions, globals, frame_layouts);
-        };
 
         let pool = crate::resource_limits::build_rayon_pool(worker_count)
             .map_err(|err| PipelineError::ISel(format!("parallel worker pool error: {err}")))?;
@@ -14881,6 +15416,7 @@ impl Pipeline {
         let mut combined_fixups = FixupList::new();
         let mut func_offsets: Vec<(String, u64)> = Vec::with_capacity(results.len());
         let mut func_eh: Vec<ModuleFunctionEhData> = Vec::with_capacity(results.len());
+        let mut text_extents: Vec<TextFunctionExtent> = Vec::with_capacity(results.len());
 
         for (func, (name, code, fixups, lsda)) in functions.iter().zip(results) {
             // `par_iter().collect()` preserves input order, so results[i]
@@ -14899,6 +15435,11 @@ impl Pipeline {
             )?;
             let code_len = checked_aarch64_object_u32(&name, "encoded code length", code.len())?;
             func_offsets.push((name.clone(), func_start));
+            text_extents.push(TextFunctionExtent {
+                name: name.clone(),
+                offset: func_start,
+                len: u64::from(code_len),
+            });
 
             // Adjust fixup offsets to be relative to the combined section.
             for fixup in fixups.iter() {
@@ -14922,11 +15463,17 @@ impl Pipeline {
             frame_layouts,
             aarch64_module_text_align_log2(functions),
         )? {
-            return Ok(obj);
+            return Ok(AArch64ModuleEmission::new(
+                ModuleEmission {
+                    object: obj,
+                    text_extents,
+                },
+                machine_code,
+            ));
         }
         reject_unsupported_aarch64_object_format(&self.config.target_triple)?;
 
-        self.emit_module_macho_with_unwind(
+        let object = self.emit_module_macho_with_unwind(
             &combined_code,
             combined_fixups,
             &func_offsets,
@@ -14938,7 +15485,14 @@ impl Pipeline {
             // `compile_module_emission` always takes the sequential path, so a
             // non-global binding can never reach here and be silently dropped.
             &[],
-        )
+        )?;
+        Ok(AArch64ModuleEmission::new(
+            ModuleEmission {
+                object,
+                text_extents,
+            },
+            machine_code,
+        ))
     }
 
     /// Phase 2+3 of the generic multi-function module emitters: build the
@@ -15551,6 +16105,9 @@ impl Pipeline {
         };
 
         let mut isel = InstructionSelector::new(input.name.clone(), sig.clone());
+        let admitted_features = self.aarch64_target_machine.admitted_features();
+        isel.set_lse_enabled(admitted_features.admits(AArch64IsaFeature::Lse));
+        isel.set_fp16_enabled(admitted_features.admits(AArch64IsaFeature::Fp16));
         // Select from the compilation target, not the host. DarwinPCS packs
         // narrow stack arguments while AAPCS64/ELF gives each an 8-byte slot;
         // using one convention on the other target is silent cross-boundary
@@ -15681,6 +16238,7 @@ impl Pipeline {
     ) -> Result<trust_cg_opt::PassStats, PipelineError> {
         let function = func.name.clone();
         catch_optimization_invariant(function, || self.run_optimization(func))
+            .and_then(|result| result)
     }
 
     fn run_optimization_with_proof_metadata_checked(
@@ -15693,6 +16251,7 @@ impl Pipeline {
         catch_optimization_invariant(function, || {
             self.run_optimization_with_proof_metadata(func, proof_metadata, provenance)
         })
+        .and_then(|result| result)
     }
 
     fn run_optimization_with_proof_metadata_and_gate_checked(
@@ -15711,9 +16270,13 @@ impl Pipeline {
                 kernel_gate,
             )
         })
+        .and_then(|result| result)
     }
 
-    fn run_optimization(&self, func: &mut IrMachFunction) -> trust_cg_opt::PassStats {
+    fn run_optimization(
+        &self,
+        func: &mut IrMachFunction,
+    ) -> Result<trust_cg_opt::PassStats, PipelineError> {
         self.run_optimization_with_proof_metadata(func, None, None)
     }
 
@@ -15722,7 +16285,7 @@ impl Pipeline {
         func: &mut IrMachFunction,
         proof_metadata: Option<trust_cg_opt::proof_opts::ProofOptimizationMetadata>,
         provenance: Option<&mut trust_cg_ir::ProvenanceMap>,
-    ) -> trust_cg_opt::PassStats {
+    ) -> Result<trust_cg_opt::PassStats, PipelineError> {
         if cfg!(test) {
             // Retain the structural proof-pass model for in-crate unit tests.  Downstream and
             // integration builds compile the production branch below.
@@ -15751,7 +16314,7 @@ impl Pipeline {
         proof_metadata: Option<trust_cg_opt::proof_opts::ProofOptimizationMetadata>,
         provenance: Option<&mut trust_cg_ir::ProvenanceMap>,
         kernel_gate: Option<AArch64KernelGate>,
-    ) -> trust_cg_opt::PassStats {
+    ) -> Result<trust_cg_opt::PassStats, PipelineError> {
         use trust_cg_opt::pass_manager::MachinePass;
         use trust_cg_opt::pipeline::{OptLevel as OptOptLevel, OptimizationPipeline};
         use trust_cg_opt::scheduler::{InstructionScheduler, PressureAwareScheduler};
@@ -15771,8 +16334,15 @@ impl Pipeline {
         // Mach-O (Darwin); every explicit Apple/darwin triple qualifies too.
         let target_is_darwin = self.config.target_triple.is_empty()
             || target_triple_uses_macho(&self.config.target_triple);
-        let mut pipeline =
-            OptimizationPipeline::new(opt_level).with_target_is_darwin(target_is_darwin);
+        let mut pipeline = OptimizationPipeline::new(opt_level)
+            .with_target_is_darwin(target_is_darwin)
+            // Capability ownership stays in codegen; optimization receives a
+            // boolean admission and must otherwise choose its portable shape.
+            .with_aarch64_dotprod(
+                self.aarch64_target_machine
+                    .admitted_features()
+                    .admits(AArch64IsaFeature::DotProd),
+            );
         if let Some(disabled) = &self.config.disabled_passes_override {
             pipeline = pipeline.with_disabled_passes(disabled.clone());
         }
@@ -15818,11 +16388,11 @@ impl Pipeline {
         log_pipeline_phase_end(func, "opt-pass-manager", phase_timer);
 
         let phase_timer = log_pipeline_phase_start(func, "cegis-superopt");
-        let _ = self.run_cegis_superopt(func);
+        let _ = self.run_cegis_superopt_checked(func)?;
         log_pipeline_phase_end(func, "cegis-superopt", phase_timer);
 
         if self.pass_disabled("sched") {
-            return stats;
+            return Ok(stats);
         }
 
         // Pre-register-allocation instruction scheduling.
@@ -15845,7 +16415,7 @@ impl Pipeline {
                 log_pipeline_phase_end(func, "codegen-scheduler", phase_timer);
             }
         }
-        stats
+        Ok(stats)
     }
 
     /// Phase 3.5: Run function-level verification (optional).
@@ -15937,7 +16507,7 @@ impl Pipeline {
         // after every optimizer/scheduler mutation, not only at the public
         // pre-optimization entry, so no pass can silently remove or alter a
         // `RET`'s authenticated ABI return-register sink metadata.
-        validate_aarch64_mach_function(ir_func)?;
+        self.validate_aarch64_mach_function_for_profile(ir_func)?;
         // Regalloc phase-internal attribution (Task 3): the pipeline-side seams
         // that bracket the core allocator. Gated on the SAME env var as pass
         // timing (via `trust_cg_time_pipeline_enabled`, which is true under
@@ -17150,7 +17720,11 @@ pub fn compile_to_object(
         disabled_passes_override: None,
         contains4_scanner_batch_rewrite_override: None,
     };
-    let pipeline = Pipeline::new(config);
+    // This legacy one-shot API's empty target triple is the historical
+    // AArch64 Apple/Mach-O contract (see the object-format helpers above), so
+    // preserve that target's guaranteed optional ISA profile. New generic
+    // callers should construct a target-aware Compiler/Pipeline explicitly.
+    let pipeline = Pipeline::new(config).with_aarch64_isa_profile(AArch64IsaProfile::APPLE_ARM64);
     pipeline.compile_function(input)
 }
 
@@ -18505,7 +19079,9 @@ mod tests {
             ..PipelineConfig::default()
         });
         let mut provenance = Some(provenance);
-        pipeline.run_optimization_with_proof_metadata(&mut ir_func, None, provenance.as_mut());
+        pipeline
+            .run_optimization_with_proof_metadata(&mut ir_func, None, provenance.as_mut())
+            .expect("O3 test optimization should complete");
         pipeline
             .run_verification(&ir_func)
             .expect("test function should verify before regalloc");
@@ -22718,6 +23294,165 @@ mod tests {
         assert_eq!(relocs[0].symbol_index as usize, callee_idx);
     }
 
+    fn build_aarch64_feature_module_function(
+        name: &str,
+        feature: Option<AArch64IsaFeature>,
+    ) -> IrMachFunction {
+        use trust_cg_ir::aarch64_regs::{H0, H1, H2, V0, V1, V2};
+
+        let mut func = IrMachFunction::new(name.to_owned(), IrSignature::new(vec![], vec![]));
+        let entry = func.entry;
+        let insts = match feature {
+            None => Vec::new(),
+            Some(AArch64IsaFeature::Lse) => vec![
+                IrMachInst::new(IrOpcode::Movz, vec![IrOperand::PReg(X0), IrOperand::Imm(1)]),
+                IrMachInst::new(IrOpcode::Movz, vec![IrOperand::PReg(X2), IrOperand::Imm(0)]),
+                IrMachInst::new(
+                    IrOpcode::Ldadd,
+                    vec![
+                        IrOperand::PReg(X0),
+                        IrOperand::PReg(X1),
+                        IrOperand::PReg(X2),
+                    ],
+                ),
+            ],
+            Some(AArch64IsaFeature::DotProd) => vec![
+                IrMachInst::new(
+                    IrOpcode::NeonMovi,
+                    vec![IrOperand::PReg(V0), IrOperand::Imm(0)],
+                ),
+                IrMachInst::new(
+                    IrOpcode::NeonMovi,
+                    vec![IrOperand::PReg(V1), IrOperand::Imm(0)],
+                ),
+                IrMachInst::new(
+                    IrOpcode::NeonMovi,
+                    vec![IrOperand::PReg(V2), IrOperand::Imm(0)],
+                ),
+                IrMachInst::new(
+                    IrOpcode::NeonUdotV,
+                    vec![
+                        IrOperand::PReg(V0),
+                        IrOperand::PReg(V1),
+                        IrOperand::PReg(V2),
+                        IrOperand::Imm(1),
+                    ],
+                ),
+            ],
+            Some(AArch64IsaFeature::Fp16) => vec![
+                IrMachInst::new(
+                    IrOpcode::FmovImm,
+                    vec![IrOperand::PReg(H1), IrOperand::FImm(1.0)],
+                ),
+                IrMachInst::new(
+                    IrOpcode::FmovImm,
+                    vec![IrOperand::PReg(H2), IrOperand::FImm(2.0)],
+                ),
+                IrMachInst::new(
+                    IrOpcode::FaddRR,
+                    vec![
+                        IrOperand::PReg(H0),
+                        IrOperand::PReg(H1),
+                        IrOperand::PReg(H2),
+                    ],
+                ),
+            ],
+        };
+        for inst in insts {
+            let inst = func.push_inst(inst);
+            func.append_inst(entry, inst);
+        }
+        let ret = func.push_inst(IrMachInst::new(IrOpcode::Ret, vec![]));
+        func.append_inst(entry, ret);
+        func
+    }
+
+    #[test]
+    fn module_emission_unions_target_evidence_and_parallel_bytes_in_real_worker_route() {
+        let mut functions = vec![
+            build_aarch64_feature_module_function("baseline_probe", None),
+            build_aarch64_feature_module_function("lse_probe", Some(AArch64IsaFeature::Lse)),
+            build_aarch64_feature_module_function(
+                "dotprod_probe",
+                Some(AArch64IsaFeature::DotProd),
+            ),
+            build_aarch64_feature_module_function("fp16_probe", Some(AArch64IsaFeature::Fp16)),
+        ];
+        functions.extend((4..32).map(|index| {
+            build_aarch64_feature_module_function(&format!("baseline_probe_{index}"), None)
+        }));
+        assert_eq!(
+            crate::resource_limits::worker_count_for_items(functions.len()),
+            Some(2),
+            "module evidence parity must exercise the real parallel encoder route"
+        );
+
+        let pipeline = Pipeline::new(PipelineConfig::default());
+        let sequential = pipeline
+            .compile_module_emission_with_target_evidence(&functions, &[], &[], &[])
+            .expect("sequential Apple AArch64 module emission succeeds");
+        let parallel = pipeline
+            .compile_module_parallel_emission_with_target_evidence(&functions, &[], &[])
+            .expect("parallel Apple AArch64 module emission succeeds");
+        let expected = OutputTargetFeatures::try_from_output(AArch64IsaFeature::ALL).unwrap();
+
+        assert_eq!(sequential.machine_code().required_features(), expected);
+        assert_eq!(parallel.machine_code(), sequential.machine_code());
+        assert_eq!(
+            sequential.emission().object.as_slice(),
+            parallel.emission().object.as_slice(),
+            "parallel evidence API must preserve sequential object bytes"
+        );
+        assert_eq!(
+            sequential.emission().text_extents.as_slice(),
+            parallel.emission().text_extents.as_slice(),
+            "parallel evidence API must preserve exact function order/layout"
+        );
+
+        let legacy_sequential = pipeline
+            .compile_module_emission(&functions, &[], &[], &[])
+            .expect("legacy sequential emission delegates successfully");
+        let legacy_parallel = pipeline
+            .compile_module_parallel_with_globals_and_layouts(&functions, &[], &[])
+            .expect("legacy parallel emission delegates successfully");
+        assert_eq!(
+            legacy_sequential.object.as_slice(),
+            sequential.emission().object.as_slice()
+        );
+        assert_eq!(
+            legacy_parallel.as_slice(),
+            parallel.emission().object.as_slice()
+        );
+    }
+
+    #[test]
+    fn module_emission_evidence_is_baseline_and_fails_closed_outside_admission() {
+        let pipeline = Pipeline::new(PipelineConfig {
+            target_triple: "aarch64-unknown-linux-gnu".to_owned(),
+            ..PipelineConfig::default()
+        });
+        let baseline = [build_aarch64_feature_module_function("baseline_only", None)];
+        let emission = pipeline
+            .compile_module_emission_with_target_evidence(&baseline, &[], &[], &[])
+            .expect("baseline Linux AArch64 module emits");
+        assert_eq!(
+            emission.machine_code().required_features(),
+            OutputTargetFeatures::NONE
+        );
+
+        let lse = [build_aarch64_feature_module_function(
+            "unadmitted_lse",
+            Some(AArch64IsaFeature::Lse),
+        )];
+        assert!(matches!(
+            pipeline.compile_module_emission_with_target_evidence(&lse, &[], &[], &[]),
+            Err(PipelineError::Aarch64LseNotAdmitted {
+                opcode: IrOpcode::Ldadd,
+                ..
+            })
+        ));
+    }
+
     /// Build a small self-contained LIR function `name() -> i64 { return a + b }`
     /// plus an empty proof context, for batch-prepare determinism tests.
     fn build_add_lir_function(
@@ -22782,13 +23517,16 @@ mod tests {
     #[test]
     fn prepare_functions_parallel_is_byte_identical_to_serial() {
         // A multi-function module mirroring the TY compiled-BFS shape (several
-        // independent functions prepared together). Six functions comfortably
-        // exceed the 2-worker parallel threshold and exercise multiple rayon
-        // workers, so this genuinely covers the parallel path on any multicore
-        // host (and still asserts equality if it degrades to serial).
-        let inputs: Vec<(trust_cg_lower::Function, trust_cg_lower::ProofContext)> = (0..6)
+        // independent functions prepared together). The work-aware scheduler
+        // requires 16 items per worker, so 32 pins a real two-worker route.
+        let inputs: Vec<(trust_cg_lower::Function, trust_cg_lower::ProofContext)> = (0..32)
             .map(|i| build_add_lir_function(&format!("kern_fn_{i}"), i * 7 + 1, i * 3 + 2))
             .collect();
+        assert_eq!(
+            crate::resource_limits::worker_count_for_items(inputs.len()),
+            Some(2),
+            "the determinism test must exercise the real parallel worker path"
+        );
 
         let pipeline = Pipeline::new(PipelineConfig {
             opt_level: OptLevel::O2,
@@ -22797,21 +23535,35 @@ mod tests {
         });
 
         // Serial reference: the exact per-function call the batch API fans out.
-        let serial: Vec<IrMachFunction> = inputs
+        let serial_with_evidence: Vec<(IrMachFunction, AArch64MachineCodeEvidence)> = inputs
             .iter()
             .map(|(func, ctx)| {
-                pipeline
-                    .prepare_function_with_proofs(func, Some(ctx))
-                    .expect("serial prepare succeeds")
+                let (prepared, metrics) = pipeline
+                    .prepare_function_with_metrics(func, Some(ctx))
+                    .expect("serial prepare succeeds");
+                let evidence = metrics
+                    .aarch64_machine_code
+                    .expect("serial preparation retains AArch64 evidence");
+                (prepared, evidence)
             })
             .collect();
 
-        // Parallel batch under test.
-        let parallel: Vec<IrMachFunction> = pipeline
-            .prepare_functions_parallel(&inputs)
+        // Parallel batch under test. Its richer result is what a manual batch
+        // caller such as TY can consume without serializing or rescanning.
+        let parallel_with_evidence: Vec<(IrMachFunction, AArch64MachineCodeEvidence)> = pipeline
+            .prepare_functions_parallel_with_metrics(&inputs)
             .into_iter()
-            .map(|r| r.expect("parallel prepare succeeds"))
+            .map(|result| {
+                let (prepared, metrics) = result.expect("parallel prepare succeeds");
+                let evidence = metrics
+                    .aarch64_machine_code
+                    .expect("parallel preparation retains AArch64 evidence");
+                (prepared, evidence)
+            })
             .collect();
+        let (serial, serial_evidence): (Vec<_>, Vec<_>) = serial_with_evidence.into_iter().unzip();
+        let (parallel, parallel_evidence): (Vec<_>, Vec<_>) =
+            parallel_with_evidence.into_iter().unzip();
 
         assert_eq!(
             serial.len(),
@@ -22823,6 +23575,10 @@ mod tests {
         //    Debug captures the symbol name, vreg numbering, block/inst order,
         //    operands, and frame layout — any nondeterminism would surface here.
         for (i, (s, p)) in serial.iter().zip(&parallel).enumerate() {
+            assert_eq!(
+                s.name, inputs[i].0.name,
+                "serial result order skew at index {i}"
+            );
             assert_eq!(s.name, p.name, "name mismatch / order skew at index {i}");
             assert_eq!(
                 format!("{s:#?}"),
@@ -22830,6 +23586,30 @@ mod tests {
                 "prepared IrMachFunction differs at index {i} ({})",
                 s.name
             );
+            assert_eq!(
+                serial_evidence[i], parallel_evidence[i],
+                "typed machine-code evidence differs at index {i} ({})",
+                s.name
+            );
+            assert_eq!(
+                parallel_evidence[i].required_features(),
+                OutputTargetFeatures::NONE,
+                "baseline add kernel unexpectedly requires an optional ISA feature"
+            );
+        }
+
+        // The compatibility API delegates to the richer batch route and drops
+        // metrics only. A small prefix pins that legacy result shape without
+        // repeating the entire six-function workload.
+        let legacy: Vec<IrMachFunction> = pipeline
+            .prepare_functions_parallel(&inputs[..2])
+            .into_iter()
+            .map(|result| result.expect("legacy parallel prepare succeeds"))
+            .collect();
+        assert_eq!(legacy.len(), 2);
+        for (index, prepared) in legacy.iter().enumerate() {
+            assert_eq!(prepared.name, inputs[index].0.name);
+            assert_eq!(format!("{prepared:#?}"), format!("{:#?}", serial[index]));
         }
 
         // 2. End-to-end byte-identity of the linked object (symbol order + code
@@ -31131,7 +31911,377 @@ mod tests {
     fn pipeline_config_default_is_o2() {
         let config = PipelineConfig::default();
         assert_eq!(config.opt_level, OptLevel::O2);
+        let legacy = Pipeline::new(config.clone());
+        assert_eq!(
+            legacy.aarch64_isa_profile(),
+            AArch64IsaProfile::APPLE_ARM64,
+            "the legacy empty target triple is Apple AArch64/Mach-O"
+        );
+        assert_eq!(
+            *legacy.aarch64_target_machine().identity(),
+            TargetSpec::parse("aarch64-apple-darwin").unwrap()
+        );
+        let linux = Pipeline::new(PipelineConfig {
+            target_triple: "aarch64-unknown-linux-gnu".to_owned(),
+            ..config.clone()
+        });
+        assert_eq!(linux.aarch64_isa_profile(), AArch64IsaProfile::BASELINE);
+        assert_eq!(
+            *linux.aarch64_target_machine().identity(),
+            TargetSpec::parse("aarch64-unknown-linux-gnu").unwrap()
+        );
+        let invalid = Pipeline::new(PipelineConfig {
+            target_triple: "not-a-target".to_owned(),
+            ..config.clone()
+        });
+        assert_eq!(
+            invalid.aarch64_isa_profile(),
+            AArch64IsaProfile::BASELINE,
+            "an unrecognized target cannot authorize optional instructions"
+        );
+        assert_eq!(
+            *invalid.aarch64_target_machine().identity(),
+            TargetSpec::unknown_for_architecture(Target::Aarch64),
+            "an invalid target must retain only a fail-closed AArch64 identity"
+        );
         assert!(!config.emit_debug);
+    }
+
+    #[test]
+    fn aarch64_final_validation_derives_typed_required_feature_matrix() {
+        use trust_cg_ir::aarch64_regs::{H0, H1, H2, V0, V1, V2, X0, X1, X2};
+
+        let make_probe = |name: &str, feature_inst: Option<IrMachInst>| {
+            let mut func = IrMachFunction::new(name.to_owned(), IrSignature::new(vec![], vec![]));
+            let entry = func.entry;
+            if let Some(inst) = feature_inst {
+                let inst = func.push_inst(inst);
+                func.append_inst(entry, inst);
+            }
+            let ret = func.push_inst(IrMachInst::new(IrOpcode::Ret, vec![]));
+            func.append_inst(entry, ret);
+            func
+        };
+
+        let cases = [
+            (
+                AArch64IsaProfile::BASELINE,
+                make_probe("baseline_required", None),
+                OutputTargetFeatures::NONE,
+            ),
+            (
+                AArch64IsaProfile::LSE,
+                make_probe(
+                    "lse_required",
+                    Some(IrMachInst::new(
+                        IrOpcode::Ldadd,
+                        vec![
+                            IrOperand::PReg(X0),
+                            IrOperand::PReg(X1),
+                            IrOperand::PReg(X2),
+                        ],
+                    )),
+                ),
+                OutputTargetFeatures::try_from_output([AArch64IsaFeature::Lse]).unwrap(),
+            ),
+            (
+                AArch64IsaProfile::DOTPROD,
+                make_probe(
+                    "dotprod_required",
+                    Some(IrMachInst::new(
+                        IrOpcode::NeonUdotV,
+                        vec![
+                            IrOperand::PReg(V0),
+                            IrOperand::PReg(V1),
+                            IrOperand::PReg(V2),
+                            IrOperand::Imm(1),
+                        ],
+                    )),
+                ),
+                OutputTargetFeatures::try_from_output([AArch64IsaFeature::DotProd]).unwrap(),
+            ),
+            (
+                AArch64IsaProfile::FP16,
+                make_probe(
+                    "fp16_required",
+                    Some(IrMachInst::new(
+                        IrOpcode::FaddRR,
+                        vec![
+                            IrOperand::PReg(H0),
+                            IrOperand::PReg(H1),
+                            IrOperand::PReg(H2),
+                        ],
+                    )),
+                ),
+                OutputTargetFeatures::try_from_output([AArch64IsaFeature::Fp16]).unwrap(),
+            ),
+        ];
+
+        for (profile, func, expected_required) in cases {
+            let pipeline = Pipeline::new(PipelineConfig {
+                target_triple: "aarch64-unknown-linux-gnu".to_owned(),
+                ..PipelineConfig::default()
+            })
+            .with_aarch64_isa_profile(profile);
+            let required = pipeline
+                .validate_aarch64_mach_function_for_profile(&func)
+                .unwrap();
+            assert_eq!(required, expected_required, "{}", func.name);
+            let evidence =
+                AArch64MachineCodeEvidence::try_new(pipeline.aarch64_target_machine(), required)
+                    .unwrap();
+            assert_eq!(evidence.required_features(), expected_required);
+            assert_eq!(
+                AArch64IsaProfile::from(evidence.admitted_features()),
+                profile
+            );
+        }
+    }
+
+    #[test]
+    fn aarch64_target_machine_rejects_required_features_outside_admission() {
+        let pipeline = Pipeline::new(PipelineConfig {
+            target_triple: "aarch64-unknown-linux-gnu".to_owned(),
+            ..PipelineConfig::default()
+        })
+        .with_aarch64_isa_profile(AArch64IsaProfile::LSE);
+        let required = OutputTargetFeatures::try_from_output([
+            AArch64IsaFeature::Lse,
+            AArch64IsaFeature::DotProd,
+        ])
+        .unwrap();
+
+        let error =
+            AArch64MachineCodeEvidence::try_new(pipeline.aarch64_target_machine(), required)
+                .expect_err("LSE-only admission must reject DotProd output");
+        assert!(matches!(
+            error,
+            trust_cg_ir::TargetMachineError::MissingOutputFeatures { missing, .. }
+                if missing.contains(AArch64IsaFeature::DotProd)
+                    && !missing.contains(AArch64IsaFeature::Lse)
+        ));
+    }
+
+    #[test]
+    fn pipeline_machine_ir_lse_requires_explicit_profile() {
+        let mut lse_func =
+            IrMachFunction::new("lse_required".to_string(), IrSignature::new(vec![], vec![]));
+        let entry = lse_func.entry;
+        let lse = lse_func.push_inst(IrMachInst::new(IrOpcode::Ldadd, vec![]));
+        lse_func.append_inst(entry, lse);
+
+        let baseline = Pipeline::new(PipelineConfig {
+            target_triple: "aarch64-unknown-linux-gnu".to_owned(),
+            ..PipelineConfig::default()
+        });
+        assert!(matches!(
+            baseline.aarch64_required_features(&lse_func),
+            Err(PipelineError::Aarch64LseNotAdmitted {
+                opcode: IrOpcode::Ldadd,
+                profile,
+                ..
+            }) if profile == "aarch64-isa-v1"
+        ));
+        assert!(matches!(
+            baseline.recheck_aarch64_post_regalloc(&lse_func),
+            Err(PipelineError::Aarch64LseNotAdmitted {
+                opcode: IrOpcode::Ldadd,
+                profile,
+                ..
+            }) if profile == "aarch64-isa-v1"
+        ));
+
+        let admitted = Pipeline::new(PipelineConfig::default())
+            .with_aarch64_isa_profile(AArch64IsaProfile::LSE);
+        admitted
+            .aarch64_required_features(&lse_func)
+            .expect("an explicit LSE profile must admit LSE machine IR");
+
+        let mut ordinary =
+            IrMachFunction::new("ordinary".to_string(), IrSignature::new(vec![], vec![]));
+        let entry = ordinary.entry;
+        let ret = ordinary.push_inst(IrMachInst::new(IrOpcode::Ret, vec![]));
+        ordinary.append_inst(entry, ret);
+        baseline
+            .aarch64_required_features(&ordinary)
+            .expect("baseline AArch64 must not reject ordinary non-atomic machine IR");
+    }
+
+    #[test]
+    fn pipeline_machine_ir_fp16_distinguishes_baseline_transport_from_data_processing() {
+        let baseline = Pipeline::new(PipelineConfig {
+            target_triple: "aarch64-unknown-linux-gnu".to_owned(),
+            ..PipelineConfig::default()
+        });
+        let half = VReg::new(0, RegClass::Fpr16);
+        let other = VReg::new(1, RegClass::Fpr16);
+        let mut arithmetic =
+            IrMachFunction::new("fp16_add".to_string(), IrSignature::new(vec![], vec![]));
+        let entry = arithmetic.entry;
+        let add = arithmetic.push_inst(IrMachInst::new(
+            IrOpcode::FaddRR,
+            vec![
+                IrOperand::VReg(half),
+                IrOperand::VReg(half),
+                IrOperand::VReg(other),
+            ],
+        ));
+        arithmetic.append_inst(entry, add);
+        assert!(matches!(
+            baseline.aarch64_required_features(&arithmetic),
+            Err(PipelineError::Aarch64Fp16NotAdmitted {
+                opcode: IrOpcode::FaddRR,
+                profile,
+                ..
+            }) if profile == "aarch64-isa-v1"
+        ));
+
+        let mut transport =
+            IrMachFunction::new("fp16_load".to_string(), IrSignature::new(vec![], vec![]));
+        let entry = transport.entry;
+        let load = transport.push_inst(IrMachInst::new(
+            IrOpcode::LdrRI,
+            vec![
+                IrOperand::VReg(half),
+                IrOperand::VReg(VReg::new(2, RegClass::Gpr64)),
+                IrOperand::Imm(0),
+            ],
+        ));
+        transport.append_inst(entry, load);
+        baseline
+            .aarch64_required_features(&transport)
+            .expect("baseline AArch64 admits storage-only H-register loads");
+
+        let address = VReg::new(2, RegClass::Gpr64);
+        let index = VReg::new(3, RegClass::Gpr64);
+        let mut indexed_transport = IrMachFunction::new(
+            "fp16_indexed_transport".to_string(),
+            IrSignature::new(vec![], vec![]),
+        );
+        let entry = indexed_transport.entry;
+        for inst in [
+            IrMachInst::new(
+                IrOpcode::LdrRO,
+                vec![
+                    IrOperand::VReg(half),
+                    IrOperand::VReg(address),
+                    IrOperand::VReg(index),
+                ],
+            ),
+            IrMachInst::new(
+                IrOpcode::StrRO,
+                vec![
+                    IrOperand::VReg(half),
+                    IrOperand::VReg(address),
+                    IrOperand::VReg(index),
+                ],
+            ),
+        ] {
+            let id = indexed_transport.push_inst(inst);
+            indexed_transport.append_inst(entry, id);
+        }
+        baseline
+            .aarch64_required_features(&indexed_transport)
+            .expect("baseline AArch64 admits register-offset H loads and stores");
+
+        Pipeline::new(PipelineConfig::default())
+            .with_aarch64_isa_profile(AArch64IsaProfile::FP16)
+            .aarch64_required_features(&arithmetic)
+            .expect("an explicit FP16 profile admits scalar half arithmetic");
+    }
+
+    #[test]
+    fn generic_aarch64_pipeline_prepares_f16_formal_and_baseline_conversions() {
+        use trust_cg_lower::function::{BasicBlock, Function as LowerFunction, Signature};
+        use trust_cg_lower::instructions::{Block, Instruction, Opcode, Value};
+        use trust_cg_lower::types::Type as LowerType;
+
+        let entry = Block(0);
+        let mut func = LowerFunction::new(
+            "baseline_f16_roundtrip",
+            Signature {
+                params: vec![LowerType::F16],
+                returns: vec![LowerType::F16],
+            },
+        );
+        func.entry_block = entry;
+        func.block_order = vec![entry];
+        func.blocks.insert(
+            entry,
+            BasicBlock {
+                params: vec![],
+                instructions: vec![
+                    Instruction {
+                        opcode: Opcode::FPExt,
+                        args: vec![Value(0)],
+                        results: vec![Value(1)],
+                    },
+                    Instruction {
+                        opcode: Opcode::FPTrunc,
+                        args: vec![Value(1)],
+                        results: vec![Value(2)],
+                    },
+                    Instruction {
+                        opcode: Opcode::Return,
+                        args: vec![Value(2)],
+                        results: vec![],
+                    },
+                ],
+                source_locs: vec![],
+            },
+        );
+        func.value_types.insert(Value(0), LowerType::F16);
+        func.value_types.insert(Value(1), LowerType::F32);
+        func.value_types.insert(Value(2), LowerType::F16);
+
+        let pipeline = Pipeline::new(PipelineConfig {
+            target_triple: "aarch64-unknown-linux-gnu".to_owned(),
+            opt_level: OptLevel::O0,
+            verify: false,
+            ..PipelineConfig::default()
+        });
+        assert_eq!(pipeline.aarch64_isa_profile(), AArch64IsaProfile::BASELINE);
+
+        let (prepared, metrics) = pipeline
+            .prepare_function_with_metrics(&func, None)
+            .expect("baseline AArch64 must prepare F16 transport and H<->S conversions");
+        let evidence = metrics
+            .aarch64_machine_code
+            .expect("successful AArch64 preparation must expose machine-code evidence");
+        assert_eq!(
+            evidence.target(),
+            *pipeline.aarch64_target_machine().identity()
+        );
+        assert_eq!(
+            evidence.admitted_features(),
+            pipeline.aarch64_target_machine().admitted_features()
+        );
+        assert_eq!(evidence.required_features(), OutputTargetFeatures::NONE);
+        let final_insts: Vec<_> = prepared
+            .block_order
+            .iter()
+            .flat_map(|block| prepared.block(*block).insts.iter().copied())
+            .map(|inst_id| prepared.inst(inst_id))
+            .collect();
+
+        assert!(
+            final_insts
+                .iter()
+                .any(|inst| inst.opcode == IrOpcode::FcvtHS),
+            "FPExt F16->F32 must survive as baseline FCVT S,H"
+        );
+        assert!(
+            final_insts
+                .iter()
+                .any(|inst| inst.opcode == IrOpcode::FcvtSH),
+            "FPTrunc F32->F16 must survive as baseline FCVT H,S"
+        );
+        assert!(
+            final_insts.iter().all(|inst| {
+                inst.opcode != IrOpcode::Copy && inst.operands.iter().all(|op| !op.is_vreg())
+            }),
+            "the final profile-validated stream must contain no Copy pseudos or VRegs: {final_insts:?}"
+        );
     }
 
     #[test]
@@ -31654,6 +32804,73 @@ mod tests {
             }
             other => panic!("expected typed optimizer rejection, got {other:?}"),
         }
+    }
+
+    #[cfg(feature = "verify")]
+    #[test]
+    fn incomplete_cegis_transaction_fails_production_preparation() {
+        let mut func = IrMachFunction::new(
+            "cegis_incomplete_production".to_string(),
+            IrSignature::new(vec![], vec![Type::I32]),
+        );
+        let zero = VReg::new(func.alloc_vreg(), RegClass::Gpr32);
+        let lhs = VReg::new(func.alloc_vreg(), RegClass::Gpr32);
+        let dst = VReg::new(func.alloc_vreg(), RegClass::Gpr32);
+        for inst in [
+            IrMachInst::new(
+                IrOpcode::Movz,
+                vec![IrOperand::VReg(zero), IrOperand::Imm(0)],
+            ),
+            IrMachInst::new(
+                IrOpcode::Movz,
+                vec![IrOperand::VReg(lhs), IrOperand::Imm(7)],
+            ),
+            IrMachInst::new(
+                IrOpcode::MulRR,
+                vec![
+                    IrOperand::VReg(dst),
+                    IrOperand::VReg(lhs),
+                    IrOperand::VReg(zero),
+                ],
+            ),
+            IrMachInst::new(
+                IrOpcode::MovR,
+                vec![IrOperand::PReg(X0), IrOperand::VReg(dst)],
+            ),
+            IrMachInst::new(IrOpcode::Ret, vec![]).with_implicit_uses(&[X0]),
+        ] {
+            let id = func.push_inst(inst);
+            func.append_inst(func.entry, id);
+        }
+
+        let pipeline = Pipeline::new(PipelineConfig {
+            opt_level: OptLevel::O0,
+            cegis_superopt_budget_sec: Some(10),
+            target_triple: "aarch64-apple-darwin".to_string(),
+            ..PipelineConfig::default()
+        })
+        .with_cegis_test_incomplete_after_first_commit();
+
+        let err = pipeline
+            .compile_ir_function(&mut func)
+            .expect_err("an incomplete CEGIS transaction must stop before emission");
+        assert!(
+            matches!(
+                err,
+                PipelineError::CegisIncomplete {
+                    completion: trust_cg_verify::CegisSearchCompletion::QueryIncomplete,
+                    ..
+                }
+            ),
+            "unexpected pipeline error: {err}"
+        );
+        assert!(
+            func.block(func.entry)
+                .insts
+                .iter()
+                .any(|id| func.inst(*id).opcode == IrOpcode::MulRR),
+            "the proven-but-incomplete MulRR rewrite must be rolled back"
+        );
     }
 
     #[test]
@@ -32519,7 +33736,9 @@ mod scheduler_integration_tests {
         let pipeline = Pipeline::new(config);
         let mut func = make_simple_func();
         // Should not panic — O0 skips scheduling.
-        pipeline.run_optimization(&mut func);
+        pipeline
+            .run_optimization(&mut func)
+            .expect("O0 optimization should complete");
     }
 
     #[test]
@@ -32528,7 +33747,9 @@ mod scheduler_integration_tests {
         let config = config_for(OptLevel::O1);
         let pipeline = Pipeline::new(config);
         let mut func = make_simple_func();
-        pipeline.run_optimization(&mut func);
+        pipeline
+            .run_optimization(&mut func)
+            .expect("O1 optimization should complete");
     }
 
     #[test]
@@ -32537,7 +33758,9 @@ mod scheduler_integration_tests {
         let config = config_for(OptLevel::O2);
         let pipeline = Pipeline::new(config);
         let mut func = make_simple_func();
-        pipeline.run_optimization(&mut func);
+        pipeline
+            .run_optimization(&mut func)
+            .expect("O2 optimization should complete");
     }
 
     #[test]
@@ -32546,7 +33769,9 @@ mod scheduler_integration_tests {
         let config = config_for(OptLevel::O3);
         let pipeline = Pipeline::new(config);
         let mut func = make_simple_func();
-        pipeline.run_optimization(&mut func);
+        pipeline
+            .run_optimization(&mut func)
+            .expect("O3 optimization should complete");
     }
 
     #[test]
@@ -32556,7 +33781,9 @@ mod scheduler_integration_tests {
         let config = config_for(OptLevel::O1);
         let pipeline = Pipeline::new(config);
         let mut func = make_simple_func();
-        pipeline.run_optimization(&mut func);
+        pipeline
+            .run_optimization(&mut func)
+            .expect("O1 optimization should complete");
     }
 
     #[test]
@@ -32570,7 +33797,9 @@ mod scheduler_integration_tests {
                 let entry = func.entry;
                 let original_order = func.block(entry).insts.clone();
 
-                pipeline.run_optimization(&mut func);
+                pipeline
+                    .run_optimization(&mut func)
+                    .expect("disabled scheduler optimization should complete");
 
                 assert_eq!(
                     func.block(entry).insts,
@@ -32590,7 +33819,9 @@ mod scheduler_integration_tests {
             let entry = func.entry;
             let original_order = func.block(entry).insts.clone();
 
-            pipeline.run_optimization(&mut func);
+            pipeline
+                .run_optimization(&mut func)
+                .expect("disabled O1 schedulers optimization should complete");
 
             assert_eq!(
                 func.block(entry).insts,

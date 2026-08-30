@@ -21,6 +21,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "common/skip.rs"]
+mod skip;
+
 use trust_cg_codegen::pipeline::{OptLevel, Pipeline, PipelineConfig};
 use trust_cg_ir::{AArch64Opcode, BlockId, MachFunction, MachOperand, PReg};
 use trust_ir::{BinOp, ICmpOp, Ty};
@@ -102,18 +105,6 @@ int main(int argc, char** argv) {
     return 0;
 }
 "#;
-
-fn is_aarch64() -> bool {
-    cfg!(target_arch = "aarch64")
-}
-
-fn has_cc() -> bool {
-    Command::new("cc")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
 
 fn make_test_dir(test_name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("trust_cg_xxh3_main_loop_{test_name}"));
@@ -680,7 +671,7 @@ fn test_xxh3_main_loop_determinism_o2() {
 
 #[test]
 fn test_xxh3_main_loop_e2e_single_block() {
-    if !is_aarch64() || !has_cc() {
+    if !skip::aarch64_linkrun_or_skip("test_xxh3_main_loop_e2e_single_block") {
         return;
     }
     run_xxh3_main_loop_case("single_block", 0x243F_6A88_85A3_08D3, &sample_data(8));
@@ -688,7 +679,7 @@ fn test_xxh3_main_loop_e2e_single_block() {
 
 #[test]
 fn test_xxh3_main_loop_e2e_four_blocks() {
-    if !is_aarch64() || !has_cc() {
+    if !skip::aarch64_linkrun_or_skip("test_xxh3_main_loop_e2e_four_blocks") {
         return;
     }
     run_xxh3_main_loop_case("four_blocks", 0x1319_8A2E_0370_7344, &sample_data(32));
@@ -696,7 +687,7 @@ fn test_xxh3_main_loop_e2e_four_blocks() {
 
 #[test]
 fn test_xxh3_main_loop_e2e_sixteen_blocks() {
-    if !is_aarch64() || !has_cc() {
+    if !skip::aarch64_linkrun_or_skip("test_xxh3_main_loop_e2e_sixteen_blocks") {
         return;
     }
     run_xxh3_main_loop_case("sixteen_blocks", 0xA409_3822_299F_31D0, &sample_data(128));
@@ -704,7 +695,7 @@ fn test_xxh3_main_loop_e2e_sixteen_blocks() {
 
 #[test]
 fn test_xxh3_main_loop_e2e_zero_blocks() {
-    if !is_aarch64() || !has_cc() {
+    if !skip::aarch64_linkrun_or_skip("test_xxh3_main_loop_e2e_zero_blocks") {
         return;
     }
     run_xxh3_main_loop_case("zero_blocks", 0x082E_FA98_EC4E_6C89, &[]);

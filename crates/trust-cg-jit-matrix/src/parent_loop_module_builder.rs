@@ -444,7 +444,7 @@ fn pack_result(
 // Arena helper
 // ---------------------------------------------------------------------
 
-use crate::parent_loop_baseline::{Action, State, TransitionSystem};
+use crate::parent_loop_baseline::{State, TransitionSystem};
 
 /// Heap-pinned arena for the JIT'd parent-loop kernel.
 ///
@@ -613,13 +613,4 @@ impl ParentLoopArena {
     pub fn actions_raw(&self) -> &[u64] {
         &self.actions
     }
-}
-
-// Force compile-time use of `Action` to silence dead-code warnings on
-// non-test builds (the arena builder consumes `Action` through the
-// `&TransitionSystem` reference, but rustc cannot see that through a
-// helper.) — kept for documentation parity with the baseline.
-#[allow(dead_code)]
-fn _action_typecheck(a: Action) -> Action {
-    a
 }

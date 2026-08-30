@@ -10,8 +10,8 @@
 # and fails on unknown classification or evidence drift. With default features,
 # accepted records may be evaluator-backed statistical evidence; they are not
 # correctness proofs. This wraps the coverage-gate test suite in trust-cg-verify so it runs
-# in the same lane as the other ratchet-style gates (check_test_ratchet.sh,
-# check_warnings_ratchet.sh, ...).
+# in the same lane as the other ratchet-style gates (`cargo run -p trust-cg-test
+# --quiet -- ratchet tests`, `... ratchet warnings`, ...).
 #
 # The actual coverage logic lives in
 #   crates/trust-cg-verify/src/coverage_gate.rs

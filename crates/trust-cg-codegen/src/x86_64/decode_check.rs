@@ -119,7 +119,11 @@ fn coverage(op: X86Opcode) -> Coverage {
         O::XorMR | O::AddMR | O::XorMRSib | O::AddMRSib => Covered,
         O::ImulRR | O::ImulRRI | O::ImulRM | O::ImulRMSib => Covered,
         O::Neg | O::Not | O::Inc | O::Dec | O::Idiv | O::Div | O::Mul | O::Cdq | O::Cqo => Covered,
-        O::ShlRR | O::ShlRI | O::ShrRR | O::ShrRI | O::SarRR | O::SarRI | O::RolRI => Covered,
+        // Variable-count rotate: D3 /0 — the independent decoder's C1/D3 group
+        // already maps ext 0 to Mnem::Rol for BOTH the imm8 and CL forms.
+        O::ShlRR | O::ShlRI | O::ShrRR | O::ShrRI | O::SarRR | O::SarRI | O::RolRI | O::RolRCl => {
+            Covered
+        }
         O::MovRI
         | O::MovRM8
         | O::MovRM16
@@ -1371,6 +1375,9 @@ fn render_intent(intent: &X86IntentInst) -> Result<Canon, String> {
         O::ShlRR => shift_rcl(Mnem::Shl, ops)?,
         O::ShrRR => shift_rcl(Mnem::Shr, ops)?,
         O::SarRR => shift_rcl(Mnem::Sar, ops)?,
+        // Variable-count rotate: canonical single-register CL form, exactly
+        // the shape the independent decoder produces for D3 /0.
+        O::RolRCl => shift_rcl(Mnem::Rol, ops)?,
 
         O::MovRI => {
             let d = dst()?;

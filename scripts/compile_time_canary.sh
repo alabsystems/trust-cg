@@ -10,16 +10,18 @@
 # CALIBRATION (documented per metrics-contract.md §3):
 #   - Measured warm certs-on baseline at 0456e2a on the x86 Mac (quiet): ~1.8s.
 #   - THRESHOLD_S=8: ~4.4x headroom, deliberately load-tolerant so parallel executor
-#     sessions don't false-red the gate. It TIGHTENS later via ratchet commits
-#     (ratchet/compile_time_baseline.json, the check_test_ratchet.sh convention) as the
-#     G2 climb progresses — threshold changes are explicit reviewed commits, never
-#     in-run adjustments, and are renegotiated BEFORE any cap-lifting change flips on.
+#     sessions don't false-red the gate. The threshold is the THRESHOLD_S literal in
+#     THIS script — there is no ratchet/ baseline file for it (ratchet/ holds the
+#     BENCH-5 perf ratchet, ratchet/perf_baseline.json, consumed by
+#     scripts/check_perf_ratchet.py, not this canary). It TIGHTENS as the G2 climb
+#     progresses by lowering that literal in an explicit reviewed commit, never an
+#     in-run adjustment, and is renegotiated BEFORE any cap-lifting change flips on.
 #
 # GATE-OFF RUNS ARE NOT EVIDENCE: this script REFUSES to run (exit 3) if
 # TCG_NO_PROOF_CERTS is set, or if TCG_REFINE_SOLVER=0 / TCG_NO_PROOF_CACHE would
 # change the measured lane. A canary pass with the gates disabled proves nothing.
 #
-# Exit codes (check_test_ratchet.sh convention):
+# Exit codes (the `cargo run -p trust-cg-test --quiet -- ratchet tests` convention):
 #   0 = OK (median <= threshold, exit codes match LLVM)
 #   1 = GATE RED: threshold breached on a quiet machine, or exit-code MISMATCH (P0)
 #   2 = TOOLING/INCONCLUSIVE: missing dylib/toolchain, or breach while 1-min load > ncpu
@@ -131,7 +133,7 @@ echo "  cache (warm):   $CACHE_DIR verdicts ${V_BEFORE}->${V_AFTER}"
 echo "  loadavg_1min:   $LOAD1 (ncpu=$NCPU)"
 echo "  llvm -O3:       ${LLVM_T}s (exit $LLVM_EXIT)"
 echo "  bridge warm:    $T1 $T2 $T3 -> median ${MEDIAN}s (exit $BRIDGE_EXIT)"
-echo "  threshold:      ${THRESHOLD_S}s (baseline ~1.8s warm certs-on @ 0456e2a; tightens by ratchet)"
+echo "  threshold:      ${THRESHOLD_S}s (baseline ~1.8s warm certs-on @ 0456e2a; tightens by reviewed commit to THRESHOLD_S)"
 
 if [ "$BRIDGE_EXIT" -ne "$LLVM_EXIT" ] || [ "$BRIDGE_EXIT" -ne "$EXPECTED_EXIT" ]; then
   echo "canary: GATE RED: exit-code MISMATCH (llvm=$LLVM_EXIT bridge=$BRIDGE_EXIT expected=$EXPECTED_EXIT) — P0 stop-the-line" >&2

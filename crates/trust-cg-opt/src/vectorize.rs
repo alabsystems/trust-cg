@@ -1412,18 +1412,32 @@ pub fn analyze_loop_with(
     //
     // The one deliberately mixed shape — the i32/i64 revertBits idiom — is
     // recognized above as `mixed_width_bitreverse_induction` and rewrites each
-    // RBIT at its own width, so it stays admitted. Everything else must agree
-    // with the plan's element type or the loop is not vectorized.
-    if !mixed_width_bitreverse_induction
-        && vectorizable_insts.iter().any(|&inst_id| {
-            infer_element_type(func, inst_id).is_some_and(|ety| ety != element_type)
-        })
-    {
+    // RBIT at its own width, so its RBITs stay admitted. `Rbit` is the ONLY
+    // opcode whose emitter re-derives its element type per instruction:
+    // `apply_vectorization_impl` stamps the single plan-wide arrangement onto
+    // every other vectorizable instruction, so even inside the mixed shape a
+    // non-`Rbit` op must have the plan's width — a `Gpr32 LslRI` feeding the
+    // 32-bit RBIT would otherwise come out encoded `.2D`, the exact shape that
+    // miscompiled `sum32 -= rbit32(i << 1)`. Everything else must agree with
+    // the plan's element type or the loop is not vectorized.
+    if vectorizable_insts.iter().any(|&inst_id| {
+        (!mixed_width_bitreverse_induction || func.inst(inst_id).opcode != AArch64Opcode::Rbit)
+            && infer_element_type(func, inst_id).is_some_and(|ety| ety != element_type)
+    }) {
         return None;
     }
 
     let arrangement = element_type.neon_arrangement();
     let vf = element_type.lanes();
+
+    // The compare-idiom emitter is likewise plan-arrangement driven: it
+    // upgrades the `CmpRR`/`CSet` registers at `element_type` and stamps
+    // `arrangement` onto the `CMEQ`, but only models i32 equality lanes.
+    // Compare idioms are not in `vectorizable_insts`, so the homogeneity gate
+    // above cannot see them; refuse any plan that would emit them wider.
+    if !compare_idioms.is_empty() && element_type != VecElementType::I32 {
+        return None;
+    }
 
     // Estimate trip count.
     let trip_count = estimate_trip_count(func, lp);
@@ -10403,6 +10417,123 @@ mod tests {
             plan.ordered_sub_reductions.is_empty(),
             "non-self subtract must not be treated as an ordered reduction"
         );
+    }
+
+    /// A `.2D` plan must not stamp its arrangement onto a 32-bit lane op.
+    ///
+    /// `apply_vectorization_impl` appends ONE `plan.arrangement` immediate to
+    /// every non-`Rbit` vectorizable instruction, but recognition FORCES
+    /// `I64` for the mixed revertBits shape without requiring the non-`Rbit`
+    /// members of the vectorizable set to agree. A `Gpr32 LslRI` feeding the
+    /// 32-bit `RBIT` therefore came out encoded `.2D` — the exact shape that
+    /// miscompiled `sum32 -= rbit32(i << 1)`.
+    #[test]
+    fn test_mixed_width_revertbits_rejects_heterogeneous_lane_width_op() {
+        let (mut func, rbit32, ..) = make_mixed_width_revertbits_sub_loop();
+        let rbit32_current = VReg::new(36, RegClass::Gpr32);
+        let shifted = VReg::new(90, RegClass::Gpr32);
+
+        let shl = func.push_inst(MachInst::new(
+            AArch64Opcode::LslRI,
+            vec![
+                MachOperand::VReg(shifted),
+                MachOperand::VReg(rbit32_current),
+                imm(1),
+            ],
+        ));
+        let position = func
+            .block(BlockId(1))
+            .insts
+            .iter()
+            .position(|&id| id == rbit32)
+            .expect("rbit32 lives in the loop body");
+        func.block_mut(BlockId(1)).insts.insert(position, shl);
+        func.inst_mut(rbit32).operands[1] = MachOperand::VReg(shifted);
+
+        let dom = DomTree::compute(&func);
+        let la = LoopAnalysis::compute(&func, &dom);
+        let cost_model = MultiTargetCostModel::new(CostModelGen::M1);
+        let lp = la.all_loops().next().unwrap();
+
+        match analyze_loop(&func, lp, &cost_model) {
+            None => {}
+            Some(plan) => {
+                for &inst_id in &plan.vectorizable_insts {
+                    if func.inst(inst_id).opcode == AArch64Opcode::Rbit {
+                        continue;
+                    }
+                    let Some(inst_ety) = infer_element_type(&func, inst_id) else {
+                        continue;
+                    };
+                    assert_eq!(
+                        inst_ety.neon_arrangement(),
+                        plan.arrangement,
+                        "instruction {inst_id:?} would be stamped with the wrong arrangement"
+                    );
+                }
+            }
+        }
+
+        // And the pass driver leaves the 32-bit shift scalar: no SIMD operands,
+        // no arrangement immediate.
+        let before = func.inst(shl).clone();
+        let mut pass = VectorizationPass::new();
+        pass.run(&mut func);
+        assert_eq!(
+            func.inst(shl).operands,
+            before.operands,
+            "the 32-bit LslRI must keep its scalar operands and gain no arrangement \
+             immediate"
+        );
+    }
+
+    /// A compare idiom must never be emitted at a non-i32 plan arrangement.
+    ///
+    /// `find_i32_eq_compare_idioms` only ever recognizes `Gpr32` `CmpRR`/`CSet`
+    /// pairs, but the idioms are NOT members of `vectorizable_insts`, so the
+    /// element-type homogeneity gate cannot see them. When the surrounding
+    /// i64 operations win the histogram, `rewrite_compare_idiom_to_neon` would
+    /// upgrade the 32-bit compare registers as `I64` lanes and stamp `.2D` onto
+    /// the `CMEQ` — a 2-lane equality over 4-lane data.
+    #[test]
+    fn test_compare_idiom_rejects_non_i32_plan_arrangement() {
+        let (mut func, cmp_eq, cset_eq) = make_i32_eq_compare_loop();
+        let header = BlockId(1);
+        // Two loop-invariant i64 adds outvote the single i32 compare idiom.
+        let add64_a = func.push_inst(MachInst::new(
+            AArch64Opcode::AddRR,
+            vec![vreg64(20), vreg64(21), vreg64(22)],
+        ));
+        let add64_b = func.push_inst(MachInst::new(
+            AArch64Opcode::AddRR,
+            vec![vreg64(23), vreg64(24), vreg64(25)],
+        ));
+        func.block_mut(header).insts.insert(0, add64_b);
+        func.block_mut(header).insts.insert(0, add64_a);
+
+        let dom = DomTree::compute(&func);
+        let la = LoopAnalysis::compute(&func, &dom);
+        let cost_model = MultiTargetCostModel::new(CostModelGen::M1);
+        let lp = la.all_loops().next().unwrap();
+
+        if let Some(plan) = analyze_loop(&func, lp, &cost_model) {
+            assert!(
+                plan.compare_idioms.is_empty() || plan.element_type == VecElementType::I32,
+                "a {:?} plan would emit the i32 compare idiom at {:?}",
+                plan.element_type,
+                plan.arrangement
+            );
+        }
+
+        // And the pass driver leaves the scalar compare idiom untouched.
+        let cmp_before = func.inst(cmp_eq).clone();
+        let cset_before = func.inst(cset_eq).clone();
+        let mut pass = VectorizationPass::new();
+        pass.run(&mut func);
+        assert_eq!(func.inst(cmp_eq).opcode, cmp_before.opcode);
+        assert_eq!(func.inst(cmp_eq).operands, cmp_before.operands);
+        assert_eq!(func.inst(cset_eq).opcode, cset_before.opcode);
+        assert_eq!(func.inst(cset_eq).operands, cset_before.operands);
     }
 
     #[test]

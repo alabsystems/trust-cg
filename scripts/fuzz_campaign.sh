@@ -10,9 +10,14 @@
 # <name> is one of: trust-ir-gen | trust-ir-jit-diff | csmith-driver | yarpgen-driver
 #
 # The driver writes a JSON result to <dir>/<driver>.json. On miscompile,
-# reprod files land in <dir>/repro-<driver>-seed-<seed>.json (for
-# trust-ir-gen) and the driver invokes scripts/file_miscompile_issue.sh if
-# TRUST_AUTOFILE=1 is set in the environment.
+# repro files land in <dir>/repro-<driver>-seed-<seed>.json (for
+# trust-ir-gen). If TRUST_CG_AUTOFILE=1 is set in the environment, the
+# trust-ir-gen driver (crates/trust-cg-fuzz/src/bin/trust-ir-gen.rs,
+# maybe_autofile) additionally looks for scripts/file_miscompile_issue.sh
+# relative to ITS working directory (this script does not cd before running
+# the driver) and runs it as `<script> <driver> <repro-path>`. That script
+# does not exist in this repo (it never has), and the driver silently skips a
+# missing script, so auto-filing is currently a no-op.
 #
 # Cap: 5 minutes per driver is the default. Raise with --duration.
 

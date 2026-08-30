@@ -588,9 +588,9 @@ pub enum AArch64Opcode {
     /// accumulates the sum of its 4 per-byte popcounts, i.e. `acc += popcount(x)`
     /// per lane, replacing the UADDLP+UADDLP+ADD fold in one instruction.
     ///
-    /// FEAT_DotProd (ARMv8.2 dot product) is assumed present: every Apple
-    /// M-series chip has it, matching the backend's existing Apple-M target
-    /// assumption (same precedent as the ARMv8.1 LSE atomics).
+    /// FEAT_DotProd (ARMv8.2 dot product) is an optional target capability.
+    /// Optimization and every executable publication path must admit it through
+    /// the resolved AArch64 ISA profile; generic AArch64 remains baseline-only.
     /// Operands: [Vd (accumulator, def+use), Vn, Vm, Imm(input arrangement 16B)].
     NeonUdotV,
     /// EXT Vd.16B, Vn.16B, Vm.16B, #imm — byte-wise extract/concatenate: the
@@ -1692,11 +1692,11 @@ impl InstFlags {
     /// Metadata (NOT an encoding property): this direct call targets a function
     /// the module-level purity fixpoint proved side-effect-free and independent
     /// of mutable global state (see `trust-cg-lower`'s
-    /// `compute_structural_pure_func_ids`). It is set only when the frontend
-    /// purity analysis is enabled (`TCG_PURE_FN_ANALYSIS`) and is read ONLY by
-    /// the x86 LICM pure-call cluster-hoist tier (gated behind
-    /// `TCG_PURE_CALL_HOIST`). No other pass consumes it, so a call carrying this
-    /// flag is otherwise treated exactly like any other call (its
+    /// `compute_structural_pure_func_ids`). It is set from deterministic
+    /// module-structural analysis and is read ONLY by the x86 LICM pure-call
+    /// cluster-hoist tier (gated behind `TCG_PURE_CALL_HOIST`). No other pass
+    /// consumes it, so a call carrying this flag is otherwise treated exactly
+    /// like any other call (its
     /// `HAS_SIDE_EFFECTS`/barrier flags are deliberately left intact — this flag
     /// enables ONLY the explicit, gated hoist, never implicit DCE/reordering).
     pub const PURE_CALL_HOISTABLE: Self = Self(0x800);

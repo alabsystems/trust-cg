@@ -18,7 +18,7 @@ use trust_cg_codegen::{
     TRUST_CG_HOST_JIT_PGO_PROFILE_AUTHORITY_MANIFEST_SCHEMA,
     TRUST_CG_HOST_JIT_PGO_PROVENANCE_DESCRIPTOR_SCHEMA, TRUST_CG_PROFILE_REPORT_SCHEMA_V1, Target,
     TyParentLoopSummary, compile_host_jit_with_profile_use, host_jit_pgo_provenance_descriptor,
-    pgo_cache_key, pgo_target_cpu, pgo_target_features, pgo_target_triple, run_host_jit_pgo,
+    pgo_cache_key, pgo_target_cpu, pgo_target_triple, run_host_jit_pgo,
 };
 use trust_cg_opt::pgo::{FunctionProfile, ProfDataError, enforce_fresh, read_from_path};
 use trust_ir::{BinOp, ICmpOp, Ty, ValueId};
@@ -455,7 +455,10 @@ fn host_jit_runner_generates_binary_profdata_and_compiles_profile_use() {
     );
     assert_eq!(loaded.target_triple, pgo_target_triple(target_spec));
     assert_eq!(loaded.target_cpu, pgo_target_cpu(config.target));
-    assert_eq!(loaded.target_features, pgo_target_features(config.target));
+    // CacheKey::new canonicalises (sorts, dedupes) the feature list, and the
+    // profdata writer records the canonical form — compare against the key,
+    // not the raw builder order.
+    assert_eq!(loaded.target_features, key.features());
 
     let report_json = serde_json::to_value(&generated.report).expect("serialize report");
     assert_eq!(report_json["schema"], TRUST_CG_PROFILE_REPORT_SCHEMA_V1);

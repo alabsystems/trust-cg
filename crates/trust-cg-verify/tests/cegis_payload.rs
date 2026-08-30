@@ -12,7 +12,8 @@ use trust_cg_ir::{
 use trust_cg_opt::{CacheBackend, CacheKey, MachinePass};
 use trust_cg_verify::cegis_pass::CegisSuperoptTestHooks;
 use trust_cg_verify::{
-    CegisCacheEntry, CegisResult, CegisSuperoptConfig, CegisSuperoptPass, RewriteLayer,
+    CegisCacheEntry, CegisResult, CegisRunOutcome, CegisSearchCompletion, CegisSuperoptConfig,
+    CegisSuperoptPass, RewriteLayer,
 };
 
 #[derive(Default)]
@@ -22,6 +23,10 @@ struct RecordingCache {
 }
 
 impl RecordingCache {
+    fn entry_count(&self) -> usize {
+        self.entries.lock().expect("entries lock").len()
+    }
+
     fn last_entry(&self) -> CegisCacheEntry {
         let bytes = self
             .last_put
@@ -68,6 +73,7 @@ fn make_config(cache: Option<Arc<dyn CacheBackend>>, budget_sec: u64) -> CegisSu
         cpu: "apple-m1".to_string(),
         features: vec!["neon".to_string(), "fp-armv8".to_string()],
         opt_level: 2,
+        search_schedule: Default::default(),
         cache,
         trace: None,
     }
@@ -116,6 +122,38 @@ fn layer_a_func(name: &str) -> (MachFunction, InstId) {
     func.append_inst(entry, movz_seven);
     func.append_inst(entry, mul);
     func.append_inst(entry, ret);
+
+    (func, mul)
+}
+
+fn layer_a_then_layer_b_func(name: &str) -> (MachFunction, InstId) {
+    let (mut func, mul) = layer_a_func(name);
+    let entry = func.entry;
+
+    let add_src = VReg::new(func.alloc_vreg(), RegClass::Gpr32);
+    let add_imm = VReg::new(func.alloc_vreg(), RegClass::Gpr32);
+    let add_dst = VReg::new(func.alloc_vreg(), RegClass::Gpr32);
+    let movz_src = func.push_inst(MachInst::new(
+        AArch64Opcode::Movz,
+        vec![MachOperand::VReg(add_src), MachOperand::Imm(11)],
+    ));
+    let movz_imm = func.push_inst(MachInst::new(
+        AArch64Opcode::Movz,
+        vec![MachOperand::VReg(add_imm), MachOperand::Imm(5)],
+    ));
+    let add = func.push_inst(MachInst::new(
+        AArch64Opcode::AddRR,
+        vec![
+            MachOperand::VReg(add_dst),
+            MachOperand::VReg(add_src),
+            MachOperand::VReg(add_imm),
+        ],
+    ));
+
+    let insert_at = func.block(entry).insts.len() - 1;
+    func.block_mut(entry)
+        .insts
+        .splice(insert_at..insert_at, [movz_src, movz_imm, add]);
 
     (func, mul)
 }
@@ -203,7 +241,7 @@ fn layer_c_fuses_bitreverse_mask_materialization_to_andri() {
 }
 
 #[test]
-fn budget_exhaustion_caches_empty_plan_without_mutation() {
+fn budget_exhaustion_never_publishes_or_replays_an_empty_prefix() {
     let cache = Arc::new(RecordingCache::default());
     let mut pass = CegisSuperoptPass::new(make_config(Some(cache.clone()), 1)).with_test_hooks(
         CegisSuperoptTestHooks {
@@ -220,14 +258,18 @@ fn budget_exhaustion_caches_empty_plan_without_mutation() {
     assert_eq!(scheduled_snapshot(&func), before);
     assert_eq!(pass.stats().cache_misses, 1);
     assert_eq!(pass.stats().cache_hits, 0);
-    assert_eq!(pass.stats().cache_puts, 1);
+    assert_eq!(pass.stats().cache_puts, 0);
     assert_eq!(pass.stats().budget_exhausted, 1);
     assert_eq!(pass.stats().verified, 0);
+    assert_eq!(cache.entry_count(), 0, "expired search must not publish");
 
-    let entry = cache.last_entry();
-    assert!(entry.proven_rewrites.is_empty());
-    assert_eq!(entry.attempted, 0);
-    assert_eq!(entry.verified, 0);
+    let mut retry = CegisSuperoptPass::new(make_config(Some(cache.clone()), 1))
+        .with_test_hooks(equivalent_hook());
+    let (mut retry_func, _retry_mul) = layer_a_func("payload_budget_exhaustion");
+    assert!(retry.run(&mut retry_func));
+    assert_eq!(retry.stats().cache_hits, 0);
+    assert_eq!(retry.stats().cache_misses, 1);
+    assert_eq!(retry.stats().cache_puts, 1);
 }
 
 #[test]
@@ -251,11 +293,101 @@ fn solver_error_is_counted_without_commit() {
     assert_eq!(pass.stats().verified, 0);
     assert_eq!(pass.stats().verifier_errors, 1);
     assert_eq!(pass.stats().rejected, 1);
+    assert_eq!(pass.stats().cache_puts, 0);
+    assert_eq!(cache.entry_count(), 0, "verifier errors must not publish");
+}
 
-    let entry = cache.last_entry();
-    assert!(entry.proven_rewrites.is_empty());
-    assert_eq!(entry.attempted, 1);
-    assert_eq!(entry.rejected, 1);
+#[test]
+fn query_timeout_or_iteration_exhaustion_never_publishes_or_replays_a_partial_result() {
+    for (case, result) in [
+        ("timeout", CegisResult::Timeout),
+        (
+            "iteration_exhaustion",
+            CegisResult::MaxIterationsReached { counterexamples: 1 },
+        ),
+    ] {
+        let cache = Arc::new(RecordingCache::default());
+        let cfg = make_config(Some(cache.clone()), 10);
+        let mut incomplete =
+            CegisSuperoptPass::new(cfg.clone()).with_test_hooks(CegisSuperoptTestHooks {
+                verifier_result: Some(result),
+                ..Default::default()
+            });
+        let function_name = format!("payload_query_{case}");
+        let (mut func, mul_id) = layer_a_func(&function_name);
+
+        assert!(!incomplete.run(&mut func));
+        assert_eq!(func.inst(mul_id).opcode, AArch64Opcode::MulRR);
+        assert_eq!(incomplete.stats().timeouts, 1);
+        assert_eq!(incomplete.stats().cache_puts, 0);
+        assert_eq!(cache.entry_count(), 0, "{case} search must not publish");
+
+        let mut retry = CegisSuperoptPass::new(cfg).with_test_hooks(equivalent_hook());
+        let (mut retry_func, _retry_mul) = layer_a_func(&function_name);
+        assert!(retry.run(&mut retry_func));
+        assert_eq!(retry.stats().cache_hits, 0, "{case} must not become a hit");
+        assert_eq!(retry.stats().cache_misses, 1);
+        assert_eq!(retry.stats().cache_puts, 1);
+    }
+}
+
+#[test]
+fn incomplete_search_rolls_back_a_previously_proven_rewrite() {
+    let cache = Arc::new(RecordingCache::default());
+    let mut pass = CegisSuperoptPass::new(make_config(Some(cache.clone()), 10))
+        .with_test_hooks(equivalent_hook())
+        .with_test_incomplete_after_first_commit();
+    let (mut func, mul_id) = layer_a_then_layer_b_func("payload_transactional_rollback");
+    let before = scheduled_snapshot(&func);
+
+    let outcome = pass.run_with_outcome(&mut func);
+
+    assert_eq!(
+        outcome,
+        CegisRunOutcome::Incomplete {
+            completion: CegisSearchCompletion::QueryIncomplete,
+        }
+    );
+    assert_eq!(
+        scheduled_snapshot(&func),
+        before,
+        "an incomplete search must not expose its proven rewrite prefix"
+    );
+    assert_eq!(func.inst(mul_id).opcode, AArch64Opcode::MulRR);
+    assert_eq!(
+        pass.stats().verified,
+        1,
+        "fixture must prove before aborting"
+    );
+    assert_eq!(pass.stats().candidates, 1);
+    assert_eq!(pass.stats().layer_a_candidates, 1);
+    assert_eq!(
+        pass.stats().layer_b_candidates,
+        0,
+        "an incomplete Layer A must suppress all later-layer enumeration"
+    );
+    assert_eq!(
+        pass.stats().solver_calls,
+        0,
+        "the synthetic proof hook must not hide later solver work"
+    );
+    assert_eq!(pass.stats().layer_a_committed, 0);
+    assert_eq!(pass.stats().cache_puts, 0);
+    assert_eq!(cache.entry_count(), 0);
+
+    let mut legacy_pass = CegisSuperoptPass::new(make_config(Some(cache.clone()), 10))
+        .with_test_hooks(equivalent_hook())
+        .with_test_incomplete_after_first_commit();
+    let (mut legacy_func, legacy_mul_id) =
+        layer_a_then_layer_b_func("payload_transactional_rollback_legacy");
+    let legacy_before = scheduled_snapshot(&legacy_func);
+
+    assert!(
+        !legacy_pass.run(&mut legacy_func),
+        "the legacy bool API must map an incomplete transaction to false"
+    );
+    assert_eq!(scheduled_snapshot(&legacy_func), legacy_before);
+    assert_eq!(legacy_func.inst(legacy_mul_id).opcode, AArch64Opcode::MulRR);
 }
 
 #[test]
@@ -334,7 +466,10 @@ fn cache_hit_replay_is_deterministic_and_solver_free() {
     assert_eq!(cold_pass.stats().cache_misses, 1);
     assert_eq!(cold_pass.stats().cache_hits, 0);
 
-    let mut hot_pass = CegisSuperoptPass::new(cfg);
+    // Keep the same synthetic verifier identity on the replay side. Test
+    // hooks are deliberately cache-namespaced away from production so a
+    // forced `Equivalent` result can never seed a real compiler invocation.
+    let mut hot_pass = CegisSuperoptPass::new(cfg).with_test_hooks(equivalent_hook());
     let (mut hot_func, hot_mul) = layer_a_func("payload_replay_determinism");
     let committed = hot_pass.run(&mut hot_func);
 

@@ -142,8 +142,6 @@ struct PortableCertSet<'a> {
     /// One representative per exact query. Some separately named guard lanes
     /// are intentional semantic aliases and therefore share a query key.
     by_query: HashMap<String, PortableCertIndexEntry<'a>>,
-    #[allow(dead_code)]
-    file_count: usize,
     drat_trim_checker_sha256: String,
 }
 
@@ -322,7 +320,6 @@ fn build_cert_set<'a>(
     }
     Ok(PortableCertSet {
         by_query,
-        file_count: expected_count,
         drat_trim_checker_sha256: manifest.drat_trim_checker_sha256,
     })
 }
@@ -1051,9 +1048,11 @@ mod tests {
 
     #[test]
     fn committed_set_is_exactly_sixteen_v3_certs_and_rechecks() {
-        let set = build_cert_set(EMBEDDED_MANIFEST, EMBEDDED_CERTS, EXPECTED_CERT_COUNT)
+        // `build_cert_set` rejects any manifest/embedded count other than
+        // `EXPECTED_CERT_COUNT`, so a successful build is the count check.
+        build_cert_set(EMBEDDED_MANIFEST, EMBEDDED_CERTS, EXPECTED_CERT_COUNT)
             .expect("committed portable certificate set");
-        assert_eq!(set.file_count, EXPECTED_CERT_COUNT);
+        assert_eq!(EMBEDDED_CERTS.len(), EXPECTED_CERT_COUNT);
         let checker = trust_cg_drat_trim::drat_trim_executable_path();
         let checker_sha = checker_binary_sha256(checker).unwrap();
         for (file, text) in EMBEDDED_CERTS {

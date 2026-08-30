@@ -51,13 +51,15 @@ Fails when trust-cg's exponent exceeds LLVM's by more than `--max-excess`
 
 ## Current state
 
-It is a **ratchet**. It was committed failing on two shapes; `loops` has since been
-brought under the threshold. The remaining failure is root-caused and attributed
+It is a **ratchet**. It was committed failing on two shapes; both have since been
+brought under the threshold — `loops` first, then `blocks` when the `compute_dominators`
+fix landed upstream through a rev bump (`patches/README.md`, retired 2026-08-24),
+after which all four shapes passed. Causes below are root-caused and attributed
 by measurement (`TRUST_CG_DISABLE_PASSES=looplatch` A/B):
 
 | shape | exponent (tcg vs LLVM) | cause |
 | --- | --- | --- |
-| `blocks` | 1.71 vs 0.28 | trust-ir `compute_dominators`, O(N³). Rotation contributes **nothing** here (6456ms vs 6595ms with it off). Fix written and validated in `patches/trust-ir-compute-dominators-idom.patch`; landing it is gated on a dependency pin bump. |
+| `blocks` | **0.53 vs 0.33 — OK** (was 1.71 vs 0.28) | trust-ir `compute_dominators` was O(N³); rotation contributed **nothing** here (6456ms vs 6595ms with it off). Cooper/Harvey/Kennedy immediate dominators landed in the pinned upstream, not as a local patch — the patch file is deleted and `patches/README.md` carries the retirement record and the after-numbers. |
 | `loops` | **~0.93 vs ~0.31 — BORDERLINE** (excess +0.57 to +0.62 across runs, against a 0.6 threshold) | was 1.04 / +0.71. The rotation driver still recomputes `DomTree` + `LoopAnalysis` after **every single** rewrite (441 times on the stress shape) — deliberate, since "stale loop info is deliberately avoided" and batching rewrites per analysis would change which rotations fire. Instead the analyses themselves got cheaper: `dom.rs` now uses the fixed-seed `fast_hash` maps (−18% on `loops_120`). |
 | `arraysize` | 0.13 vs 0.02 — OK | lowering has an O(array-size) component (5.2ms at N=256 → 28.3ms at N=65536) that emits CONSTANT-size code, so it is pure compile-time work on an intermediate later collapsed into the array-fill helper. Diluted by fixed compile cost today (ratio still climbs 1.36x → 2.12x across the ladder), so it passes — the shape exists to catch it worsening. |
 | `funcs` | 0.37 vs 0.28 | **OK** — per-function scaling is healthy, which is why the whole-corpus ratio is a constant factor rather than a curve. |

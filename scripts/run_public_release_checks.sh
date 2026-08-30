@@ -34,6 +34,12 @@ if [ "${actual_host}" != "aarch64-apple-darwin" ]; then
     exit 1
 fi
 
+# The authoritative 18-program correctness harness is release machinery, even
+# though a normal smoke does not run its timing lanes. Parse it here so a syntax
+# regression cannot make the advertised differential gate silently unusable.
+python3 -c 'import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text(), filename=sys.argv[1])' \
+    benchmarks/beat-llvm/run.py
+
 scripts/test_run_with_timeout.sh
 scripts/test_soundness_check.sh
 python3 crates/trust-cg-sat-host/tests/fixtures/sat_corpus/generators.py --check
@@ -59,8 +65,22 @@ scripts/test_pgo_runtime.sh
 # code. Skip that lane ONLY when no solver exists — a dev machine with one still
 # runs the full suite — and say so loudly, the same way the orca-alab gates
 # announce a skip when ty/ay are absent.
+# `AY_SOLVER_PATH` is the canonical override and the ONLY name the backend
+# reads (crates/trust-cg-verify/src/ay_bridge.rs, select_solver_binary: an
+# explicit AY_SOLVER_PATH wins over the toolchain layout and PATH lookup).
+# `TCG_SOLVER_PATH` is accepted as a legacy alias for existing operator
+# invocations and exported to the canonical name, so the tests see exactly the
+# solver this gate saw — a gate that believes a solver exists while the tests
+# resolve nothing is the failure mode this mapping closes.
+if [ -z "${AY_SOLVER_PATH:-}" ] && [ -n "${TCG_SOLVER_PATH:-}" ]; then
+    export AY_SOLVER_PATH="${TCG_SOLVER_PATH}"
+fi
 tcg_solver_present() {
-    [ -n "${TCG_SOLVER_PATH:-}" ] && [ -x "${TCG_SOLVER_PATH}" ] && return 0
+    if [ -n "${AY_SOLVER_PATH:-}" ]; then
+        # The backend accepts either a file path or a bare binary name on PATH.
+        [ -x "${AY_SOLVER_PATH}" ] && return 0
+        command -v "${AY_SOLVER_PATH}" >/dev/null 2>&1 && return 0
+    fi
     command -v ay >/dev/null 2>&1 && return 0
     for root in "$HOME/trust" "$HOME"; do
         [ -x "$root/build/aarch64-apple-darwin/stage2/bin/ay" ] && return 0
@@ -77,7 +97,7 @@ if tcg_solver_present; then
 else
     echo "run_public_release_checks: NO AY SOLVER FOUND -- skipping the" >&2
     echo "  trust-cg-verify CEGIS lane. This release is verified MODULO CEGIS." >&2
-    echo "  Set TCG_SOLVER_PATH or place \`ay\` on PATH to run it." >&2
+    echo "  Set AY_SOLVER_PATH (TCG_SOLVER_PATH is an accepted alias) or place \`ay\` on PATH to run it." >&2
     cargo test --locked --workspace --all-features \
         --exclude trust-cg-codegen --exclude trust-cg-verify --no-fail-fast -- \
         --test-threads="${RUST_TEST_THREADS}"

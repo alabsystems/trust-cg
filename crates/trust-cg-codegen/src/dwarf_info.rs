@@ -179,13 +179,6 @@ const DW_AT_DECL_FILE: u16 = 0x3a;
 /// DW_AT_decl_line — source line where entity is declared.
 const DW_AT_DECL_LINE: u16 = 0x3b;
 
-/// DW_AT_linkage_name — mangled/linkage name (DWARF 4).
-///
-/// Reserved for future mangled-name emission (tracked under #63 DWARF work);
-/// kept here for completeness of the DWARF 4 attribute table.
-#[allow(dead_code)] // spec-reference constant; emitted once symbol mangling lands (#63)
-const DW_AT_LINKAGE_NAME: u16 = 0x6e;
-
 /// DW_AT_data_member_location — byte offset of a struct member from the
 /// containing structure's base. DWARF 4 allows a constant (data1/data2/data4)
 /// or an expression (exprloc). We emit constant form (data4) for simplicity.

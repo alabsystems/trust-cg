@@ -19,8 +19,10 @@
 //          deferred to a follow-up). For this MVP we diff the
 //          compilation behaviour (success vs failure) between the two
 //          levels.
-//   8. On crash/miscompile, save the repro (trust_ir JSON) to disk and
-//      optionally call scripts/file_miscompile_issue.sh.
+//   8. On crash/miscompile, save the repro (trust_ir JSON) to disk and, when
+//      TRUST_CG_AUTOFILE=1 AND an operator-provided
+//      scripts/file_miscompile_issue.sh exists, run it (no such script is
+//      shipped in this repo; see `maybe_autofile`).
 //
 // The oracle loop is conservative by design: in this MVP we don't JIT and
 // compare runtime results. We do detect:

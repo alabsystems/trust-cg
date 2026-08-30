@@ -250,8 +250,9 @@ pub use cegis_cache_io::{
     WRITE_LOCK_WAIT, default_cache_root as cegis_shared_cache_root,
 };
 pub use cegis_pass::{
-    CegisCacheEntry, CegisPassStats, CegisSuperoptConfig, CegisSuperoptPass, ProvenRewrite,
-    RewriteLayer,
+    CEGIS_SEARCH_SCHEDULE_VERSION, CEGIS_SEARCH_SEMANTICS_REVISION, CegisCacheEntry,
+    CegisPassStats, CegisRunOutcome, CegisSearchCompletion, CegisSearchScheduleIdentity,
+    CegisSuperoptConfig, CegisSuperoptPass, ProvenRewrite, RewriteLayer,
 };
 pub use cegis_pass_x86::{X86CegisPassStats, X86CegisSuperoptConfig, X86CegisSuperoptPass};
 pub use certified_pass_chain::{

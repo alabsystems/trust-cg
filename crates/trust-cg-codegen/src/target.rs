@@ -12,19 +12,302 @@
 
 use std::{error::Error, fmt, str::FromStr};
 
-use trust_cg_ir::aarch64_regs;
-use trust_cg_ir::riscv_regs;
-use trust_cg_ir::x86_64_regs;
+pub use trust_cg_ir::{
+    AdmittedTargetFeatures, CallingConvention, OutputTargetFeatures, Target, TargetFeature,
+    TargetFeatureSet, TargetFeatureSetError, TargetIdentity, TargetMachine, TargetMachineError,
+};
 
-/// Supported target architectures.
+/// One optional AArch64 instruction-set capability understood by codegen.
+///
+/// The explicit bit assignments are part of the persistent artifact identity;
+/// append new features without renumbering existing ones. `ALL` is kept in
+/// canonical lexical-name order for deterministic manifests and diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Target {
-    /// x86-64 (AMD64)
-    X86_64,
-    /// AArch64 (ARM64)
-    Aarch64,
-    /// RISC-V 64-bit
-    Riscv64,
+#[repr(u8)]
+pub enum AArch64IsaFeature {
+    /// FEAT_DotProd vector dot-product instructions.
+    DotProd = 1,
+    /// FEAT_FP16 scalar half-precision data-processing instructions.
+    Fp16 = 2,
+    /// FEAT_LSE atomic read-modify-write instructions.
+    Lse = 0,
+}
+
+impl AArch64IsaFeature {
+    /// Complete compiler feature domain in canonical manifest order.
+    pub const ALL: [Self; 3] = [Self::DotProd, Self::Fp16, Self::Lse];
+
+    /// Stable feature name used by target manifests and PGO identities.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::DotProd => "dotprod",
+            Self::Fp16 => "fp16",
+            Self::Lse => "lse",
+        }
+    }
+
+    const fn mask(self) -> u32 {
+        1_u32 << (self as u8)
+    }
+}
+
+impl TargetFeature for AArch64IsaFeature {
+    const ARCHITECTURE: Target = Target::Aarch64;
+    const ALL: &'static [Self] = &AArch64IsaFeature::ALL;
+
+    fn stable_bit(self) -> u64 {
+        u64::from(self.mask())
+    }
+
+    fn name(self) -> &'static str {
+        AArch64IsaFeature::name(self)
+    }
+}
+
+/// Optional RISC-V instruction-set capabilities understood by codegen today.
+///
+/// The current backend exposes no optional RISC-V admission knobs, so its
+/// closed feature domain is empty. Keeping that as a typed domain lets all
+/// supported register-machine targets use [`TargetMachine`] without borrowing
+/// another architecture's feature type; future capabilities can be appended
+/// with stable bits as their lowering and output scans land.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum RiscVIsaFeature {}
+
+impl TargetFeature for RiscVIsaFeature {
+    const ARCHITECTURE: Target = Target::Riscv64;
+    const ALL: &'static [Self] = &[];
+
+    fn stable_bit(self) -> u64 {
+        match self {}
+    }
+
+    fn name(self) -> &'static str {
+        match self {}
+    }
+}
+
+/// Resolved AArch64 instruction-set profile used by machine-code lowering.
+///
+/// This is intentionally separate from [`TargetSpec`]: a target triple names
+/// an ABI and object format, but does not prove that the execution CPU supports
+/// optional ISA extensions. A bitset avoids the combinatorial enum growth that
+/// otherwise occurs as independent capabilities are added. Any persistent
+/// machine-code identity must bind [`Self::feature_bits`] (and its schema), not
+/// re-derive features from the host later.
+#[derive(Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AArch64IsaProfile {
+    feature_bits: u32,
+}
+
+impl AArch64IsaProfile {
+    /// Generic AArch64: no optional instruction family is admitted.
+    pub const BASELINE: Self = Self { feature_bits: 0 };
+    /// Profile admitting only FEAT_LSE.
+    pub const LSE: Self = Self::BASELINE.with_feature(AArch64IsaFeature::Lse, true);
+    /// Profile admitting only FEAT_DotProd.
+    pub const DOTPROD: Self = Self::BASELINE.with_feature(AArch64IsaFeature::DotProd, true);
+    /// Profile admitting only FEAT_FP16.
+    pub const FP16: Self = Self::BASELINE.with_feature(AArch64IsaFeature::Fp16, true);
+    /// Profile admitting LSE and DotProd, but not FP16.
+    pub const LSE_DOTPROD: Self = Self::LSE.with_feature(AArch64IsaFeature::DotProd, true);
+    /// Capabilities guaranteed by Trust Codegen's Apple arm64 target contract.
+    pub const APPLE_ARM64: Self = Self::LSE_DOTPROD.with_feature(AArch64IsaFeature::Fp16, true);
+
+    /// Return a copy with one optional capability admitted or removed.
+    pub const fn with_feature(mut self, feature: AArch64IsaFeature, enabled: bool) -> Self {
+        if enabled {
+            self.feature_bits |= feature.mask();
+        } else {
+            self.feature_bits &= !feature.mask();
+        }
+        self
+    }
+
+    /// Stable artifact-identity bits. The surrounding identity must also bind
+    /// its own schema version so future semantic changes cannot alias v1.
+    pub const fn feature_bits(self) -> u32 {
+        self.feature_bits
+    }
+
+    /// Whether this profile authorizes one optional instruction family.
+    pub const fn permits(self, feature: AArch64IsaFeature) -> bool {
+        self.feature_bits & feature.mask() != 0
+    }
+
+    /// Whether this profile authorizes emitting LSE instructions.
+    pub const fn permits_lse(self) -> bool {
+        self.permits(AArch64IsaFeature::Lse)
+    }
+
+    /// Whether this profile authorizes FEAT_DotProd instructions.
+    pub const fn permits_dotprod(self) -> bool {
+        self.permits(AArch64IsaFeature::DotProd)
+    }
+
+    /// Whether this profile authorizes FEAT_FP16 scalar data processing.
+    pub const fn permits_fp16(self) -> bool {
+        self.permits(AArch64IsaFeature::Fp16)
+    }
+
+    /// Canonical enabled-feature names for manifests and diagnostic surfaces.
+    /// The iterator is allocation-free and follows [`AArch64IsaFeature::ALL`].
+    pub fn enabled_feature_names(self) -> impl Iterator<Item = &'static str> {
+        AArch64IsaFeature::ALL
+            .into_iter()
+            .filter(move |feature| self.permits(*feature))
+            .map(AArch64IsaFeature::name)
+    }
+
+    /// Convert this compatibility profile into the shared typed admission set.
+    pub fn admitted_target_features(self) -> AdmittedTargetFeatures<AArch64IsaFeature> {
+        AdmittedTargetFeatures::try_from_features(
+            AArch64IsaFeature::ALL
+                .into_iter()
+                .filter(move |feature| self.permits(*feature)),
+        )
+        .expect("the static AArch64 target-feature domain must remain valid")
+    }
+
+    /// Reconstruct the compatibility profile from shared typed admission.
+    pub const fn from_admitted_target_features(
+        admitted: AdmittedTargetFeatures<AArch64IsaFeature>,
+    ) -> Self {
+        // AArch64IsaFeature's stable bits are defined by this compatibility
+        // profile's u32 mask and typed admission has already validated them.
+        Self {
+            feature_bits: admitted.bits() as u32,
+        }
+    }
+
+    /// Stable human-readable identity used in diagnostics and certificates.
+    pub fn canonical_name(self) -> String {
+        let mut name = String::from("aarch64-isa-v1");
+        for feature in self.enabled_feature_names() {
+            name.push('+');
+            name.push_str(feature);
+        }
+        name
+    }
+
+    /// Resolve the in-process JIT profile from the current host once.
+    ///
+    /// The result is suitable for capture in a compile request and artifact
+    /// identity. It never assumes that every AArch64 CPU has LSE.
+    pub fn for_host_jit() -> Self {
+        resolve_aarch64_host_jit_profile(
+            cfg!(target_arch = "aarch64"),
+            host_has_aarch64_lse(),
+            host_has_aarch64_dotprod(),
+            host_has_aarch64_fp16(),
+        )
+    }
+
+    /// Resolve the ISA profile guaranteed by an AOT target specification.
+    ///
+    /// Apple's arm64 Darwin deployment contract includes LSE, DotProd, and
+    /// scalar FP16; generic Linux and unknown AArch64 targets do not. A future
+    /// explicit target-feature API can admit any subset without weakening this
+    /// conservative default.
+    pub const fn for_aot_target(target: TargetSpec) -> Self {
+        if matches!(target.architecture, Target::Aarch64)
+            && matches!(target.vendor, TargetVendor::Apple)
+            && matches!(target.operating_system, TargetOperatingSystem::Darwin)
+        {
+            Self::APPLE_ARM64
+        } else {
+            Self::BASELINE
+        }
+    }
+
+    /// Whether the current process can execute code requiring this profile.
+    pub fn is_supported_by_host(self) -> bool {
+        cfg!(target_arch = "aarch64")
+            && (!self.permits_lse() || host_has_aarch64_lse())
+            && (!self.permits_dotprod() || host_has_aarch64_dotprod())
+            && (!self.permits_fp16() || host_has_aarch64_fp16())
+    }
+}
+
+impl From<AArch64IsaProfile> for AdmittedTargetFeatures<AArch64IsaFeature> {
+    fn from(profile: AArch64IsaProfile) -> Self {
+        profile.admitted_target_features()
+    }
+}
+
+impl From<AdmittedTargetFeatures<AArch64IsaFeature>> for AArch64IsaProfile {
+    fn from(admitted: AdmittedTargetFeatures<AArch64IsaFeature>) -> Self {
+        Self::from_admitted_target_features(admitted)
+    }
+}
+
+impl fmt::Debug for AArch64IsaProfile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("AArch64IsaProfile")
+            .field(&self.canonical_name())
+            .finish()
+    }
+}
+
+impl fmt::Display for AArch64IsaProfile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.canonical_name())
+    }
+}
+
+/// Runtime admission check for AArch64 LSE on the current host.
+///
+/// Returns `false` on non-AArch64 builds. Keeping this query centralized makes
+/// host-JIT lowering and raw executable publication share one authority.
+pub fn host_has_aarch64_lse() -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        std::arch::is_aarch64_feature_detected!("lse")
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        false
+    }
+}
+
+/// Runtime admission check for AArch64 FEAT_DotProd on the current host.
+pub fn host_has_aarch64_dotprod() -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        std::arch::is_aarch64_feature_detected!("dotprod")
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        false
+    }
+}
+
+/// Runtime admission check for AArch64 FEAT_FP16 scalar data processing.
+pub fn host_has_aarch64_fp16() -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        std::arch::is_aarch64_feature_detected!("fp16")
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        false
+    }
+}
+
+const fn resolve_aarch64_host_jit_profile(
+    host_is_aarch64: bool,
+    host_has_lse: bool,
+    host_has_dotprod: bool,
+    host_has_fp16: bool,
+) -> AArch64IsaProfile {
+    if !host_is_aarch64 {
+        return AArch64IsaProfile::BASELINE;
+    }
+    AArch64IsaProfile::BASELINE
+        .with_feature(AArch64IsaFeature::Lse, host_has_lse)
+        .with_feature(AArch64IsaFeature::DotProd, host_has_dotprod)
+        .with_feature(AArch64IsaFeature::Fp16, host_has_fp16)
 }
 
 /// Target triple vendor component for targets Trust Codegen understands today.
@@ -239,6 +522,58 @@ impl TargetSpec {
     /// Parse a supported Trust Codegen target spec.
     pub fn parse(input: &str) -> Result<Self, TargetSpecParseError> {
         input.parse()
+    }
+}
+
+impl TargetIdentity for TargetSpec {
+    fn architecture(&self) -> Target {
+        self.architecture
+    }
+}
+
+/// Shared immutable AArch64 target identity and optional-ISA admission.
+pub type AArch64TargetMachine = TargetMachine<TargetSpec, AArch64IsaFeature>;
+
+/// Target-feature facts derived from one final AArch64 machine-code stream.
+///
+/// Construction validates that the output-required features are a subset of
+/// the features admitted by the captured target machine. Artifact and install
+/// layers can therefore bind both what codegen was allowed to emit and what it
+/// actually emitted without rescanning instructions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AArch64MachineCodeEvidence {
+    target: TargetSpec,
+    admitted_features: AdmittedTargetFeatures<AArch64IsaFeature>,
+    required_features: OutputTargetFeatures<AArch64IsaFeature>,
+}
+
+impl AArch64MachineCodeEvidence {
+    /// Validate and capture evidence for one final machine-code stream.
+    pub fn try_new(
+        machine: &AArch64TargetMachine,
+        required_features: OutputTargetFeatures<AArch64IsaFeature>,
+    ) -> Result<Self, TargetMachineError<AArch64IsaFeature>> {
+        machine.validate_output_features(required_features)?;
+        Ok(Self {
+            target: *machine.identity(),
+            admitted_features: machine.admitted_features(),
+            required_features,
+        })
+    }
+
+    /// Immutable target identity captured for this compilation.
+    pub const fn target(self) -> TargetSpec {
+        self.target
+    }
+
+    /// Optional features codegen was authorized to emit.
+    pub const fn admitted_features(self) -> AdmittedTargetFeatures<AArch64IsaFeature> {
+        self.admitted_features
+    }
+
+    /// Optional features found in the final emitted instruction stream.
+    pub const fn required_features(self) -> OutputTargetFeatures<AArch64IsaFeature> {
+        self.required_features
     }
 }
 
@@ -515,168 +850,6 @@ fn validate_target_spec(spec: TargetSpec, input: &str) -> Result<(), TargetSpecP
     }
 }
 
-impl Target {
-    /// Returns the pointer size in bytes for this target.
-    pub fn pointer_bytes(self) -> u32 {
-        match self {
-            Target::X86_64 | Target::Aarch64 | Target::Riscv64 => 8,
-        }
-    }
-
-    /// Returns the name of this target.
-    pub fn name(self) -> &'static str {
-        match self {
-            Target::X86_64 => "x86_64",
-            Target::Aarch64 => "aarch64",
-            Target::Riscv64 => "riscv64",
-        }
-    }
-
-    /// Returns the required stack alignment in bytes.
-    pub fn stack_alignment(self) -> u32 {
-        match self {
-            // Both x86-64 System V and AArch64 require 16-byte stack alignment.
-            Target::X86_64 | Target::Aarch64 => 16,
-            // RISC-V: 16-byte alignment for RV64.
-            Target::Riscv64 => 16,
-        }
-    }
-
-    /// Returns the number of integer argument-passing registers.
-    pub fn num_arg_gprs(self) -> usize {
-        match self {
-            Target::X86_64 => x86_64_regs::X86_ARG_GPRS.len(), // 6 (RDI,RSI,RDX,RCX,R8,R9)
-            Target::Aarch64 => aarch64_regs::ARG_GPRS.len(),   // 8 (X0-X7)
-            Target::Riscv64 => riscv_regs::RISCV_ARG_GPRS.len(), // a0-a7
-        }
-    }
-
-    /// Returns the number of floating-point argument-passing registers.
-    pub fn num_arg_fprs(self) -> usize {
-        match self {
-            Target::X86_64 => x86_64_regs::X86_ARG_XMMS.len(), // 8 (XMM0-XMM7)
-            Target::Aarch64 => aarch64_regs::ARG_FPRS.len(),   // 8 (V0-V7)
-            Target::Riscv64 => riscv_regs::RISCV_ARG_FPRS.len(), // fa0-fa7
-        }
-    }
-
-    /// Returns the number of callee-saved GPRs.
-    pub fn num_callee_saved_gprs(self) -> usize {
-        match self {
-            Target::X86_64 => x86_64_regs::X86_CALLEE_SAVED_GPRS.len(), // 6 (RBX,RBP,R12-R15)
-            Target::Aarch64 => aarch64_regs::CALLEE_SAVED_GPRS.len(),   // 10 (X19-X28)
-            Target::Riscv64 => riscv_regs::RISCV_CALLEE_SAVED_GPRS.len(), // s0-s11
-        }
-    }
-
-    /// Returns the number of allocatable GPRs.
-    pub fn num_allocatable_gprs(self) -> usize {
-        match self {
-            Target::X86_64 => x86_64_regs::X86_ALLOCATABLE_GPRS.len(), // 14
-            Target::Aarch64 => aarch64_regs::ALLOCATABLE_GPRS.len(),   // 25
-            Target::Riscv64 => riscv_regs::RISCV_ALLOCATABLE_GPRS.len(),
-        }
-    }
-
-    /// Returns true if this target uses a frame pointer by default.
-    ///
-    /// Apple AArch64 always requires a frame pointer. x86-64 can omit it
-    /// with -fomit-frame-pointer but we default to using it.
-    pub fn requires_frame_pointer(self) -> bool {
-        match self {
-            Target::Aarch64 => true, // Apple AArch64 mandate
-            Target::X86_64 => false, // Optional, but recommended
-            Target::Riscv64 => false,
-        }
-    }
-
-    /// Returns the target architecture of the host process.
-    ///
-    /// This is determined at compile time via `cfg(target_arch = ...)`.
-    /// Used by front-end APIs (e.g. `tla-trust-cg`) to default to host codegen
-    /// without hard-coding a specific target.
-    ///
-    /// Returns `Target::Aarch64` on unknown architectures as a safe default,
-    /// since AArch64 is Trust Codegen's primary/most-tested backend.
-    pub fn host() -> Self {
-        #[cfg(target_arch = "x86_64")]
-        {
-            Target::X86_64
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            Target::Aarch64
-        }
-        #[cfg(target_arch = "riscv64")]
-        {
-            Target::Riscv64
-        }
-        #[cfg(not(any(
-            target_arch = "x86_64",
-            target_arch = "aarch64",
-            target_arch = "riscv64",
-        )))]
-        {
-            Target::Aarch64
-        }
-    }
-
-    /// Returns the calling convention description for this target.
-    pub fn calling_convention(self) -> CallingConvention {
-        match self {
-            Target::Aarch64 => CallingConvention {
-                name: "aapcs64",
-                num_arg_gprs: 8,
-                num_arg_fprs: 8,
-                num_ret_gprs: 8,
-                num_ret_fprs: 8,
-                red_zone_size: 128,
-                shadow_space: 0,
-            },
-            Target::X86_64 => CallingConvention {
-                name: "sysv_amd64",
-                num_arg_gprs: 6,
-                num_arg_fprs: 8,
-                num_ret_gprs: 2,
-                num_ret_fprs: 2,
-                red_zone_size: 128, // System V AMD64 has a 128-byte red zone
-                shadow_space: 0,    // No shadow space in System V (Windows x64 has 32 bytes)
-            },
-            Target::Riscv64 => CallingConvention {
-                name: "riscv_lp64d",
-                num_arg_gprs: 8,
-                num_arg_fprs: 8,
-                num_ret_gprs: 2,
-                num_ret_fprs: 2,
-                red_zone_size: 0, // RISC-V has no red zone
-                shadow_space: 0,
-            },
-        }
-    }
-}
-
-/// Describes a calling convention's key parameters.
-///
-/// This is a target-generic description that captures the essential
-/// constraints for ABI lowering, without being tied to specific register types.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CallingConvention {
-    /// Name of the calling convention (e.g., "sysv_amd64", "aapcs64").
-    pub name: &'static str,
-    /// Number of integer/pointer argument-passing registers.
-    pub num_arg_gprs: usize,
-    /// Number of floating-point argument-passing registers.
-    pub num_arg_fprs: usize,
-    /// Number of integer return-value registers.
-    pub num_ret_gprs: usize,
-    /// Number of floating-point return-value registers.
-    pub num_ret_fprs: usize,
-    /// Red zone size in bytes (area below SP that leaf functions may use).
-    pub red_zone_size: u32,
-    /// Shadow space / home space required above return address (Windows x64 = 32, others = 0).
-    pub shadow_space: u32,
-}
-
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -822,6 +995,165 @@ mod tests {
             host,
             Target::X86_64 | Target::Aarch64 | Target::Riscv64
         ));
+    }
+
+    #[test]
+    fn aarch64_isa_profile_has_stable_cache_identity() {
+        assert_eq!(AArch64IsaProfile::BASELINE.feature_bits(), 0);
+        assert_eq!(AArch64IsaProfile::LSE.feature_bits(), 1);
+        assert_eq!(AArch64IsaProfile::DOTPROD.feature_bits(), 2);
+        assert_eq!(AArch64IsaProfile::FP16.feature_bits(), 4);
+        assert_eq!(AArch64IsaProfile::LSE_DOTPROD.feature_bits(), 3);
+        assert_eq!(AArch64IsaProfile::APPLE_ARM64.feature_bits(), 7);
+        assert_eq!(
+            AArch64IsaProfile::BASELINE.canonical_name(),
+            "aarch64-isa-v1"
+        );
+        assert_eq!(
+            AArch64IsaProfile::LSE.canonical_name(),
+            "aarch64-isa-v1+lse"
+        );
+        assert_eq!(
+            AArch64IsaProfile::APPLE_ARM64.canonical_name(),
+            "aarch64-isa-v1+dotprod+fp16+lse"
+        );
+        assert!(!AArch64IsaProfile::BASELINE.permits_lse());
+        assert!(AArch64IsaProfile::LSE.permits_lse());
+        assert!(!AArch64IsaProfile::LSE.permits_dotprod());
+        assert!(AArch64IsaProfile::DOTPROD.permits_dotprod());
+        assert!(AArch64IsaProfile::FP16.permits_fp16());
+        assert_eq!(
+            AArch64IsaProfile::APPLE_ARM64
+                .enabled_feature_names()
+                .collect::<Vec<_>>(),
+            vec!["dotprod", "fp16", "lse"]
+        );
+    }
+
+    #[test]
+    fn aarch64_target_machine_contract_accepts_real_identity_and_features() {
+        let identity = TargetSpec::parse("aarch64-apple-darwin").unwrap();
+        let admitted = AArch64IsaProfile::APPLE_ARM64.admitted_target_features();
+        let machine: crate::TargetMachine<TargetSpec, AArch64IsaFeature> =
+            TargetMachine::try_new(identity, admitted).unwrap();
+
+        assert_eq!(machine.identity(), &identity);
+        assert_eq!(
+            machine.admitted_features().bits(),
+            u64::from(AArch64IsaProfile::APPLE_ARM64.feature_bits())
+        );
+        let required = OutputTargetFeatures::try_from_output([
+            AArch64IsaFeature::DotProd,
+            AArch64IsaFeature::Fp16,
+        ])
+        .unwrap();
+        machine.validate_output_features(required).unwrap();
+        let evidence = AArch64MachineCodeEvidence::try_new(&machine, required).unwrap();
+        assert_eq!(evidence.target(), identity);
+        assert_eq!(evidence.admitted_features(), admitted);
+        assert_eq!(evidence.required_features(), required);
+
+        for feature_bits in 0_u32..=7 {
+            let profile = AArch64IsaFeature::ALL.into_iter().fold(
+                AArch64IsaProfile::BASELINE,
+                |profile, feature| {
+                    profile.with_feature(feature, feature_bits & feature.mask() != 0)
+                },
+            );
+            assert_eq!(
+                AArch64IsaProfile::from(profile.admitted_target_features()),
+                profile,
+                "typed admission must preserve AArch64 profile bits {feature_bits:#05b}"
+            );
+        }
+    }
+
+    #[test]
+    fn riscv_target_machine_uses_an_explicit_empty_feature_domain() {
+        let identity = TargetSpec::parse("riscv64-unknown-unknown").unwrap();
+        let machine: TargetMachine<TargetSpec, RiscVIsaFeature> =
+            TargetMachine::try_new(identity, AdmittedTargetFeatures::NONE).unwrap();
+
+        assert_eq!(machine.identity(), &identity);
+        assert!(machine.admitted_features().as_set().is_empty());
+        machine
+            .validate_output_features(OutputTargetFeatures::NONE)
+            .unwrap();
+    }
+
+    #[test]
+    fn aarch64_aot_profile_is_conservative_except_for_apple_arm64() {
+        let apple_arm64 = TargetSpec::parse("aarch64-apple-darwin").unwrap();
+        assert_eq!(
+            AArch64IsaProfile::for_aot_target(apple_arm64),
+            AArch64IsaProfile::APPLE_ARM64
+        );
+
+        let generic_linux = TargetSpec::parse("aarch64-unknown-linux-gnu").unwrap();
+        assert_eq!(
+            AArch64IsaProfile::for_aot_target(generic_linux),
+            AArch64IsaProfile::BASELINE
+        );
+
+        let generic = TargetSpec::unknown_for_architecture(Target::Aarch64);
+        assert_eq!(
+            AArch64IsaProfile::for_aot_target(generic),
+            AArch64IsaProfile::BASELINE
+        );
+
+        let non_aarch64 = TargetSpec::parse("x86_64-apple-darwin").unwrap();
+        assert_eq!(
+            AArch64IsaProfile::for_aot_target(non_aarch64),
+            AArch64IsaProfile::BASELINE
+        );
+    }
+
+    #[test]
+    fn aarch64_host_profile_never_invents_features() {
+        assert_eq!(
+            resolve_aarch64_host_jit_profile(false, false, false, false),
+            AArch64IsaProfile::BASELINE
+        );
+        assert_eq!(
+            resolve_aarch64_host_jit_profile(false, true, true, true),
+            AArch64IsaProfile::BASELINE,
+            "feature observations cannot authorize AArch64 code on a non-AArch64 host"
+        );
+        assert_eq!(
+            resolve_aarch64_host_jit_profile(true, false, false, false),
+            AArch64IsaProfile::BASELINE
+        );
+        assert_eq!(
+            resolve_aarch64_host_jit_profile(true, true, false, false),
+            AArch64IsaProfile::LSE
+        );
+        assert_eq!(
+            resolve_aarch64_host_jit_profile(true, false, true, false),
+            AArch64IsaProfile::DOTPROD
+        );
+        assert_eq!(
+            resolve_aarch64_host_jit_profile(true, true, true, false),
+            AArch64IsaProfile::LSE_DOTPROD
+        );
+        assert_eq!(
+            resolve_aarch64_host_jit_profile(true, true, true, true),
+            AArch64IsaProfile::APPLE_ARM64
+        );
+    }
+
+    #[test]
+    fn aarch64_host_profile_matches_runtime_admission() {
+        let profile = AArch64IsaProfile::for_host_jit();
+        assert_eq!(
+            profile,
+            resolve_aarch64_host_jit_profile(
+                cfg!(target_arch = "aarch64"),
+                host_has_aarch64_lse(),
+                host_has_aarch64_dotprod(),
+                host_has_aarch64_fp16(),
+            )
+        );
+        assert!(!cfg!(target_arch = "aarch64") || profile.is_supported_by_host());
     }
 
     #[test]

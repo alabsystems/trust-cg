@@ -206,7 +206,7 @@ pub use x86_if_convert::X86IfConvert;
 pub use x86_licm::X86LoopInvariantCodeMotion;
 pub use x86_loop_unroll::X86LoopUnroll;
 pub use x86_pass_manager::{X86MachinePass, X86PassManager, X86PassStats};
-pub use x86_peephole::{MemRmwAdmit, X86Peephole};
+pub use x86_peephole::{ReconstructionAdmit, X86Peephole};
 pub use x86_proof_opts::{X86ProofGuardElimination, X86ProofOptStats};
 pub use x86_rotate::X86LoopRotate;
 pub use x86_sroa::X86ScalarReplacementOfAggregates;

@@ -131,7 +131,7 @@ pub struct RunSummary<T: Serialize + DeserializeOwned + JsonSchema> {
     pub duration_ms: u64,
     /// Host metadata.
     pub host: HostInfo,
-    /// `blake3` digest of the resolved config + argv — used for cache
+    /// Digest of the resolved config + argv (reserved; not computed in production yet) — for cache
     /// invalidation and repro validation.
     pub config_digest: String,
     /// Aggregate counts.

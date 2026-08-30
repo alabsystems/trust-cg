@@ -21,7 +21,7 @@
       "type": "string"
     },
     "config_digest": {
-      "description": "`blake3` digest of the resolved config + argv — used for cache invalidation and repro validation.",
+      "description": "Digest of the resolved config + argv (reserved; not computed in production yet) — for cache invalidation and repro validation.",
       "type": "string"
     },
     "duration_ms": {

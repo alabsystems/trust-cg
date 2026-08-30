@@ -68,7 +68,9 @@ invoked as `clean cert verify-external <cert.json> --verbose`. Without a usable
 checker, UNSAT stays `Unknown` and the whole solver lane reports itself
 unavailable rather than pretending to authority it does not have.
 
-Resolution order: `$TCG_CLEAN_CHECKER`, else `~/Clean/target/release/clean`.
+Resolution order: `$TCG_EXTERNAL_CLEAN_CHECKER` (canonical), else
+`$TCG_CLEAN_CHECKER` (legacy alias, consulted only when the canonical name is
+unset), else `~/Clean/target/release/clean`.
 
 **The checker must be built with the `carcara-verify` cargo feature:**
 

@@ -22,10 +22,7 @@ homepage.workspace = true
 readme.workspace = true
 
 [dependencies]
-trust-cg-ir = { workspace = true }
 trust-cg-lower = { workspace = true }
-trust-cg-opt = { workspace = true }
-trust-cg-regalloc = { workspace = true }
 trust-cg-codegen = { workspace = true }
 trust-ir = { workspace = true }
 trust-ir-build = { workspace = true }

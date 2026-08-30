@@ -64,17 +64,6 @@ impl Complexity {
             Complexity::Large => "large_100inst",
         }
     }
-
-    #[allow(dead_code)]
-    fn expected_inst_count(&self) -> usize {
-        match self {
-            Complexity::Trivial => 2,
-            Complexity::Simple => 3,
-            Complexity::Medium => 10,
-            Complexity::Complex => 30,
-            Complexity::Large => 100,
-        }
-    }
 }
 
 /// Build `return_const() -> i32`: MOVZ X0, #42; RET
@@ -579,11 +568,6 @@ impl BenchResult {
             return f64::INFINITY;
         }
         (self.inst_count as f64 * self.iterations as f64) / total_secs
-    }
-
-    #[allow(dead_code)]
-    fn avg_per_function_us(&self) -> f64 {
-        self.total_duration.as_micros() as f64 / self.iterations as f64
     }
 }
 

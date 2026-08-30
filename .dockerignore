@@ -1,20 +1,14 @@
+# Build-context filter only. The one real Dockerfile
+# (docker/sat-comp-2026/Dockerfile) clones the repo from git inside its builder
+# stage and never reads this context, so this list exists to keep an accidental
+# `docker build .` from shipping build trees; every entry names a path that
+# actually occurs in a checkout.
 .git
 .github
 .claude
-.codex
 .env
 target
 target-*
-fuzz/target
 *.log
-*.jsonl
-reports
-results
-worker_logs
-logs
-metrics
-tmp
-states
-.pytest_cache
 .venv
 venv

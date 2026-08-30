@@ -86,9 +86,12 @@
 //! neither the induction nor a loop-invariant `f64`, a fused accumulate whose
 //! accumulator is a MULTIPLICAND rather than the addend
 //! (`acc = fmadd(acc, _, _)`, a rounding-sensitive
-//! multiply-recurrence), an extra live-out — the loop is left ENTIRELY to the
-//! scalar path (`scalar_unroll`'s order-preserving SERIAL unroll is the
-//! fallback). Fail-closed beats miscompile.
+//! multiply-recurrence), an extra live-out, an accumulator that does not
+//! provably ENTER the loop holding `+0.0` (the drain OVERWRITES `acc` with the
+//! vector partial sum, so a non-zero init would be silently discarded — see
+//! (R5b)) — the loop is left ENTIRELY to the scalar path (`scalar_unroll`'s
+//! order-preserving SERIAL unroll is the fallback). Fail-closed beats
+//! miscompile.
 //!
 //! Runs at O2/O3 immediately BEFORE `reduction_split`/`scalar_unroll` (so it gets
 //! first shot at the FP-reduction loop). Disable with
@@ -384,6 +387,67 @@ fn recognize_rotated_header_exit(
     Some((vreg_of(&cmp.operands[1])?, exit, cmp_id))
 }
 
+/// FPR-to-FPR copy levels followed while proving the accumulator's entry value.
+/// isel's `f64` zero seed is `Movz Xn, #0; FMOV Dz, Xn; FMOV Dacc, Dz` — one
+/// copy level; a couple more absorb a re-materialized or re-copied seed. Any
+/// longer chain is not the idiom and bails.
+const ACC_SEED_MAX_COPIES: u32 = 4;
+
+/// Prove the `f64` accumulator `acc` holds `+0.0` on entry to the loop, i.e. at
+/// the preheader terminator `preheader_term`.
+///
+/// Fail-closed by construction. At each step the ONE definition reaching the
+/// current program point (per the audited [`crate::reaching_const`]
+/// reaching-defs engine — two reaching defs, e.g. an enclosing loop carrying
+/// `acc` across outer iterations, or any uninitialized path, resolve to `None`)
+/// must be either
+///
+/// * an FPR-to-FPR copy (`FMOV Dd, Ds` / `Copy`), which is followed to its
+///   source (bounded by [`ACC_SEED_MAX_COPIES`]), or
+/// * the isel zero-seed `FMOV Dd, Xn` whose GPR source provably materializes
+///   the constant `0` — the all-zero `f64` bit pattern, `+0.0`.
+///
+/// The GPR source is queried through a `Gpr64` view on purpose: `FMOV Dd, Xn`
+/// copies all 64 bits, so a value that is merely zero in its low 32 bits is NOT
+/// enough. Anything else — an opaque init, a call result, a non-zero constant —
+/// ⇒ `false`.
+fn acc_enters_as_pos_zero(func: &MachFunction, preheader_term: InstId, acc: VReg) -> bool {
+    let mut at = preheader_term;
+    let mut id = acc.id;
+    for _ in 0..ACC_SEED_MAX_COPIES {
+        let Some(def_id) = crate::reaching_const::unique_reaching_def(func, at, id) else {
+            return false;
+        };
+        let inst = func.inst(def_id);
+        if inst.operands.len() != 2 {
+            return false;
+        }
+        let Some(dst) = vreg_of(&inst.operands[0]).filter(|d| d.id == id) else {
+            return false;
+        };
+        let Some(src) = vreg_of(&inst.operands[1]) else {
+            return false; // a PReg source (e.g. an incoming argument) is opaque
+        };
+        match inst.opcode {
+            AArch64Opcode::FmovGprFpr if dst.class == RegClass::Fpr64 => {
+                return crate::reaching_const::unique_reaching_const(
+                    func,
+                    def_id,
+                    VReg::new(src.id, RegClass::Gpr64),
+                ) == Some(0);
+            }
+            AArch64Opcode::FmovFprFpr | AArch64Opcode::Copy
+                if dst.class == RegClass::Fpr64 && src.class == RegClass::Fpr64 =>
+            {
+                at = def_id;
+                id = src.id;
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
 impl Recognized {
     fn recognize(
         func: &MachFunction,
@@ -461,6 +525,23 @@ impl Recognized {
         }
         // i64 induction, f64 accumulator only (f32 leaves/acc bail below).
         if iv.class != RegClass::Gpr64 || acc.class != RegClass::Fpr64 {
+            return None;
+        }
+
+        // (R5b) the loop-carried accumulator MUST enter the loop holding `+0.0`.
+        // `apply` seeds a FRESH vector accumulator `svec = 0.0` and, at the
+        // vector exit, OVERWRITES `acc`/`acc_src` with `svec` — unconditionally,
+        // even when the vector loop ran ZERO iterations. That is only value-
+        // preserving if the incoming accumulator was itself `+0.0`; with any
+        // other entry value (`acc = init; for i … acc += f(i)`) the init is
+        // silently DISCARDED. Recognition therefore has to REQUIRE what the
+        // emitter assumes: prove, on the audited reaching-defs engine, that the
+        // definition of `acc` reaching the preheader terminator materializes the
+        // all-zero bit pattern. Anything else — a non-zero init, a value from a
+        // call, two reaching defs (e.g. an enclosing loop carrying `acc` across
+        // outer iterations) — ⇒ BAIL to the scalar path. Fail-closed beats
+        // miscompile.
+        if !acc_enters_as_pos_zero(func, preheader_term, acc) {
             return None;
         }
 

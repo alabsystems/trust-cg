@@ -1111,7 +1111,7 @@ pub fn x86_opcode_effect(opcode: X86Opcode) -> MemoryEffect {
         }
 
         // Shifts
-        ShlRR | ShlRI | ShrRR | ShrRI | SarRR | SarRI | RolRI => MemoryEffect::Pure,
+        ShlRR | ShlRI | ShrRR | ShrRI | SarRR | SarRI | RolRI | RolRCl => MemoryEffect::Pure,
 
         // Compare/test (set flags, no memory access)
         CmpRR | CmpRI | CmpRI8 | TestRR | TestRI | Ucomisd | Ucomiss | BtRI => MemoryEffect::Pure,
@@ -1364,7 +1364,10 @@ pub fn x86_writes_flags(opcode: X86Opcode) -> bool {
         // Logical
         | AndRR | AndRI | OrRR | OrRI | XorRR | XorRI | Not
         // Shifts
-        | ShlRR | ShlRI | ShrRR | ShrRI | SarRR | SarRI | RolRI
+        // Variable-count rotate: writes CF/OF when the CL count is nonzero
+        // (NOT the full shift mask — SF/ZF/AF/PF are untouched; the exact
+        // per-flag contract lives in the TV-5 post-RA flag model).
+        | ShlRR | ShlRI | ShrRR | ShrRI | SarRR | SarRI | RolRI | RolRCl
         // Compare/test
         | CmpRR | CmpRI | CmpRI8 | CmpRM | TestRR | TestRI | TestRM
         | Ptest

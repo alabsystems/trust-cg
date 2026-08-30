@@ -13,6 +13,15 @@ target/
 # Cargo.lock is committed: trust-cg's dependency revs (notably trust-ir) are
 # pinned for cross-repo reproducibility with ty/trust-mc (shared-core alignment).
 **/*.rs.bk
+# Editor / patch-tool leftovers (a failed `git apply` leaves *.orig / *.rej;
+# *.bak files have been committed to this repo twice by accident).
+*.bak
+*.orig
+*.rej
+# cargo-fuzz run output next to the fuzz/ manifest. Curated repros live in
+# the TRACKED fuzz/repros/ tree (see fuzz/repros/README.md), which is NOT ignored.
+/fuzz/corpus/
+/fuzz/artifacts/
 
 # SAT-Comp 2026 starexec_build artefact directory (binary is rebuilt
 # from source by `./starexec_build`; never committed).
@@ -26,6 +35,9 @@ build/
 
 # Benchmark outputs
 benchmarks/**/results/
+# reports/perf/run_bench.sh raw output (the reviewed snapshot is the tracked
+# reports/perf/results.csv, copied out by hand).
+/reports/perf/results/
 benchmarks/**/logs/
 benchmarks/**/data/
 
@@ -84,7 +96,7 @@ target-bridge/
 publish/.out/
 
 # Session scratch work area (untracked temp files; never commit)
-# Fuzzer repro directories are source-controlled regression fixtures.
+# Fuzzer repro programs are source-controlled regression fixtures (fuzz/repros/).
 /scratchpad/
 
 # Raw eval RUN OUTPUT (scripts/run_llvm_test_suite.sh,

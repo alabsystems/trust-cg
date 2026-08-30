@@ -182,11 +182,23 @@ impl AnalysisCache {
     /// tree and the loop analysis together while it mutates the function
     /// (the analyses belong to the cache, not to the function).
     pub fn domtree_and_loops(&mut self, func: &MachFunction) -> (&DomTree, &LoopAnalysis) {
-        self.loop_analysis(func);
-        (
-            self.domtree.as_ref().unwrap(),
-            self.loop_analysis.as_ref().unwrap(),
-        )
+        // Fill each slot in place and hand back the reference the fill
+        // produces, so "both analyses are present" is carried by the data
+        // flow rather than re-checked with `unwrap`. Order and bookkeeping
+        // match `loop_analysis`: the dominator tree is computed first (loop
+        // analysis consumes it), and each slot is computed at most once per
+        // `invalidate` window, bumping its counter only when it is computed.
+        // The closures borrow `self.stats` while the slots are borrowed
+        // mutably; those are disjoint fields, so no aliasing is involved.
+        let dom: &DomTree = self.domtree.get_or_insert_with(|| {
+            self.stats.domtree_computations += 1;
+            DomTree::compute(func)
+        });
+        let loops: &LoopAnalysis = self.loop_analysis.get_or_insert_with(|| {
+            self.stats.loop_analysis_computations += 1;
+            LoopAnalysis::compute(func, dom)
+        });
+        (dom, loops)
     }
 
     pub fn stats(&self) -> AnalysisCacheStats {
@@ -479,6 +491,33 @@ fn bookkeeping_name(pass_name: &str) -> String {
     format!("{pass_name}::bookkeeping")
 }
 
+/// The `(pass, pass::bookkeeping)` label pair for one pass invocation, built
+/// ONLY when a consumer is actually enabled.
+///
+/// Both labels are consumed exclusively by env-gated diagnostics: the per-pass
+/// timing log (`TRUST_CG_TIME_PASSES`), the MIR dump (`TRUST_CG_DUMP_MIR`) and
+/// the changed-claim checker (`TCG_DIAG_CHANGED`). Building them
+/// unconditionally cost three heap allocations per pass invocation —
+/// `pass.name().to_string()` plus two `format!("{name}::bookkeeping")` calls,
+/// the second of which re-formatted a string the first had already built — on
+/// EVERY compile, with every consumer off by default. An empty program runs
+/// 1794 pass invocations across its 14 std-startup functions, so that is ~5.4k
+/// allocations formatted and dropped without ever being read.
+///
+/// Returns empty strings when no consumer is enabled; `log_pass_start` returns
+/// `None` in that case and `log_pass_end` short-circuits on it, and the dump /
+/// diag `eprintln!`s are behind their own flags, so the labels are never
+/// observed. Purely an allocation elision: no pass is run, skipped, or ordered
+/// differently, so the emitted object is byte-identical.
+fn pass_labels(pass: &dyn MachinePass, want: bool) -> (String, String) {
+    if !want {
+        return (String::new(), String::new());
+    }
+    let name = pass.name().to_string();
+    let bk = bookkeeping_name(&name);
+    (name, bk)
+}
+
 /// Cached `TCG_DIAG_CHANGED` flag: read the environment once per process so
 /// the default-off path costs one branch per pass run, not a getenv.
 fn diag_changed_enabled() -> bool {
@@ -503,18 +542,24 @@ struct PassTimeLog {
     lines: Vec<String>,
 }
 
-impl Drop for PassTimeLog {
-    fn drop(&mut self) {
+impl PassTimeLog {
+    fn flush(&mut self) {
         if self.lines.is_empty() {
             return;
         }
         use std::io::Write;
         let stderr = std::io::stderr();
         let mut out = stderr.lock();
-        for line in &self.lines {
+        for line in self.lines.drain(..) {
             let _ = writeln!(out, "{line}");
         }
         let _ = out.flush();
+    }
+}
+
+impl Drop for PassTimeLog {
+    fn drop(&mut self) {
+        self.flush();
     }
 }
 
@@ -525,6 +570,17 @@ thread_local! {
 
 fn pass_time_record(line: String) {
     PASS_TIME_LOG.with(|log| log.borrow_mut().lines.push(line));
+}
+
+/// Flush pass timings accumulated by the calling thread.
+///
+/// Reusable compiler worker threads call this at a task boundary because their
+/// thread-local destructors do not run until the process exits.
+#[doc(hidden)]
+pub fn flush_current_thread_pass_time_log() {
+    if should_time_passes() {
+        PASS_TIME_LOG.with(|log| log.borrow_mut().flush());
+    }
 }
 
 fn log_pass_start(func: &MachFunction, iteration: u32, pass_name: &str) -> Option<Instant> {
@@ -701,6 +757,10 @@ impl PassManager {
         // over the corpus already enforces for every change this session.
         let mut mutation_epoch: u64 = 0;
         let mut nochange_epoch: Vec<Option<u64>> = vec![None; self.passes.len()];
+        // Every label consumer is env-gated and off by default; see `pass_labels`.
+        // The TCG_DIAG_CHANGED path prints `pass_name` too, so it counts as a
+        // consumer here.
+        let want_labels = should_time_passes() || should_dump || diag_changed_enabled();
 
         // The CFG analyses (dominators, loops) are pure functions of the CFG, and
         // `update_cache_after_changed_pass` already keeps them across passes
@@ -725,7 +785,7 @@ impl PassManager {
                     continue;
                 }
                 stats.runs[i].1 += 1;
-                let pass_name = pass.name().to_string();
+                let (pass_name, bk_name) = pass_labels(pass.as_ref(), want_labels);
                 let before_cfg = current_cfg;
                 // DIAGNOSTIC (default off, `TCG_DIAG_CHANGED=1`): verify each
                 // pass's claimed change against actual function content. A
@@ -762,17 +822,11 @@ impl PassManager {
                         );
                     }
                 }
-                let bk = log_pass_start(func, iteration + 1, &bookkeeping_name(&pass_name));
+                let bk = log_pass_start(func, iteration + 1, &bk_name);
                 collect_proof_optimization_certificates(&mut stats, pass.as_mut());
                 collect_certified_pass_runs(&mut stats, pass.as_mut());
                 collect_kernel_recheck(&mut stats, pass.as_ref());
-                log_pass_end(
-                    func,
-                    iteration + 1,
-                    &bookkeeping_name(&pass_name),
-                    false,
-                    bk,
-                );
+                log_pass_end(func, iteration + 1, &bk_name, false, bk);
                 if pass_changed {
                     any_changed = true;
                     stats.changes += 1;
@@ -847,6 +901,8 @@ impl PassManager {
         // over the corpus already enforces for every change this session.
         let mut mutation_epoch: u64 = 0;
         let mut nochange_epoch: Vec<Option<u64>> = vec![None; self.passes.len()];
+        // Every label consumer is env-gated and off by default; see `pass_labels`.
+        let want_labels = should_time_passes() || should_dump;
 
         for iteration in 0..max_iterations {
             stats.iterations = iteration + 1;
@@ -865,23 +921,17 @@ impl PassManager {
                     continue;
                 }
                 stats.runs[i].1 += 1;
-                let pass_name = pass.name().to_string();
+                let (pass_name, bk_name) = pass_labels(pass.as_ref(), want_labels);
                 let before_cfg = current_cfg;
                 let timer = log_pass_start(func, iteration + 1, &pass_name);
                 let pass_changed =
                     pass.run_with_analyses_and_provenance(func, &mut cache, provenance);
                 log_pass_end(func, iteration + 1, &pass_name, pass_changed, timer);
-                let bk = log_pass_start(func, iteration + 1, &bookkeeping_name(&pass_name));
+                let bk = log_pass_start(func, iteration + 1, &bk_name);
                 collect_proof_optimization_certificates(&mut stats, pass.as_mut());
                 collect_certified_pass_runs(&mut stats, pass.as_mut());
                 collect_kernel_recheck(&mut stats, pass.as_ref());
-                log_pass_end(
-                    func,
-                    iteration + 1,
-                    &bookkeeping_name(&pass_name),
-                    false,
-                    bk,
-                );
+                log_pass_end(func, iteration + 1, &bk_name, false, bk);
                 if pass_changed {
                     any_changed = true;
                     stats.changes += 1;
@@ -937,22 +987,24 @@ impl PassManager {
             dump_function(func);
         }
 
+        // Every label consumer is env-gated and off by default; see `pass_labels`.
+        let want_labels = should_time_passes() || should_dump;
         let mut cache = AnalysisCache::new();
         // See the fixpoint drivers: one fingerprint maintained across pass
         // runs instead of one recompute per invocation.
         let mut current_cfg = cfg_fingerprint(func);
         for (i, pass) in self.passes.iter_mut().enumerate() {
             stats.runs[i].1 = 1;
-            let pass_name = pass.name().to_string();
+            let (pass_name, bk_name) = pass_labels(pass.as_ref(), want_labels);
             let before_cfg = current_cfg;
             let timer = log_pass_start(func, 1, &pass_name);
             let pass_changed = pass.run_with_analyses(func, &mut cache);
             log_pass_end(func, 1, &pass_name, pass_changed, timer);
-            let bk = log_pass_start(func, 1, &bookkeeping_name(&pass_name));
+            let bk = log_pass_start(func, 1, &bk_name);
             collect_proof_optimization_certificates(&mut stats, pass.as_mut());
             collect_certified_pass_runs(&mut stats, pass.as_mut());
             collect_kernel_recheck(&mut stats, pass.as_ref());
-            log_pass_end(func, 1, &bookkeeping_name(&pass_name), false, bk);
+            log_pass_end(func, 1, &bk_name, false, bk);
             if pass_changed {
                 stats.changes += 1;
                 current_cfg = update_cache_after_changed_pass(func, &mut cache, before_cfg);
@@ -996,22 +1048,24 @@ impl PassManager {
             dump_function(func);
         }
 
+        // Every label consumer is env-gated and off by default; see `pass_labels`.
+        let want_labels = should_time_passes() || should_dump;
         let mut cache = AnalysisCache::new();
         // See the fixpoint drivers: one fingerprint maintained across pass
         // runs instead of one recompute per invocation.
         let mut current_cfg = cfg_fingerprint(func);
         for (i, pass) in self.passes.iter_mut().enumerate() {
             stats.runs[i].1 = 1;
-            let pass_name = pass.name().to_string();
+            let (pass_name, bk_name) = pass_labels(pass.as_ref(), want_labels);
             let before_cfg = current_cfg;
             let timer = log_pass_start(func, 1, &pass_name);
             let pass_changed = pass.run_with_analyses_and_provenance(func, &mut cache, provenance);
             log_pass_end(func, 1, &pass_name, pass_changed, timer);
-            let bk = log_pass_start(func, 1, &bookkeeping_name(&pass_name));
+            let bk = log_pass_start(func, 1, &bk_name);
             collect_proof_optimization_certificates(&mut stats, pass.as_mut());
             collect_certified_pass_runs(&mut stats, pass.as_mut());
             collect_kernel_recheck(&mut stats, pass.as_ref());
-            log_pass_end(func, 1, &bookkeeping_name(&pass_name), false, bk);
+            log_pass_end(func, 1, &bk_name, false, bk);
             if pass_changed {
                 stats.changes += 1;
                 current_cfg = update_cache_after_changed_pass(func, &mut cache, before_cfg);
@@ -1588,5 +1642,59 @@ mod tests {
             stats.kernel_recheck().is_ok(),
             "discharged-obligation elimination must re-justify on re-check"
         );
+    }
+
+    /// `pass_labels` is the allocation elision for the env-gated label
+    /// consumers: with every consumer off it must build NOTHING, and with one
+    /// on it must yield exactly the strings the timing log / dump / diag paths
+    /// print, so enabling a consumer never changes what is reported.
+    #[test]
+    fn pass_labels_are_empty_when_no_consumer_is_enabled() {
+        let (name, bk) = pass_labels(&NoOpPass, false);
+        assert!(name.is_empty(), "pass label built with every consumer off");
+        assert!(
+            bk.is_empty(),
+            "bookkeeping label built with every consumer off"
+        );
+        assert_eq!(
+            name.capacity(),
+            0,
+            "pass label allocated with every consumer off"
+        );
+        assert_eq!(
+            bk.capacity(),
+            0,
+            "bookkeeping label allocated with every consumer off"
+        );
+    }
+
+    #[test]
+    fn pass_labels_are_the_real_names_when_a_consumer_is_enabled() {
+        let (name, bk) = pass_labels(&NoOpPass, true);
+        assert_eq!(name, "no-op");
+        assert_eq!(bk, bookkeeping_name("no-op"));
+        assert_eq!(bk, "no-op::bookkeeping");
+
+        let (name, bk) = pass_labels(&CountingPass { remaining: 0 }, true);
+        assert_eq!(name, "counting");
+        assert_eq!(bk, "counting::bookkeeping");
+    }
+
+    /// Eliding the labels must not touch the fixpoint itself: the same passes
+    /// run the same number of times and report the same changes, and the
+    /// per-pass stats still carry the real pass names (those come from
+    /// `PassStats::runs`, not from the elided labels).
+    #[test]
+    fn label_elision_leaves_fixpoint_stats_and_names_intact() {
+        let mut pm = PassManager::new()
+            .with_pass(Box::new(NoOpPass))
+            .with_pass(Box::new(CountingPass { remaining: 2 }));
+        let mut func = make_empty_func();
+        let stats = pm.run_to_fixpoint(&mut func, 10);
+        assert_eq!(stats.iterations, 3);
+        assert_eq!(stats.changes, 2);
+        assert_eq!(stats.runs[0].0, "no-op");
+        assert_eq!(stats.runs[1].0, "counting");
+        assert_eq!(stats.runs[1].1, 3);
     }
 }

@@ -29,6 +29,11 @@
 // builder/pipeline source identity: a compiler, schema, feature, or module-
 // builder change must be a cold miss rather than replaying stale semantics.
 //
+// Its payload is pre-codegen semantic TrustIR rather than executable bytes,
+// but it is still an artifact of module construction. A future prefixed
+// control could affect that builder, so lookup and publication share the same
+// fail-closed environment guard as compiled-provider L1 and executable L2.
+//
 // # Failure mode
 //
 // Every disk I/O failure in this module degrades to "act as if the
@@ -236,7 +241,7 @@ fn ensure_cache_dir() -> Option<PathBuf> {
 /// success, also bumps the file's mtime so touch-based LRU sees it
 /// as recently used.
 pub fn disk_lookup(hash: u64, kernel_name: &str) -> Option<String> {
-    if !disk_io_enabled() {
+    if !crate::env_lock::artifact_reuse_environment_safety().is_reuse_safe() || !disk_io_enabled() {
         return None;
     }
     let path = cache_path(hash, kernel_name)?;
@@ -314,7 +319,7 @@ fn decode_cache_entry(encoded: &[u8]) -> Option<String> {
 /// never propagated; the caller's compile proceeds normally on a write
 /// error.
 pub fn disk_store(hash: u64, kernel_name: &str, module_text: &str) {
-    if !disk_io_enabled() {
+    if !crate::env_lock::artifact_reuse_environment_safety().is_reuse_safe() || !disk_io_enabled() {
         return;
     }
     let dir = match ensure_cache_dir() {
@@ -777,14 +782,14 @@ mod tests {
     }
 
     #[test]
-    fn runtime_codegen_controls_do_not_rekey_ir_text_cache() {
+    fn runtime_codegen_controls_bypass_ir_text_cache() {
         const CHILD_MODE_ENV: &str = "JIT_MATRIX_TEST_IR_CACHE_CHILD_MODE";
         const CHILD_ROOT_ENV: &str = "JIT_MATRIX_TEST_IR_CACHE_CHILD_ROOT";
         const TEST_NAME: &str =
-            "jit_disk_cache::tests::runtime_codegen_controls_do_not_rekey_ir_text_cache";
+            "jit_disk_cache::tests::runtime_codegen_controls_bypass_ir_text_cache";
         const HASH: u64 = 0xc01d_cac4e;
         const KERNEL: &str = "runtime-control-stable";
-        const PAYLOAD: &str = "persisted Trust-IR is recompiled under live codegen controls";
+        const PAYLOAD: &str = "persisted default-policy TrustIR";
 
         if let Some(mode) = std::env::var_os(CHILD_MODE_ENV) {
             let root = std::env::var_os(CHILD_ROOT_ENV)
@@ -800,7 +805,18 @@ mod tests {
                     assert_eq!(
                         disk_lookup(HASH, KERNEL).as_deref(),
                         Some(PAYLOAD),
-                        "a runtime codegen-control change must not hide reusable Trust-IR text"
+                        "default-policy lookup must recover the original TrustIR"
+                    );
+                }
+                Some("blocked-lookup") => assert!(
+                    disk_lookup(HASH, KERNEL).is_none(),
+                    "an unkeyed control must bypass TrustIR lookup"
+                ),
+                Some("blocked-store") => {
+                    disk_store(HASH, KERNEL, "must not replace the default-policy entry");
+                    assert!(
+                        disk_lookup(HASH, KERNEL).is_none(),
+                        "an unkeyed control must bypass TrustIR publication and lookup"
                     );
                 }
                 _ => panic!("unknown IR-cache child mode: {mode:?}"),
@@ -817,17 +833,19 @@ mod tests {
         // Scope each real backend control to a child process instead of
         // mutating this parallel test process's environment. Child exit makes
         // restoration unwind-safe even if either assertion fails.
-        let run_child = |mode: &str, disabled_pass: &str| {
-            std::process::Command::new(&test_binary)
+        let run_child = |mode: &str, disabled_pass: Option<&str>| {
+            let mut command = std::process::Command::new(&test_binary);
+            command
                 .arg(TEST_NAME)
                 .arg("--exact")
                 .arg("--nocapture")
                 .arg("--test-threads=1")
                 .env(CHILD_MODE_ENV, mode)
-                .env(CHILD_ROOT_ENV, tmp.path())
-                .env("TRUST_CG_DISABLE_PASSES", disabled_pass)
-                .output()
-                .expect("run isolated IR-cache child test")
+                .env(CHILD_ROOT_ENV, tmp.path());
+            if let Some(disabled_pass) = disabled_pass {
+                command.env("TRUST_CG_DISABLE_PASSES", disabled_pass);
+            }
+            command.output().expect("run isolated IR-cache child test")
         };
         let assert_success = |phase: &str, output: std::process::Output| {
             assert!(
@@ -839,8 +857,16 @@ mod tests {
             );
         };
 
-        assert_success("store", run_child("store", "aliashoist"));
-        assert_success("lookup", run_child("lookup", "vec"));
+        assert_success("default store", run_child("store", None));
+        assert_success(
+            "blocked lookup",
+            run_child("blocked-lookup", Some("aliashoist")),
+        );
+        assert_success("blocked store", run_child("blocked-store", Some("vec")));
+        assert_success(
+            "default lookup after blocked store",
+            run_child("lookup", None),
+        );
     }
 
     #[test]

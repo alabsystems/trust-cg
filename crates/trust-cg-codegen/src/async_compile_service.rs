@@ -6,8 +6,9 @@
 //! Runtime-neutral submit/cancel/poll facade for compile-service workers.
 //!
 //! This module deliberately does not own an executor. Callers enqueue
-//! [`CompileRequest`] values, drive backend work with [`AsyncCompileService::start_next`]
-//! and [`AsyncCompileService::finish`], and observe state through
+//! [`CompileRequest`] or target-authoritative [`CompilePlan`] values, drive
+//! backend work with [`AsyncCompileService::start_next`] or
+//! [`AsyncCompileService::start_next_plan`], and observe state through
 //! [`AsyncCompileService::poll`].
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -15,9 +16,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use serde_json::{Value, json};
 
 use crate::compile_service::{
-    ArtifactInstallDisposition, CompileDiagnostic, CompileGeneration, CompileRequest,
+    ArtifactInstallDisposition, CompileDiagnostic, CompileGeneration, CompilePlan, CompileRequest,
     CompileRequestId, CompileResponse, CompileService, CompileStatus, DiagnosticSeverity,
-    ExplainReject, RejectCode,
+    ExplainReject, RejectCode, compile_response_matches_plan,
 };
 use crate::jit_contract::ArtifactManifestV1;
 use crate::jit_install_gate::{
@@ -289,6 +290,17 @@ pub struct AsyncCompileTicket {
     pub request: CompileRequest,
 }
 
+/// Worker-owned ticket that preserves explicit target authority.
+#[derive(Debug, Clone)]
+pub struct AsyncCompilePlanTicket {
+    /// Request id being compiled.
+    pub request_id: CompileRequestId,
+    /// Request generation being compiled.
+    pub generation: CompileGeneration,
+    /// Full target-aware plan to pass to [`CompileService::compile_plan`].
+    pub plan: CompilePlan,
+}
+
 /// Typed poll result for a request id.
 #[derive(Debug, Clone)]
 pub struct AsyncCompilePoll {
@@ -504,7 +516,14 @@ impl AsyncCompileTelemetrySummary {
 
 #[derive(Debug, Clone)]
 struct RunningRequest {
-    request: CompileRequest,
+    plan: CompilePlan,
+    requires_plan_worker: bool,
+}
+
+#[derive(Debug, Clone)]
+struct QueuedRequest {
+    plan: CompilePlan,
+    requires_plan_worker: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -538,7 +557,7 @@ struct AsyncManifestCacheEntry {
 pub struct AsyncCompileService {
     service: CompileService,
     config: AsyncCompileServiceConfig,
-    queued: VecDeque<CompileRequest>,
+    queued: VecDeque<QueuedRequest>,
     running: HashMap<CompileRequestId, RunningRequest>,
     terminal: HashMap<CompileRequestId, TerminalRequest>,
     terminal_order: VecDeque<CompileRequestId>,
@@ -839,14 +858,36 @@ impl AsyncCompileService {
         &mut self,
         request: CompileRequest,
     ) -> Result<AsyncSubmitAccepted, AsyncSubmitReject> {
-        let cache_record = self.cache_lookup_record(&request);
-        if let Some(code) = self.submit_reject_code(&request, cache_record.as_ref()) {
+        self.submit_inner(CompilePlan::for_request(request), false)
+    }
+
+    /// Submit an explicit target-aware plan for later worker execution.
+    ///
+    /// Plan submissions are delivered only by [`Self::start_next_plan`] (or
+    /// [`Self::run_next_plan_with`]), so the legacy request-only ticket path
+    /// can never silently discard the target spec.
+    pub fn submit_plan(
+        &mut self,
+        plan: CompilePlan,
+    ) -> Result<AsyncSubmitAccepted, AsyncSubmitReject> {
+        self.submit_inner(plan, true)
+    }
+
+    fn submit_inner(
+        &mut self,
+        plan: CompilePlan,
+        requires_plan_worker: bool,
+    ) -> Result<AsyncSubmitAccepted, AsyncSubmitReject> {
+        let request = plan.request();
+        let cache_record = self.cache_lookup_record(request);
+        if let Some(code) = self.submit_reject_code(request, cache_record.as_ref()) {
             let duplicate_active_request = code == AsyncSubmitRejectCode::DuplicateRequest
                 && self.has_active_request_id(&request.request_id);
             if let Some(record) = cache_record.clone().filter(|_| !duplicate_active_request) {
                 self.cache_records
                     .insert(request.request_id.clone(), record);
             }
+            let (request, _) = plan.into_parts();
             let reject = self.submit_reject(request, code);
             self.record_response_event_with_cache_record(
                 AsyncCompileTelemetryEvent::Submit,
@@ -903,7 +944,10 @@ impl AsyncCompileService {
             None,
             None,
         );
-        self.queued.push_back(request);
+        self.queued.push_back(QueuedRequest {
+            plan,
+            requires_plan_worker,
+        });
         self.accepted_submits += 1;
         Ok(AsyncSubmitAccepted {
             request_id,
@@ -916,12 +960,13 @@ impl AsyncCompileService {
         if let Some(position) = self
             .queued
             .iter()
-            .position(|request| request.request_id == *request_id)
+            .position(|queued| queued.plan.request().request_id == *request_id)
         {
-            let request = self
+            let queued = self
                 .queued
                 .remove(position)
                 .expect("queued position exists");
+            let (request, _) = queued.plan.into_parts();
             request.cancellation.cancel();
             let response = terminal_response(
                 &request,
@@ -950,9 +995,9 @@ impl AsyncCompileService {
         }
 
         if let Some(running) = self.running.remove(request_id) {
-            running.request.cancellation.cancel();
+            running.plan.request().cancellation.cancel();
             let response = terminal_response(
-                &running.request,
+                running.plan.request(),
                 CompileStatus::Cancelled,
                 "async.cancelled",
                 "async compile request cancelled while running",
@@ -985,14 +1030,15 @@ impl AsyncCompileService {
         if let Some(position) = self
             .queued
             .iter()
-            .position(|request| request.request_id == *request_id)
+            .position(|queued| queued.plan.request().request_id == *request_id)
         {
-            let request = &self.queued[position];
+            let request = self.queued[position].plan.request();
             if request.cancellation.is_cancelled() || request_is_stale(request) {
-                let request = self
+                let queued = self
                     .queued
                     .remove(position)
                     .expect("queued position exists");
+                let (request, _) = queued.plan.into_parts();
                 let (status, state, code, message) = if request.cancellation.is_cancelled() {
                     (
                         CompileStatus::Cancelled,
@@ -1043,29 +1089,31 @@ impl AsyncCompileService {
         }
 
         if let Some(running) = self.running.get(request_id) {
-            if running.request.cancellation.is_cancelled() || request_is_stale(&running.request) {
+            if running.plan.request().cancellation.is_cancelled()
+                || request_is_stale(running.plan.request())
+            {
                 let running = self
                     .running
                     .remove(request_id)
                     .expect("running request exists");
-                let (status, state, code, message) = if running.request.cancellation.is_cancelled()
-                {
-                    (
-                        CompileStatus::Cancelled,
-                        AsyncCompileState::Cancelled,
-                        "async.cancelled",
-                        "async compile request cancelled while running",
-                    )
-                } else {
-                    (
-                        CompileStatus::Stale,
-                        AsyncCompileState::StaleGeneration,
-                        "async.stale_generation",
-                        "async compile request stale while running",
-                    )
-                };
+                let (status, state, code, message) =
+                    if running.plan.request().cancellation.is_cancelled() {
+                        (
+                            CompileStatus::Cancelled,
+                            AsyncCompileState::Cancelled,
+                            "async.cancelled",
+                            "async compile request cancelled while running",
+                        )
+                    } else {
+                        (
+                            CompileStatus::Stale,
+                            AsyncCompileState::StaleGeneration,
+                            "async.stale_generation",
+                            "async compile request stale while running",
+                        )
+                    };
                 let response = terminal_response(
-                    &running.request,
+                    running.plan.request(),
                     status,
                     code,
                     message,
@@ -1134,11 +1182,46 @@ impl AsyncCompileService {
     }
 
     /// Start the next queued request and return a worker ticket.
+    ///
+    /// A target-aware plan at the queue head stops this legacy path; use
+    /// [`Self::start_next_plan`] so its authority is preserved without
+    /// reordering later work.
     pub fn start_next(&mut self) -> Option<AsyncCompileTicket> {
-        while let Some(request) = self.queued.pop_front() {
+        let plan = self.start_next_inner(false)?;
+        let (request, _) = plan.into_parts();
+        let request_id = request.request_id.clone();
+        let generation = request.generation;
+        Some(AsyncCompileTicket {
+            request_id,
+            generation,
+            request,
+        })
+    }
+
+    /// Start the next queued request while preserving its complete target
+    /// plan. This worker path accepts both legacy and explicit-plan submits.
+    pub fn start_next_plan(&mut self) -> Option<AsyncCompilePlanTicket> {
+        let plan = self.start_next_inner(true)?;
+        Some(AsyncCompilePlanTicket {
+            request_id: plan.request().request_id.clone(),
+            generation: plan.request().generation,
+            plan,
+        })
+    }
+
+    fn start_next_inner(&mut self, plan_aware: bool) -> Option<CompilePlan> {
+        loop {
+            let queued = self.queued.front()?;
+            if !plan_aware && queued.requires_plan_worker {
+                return None;
+            }
+            let queued = self.queued.pop_front().expect("queued front exists");
+            let requires_plan_worker = queued.requires_plan_worker;
+            let plan = queued.plan;
+            let request = plan.request();
             if request.cancellation.is_cancelled() {
                 let response = terminal_response(
-                    &request,
+                    request,
                     CompileStatus::Cancelled,
                     "async.cancelled",
                     "async compile request cancelled before start",
@@ -1158,9 +1241,9 @@ impl AsyncCompileService {
                 continue;
             }
 
-            if request_is_stale(&request) {
+            if request_is_stale(request) {
                 let response = terminal_response(
-                    &request,
+                    request,
                     CompileStatus::Stale,
                     "async.stale_generation",
                     "async compile request stale before start",
@@ -1185,7 +1268,8 @@ impl AsyncCompileService {
             self.running.insert(
                 request_id.clone(),
                 RunningRequest {
-                    request: request.clone(),
+                    plan: plan.clone(),
+                    requires_plan_worker,
                 },
             );
             self.record_request_event(
@@ -1197,14 +1281,8 @@ impl AsyncCompileService {
                 None,
                 None,
             );
-            return Some(AsyncCompileTicket {
-                request_id,
-                generation,
-                request,
-            });
+            return Some(plan);
         }
-
-        None
     }
 
     /// Finish a running request and publish a non-installable result if the
@@ -1214,30 +1292,66 @@ impl AsyncCompileService {
         ticket: AsyncCompileTicket,
         response: CompileResponse,
     ) -> AsyncCompilePoll {
-        let Some(running) = self.running.remove(&ticket.request_id) else {
-            return self.poll(&ticket.request_id);
+        self.finish_inner(ticket.request_id, None, response)
+    }
+
+    fn finish_inner(
+        &mut self,
+        request_id: CompileRequestId,
+        ticket_plan: Option<CompilePlan>,
+        response: CompileResponse,
+    ) -> AsyncCompilePoll {
+        let Some(running) = self.running.remove(&request_id) else {
+            return self.poll(&request_id);
         };
 
-        let (mut state, mut response) = if running.request.cancellation.is_cancelled() {
+        let ticket_matches_running = ticket_plan.as_ref().is_some_and(|ticket_plan| {
+            ticket_plan.target_spec() == running.plan.target_spec()
+                && ticket_plan.request().request_id == running.plan.request().request_id
+                && ticket_plan.request().generation == running.plan.request().generation
+        });
+        let plan_response_mismatch = if running.requires_plan_worker {
+            !ticket_matches_running
+                || ticket_plan
+                    .as_ref()
+                    .is_none_or(|plan| !compile_response_matches_plan(&response, plan))
+        } else {
+            ticket_plan.as_ref().is_some_and(|plan| {
+                !ticket_matches_running || !compile_response_matches_plan(&response, plan)
+            })
+        };
+
+        let (mut state, mut response) = if running.plan.request().cancellation.is_cancelled() {
             (
                 AsyncCompileState::Cancelled,
                 terminal_response(
-                    &running.request,
+                    running.plan.request(),
                     CompileStatus::Cancelled,
                     "async.cancelled",
                     "async compile request cancelled before publish",
                     "async_compile.finish",
                 ),
             )
-        } else if request_is_stale(&running.request) {
+        } else if request_is_stale(running.plan.request()) {
             (
                 AsyncCompileState::StaleGeneration,
                 terminal_response(
-                    &running.request,
+                    running.plan.request(),
                     CompileStatus::Stale,
                     "async.stale_generation",
                     "async compile request stale before publish",
                     "async_compile.finish",
+                ),
+            )
+        } else if plan_response_mismatch {
+            (
+                AsyncCompileState::Rejected,
+                terminal_response(
+                    running.plan.request(),
+                    CompileStatus::Rejected,
+                    "async.compile_plan_mismatch",
+                    "async compile response did not match the running target-aware plan",
+                    "async_compile.finish_plan",
                 ),
             )
         } else {
@@ -1245,20 +1359,18 @@ impl AsyncCompileService {
         };
         let native_install_gate_blocker = if state == AsyncCompileState::CompiledInstallable {
             let response_native_install_gate = response_native_install_gate_packet(&response);
-            let native_install_gate = response_native_install_gate.clone().or_else(|| {
-                self.native_install_gate_packets
-                    .get(&ticket.request_id)
-                    .cloned()
-            });
+            let native_install_gate = response_native_install_gate
+                .clone()
+                .or_else(|| self.native_install_gate_packets.get(&request_id).cloned());
             if let Some(packet) = native_install_gate.clone() {
                 attach_async_poll_gate_packet(&mut response, packet.clone());
                 self.native_install_gate_packets
-                    .insert(ticket.request_id.clone(), packet);
+                    .insert(request_id.clone(), packet);
             }
             let blocker = response_gate_blocker(state, &response, native_install_gate.as_ref());
             if let Some(blocker) = blocker {
                 self.native_install_gate_blockers
-                    .insert(ticket.request_id.clone(), blocker);
+                    .insert(request_id.clone(), blocker);
                 response = gate_blocked_response(response, blocker);
                 state = AsyncCompileState::Rejected;
             }
@@ -1267,7 +1379,7 @@ impl AsyncCompileService {
             None
         };
 
-        self.insert_terminal(ticket.request_id.clone(), state, Some(response.clone()));
+        self.insert_terminal(request_id.clone(), state, Some(response.clone()));
         let finish_reason = native_install_gate_blocker
             .map(AsyncInstallGateBlockerCode::as_str)
             .or_else(|| terminal_reason_code(state, &response));
@@ -1315,10 +1427,19 @@ impl AsyncCompileService {
             | AsyncCompileState::NotFound => {}
         }
         AsyncCompilePoll {
-            request_id: ticket.request_id,
+            request_id,
             state,
             response: Some(response),
         }
+    }
+
+    /// Finish a target-aware running plan.
+    pub fn finish_plan(
+        &mut self,
+        ticket: AsyncCompilePlanTicket,
+        response: CompileResponse,
+    ) -> AsyncCompilePoll {
+        self.finish_inner(ticket.request_id, Some(ticket.plan), response)
     }
 
     /// Convenience synchronous worker hook for tests and simple integrations.
@@ -1329,6 +1450,16 @@ impl AsyncCompileService {
         let ticket = self.start_next()?;
         let response = compile(&self.service, ticket.request.clone());
         Some(self.finish(ticket, response))
+    }
+
+    /// Convenience target-aware worker hook for tests and simple integrations.
+    pub fn run_next_plan_with<F>(&mut self, compile: F) -> Option<AsyncCompilePoll>
+    where
+        F: FnOnce(&CompileService, CompilePlan) -> CompileResponse,
+    {
+        let ticket = self.start_next_plan()?;
+        let response = compile(&self.service, ticket.plan.clone());
+        Some(self.finish_plan(ticket, response))
     }
 
     /// Explain a terminal non-installable async state.
@@ -1436,7 +1567,7 @@ impl AsyncCompileService {
     fn has_active_request_id(&self, request_id: &CompileRequestId) -> bool {
         self.queued
             .iter()
-            .any(|request| request.request_id == *request_id)
+            .any(|queued| queued.plan.request().request_id == *request_id)
             || self.running.contains_key(request_id)
     }
 

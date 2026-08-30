@@ -8,7 +8,7 @@ The v0.1.0 labels here are deliberate provenance, not staleness: this evidence
 was taken against the v0.1.0 SAT-Comp package that
 [`docker/sat-comp-2026/Dockerfile`](../docker/sat-comp-2026/Dockerfile) still
 pins. Re-running it on a later release would require re-measuring, not
-relabelling. The current trust-cg release is 0.4.0; see
+relabelling. The current trust-cg release is 0.5.0; see
 [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## Release claim status

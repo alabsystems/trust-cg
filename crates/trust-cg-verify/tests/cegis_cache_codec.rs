@@ -23,9 +23,10 @@
 
 use rmp_serde as incumbent;
 use trust_cg_ir::{AArch64Opcode, MachInst, MachOperand, PReg, RegClass, SpecialReg, VReg};
+use trust_cg_verify::CacheCodecError;
 use trust_cg_verify::cegis_pass::{
-    CegisCacheEntry, MachInstBlob, MachOperandBlob, ProvenRewrite, RegClassBlob, RewriteLayer,
-    SpecialRegBlob,
+    CegisCacheEntry, CegisSearchCompletion, MachInstBlob, MachOperandBlob, ProvenRewrite,
+    RegClassBlob, RewriteLayer, SpecialRegBlob,
 };
 
 // ---------------------------------------------------------------------------
@@ -146,6 +147,7 @@ fn gen_entry(rng: &mut Rng) -> CegisCacheEntry {
     let n = rng.below(5);
     CegisCacheEntry {
         version: CegisCacheEntry::VERSION,
+        completion: CegisSearchCompletion::Complete,
         proven_rewrites: (0..n).map(|_| gen_rewrite(rng)).collect(),
         attempted: rng.next(),
         verified: rng.next(),
@@ -224,6 +226,7 @@ fn every_variant_entry() -> CegisCacheEntry {
     ];
     CegisCacheEntry {
         version: CegisCacheEntry::VERSION,
+        completion: CegisSearchCompletion::Complete,
         proven_rewrites: vec![
             ProvenRewrite {
                 inst_index: u32::MAX,
@@ -328,6 +331,7 @@ fn a_real_machinst_projection_round_trips() {
     );
     let entry = CegisCacheEntry {
         version: CegisCacheEntry::VERSION,
+        completion: CegisSearchCompletion::Complete,
         proven_rewrites: vec![ProvenRewrite {
             inst_index: 3,
             proof_hash: 0xDEAD_BEEF,
@@ -518,6 +522,7 @@ fn a_real_v5_messagepack_blob_is_a_miss() {
 fn a_current_format_blob_carrying_the_wrong_version_is_a_miss() {
     let entry = CegisCacheEntry {
         version: CegisCacheEntry::VERSION + 1,
+        completion: CegisSearchCompletion::Complete,
         ..Default::default()
     };
     let bytes = entry.encode().expect("encode");
@@ -525,10 +530,55 @@ fn a_current_format_blob_carrying_the_wrong_version_is_a_miss() {
 }
 
 #[test]
-fn the_version_is_six() {
+fn the_version_is_seven() {
     // Pins the bump itself. If someone reverts the codec without reverting the
     // version, or vice versa, exactly one of the two lands and this fires.
-    assert_eq!(CegisCacheEntry::VERSION, 6);
+    assert_eq!(CegisCacheEntry::VERSION, 7);
+}
+
+#[test]
+fn incomplete_entries_cannot_be_published_or_replayed() {
+    let complete_bytes = CegisCacheEntry::empty().encode().expect("complete encode");
+    // magic (4) + version (4) puts the completion tag at byte 8.
+    assert_eq!(
+        complete_bytes[8], 1,
+        "completion tag moved; update this test"
+    );
+
+    for (completion, wire_tag) in [
+        (CegisSearchCompletion::NotCompleted, 0),
+        (CegisSearchCompletion::DeadlineExceeded, 2),
+        (CegisSearchCompletion::QueryIncomplete, 3),
+        (CegisSearchCompletion::VerifierError, 4),
+        (CegisSearchCompletion::VerifierPanicked, 5),
+    ] {
+        let mut entry = CegisCacheEntry::empty();
+        entry.completion = completion;
+        assert_eq!(
+            entry.encode(),
+            Err(CacheCodecError::IncompleteSearch { completion }),
+            "{completion:?} must fail closed at publication"
+        );
+
+        // Model bytes written by a buggy/older internal producer. Even a
+        // structurally valid current-format entry must miss unless it records
+        // a complete search.
+        let mut incomplete_bytes = complete_bytes.clone();
+        incomplete_bytes[8] = wire_tag;
+        assert_eq!(
+            CegisCacheEntry::decode(&incomplete_bytes),
+            None,
+            "{completion:?} must fail closed at replay"
+        );
+    }
+}
+
+#[test]
+fn an_unknown_completion_tag_is_a_miss() {
+    let mut bytes = CegisCacheEntry::empty().encode().expect("encode");
+    assert_eq!(bytes[8], 1, "completion tag moved; update this test");
+    bytes[8] = u8::MAX;
+    assert_eq!(CegisCacheEntry::decode(&bytes), None);
 }
 
 // ---------------------------------------------------------------------------
@@ -586,6 +636,7 @@ fn a_corrupt_length_prefix_is_a_miss() {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"TCGC");
     bytes.extend_from_slice(&CegisCacheEntry::VERSION.to_le_bytes());
+    bytes.push(1); // completion = Complete
     bytes.extend_from_slice(&0u64.to_le_bytes()); // attempted
     bytes.extend_from_slice(&0u64.to_le_bytes()); // verified
     bytes.extend_from_slice(&0u64.to_le_bytes()); // rejected
@@ -600,7 +651,7 @@ fn foreign_bytes_are_a_miss() {
         &b"TCG"[..],
         &b"TCGD"[..],
         &b"\x95\x05\x90\x00\x00\x00"[..], // a MessagePack 5-array
-        &b"{\"version\":6}"[..],
+        &b"{\"version\":7}"[..],
         &[0xFFu8; 256][..],
         &[0x00u8; 256][..],
     ] {
@@ -645,6 +696,7 @@ fn an_unknown_operand_tag_is_a_miss() {
     // known value.
     let entry = CegisCacheEntry {
         version: CegisCacheEntry::VERSION,
+        completion: CegisSearchCompletion::Complete,
         proven_rewrites: vec![ProvenRewrite {
             inst_index: 0,
             proof_hash: 0,
@@ -674,6 +726,7 @@ fn an_unknown_operand_tag_is_a_miss() {
 fn a_non_utf8_symbol_is_a_miss() {
     let entry = CegisCacheEntry {
         version: CegisCacheEntry::VERSION,
+        completion: CegisSearchCompletion::Complete,
         proven_rewrites: vec![ProvenRewrite {
             inst_index: 0,
             proof_hash: 0,

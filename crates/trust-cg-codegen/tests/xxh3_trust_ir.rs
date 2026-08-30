@@ -21,6 +21,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "common/skip.rs"]
+mod skip;
+
 use trust_cg_codegen::pipeline::{OptLevel, Pipeline, PipelineConfig};
 
 use trust_ir::{BinOp, ICmpOp, Inst, InstrNode};
@@ -84,18 +87,6 @@ fn v(n: u32) -> ValueId {
 
 fn b(n: u32) -> BlockId {
     BlockId::new(n)
-}
-
-fn is_aarch64() -> bool {
-    cfg!(target_arch = "aarch64")
-}
-
-fn has_cc() -> bool {
-    Command::new("cc")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
 }
 
 fn make_test_dir(test_name: &str) -> PathBuf {
@@ -1026,7 +1017,7 @@ int main(int argc, char** argv) {
 /// End-to-end test: compile xxh3, link with C driver, run with empty input.
 #[test]
 fn test_xxh3_e2e_empty() {
-    if !is_aarch64() || !has_cc() {
+    if !skip::aarch64_linkrun_or_skip("test_xxh3_e2e_empty") {
         return;
     }
 
@@ -1071,7 +1062,7 @@ fn test_xxh3_e2e_empty() {
 /// End-to-end test: compile xxh3, link, run with "test" (4 bytes).
 #[test]
 fn test_xxh3_e2e_4byte() {
-    if !is_aarch64() || !has_cc() {
+    if !skip::aarch64_linkrun_or_skip("test_xxh3_e2e_4byte") {
         return;
     }
 
@@ -1104,7 +1095,7 @@ fn test_xxh3_e2e_4byte() {
 /// End-to-end test: compile xxh3, link, run with "a" (1 byte).
 #[test]
 fn test_xxh3_e2e_1byte() {
-    if !is_aarch64() || !has_cc() {
+    if !skip::aarch64_linkrun_or_skip("test_xxh3_e2e_1byte") {
         return;
     }
 
@@ -1137,7 +1128,7 @@ fn test_xxh3_e2e_1byte() {
 /// End-to-end test: 8-byte input (exercises the 4-8 path boundary).
 #[test]
 fn test_xxh3_e2e_8byte() {
-    if !is_aarch64() || !has_cc() {
+    if !skip::aarch64_linkrun_or_skip("test_xxh3_e2e_8byte") {
         return;
     }
 
@@ -1170,7 +1161,7 @@ fn test_xxh3_e2e_8byte() {
 /// End-to-end test: 16-byte input (exercises the 9-16 path).
 #[test]
 fn test_xxh3_e2e_16byte() {
-    if !is_aarch64() || !has_cc() {
+    if !skip::aarch64_linkrun_or_skip("test_xxh3_e2e_16byte") {
         return;
     }
 
@@ -1205,7 +1196,7 @@ fn test_xxh3_e2e_16byte() {
 /// the empty-input case that depends on const-fold.
 #[test]
 fn test_xxh3_e2e_1byte_o2_bisect_382() {
-    if !is_aarch64() || !has_cc() {
+    if !skip::aarch64_linkrun_or_skip("test_xxh3_e2e_1byte_o2_bisect_382") {
         return;
     }
 
@@ -1244,7 +1235,7 @@ fn test_xxh3_e2e_1byte_o2_bisect_382() {
 /// result to the reference implementation.
 #[test]
 fn test_xxh3_e2e_o2_compiles_and_runs() {
-    if !is_aarch64() || !has_cc() {
+    if !skip::aarch64_linkrun_or_skip("test_xxh3_e2e_o2_compiles_and_runs") {
         return;
     }
 
@@ -1291,7 +1282,7 @@ fn test_xxh3_e2e_o2_compiles_and_runs() {
 /// eliding the shared MOVKs across registers. Gated on aarch64 + cc.
 #[test]
 fn test_xxh3_o2_empty_input_regression_366() {
-    if !is_aarch64() || !has_cc() {
+    if !skip::aarch64_linkrun_or_skip("test_xxh3_o2_empty_input_regression_366") {
         return;
     }
 
@@ -1389,7 +1380,7 @@ fn test_xxh3_instruction_count() {
 /// hash must be bit-exact against the xxHash v0.8.2 reference.
 #[test]
 fn test_xxh3_e2e_12byte_fingerprint_vector() {
-    if !is_aarch64() || !has_cc() {
+    if !skip::aarch64_linkrun_or_skip("test_xxh3_e2e_12byte_fingerprint_vector") {
         return;
     }
 

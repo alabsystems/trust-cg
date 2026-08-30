@@ -1639,9 +1639,9 @@ pub struct X86InstructionSelector {
     /// Callee symbol names the module-level purity fixpoint proved pure. A
     /// direct call to a name in this set gets `InstFlags::PURE_CALL_HOISTABLE`
     /// stamped on its `X86Opcode::Call` (metadata only — the call's side-effect
-    /// flags are left intact). Empty unless `TCG_PURE_FN_ANALYSIS` is enabled
-    /// and the caller seeds it via `seed_pure_callees`. Mirrors the AArch64
-    /// `isel.rs` `pure_callees` plumbing.
+    /// flags are left intact). The caller seeds it from deterministic structural
+    /// analysis via `seed_pure_callees`. Mirrors the AArch64 `isel.rs`
+    /// `pure_callees` plumbing.
     pure_callees: HashSet<String>,
 }
 

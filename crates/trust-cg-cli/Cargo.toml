@@ -25,7 +25,6 @@ path = "src/bin/ty_replay_jit_probe.rs"
 
 [dependencies]
 trust-cg-codegen = { workspace = true }
-trust-cg-ir = { workspace = true }
 trust-cg-opt = { workspace = true }
 trust-cg-verify = { workspace = true }
 trust-ir = { workspace = true, features = ["serde"] }
@@ -34,10 +33,10 @@ clap = { version = "4", features = ["derive"] }
 rayon = "1.10"
 
 [dev-dependencies]
-trust-cg-codegen = { workspace = true }
-trust-ir = { workspace = true, features = ["serde"] }
+# Only `tests/pgo_profile_use.rs` names trust-cg-ir directly; the binaries
+# reach its types through trust-cg-codegen.
+trust-cg-ir = { workspace = true }
 trust-ir-build = { workspace = true }
-serde_json = { workspace = true }
 # The REFERENCE wasm validator (Bytecode Alliance), same pin the codegen
 # crate's `tests/wasm_module_validation.rs` uses: the CLI wasm-lane tests
 # claim the emitted bytes are a well-formed module, so they validate them with

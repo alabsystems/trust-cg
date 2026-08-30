@@ -65,22 +65,6 @@ fn probe(name: &str, arg: &str) -> VersionInfo {
     }
 }
 
-/// Discover tool presence + version without shelling out beyond
-/// `--version`. Returns `VersionInfo` for each requested name.
-///
-/// # Errors
-/// Currently infallible; returns `Result` for forward-compatibility.
-pub fn probe_many<I, S>(names: I) -> Result<Vec<VersionInfo>>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<str>,
-{
-    Ok(names
-        .into_iter()
-        .map(|n| probe(n.as_ref(), "--version"))
-        .collect())
-}
-
 macro_rules! tool {
     ($(#[$attr:meta])* $name:ident, $bin:expr, $version_arg:expr) => {
         $(#[$attr])*

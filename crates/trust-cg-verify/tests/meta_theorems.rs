@@ -33,7 +33,7 @@
 //       the coverage-error list, not on silence.
 //   (e) The 4 headline coverage numbers are pinned exactly. Every uncovered row
 //       must be an explicit `DeferredUnfaithfulModel`, never a wiring gap.
-//       AArch64 is 156/248 with 92 explicit model gaps; x86-64 is 167/196
+//       AArch64 is 156/248 with 92 explicit model gaps; x86-64 is 168/197
 //       with 29; RISC-V is 14/17 with 3; wasm is 111/113 with 2 (the two
 //       INTEGER constant rows closed by P4's independent LEB decoder; the two
 //       FLOAT constant rows joined the mirror with the same work and are named
@@ -625,7 +625,13 @@ fn meta_e_headline_coverage_is_pinned_and_honest() {
         // covered by the MemRmw reconstruction (MemStore ∘ MemAlu composition
         // over the shared independent EA encoders; wrong EA / Add-for-Xor /
         // dropped-src / plain-store REFUTE). Nothing emits the quartet yet.
-        (GateArch::X86_64, 196usize, 167usize),
+        // 167/196 -> 168/197 (rotate Stage 1): RolRCl (variable-count rotate)
+        // -> EmittableNeedsProof, covered by the RotlVar reconstruction (the
+        // bridge's masked shl/shr/or rotate idiom vs the hardware-masked
+        // encode_rol_rcl_masked, total/precondition-free; ROR-for-ROL /
+        // dropped wrap half / unmasked count / wrong mask / SHL-for-ROL
+        // REFUTE). Nothing emits RolRCl yet.
+        (GateArch::X86_64, 197usize, 168usize),
     ];
     for (arch, emittable_pin, covered_pin) in pins {
         let report = on_large_stack(move || CoverageGate::new().audit(arch));

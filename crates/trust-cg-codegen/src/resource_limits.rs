@@ -5,11 +5,17 @@
 
 //! Shared host resource limits for Trust Codegen-owned compilation paths.
 
+use std::num::NonZeroUsize;
 use std::path::Path;
+
+use trust_cg_process_env::resource_budget::{
+    ArtifactNeutralExecutorBudget, ArtifactNeutralExecutorDefaults, HostResourceSnapshot,
+    PROOF_VERIFIER_STACK_BYTES,
+};
 
 /// Environment variable controlling the maximum Rayon worker count used by
 /// Trust Codegen-owned compilation fanout.
-pub const TRUST_CG_MAX_PARALLELISM_ENV: &str = "TRUST_CG_MAX_PARALLELISM";
+pub use trust_cg_process_env::resource_budget::TRUST_CG_MAX_PARALLELISM_ENV;
 
 /// Environment variable controlling the maximum input file size accepted by
 /// the trust_ir loader before reading the whole module into memory.
@@ -18,7 +24,7 @@ pub const TRUST_CG_MAX_INPUT_BYTES_ENV: &str = "TRUST_CG_MAX_INPUT_BYTES";
 /// Floor for the regalloc+encode fanout when host memory cannot be determined.
 ///
 /// This is the historical fixed cap. It is now a FLOOR rather than the value:
-/// see [`memory_adaptive_parallelism_default`].
+/// see [`memory_adaptive_parallelism_default_for_host`].
 const DEFAULT_MAX_PARALLELISM: usize = 2;
 
 /// Memory budgeted per concurrent regalloc+encode worker.
@@ -138,20 +144,47 @@ fn verification_worker_count_for_items_with_limit(
 /// exists, which means something else — plausibly the host compiler — got there
 /// first and owns the policy. We defer to it rather than fight over it.
 pub fn bound_global_rayon_pool() {
-    let available = std::thread::available_parallelism().map_or(1, usize::from);
-    let workers = match std::env::var(TRUST_CG_MAX_PARALLELISM_ENV)
-        .ok()
-        .as_deref()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-    {
-        Some(explicit) => explicit,
-        None => DEFAULT_MAX_PARALLELISM,
-    };
+    let workers = artifact_neutral_parallelism_limit(
+        NonZeroUsize::new(DEFAULT_MAX_PARALLELISM).expect("global pool default must be positive"),
+    )
+    .get();
     let _ = rayon::ThreadPoolBuilder::new()
-        .num_threads(workers.min(available).max(1))
+        .num_threads(workers)
         .thread_name(|idx| format!("trust-cg-global-{idx}"))
         .build_global();
+}
+
+/// Resolve a compatibility worker cap through the shared typed contract.
+///
+/// This helper is only for work-complete, order-stable lanes. Search lanes must
+/// carry an identity-bound search policy instead. A malformed or zero
+/// `TRUST_CG_MAX_PARALLELISM` fails closed with a deterministic panic because
+/// legacy callers return an integer rather than `Result`.
+#[must_use]
+pub fn artifact_neutral_parallelism_limit(default_limit: NonZeroUsize) -> NonZeroUsize {
+    capture_executor_budget(
+        default_limit.get(),
+        1,
+        HostResourceSnapshot::capture_cpu_only(),
+    )
+    .cpu_slots()
+}
+
+/// Resolve a large-stack worker cap through the shared memory-aware contract.
+///
+/// Unlike [`artifact_neutral_parallelism_limit`], this captures host memory and
+/// ensures `slots * 32 MiB` does not exceed known available memory. A frontend
+/// can impose a lower lane-specific `hard_limit` without re-parsing ambient
+/// controls.
+#[must_use]
+pub fn artifact_neutral_large_stack_slot_limit(
+    default_limit: NonZeroUsize,
+    hard_limit: NonZeroUsize,
+) -> NonZeroUsize {
+    let host = HostResourceSnapshot::capture();
+    let resolved =
+        capture_executor_budget(default_limit.get(), default_limit.get(), host).large_stack_slots();
+    NonZeroUsize::new(resolved.get().min(hard_limit.get())).unwrap_or(NonZeroUsize::MIN)
 }
 
 /// Build a bounded Rayon pool for Trust Codegen-owned fanout.
@@ -182,34 +215,25 @@ pub(crate) fn read_utf8_bounded(path: &Path) -> Result<String, String> {
 }
 
 fn configured_parallelism_limit() -> usize {
-    let available = std::thread::available_parallelism().map_or(1, usize::from);
-    parse_parallelism_limit_with_default(
-        std::env::var(TRUST_CG_MAX_PARALLELISM_ENV).ok().as_deref(),
-        available,
-        memory_adaptive_parallelism_default(available),
-    )
+    let host = HostResourceSnapshot::capture();
+    let default = memory_adaptive_parallelism_default_for_host(host);
+    capture_executor_budget(default, 1, host).cpu_slots().get()
 }
 
-/// Host-available memory in bytes, or `None` when it cannot be determined.
-///
-/// Uses `MemAvailable` (not `MemFree`): it is the kernel's own estimate of what
-/// is obtainable without swapping, which is exactly the question here.
-fn host_available_memory_bytes() -> Option<u64> {
-    #[cfg(target_os = "linux")]
-    {
-        let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-        for line in meminfo.lines() {
-            if let Some(rest) = line.strip_prefix("MemAvailable:") {
-                let kib: u64 = rest.split_whitespace().next()?.parse().ok()?;
-                return Some(kib.saturating_mul(1024));
-            }
-        }
-        None
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        None
-    }
+fn capture_executor_budget(
+    default_cpu_slots: usize,
+    default_large_stack_slots: usize,
+    host: HostResourceSnapshot,
+) -> ArtifactNeutralExecutorBudget {
+    let defaults = ArtifactNeutralExecutorDefaults::new(
+        NonZeroUsize::new(default_cpu_slots).expect("executor CPU default must be positive"),
+        NonZeroUsize::new(default_large_stack_slots)
+            .expect("executor large-stack default must be positive"),
+        NonZeroUsize::new(PROOF_VERIFIER_STACK_BYTES)
+            .expect("proof-verifier stack reservation must be positive"),
+    );
+    ArtifactNeutralExecutorBudget::capture_for_host(defaults, host)
+        .unwrap_or_else(|error| panic!("invalid Trust Codegen execution resource budget: {error}"))
 }
 
 /// Default worker cap for the memory-hungry regalloc+encode fanout, scaled to
@@ -224,14 +248,23 @@ fn host_available_memory_bytes() -> Option<u64> {
 /// resource the cap exists to protect. It never returns less than the
 /// historical [`DEFAULT_MAX_PARALLELISM`], never exceeds host parallelism, and
 /// falls back to the historical value when memory is unknown. An explicit
-/// `TRUST_CG_MAX_PARALLELISM` still wins (see
-/// [`parse_parallelism_limit_with_default`]).
+/// `TRUST_CG_MAX_PARALLELISM` still wins through the shared typed executor
+/// budget.
 ///
 /// Worker count never affects output — the fanout collects into a
 /// function-ordered vector, so artifacts are byte-identical at any width.
 #[must_use]
+#[cfg(test)]
 fn memory_adaptive_parallelism_default(available_parallelism: usize) -> usize {
-    let Some(mem) = host_available_memory_bytes() else {
+    memory_adaptive_parallelism_default_for_host(HostResourceSnapshot::new(
+        NonZeroUsize::new(available_parallelism).unwrap_or(NonZeroUsize::MIN),
+        HostResourceSnapshot::capture().available_memory_bytes(),
+    ))
+}
+
+fn memory_adaptive_parallelism_default_for_host(host: HostResourceSnapshot) -> usize {
+    let available_parallelism = host.available_parallelism().get();
+    let Some(mem) = host.available_memory_bytes().map(std::num::NonZeroU64::get) else {
         // ⚑ Clamp here too. This early return is the ONLY path that skipped
         // `.min(available_parallelism)`, so on any host where the memory probe
         // yields nothing — every non-Linux target, which is where the probe is
@@ -248,30 +281,6 @@ fn memory_adaptive_parallelism_default(available_parallelism: usize) -> usize {
 
 fn configured_input_byte_limit() -> u64 {
     parse_input_byte_limit(std::env::var(TRUST_CG_MAX_INPUT_BYTES_ENV).ok().as_deref())
-}
-
-/// Historical fixed-default resolution, retained so the pre-adaptive contract
-/// stays pinned by tests. Production resolves through
-/// [`parse_parallelism_limit_with_default`] with a host-adaptive default.
-#[cfg(test)]
-fn parse_parallelism_limit(raw: Option<&str>, available: usize) -> usize {
-    parse_parallelism_limit_with_default(raw, available, DEFAULT_MAX_PARALLELISM)
-}
-
-/// Resolve the fanout width: an explicit operator limit always wins; otherwise
-/// `default_limit` (host-adaptive in production) applies. Both are clamped to
-/// host parallelism and to at least one worker.
-fn parse_parallelism_limit_with_default(
-    raw: Option<&str>,
-    available: usize,
-    default_limit: usize,
-) -> usize {
-    let available = available.max(1);
-    let configured = raw
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(default_limit);
-    configured.min(available).max(1)
 }
 
 fn parse_input_byte_limit(raw: Option<&str>) -> u64 {
@@ -301,46 +310,42 @@ mod tests {
 
     #[test]
     fn parallelism_limit_defaults_to_bounded_host_cap() {
-        assert_eq!(parse_parallelism_limit(None, 64), DEFAULT_MAX_PARALLELISM);
-        assert_eq!(parse_parallelism_limit(Some("999"), 4), 4);
-        assert_eq!(parse_parallelism_limit(Some("1"), 64), 1);
-        assert_eq!(
-            parse_parallelism_limit(Some("bad"), 64),
-            DEFAULT_MAX_PARALLELISM
-        );
-        assert_eq!(
-            parse_parallelism_limit(Some("0"), 64),
-            DEFAULT_MAX_PARALLELISM
-        );
+        trust_cg_process_env::with_env_overrides_removed(&[TRUST_CG_MAX_PARALLELISM_ENV], || {
+            let host = HostResourceSnapshot::new(NonZeroUsize::new(64).unwrap(), None);
+            let budget = capture_executor_budget(DEFAULT_MAX_PARALLELISM, 1, host);
+            assert_eq!(budget.cpu_slots().get(), DEFAULT_MAX_PARALLELISM);
+        });
     }
 
     #[test]
     fn worker_count_disables_parallelism_below_two_workers() {
-        assert_eq!(worker_count_for_items(0), None);
-        assert_eq!(worker_count_for_items(1), None);
-        // Work-aware width: a handful of items stays SERIAL rather than
-        // spawning a thread per item. An ordinary crate's CGU is this size, and
-        // the full-width fanout measured 8% more CPU for no wall gain there.
-        assert_eq!(worker_count_for_items(2), None, "2 items must not fan out");
-        assert_eq!(
-            worker_count_for_items(9),
-            None,
-            "corpus-sized CGU stays serial"
-        );
-        assert_eq!(
-            worker_count_for_items(31),
-            None,
-            "under 2 workers' worth of items"
-        );
-        // Genuinely large modules still fan out, bounded by items/16.
-        assert!(
-            worker_count_for_items(32).is_some_and(|w| w >= 2),
-            "32 items is two workers' worth"
-        );
-        assert!(
-            worker_count_for_items(129).is_some_and(|w| w >= 2 && w <= 8),
-            "129 items yields at most items/16 workers"
-        );
+        trust_cg_process_env::with_env_overrides_removed(&[TRUST_CG_MAX_PARALLELISM_ENV], || {
+            assert_eq!(worker_count_for_items(0), None);
+            assert_eq!(worker_count_for_items(1), None);
+            // Work-aware width: a handful of items stays SERIAL rather than
+            // spawning a thread per item. An ordinary crate's CGU is this size, and
+            // the full-width fanout measured 8% more CPU for no wall gain there.
+            assert_eq!(worker_count_for_items(2), None, "2 items must not fan out");
+            assert_eq!(
+                worker_count_for_items(9),
+                None,
+                "corpus-sized CGU stays serial"
+            );
+            assert_eq!(
+                worker_count_for_items(31),
+                None,
+                "under 2 workers' worth of items"
+            );
+            // Genuinely large modules still fan out, bounded by items/16.
+            assert!(
+                worker_count_for_items(32).is_some_and(|w| w >= 2),
+                "32 items is two workers' worth"
+            );
+            assert!(
+                worker_count_for_items(129).is_some_and(|w| w >= 2 && w <= 8),
+                "129 items yields at most items/16 workers"
+            );
+        });
     }
 
     #[test]
@@ -356,23 +361,6 @@ mod tests {
             verification_worker_count_for_items_with_limit(3, 8),
             Some(3)
         );
-    }
-
-    /// An explicit operator limit ALWAYS wins over the host-adaptive default —
-    /// including when it is lower. A machine-derived default must never be able
-    /// to exceed a stated limit.
-    #[test]
-    fn explicit_parallelism_limit_overrides_adaptive_default() {
-        assert_eq!(parse_parallelism_limit_with_default(Some("3"), 64, 32), 3);
-        assert_eq!(parse_parallelism_limit_with_default(Some("1"), 64, 32), 1);
-        // Explicit above host parallelism still clamps to the host.
-        assert_eq!(parse_parallelism_limit_with_default(Some("999"), 8, 2), 8);
-        // No explicit limit -> the adaptive default, clamped to the host.
-        assert_eq!(parse_parallelism_limit_with_default(None, 64, 12), 12);
-        assert_eq!(parse_parallelism_limit_with_default(None, 4, 12), 4);
-        // Invalid/zero explicit values fall back to the adaptive default.
-        assert_eq!(parse_parallelism_limit_with_default(Some("bad"), 64, 9), 9);
-        assert_eq!(parse_parallelism_limit_with_default(Some("0"), 64, 9), 9);
     }
 
     /// The adaptive default is bounded on both sides: never below the historical
@@ -399,7 +387,10 @@ mod tests {
     #[test]
     fn many_core_host_with_memory_is_not_capped_at_two() {
         let cores = std::thread::available_parallelism().map_or(1, usize::from);
-        let Some(mem) = host_available_memory_bytes() else {
+        let Some(mem) = HostResourceSnapshot::capture()
+            .available_memory_bytes()
+            .map(std::num::NonZeroU64::get)
+        else {
             return; // memory unknown -> conservative fallback is correct
         };
         let backable = (mem / PARALLELISM_MEMORY_BUDGET_PER_WORKER) as usize;

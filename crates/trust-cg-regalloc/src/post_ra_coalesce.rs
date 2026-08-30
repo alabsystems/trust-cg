@@ -980,7 +980,7 @@ fn try_narrow_zext_collapse(
         return false;
     }
 
-    for &inst_id in prior_insts.iter().rev() {
+    for (prior_pos, &inst_id) in prior_insts.iter().enumerate().rev() {
         let inst = &func.insts[inst_id.0 as usize];
 
         if inst.opcode == NOP_OPCODE {
@@ -988,9 +988,46 @@ fn try_narrow_zext_collapse(
         }
 
         if defines_preg(inst, ext_src) {
-            if !can_retarget_source_def(inst, ext_src, narrow_dst, cfg)
-                || !writes_narrow_view_zero_extended(inst.opcode)
+            // (a) WHOLE-PAIR no-op: the producer is a pure narrow register
+            // move of the extension destination's own low half —
+            // `Copy/MovR/MOVWrr Wt <- Xd` followed by `UXTW Xd <- Wt` is
+            // `Xd = zext32(low32(Xd))`, whose only effect is zeroing bits
+            // 63:32 of `Xd`. When those bits are already provably zero at the
+            // producer, BOTH instructions are architectural no-ops: delete
+            // both (`mov w1, w0 ; mov w0, w1` in a hot loop -> nothing).
+            //
+            // Safety of deleting the producer: the walk from the extension
+            // down to here already proved no intervening instruction reads or
+            // writes any alias of `ext_src` or `ext_dst`, and
+            // `preg_live_after_copy` proved `ext_src` dead after the
+            // extension, so `ext_src`'s value is consumed only by the deleted
+            // extension. Safety of deleting the extension: `ext_dst` is not
+            // written between the producer and the extension (same walk), so
+            // its high half is still zero and its low half is exactly what
+            // the extension would have re-materialized.
+            if pure_narrow_gpr_move_source(inst, ext_src) == Some(ext_dst)
+                && gpr64_high_half_known_zero(func, &prior_insts[..prior_pos], ext_dst)
             {
+                nop_inst(&mut func.insts[inst_id.0 as usize]);
+                return true;
+            }
+
+            // (b) Retarget the producer to write the narrow destination
+            // directly. Beyond the audited ALU allowlist, admit the
+            // allocator's own copy pseudos (`PSEUDO_COPY` / ISel `Copy`) with
+            // a register source: `Copy Wt <- s ; UXTW Xd <- Wt` becomes
+            // `Copy Wd <- s`, which `lower_copies` emits as the 32-bit
+            // `MOVWrr wd, w(s)` (width from the DESTINATION class) — a 32-bit
+            // register write that zeroes bits 63:32 of `Xd`, bit-identical to
+            // what the extension produced. This is the post-call
+            // narrow-return shape (`bl f ; copy w1 <- x0 ; uxtw x0 <- w1`)
+            // the opcode allowlists refuse today. The source must not be the
+            // narrow destination itself: retargeting would create an IDENTITY
+            // copy that `lower_copies` deletes outright, losing the zeroing.
+            let retargetable = (can_retarget_source_def(inst, ext_src, narrow_dst, cfg)
+                && writes_narrow_view_zero_extended(inst.opcode))
+                || retargetable_copy_pseudo_producer(inst, ext_src, narrow_dst);
+            if !retargetable {
                 return false;
             }
 
@@ -1018,6 +1055,121 @@ fn try_narrow_zext_collapse(
         }
     }
 
+    false
+}
+
+/// If `inst` is a pure two-operand GPR register move writing EXACTLY the GPR32
+/// register `narrow_def` from a single explicit `PReg` source, return that
+/// source. Covers the allocator's copy pseudos (`PSEUDO_COPY`, ISel `Copy`)
+/// and the real GPR32-destination moves (`MovR`, `MOVWrr`) — every one is
+/// emitted as a 32-bit `mov wd, w(src)`. Fail-closed on implicit operands,
+/// call/ABI-marked instructions, and any other operand shape.
+fn pure_narrow_gpr_move_source(inst: &MachInst, narrow_def: PReg) -> Option<PReg> {
+    use trust_cg_ir::inst::AArch64Opcode;
+    if trust_cg_ir::regs::preg_class(narrow_def) != trust_cg_ir::regs::RegClass::Gpr32 {
+        return None;
+    }
+    let opcode_is_gpr_move = crate::phi_elim::is_copy_opcode(inst.opcode)
+        || inst.opcode == AArch64Opcode::MovR as u16
+        || inst.opcode == AArch64Opcode::MOVWrr as u16;
+    if !opcode_is_gpr_move {
+        return None;
+    }
+    if inst.flags.is_call() || inst.flags.is_call_arg_setup() {
+        return None;
+    }
+    if !inst.implicit_defs.is_empty() || !inst.implicit_uses.is_empty() {
+        return None;
+    }
+    if inst.defs.len() != 1 || inst.uses.len() != 1 {
+        return None;
+    }
+    if inst.defs.first().and_then(MachOperand::as_preg) != Some(narrow_def) {
+        return None;
+    }
+    inst.uses.first().and_then(MachOperand::as_preg)
+}
+
+/// Copy-pseudo admission for the narrow-zext retarget path: `inst` is a pure
+/// copy pseudo defining exactly `ext_src` from a GPR register source that is
+/// NOT `narrow_dst` itself (retargeting would otherwise create an identity
+/// copy that `lower_copies` deletes, losing the 32-bit write's zeroing of the
+/// destination's high half).
+fn retargetable_copy_pseudo_producer(inst: &MachInst, ext_src: PReg, narrow_dst: PReg) -> bool {
+    if !crate::phi_elim::is_copy_opcode(inst.opcode) {
+        return false;
+    }
+    let Some(src) = pure_narrow_gpr_move_source(inst, ext_src) else {
+        return false;
+    };
+    let src_class = trust_cg_ir::regs::preg_class(src);
+    (src_class == trust_cg_ir::regs::RegClass::Gpr32
+        || src_class == trust_cg_ir::regs::RegClass::Gpr64)
+        && src != narrow_dst
+}
+
+/// Are bits 63:32 of the GPR64 register `wide_preg` provably ZERO after the
+/// given instruction prefix executes (block-local, fail-closed)?
+///
+/// Scans backward for the instruction that decides `wide_preg`'s high half:
+///
+/// * an EXACT single-def write of the GPR32 view by an opcode audited to
+///   encode a 32-bit register write ([`writes_narrow_view_zero_extended`])
+///   zeroes the high half — proven;
+/// * an EXACT single-def `AndRI` write of the GPR64 view in the 3-operand
+///   `defs=[dst], uses=[src, Imm(mask)]` layout whose literal bitmask has zero
+///   high bits forces `hi32(result) = hi32(src) & 0 = 0` — proven (the
+///   immediate must be non-zero: `Imm(0)` is also the blinded form of
+///   relocation-bearing operands; the pre-decomposed `(N, immr, imms)` operand
+///   layout is NOT a literal mask and is refused by the operand-count check);
+/// * a call — unproven, fail closed, whatever its implicit-def list says;
+/// * any other write touching an alias of `wide_preg` (including implicit
+///   defs) — unproven, fail closed;
+/// * block entry reached — unproven, fail closed.
+fn gpr64_high_half_known_zero(
+    func: &MachFunction,
+    insts_before: &[InstId],
+    wide_preg: PReg,
+) -> bool {
+    use trust_cg_ir::inst::AArch64Opcode;
+    let Some(narrow_view) = trust_cg_ir::regs::gpr64_to_gpr32(wide_preg) else {
+        return false;
+    };
+    for &inst_id in insts_before.iter().rev() {
+        let inst = &func.insts[inst_id.0 as usize];
+
+        if inst.opcode == NOP_OPCODE {
+            continue;
+        }
+
+        if inst.flags.is_call() {
+            return false;
+        }
+
+        let single_pure_def = inst.implicit_defs.is_empty() && inst.defs.len() == 1;
+        let exact_def = inst.defs.first().and_then(MachOperand::as_preg);
+
+        if single_pure_def
+            && exact_def == Some(narrow_view)
+            && writes_narrow_view_zero_extended(inst.opcode)
+        {
+            return true;
+        }
+
+        if single_pure_def
+            && exact_def == Some(wide_preg)
+            && inst.opcode == AArch64Opcode::AndRI as u16
+            && inst.uses.len() == 2
+            && matches!(inst.uses.get(1), Some(MachOperand::Imm(mask))
+                if *mask != 0 && (*mask as u64) >> 32 == 0)
+        {
+            return true;
+        }
+
+        if defines_preg_or_alias(inst, wide_preg) {
+            return false;
+        }
+    }
     false
 }
 
@@ -2429,6 +2581,160 @@ mod tests {
 
         assert_eq!(result.copies_removed, 0);
         assert_eq!(func.blocks[0].insts.len(), 3);
+    }
+
+    #[test]
+    fn test_narrow_zext_pair_deleted_when_high_half_known_zero() {
+        // and x0, x3, #63       (mask high half provably zero)
+        // mov w1, w0            (MovR, GPR32 dst — truncation `as u32`)
+        // uxtw x0, w1           (`mov w0, w1`)
+        // ret (implicitly uses x0)
+        //
+        // The move/extension pair is `X0 = zext32(low32(X0))` and bits 63:32
+        // of X0 are already zero after the AND — BOTH instructions go.
+        let mut func = make_function(vec![vec![
+            imm_form_inst(trust_cg_ir::inst::AArch64Opcode::AndRI as u16, X0, X3, 63),
+            preg_copy_with_opcode(trust_cg_ir::inst::AArch64Opcode::MovR as u16, W1, X0),
+            uxtw_inst(X0, W1),
+            ret_inst(vec![X0]),
+        ]]);
+
+        let result = post_ra_coalesce(&mut func);
+
+        assert_eq!(result.copies_removed, 1);
+        assert_eq!(func.blocks[0].insts.len(), 2);
+        let and = &func.insts[func.blocks[0].insts[0].0 as usize];
+        assert_eq!(and.opcode, trust_cg_ir::inst::AArch64Opcode::AndRI as u16);
+        assert_eq!(and.defs, vec![MachOperand::PReg(X0)]);
+        let ret = &func.insts[func.blocks[0].insts[1].0 as usize];
+        assert_eq!(ret.opcode, trust_cg_ir::inst::AArch64Opcode::Ret as u16);
+    }
+
+    #[test]
+    fn test_narrow_zext_pair_kept_when_and_mask_has_high_bits() {
+        // and x0, x3, #0xFF00000000 — the mask keeps high bits, so bits 63:32
+        // of X0 are NOT provably zero: the pair must not vanish. The MovR
+        // producer is on the retarget allowlist, so the pair collapses to the
+        // single 32-bit move `mov w0, w0` (MovR W0 <- X0) instead.
+        let mut func = make_function(vec![vec![
+            imm_form_inst(
+                trust_cg_ir::inst::AArch64Opcode::AndRI as u16,
+                X0,
+                X3,
+                0xFF_0000_0000,
+            ),
+            preg_copy_with_opcode(trust_cg_ir::inst::AArch64Opcode::MovR as u16, W1, X0),
+            uxtw_inst(X0, W1),
+            ret_inst(vec![X0]),
+        ]]);
+
+        let result = post_ra_coalesce(&mut func);
+
+        assert_eq!(result.copies_removed, 1);
+        assert_eq!(func.blocks[0].insts.len(), 3);
+        let mov = &func.insts[func.blocks[0].insts[1].0 as usize];
+        assert_eq!(mov.opcode, trust_cg_ir::inst::AArch64Opcode::MovR as u16);
+        assert_eq!(mov.defs, vec![MachOperand::PReg(W0)]);
+        assert_eq!(mov.uses, vec![MachOperand::PReg(X0)]);
+    }
+
+    #[test]
+    fn test_narrow_zext_pair_kept_when_and_is_predecomposed() {
+        // `AndRI X0, X3, N=1, immr=0, imms=32` — the pre-decomposed
+        // `(N, immr, imms)` operand layout the encoder also accepts. Operand 1
+        // is `Imm(1)` (N), not a literal mask; this encodes a 33-bit mask
+        // whose high half is NOT zero. The prover must refuse the layout
+        // outright rather than read `N` as a mask.
+        let mut func = make_function(vec![vec![
+            MachInst {
+                opcode: trust_cg_ir::inst::AArch64Opcode::AndRI as u16,
+                defs: vec![MachOperand::PReg(X0)],
+                uses: vec![
+                    MachOperand::PReg(X3),
+                    MachOperand::Imm(1),
+                    MachOperand::Imm(0),
+                    MachOperand::Imm(32),
+                ],
+                implicit_defs: Vec::new(),
+                implicit_uses: Vec::new(),
+                flags: InstFlags::default(),
+                tied_operands: vec![],
+            },
+            preg_copy_with_opcode(trust_cg_ir::inst::AArch64Opcode::MovR as u16, W1, X0),
+            uxtw_inst(X0, W1),
+            ret_inst(vec![X0]),
+        ]]);
+
+        let result = post_ra_coalesce(&mut func);
+
+        // Not the whole-pair deletion: three instructions remain.
+        assert_eq!(result.copies_removed, 1);
+        assert_eq!(func.blocks[0].insts.len(), 3);
+        let mov = &func.insts[func.blocks[0].insts[1].0 as usize];
+        assert_eq!(mov.opcode, trust_cg_ir::inst::AArch64Opcode::MovR as u16);
+        assert_eq!(mov.defs, vec![MachOperand::PReg(W0)]);
+    }
+
+    #[test]
+    fn test_narrow_zext_pair_kept_as_single_move_after_call() {
+        // bl f                  (X0 = call result; high half UNKNOWN)
+        // copy w1 <- x0         (allocator copy pseudo)
+        // uxtw x0, w1
+        // ret (implicitly uses x0)
+        //
+        // The high half is not provably zero, so the pair cannot vanish; but
+        // the copy PSEUDO is a legal zext-collapse producer: retargeting it to
+        // W0 emits the 32-bit `mov w0, w0`, which zeroes bits 63:32 exactly as
+        // the extension did — one instruction instead of two.
+        let mut func = make_function(vec![vec![
+            call_inst(vec![X0, X1]),
+            preg_copy(W1, X0),
+            uxtw_inst(X0, W1),
+            ret_inst(vec![X0]),
+        ]]);
+
+        let result = post_ra_coalesce(&mut func);
+
+        assert_eq!(result.copies_removed, 1);
+        assert_eq!(func.blocks[0].insts.len(), 3);
+        let copy = &func.insts[func.blocks[0].insts[1].0 as usize];
+        assert_eq!(copy.opcode, PSEUDO_COPY);
+        assert_eq!(copy.defs, vec![MachOperand::PReg(W0)]);
+        assert_eq!(copy.uses, vec![MachOperand::PReg(X0)]);
+    }
+
+    #[test]
+    fn test_narrow_zext_copy_producer_refused_when_retarget_is_identity() {
+        // copy w1 <- w0 ; uxtw x0, w1: retargeting the producer to W0 would
+        // create the identity `copy w0 <- w0`, which copy lowering deletes
+        // outright — losing the high-half zeroing the UXTW performed. Must be
+        // refused (X2's def below keeps W0's high-half provenance unknown).
+        let mut func = make_function(vec![vec![
+            preg_inst(trust_cg_ir::inst::AArch64Opcode::LdrRI as u16, &[X0], &[X2]),
+            preg_copy(W1, W0),
+            uxtw_inst(X0, W1),
+            ret_inst(vec![X0]),
+        ]]);
+
+        let result = post_ra_coalesce(&mut func);
+
+        assert_eq!(result.copies_removed, 0);
+        assert_eq!(func.blocks[0].insts.len(), 4);
+    }
+
+    #[test]
+    fn test_narrow_zext_pair_kept_under_kill_switch() {
+        let mut func = make_function(vec![vec![
+            imm_form_inst(trust_cg_ir::inst::AArch64Opcode::AndRI as u16, X0, X3, 63),
+            preg_copy_with_opcode(trust_cg_ir::inst::AArch64Opcode::MovR as u16, W1, X0),
+            uxtw_inst(X0, W1),
+            ret_inst(vec![X0]),
+        ]]);
+
+        let result = post_ra_coalesce_with_config(&mut func, PostRACoalesceConfig::NARROW);
+
+        assert_eq!(result.copies_removed, 0);
+        assert_eq!(func.blocks[0].insts.len(), 4);
     }
 
     #[test]

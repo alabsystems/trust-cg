@@ -908,8 +908,22 @@ fn resolve_invariant_const(
     let mut cur = v;
     for _ in 0..8 {
         let mut only_def: Option<(Block, &X86ISelInst)> = None;
+        let mut probe: HashSet<VReg> = HashSet::new();
+        probe.insert(cur);
         for (&b, blk) in &func.blocks {
             for inst in &blk.insts {
+                // This scan rests on `def_vreg`, the operand-0 def model,
+                // which cannot see an `Xchg`-class SECOND def. A hidden-def
+                // instruction MENTIONING `cur` anywhere in the function may
+                // rewrite it between the `MovRI` and the loop, leaving
+                // `only_def` at exactly one while the runtime value is no
+                // longer `c` — and every caller acts on the answer (the
+                // `CmpRR` bound, the IV step, and the `MovRI` seed planted
+                // INSIDE the unrolled body). Refuse, the same fail-closed
+                // discipline the header/body/preheader scans already apply.
+                if has_hidden_defs(inst.opcode) && inst_mentions_any(inst, &probe) {
+                    return None;
+                }
                 if def_vreg(inst) == Some(cur) {
                     if only_def.is_some() {
                         return None; // multi-def
@@ -1970,6 +1984,73 @@ mod tests {
             .insts
             .insert(0, inst(X86Opcode::Xchg, vec![vr(4), vr(0)]));
         assert!(!run(&mut f));
+    }
+
+    /// Build the `counted_loop` fixture with an extra ENTRY block ahead of
+    /// the preheader: `MID -> PRE -> HDR ...`. The entry block is the only
+    /// place a hidden-def instruction can sit "between the MovRI and the
+    /// loop" without being caught by the preheader / header / body scans.
+    fn counted_loop_with_entry(init: i64, step: i64, limit: i64) -> X86ISelFunction {
+        let mut f = counted_loop(init, step, limit);
+        f.block_order = vec![MID, PRE, HDR, LATCH, EXIT];
+        let e = f.blocks.get_mut(&MID).unwrap();
+        e.insts = vec![inst(X86Opcode::Jmp, vec![blk(PRE)])];
+        e.successors = vec![PRE];
+        f
+    }
+
+    #[test]
+    fn refuses_hidden_def_clobbered_cmprr_bound() {
+        // The whole-function invariant-const scan rests on the operand-0 def
+        // model, which cannot see `Xchg`'s SECOND def. Here the bound vreg
+        // v9 is `MovRI #4` in the entry block and is then EXCHANGED (so it
+        // holds a runtime value at the loop). Reading it as the constant 4
+        // would simulate a trip count for a bound the loop never sees.
+        let mut f = counted_loop_with_entry(0, 1, 999);
+        {
+            let e = f.blocks.get_mut(&MID).unwrap();
+            e.insts = vec![
+                inst(X86Opcode::MovRI, vec![vr(9), imm(4)]),
+                inst(X86Opcode::Xchg, vec![vr(4), vr(9)]),
+                inst(X86Opcode::Jmp, vec![blk(PRE)]),
+            ];
+        }
+        let hdr = f.blocks.get_mut(&HDR).unwrap();
+        hdr.insts[0] = inst(X86Opcode::CmpRR, vec![vr(0), vr(9)]);
+        assert!(!run(&mut f), "hidden-def-clobbered bound must refuse");
+    }
+
+    #[test]
+    fn refuses_hidden_def_clobbered_seed_vreg() {
+        // Same hole on the SEED path: v12 is `MovRI #7` in the entry block,
+        // exchanged before the loop, and read by the body. Seeding
+        // `MovRI v12,#7` inside the unrolled body would overwrite v12's real
+        // runtime value for every body read of it.
+        let mut f = counted_loop_with_entry(0, 1, 4);
+        {
+            let e = f.blocks.get_mut(&MID).unwrap();
+            e.insts = vec![
+                inst(X86Opcode::MovRI, vec![vr(12), imm(7)]),
+                inst(X86Opcode::Xchg, vec![vr(4), vr(12)]),
+                inst(X86Opcode::Jmp, vec![blk(PRE)]),
+            ];
+        }
+        {
+            let latch = f.blocks.get_mut(&LATCH).unwrap();
+            latch
+                .insts
+                .insert(0, inst(X86Opcode::AddRR, vec![vr(1), vr(12)]));
+        }
+        let unrolled = run(&mut f);
+        let seeded_stale = f.blocks[&LATCH]
+            .insts
+            .iter()
+            .any(|i| i.opcode == X86Opcode::MovRI && i.operands.as_slice() == [vr(12), imm(7)]);
+        assert!(
+            !seeded_stale,
+            "a hidden-def-clobbered vreg must never be re-seeded with its stale constant \
+             (unrolled={unrolled})"
+        );
     }
 
     #[test]

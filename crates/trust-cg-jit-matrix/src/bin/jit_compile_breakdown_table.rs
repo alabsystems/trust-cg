@@ -375,7 +375,10 @@ fn main() -> ExitCode {
     for _ in 0..args.repetitions {
         let t = Instant::now();
         let payload = decode_buffer_payload(&warm_bytes).expect("decode");
-        let replayed = publish_decoded_payload(payload).expect("publish");
+        // SAFETY: `payload` was serialized immediately above from a buffer
+        // produced by this live Trust Codegen process and has not crossed an
+        // untrusted persistence boundary.
+        let replayed = unsafe { publish_decoded_payload(payload) }.expect("publish");
         bytes_replay.record(t.elapsed());
         std::hint::black_box(replayed);
     }

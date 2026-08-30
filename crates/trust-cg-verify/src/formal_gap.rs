@@ -153,3 +153,28 @@ pub fn print_gap_skip(context: &str, reason: &str) {
          once an authority ships externally checkable proofs."
     );
 }
+
+/// The uniform loud line for a lib test that returns early because an
+/// EXTERNAL authority it depends on is absent — the ay solver plus a capable
+/// independent Clean/Carcara checker, or an explicit env override the test
+/// insists on. One grep-able stderr line, `SKIP <test>: <reason>`; the caller
+/// keeps its own `return`, so the skip condition and control flow are exactly
+/// what they were — only the silence is gone.
+pub fn skip_test(test: &str, reason: &str) {
+    eprintln!("SKIP {test}: {reason}");
+}
+
+/// `skip_test` reason: `ay_bridge::z3_available()` is false — no ay solver
+/// paired with a CAPABLE independent checker (AY alone is not proof authority).
+pub const NO_PROOF_AUTHORITY: &str = "no ay solver with a capable Clean/Carcara checker \
+     (set AY_SOLVER_PATH and TCG_EXTERNAL_CLEAN_CHECKER / install ay + clean to run)";
+
+/// `skip_test` reason: an ay binary may exist but no capable independent
+/// checker does, so nothing can be promoted to `Verified`.
+pub const NO_CLEAN_CHECKER: &str = "no capable independent Clean/Carcara checker \
+     (set TCG_EXTERNAL_CLEAN_CHECKER / install clean to run)";
+
+/// `skip_test` reason: the test runs only against EXPLICITLY named authority
+/// binaries and both env overrides are not set.
+pub const NO_EXPLICIT_AUTHORITY_ENV: &str = "AY_SOLVER_PATH and TCG_EXTERNAL_CLEAN_CHECKER \
+     are not both set (set AY_SOLVER_PATH and TCG_EXTERNAL_CLEAN_CHECKER to run)";

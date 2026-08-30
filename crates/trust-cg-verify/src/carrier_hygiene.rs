@@ -776,6 +776,13 @@ fn wide_read(opcode: X86Opcode) -> Option<(RequiredExtension, WideOperandSel)> {
         X86Opcode::ShrRR | X86Opcode::ShrRI => {
             Some((RequiredExtension::Zero, WideOperandSel::ShiftSrc))
         }
+        // ROL by CL reads the shiftee UNSIGNED across the ENTIRE carrier: its
+        // wrap half is exactly a logical right shift of the full register, so
+        // a narrow value's dirty high bits would rotate INTO the low result
+        // bits. NOT the ShlRR posture (a pure left shift never reads high
+        // bits into the low part) — the wrap half makes rotates SHR-like
+        // consumers. Operand 1 (`[dst, src]`).
+        X86Opcode::RolRCl => Some((RequiredExtension::Zero, WideOperandSel::ShiftSrc)),
         _ => None,
     }
 }

@@ -83,42 +83,6 @@ pub enum CmpOp {
 }
 
 impl CmpOp {
-    /// Convert to an ICmpOp if this is an integer comparison.
-    pub fn to_icmp(&self) -> Option<ICmpOp> {
-        match self {
-            CmpOp::Eq => Some(ICmpOp::Eq),
-            CmpOp::Ne => Some(ICmpOp::Ne),
-            CmpOp::Slt => Some(ICmpOp::Slt),
-            CmpOp::Sle => Some(ICmpOp::Sle),
-            CmpOp::Sgt => Some(ICmpOp::Sgt),
-            CmpOp::Sge => Some(ICmpOp::Sge),
-            CmpOp::Ult => Some(ICmpOp::Ult),
-            CmpOp::Ule => Some(ICmpOp::Ule),
-            CmpOp::Ugt => Some(ICmpOp::Ugt),
-            CmpOp::Uge => Some(ICmpOp::Uge),
-            _ => None,
-        }
-    }
-
-    /// Convert to an FCmpOp if this is a float comparison.
-    pub fn to_fcmp(&self) -> Option<FCmpOp> {
-        match self {
-            CmpOp::FOeq => Some(FCmpOp::OEq),
-            CmpOp::FOne => Some(FCmpOp::ONe),
-            CmpOp::FOlt => Some(FCmpOp::OLt),
-            CmpOp::FOle => Some(FCmpOp::OLe),
-            CmpOp::FOgt => Some(FCmpOp::OGt),
-            CmpOp::FOge => Some(FCmpOp::OGe),
-            CmpOp::FUeq => Some(FCmpOp::UEq),
-            CmpOp::FUne => Some(FCmpOp::UNe),
-            CmpOp::FUlt => Some(FCmpOp::ULt),
-            CmpOp::FUle => Some(FCmpOp::ULe),
-            CmpOp::FUgt => Some(FCmpOp::UGt),
-            CmpOp::FUge => Some(FCmpOp::UGe),
-            _ => None,
-        }
-    }
-
     /// Returns true if this is a float comparison.
     pub fn is_float(&self) -> bool {
         matches!(
@@ -136,40 +100,6 @@ impl CmpOp {
                 | CmpOp::FUgt
                 | CmpOp::FUge
         )
-    }
-
-    /// Create from an ICmpOp.
-    pub fn from_icmp(op: ICmpOp) -> Self {
-        match op {
-            ICmpOp::Eq => CmpOp::Eq,
-            ICmpOp::Ne => CmpOp::Ne,
-            ICmpOp::Slt => CmpOp::Slt,
-            ICmpOp::Sle => CmpOp::Sle,
-            ICmpOp::Sgt => CmpOp::Sgt,
-            ICmpOp::Sge => CmpOp::Sge,
-            ICmpOp::Ult => CmpOp::Ult,
-            ICmpOp::Ule => CmpOp::Ule,
-            ICmpOp::Ugt => CmpOp::Ugt,
-            ICmpOp::Uge => CmpOp::Uge,
-        }
-    }
-
-    /// Create from an FCmpOp.
-    pub fn from_fcmp(op: FCmpOp) -> Self {
-        match op {
-            FCmpOp::OEq => CmpOp::FOeq,
-            FCmpOp::ONe => CmpOp::FOne,
-            FCmpOp::OLt => CmpOp::FOlt,
-            FCmpOp::OLe => CmpOp::FOle,
-            FCmpOp::OGt => CmpOp::FOgt,
-            FCmpOp::OGe => CmpOp::FOge,
-            FCmpOp::UEq => CmpOp::FUeq,
-            FCmpOp::UNe => CmpOp::FUne,
-            FCmpOp::ULt => CmpOp::FUlt,
-            FCmpOp::ULe => CmpOp::FUle,
-            FCmpOp::UGt => CmpOp::FUgt,
-            FCmpOp::UGe => CmpOp::FUge,
-        }
     }
 }
 
@@ -215,28 +145,6 @@ impl Operand {
     pub fn bool_const(value: bool) -> Self {
         Operand::Constant(OperandConstant::Bool(value))
     }
-
-    pub fn is_constant(&self) -> bool {
-        matches!(self, Operand::Constant(_))
-    }
-
-    pub fn is_value(&self) -> bool {
-        matches!(self, Operand::Value(_))
-    }
-
-    pub fn as_value(&self) -> Option<ValueId> {
-        match self {
-            Operand::Value(v) => Some(*v),
-            _ => None,
-        }
-    }
-
-    pub fn as_constant(&self) -> Option<&OperandConstant> {
-        match self {
-            Operand::Constant(c) => Some(c),
-            _ => None,
-        }
-    }
 }
 
 impl From<ValueId> for Operand {
@@ -273,14 +181,6 @@ pub enum Visibility {
 }
 
 impl Visibility {
-    pub fn is_default(&self) -> bool {
-        matches!(self, Visibility::Default)
-    }
-
-    pub fn is_hidden(&self) -> bool {
-        matches!(self, Visibility::Hidden)
-    }
-
     pub fn macho_flags(&self) -> u8 {
         match self {
             Visibility::Default | Visibility::Protected => 0x01,
@@ -319,14 +219,6 @@ impl DataLayout {
             int_align: vec![(8, 1), (16, 2), (32, 4), (64, 8), (128, 16)],
         }
     }
-
-    pub fn align_of_int(&self, bits: u16) -> u32 {
-        self.int_align
-            .iter()
-            .find(|(b, _)| *b == bits)
-            .map(|(_, a)| *a)
-            .unwrap_or((bits as u32).div_ceil(8))
-    }
 }
 
 /// Linkage type (Trust Codegen extension, not in real trust_ir).
@@ -352,18 +244,4 @@ pub struct GlobalDef {
     pub visibility: Visibility,
     pub initializer: Option<Vec<u8>>,
     pub align: Option<u32>,
-}
-
-/// Legacy SwitchCase from old stubs (value was i64, no args).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct LegacySwitchCase {
-    pub value: i64,
-    pub target: BlockId,
-}
-
-/// Landing pad clause (Trust Codegen extension, not in real trust_ir).
-#[derive(Debug, Clone, PartialEq)]
-pub enum LandingPadClause {
-    Catch(Ty),
-    Filter(Vec<Ty>),
 }

@@ -38,7 +38,6 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-arbitrary = { version = "1", features = ["derive"] }
 
 trust-cg-ir = { path = "../crates/trust-cg-ir" }
 trust-cg-lower = { path = "../crates/trust-cg-lower" }

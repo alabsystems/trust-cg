@@ -634,3 +634,104 @@ fn second_run_is_a_no_op_for_every_firing_variant() {
         }
     }
 }
+
+/// Rewrite the guard's accumulator zero-seed `Movz g(94), #0` to `#k` — i.e.
+/// give the loop-carried accumulator a NON-ZERO entry value
+/// (`acc = k; for i … acc += f(i)`).
+fn set_acc_init_const(func: &mut MachFunction, k: i64) {
+    let mut patched = 0usize;
+    for idx in 0..func.insts.len() {
+        let inst = &func.insts[idx];
+        if inst.opcode == AArch64Opcode::Movz
+            && matches!(inst.operands.first(), Some(MachOperand::VReg(v)) if v.id == 94)
+        {
+            func.insts[idx].operands[1] = i(k);
+            patched += 1;
+        }
+    }
+    assert_eq!(patched, 1, "exactly one acc zero-seed to rewrite");
+}
+
+#[test]
+fn bails_when_accumulator_does_not_enter_as_zero() {
+    // The emitter seeds a FRESH `svec = 0.0` and OVERWRITES `acc`/`acc_src` with
+    // it at the vector exit, so a non-zero incoming accumulator would be
+    // silently DISCARDED. Recognition must refuse the loop.
+    for k in [1_i64, 0x4014_0000_0000_0000 /* 5.0 */, -1] {
+        let mut func = build_loop(1, Accum::PlainFadd, false, false);
+        set_acc_init_const(&mut func, k);
+        let mut pass = NeonFPRedPass::new();
+        assert!(
+            !pass.run(&mut func),
+            "must bail on a non-zero accumulator init (bits {k:#x})"
+        );
+        assert_eq!(pass.fired(), 0);
+    }
+}
+
+#[test]
+fn bails_when_accumulator_init_is_not_provably_constant() {
+    // An accumulator seeded from an opaque value (e.g. an `f64` parameter) has
+    // no provable `+0.0` entry — fail closed.
+    let mut func = build_loop(1, Accum::PlainFadd, false, false);
+    // Replace `Movz g(94), #0` with a copy from an unknown GPR, so the FMOV's
+    // source no longer resolves to a constant.
+    for idx in 0..func.insts.len() {
+        let inst = &func.insts[idx];
+        if inst.opcode == AArch64Opcode::Movz
+            && matches!(inst.operands.first(), Some(MachOperand::VReg(v)) if v.id == 94)
+        {
+            func.insts[idx] = MachInst::new(AArch64Opcode::MovR, vec![g(94), g(96)]);
+        }
+    }
+    let mut pass = NeonFPRedPass::new();
+    assert!(
+        !pass.run(&mut func),
+        "must bail when the accumulator init is not a provable +0.0"
+    );
+}
+
+#[test]
+fn zero_seeded_accumulator_still_vectorizes() {
+    // The guarded-in shape (`acc = 0.0`) is unchanged: it must still fire.
+    let mut func = build_loop(1, Accum::PlainFadd, false, false);
+    let mut pass = NeonFPRedPass::new();
+    assert!(pass.run(&mut func));
+    assert_eq!(pass.fired(), 1);
+}
+
+#[test]
+fn accepts_the_isel_zero_seed_through_an_fpr_copy() {
+    // Real isel emits the f64 zero seed as `Movz Xn,#0; FMOV Dz,Xn; FMOV Dacc,Dz`
+    // — one FPR-to-FPR copy level between the accumulator and the zero. The gate
+    // must see through it (else the canonical `acc = 0.0` loop stops vectorizing).
+    let mut func = build_loop(1, Accum::PlainFadd, false, false);
+    // Redirect `FmovGprFpr f(11), g(94)` to a temp f(50), then copy f(50)->f(11).
+    let mut seed_pos = None;
+    for idx in 0..func.insts.len() {
+        let inst = &func.insts[idx];
+        if inst.opcode == AArch64Opcode::FmovGprFpr
+            && matches!(inst.operands.first(), Some(MachOperand::VReg(v)) if v.id == 11)
+        {
+            func.insts[idx].operands[0] = f(50);
+            seed_pos = Some(InstId(idx as u32));
+        }
+    }
+    let seed = seed_pos.expect("acc zero seed");
+    let copy = func.push_inst(MachInst::new(AArch64Opcode::FmovFprFpr, vec![f(11), f(50)]));
+    let guard = func.entry;
+    let at = func
+        .block(guard)
+        .insts
+        .iter()
+        .position(|&i| i == seed)
+        .unwrap();
+    func.block_mut(guard).insts.insert(at + 1, copy);
+
+    let mut pass = NeonFPRedPass::new();
+    assert!(
+        pass.run(&mut func),
+        "the copied-through zero seed must still vectorize"
+    );
+    assert_eq!(pass.fired(), 1);
+}

@@ -98,7 +98,7 @@ fn neon_bytesum_hw0_movz_movk_chain_reaches_real_encoder() {
     // Canonical optimizer materialization is an hw0 MOVZ seed followed by a
     // MOVK halfword repair: MOVZ #0; MOVK #1, LSL #16.
     let mut func = bytesum_loop(65_536 + 127);
-    let mut pass = NeonBytesumPass::new();
+    let mut pass = NeonBytesumPass::new().with_aarch64_dotprod(true);
     assert!(pass.run(&mut func));
     assert_eq!(pass.fired(), 1);
 

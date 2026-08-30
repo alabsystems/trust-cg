@@ -4980,6 +4980,10 @@ mod tests {
     #[test]
     fn correct_iadd_i32_refines() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "correct_iadd_i32_refines",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         let mir = MirRvalue::BinaryOp {
@@ -5011,6 +5015,10 @@ mod tests {
     #[test]
     fn correct_udiv_i32_refines() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "correct_udiv_i32_refines",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         let mir = MirRvalue::BinaryOp {
@@ -5311,6 +5319,10 @@ mod tests {
     #[test]
     fn correct_use_is_identity() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "correct_use_is_identity",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         let mir = MirRvalue::Use { src: var_s32("a") };
@@ -5372,6 +5384,10 @@ mod tests {
     #[test]
     fn check_rvalue_lowering_end_to_end() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "check_rvalue_lowering_end_to_end",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         let mir = MirRvalue::BinaryOp {
@@ -5531,6 +5547,10 @@ mod tests {
     #[test]
     fn correct_raw_sdiv_i32_refines() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "correct_raw_sdiv_i32_refines",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         let mir = MirRvalue::BinaryOp {
@@ -5625,6 +5645,10 @@ mod tests {
     #[test]
     fn correct_raw_sdiv_i128_does_not_false_refute() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "correct_raw_sdiv_i128_does_not_false_refute",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         let mir = MirRvalue::BinaryOp {
@@ -5653,6 +5677,10 @@ mod tests {
     #[test]
     fn sdiv_as_udiv_is_refuted_i128() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "sdiv_as_udiv_is_refuted_i128",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         let mir = MirRvalue::BinaryOp {
@@ -5712,6 +5740,10 @@ mod tests {
     #[test]
     fn correct_raw_srem_refines() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "correct_raw_srem_refines",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         let mir_i8 = MirRvalue::BinaryOp {
@@ -7707,6 +7739,10 @@ mod tests {
     #[test]
     fn mem_store_then_load_same_addr_refines() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "mem_store_then_load_same_addr_refines",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         let source = vec![
@@ -7752,6 +7788,10 @@ mod tests {
     #[test]
     fn mem_wrong_offset_load_is_refuted_with_probe() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "mem_wrong_offset_load_is_refuted_with_probe",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         let source = vec![
@@ -7825,6 +7865,10 @@ mod tests {
     #[test]
     fn mem_dropped_store_is_refuted_with_probe() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "mem_dropped_store_is_refuted_with_probe",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         let source = vec![
@@ -7892,6 +7936,10 @@ mod tests {
     #[test]
     fn mem_dropped_store_no_load_caught_by_final_memory_with_probe() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "mem_dropped_store_no_load_caught_by_final_memory_with_probe",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         let source = vec![
@@ -7958,6 +8006,10 @@ mod tests {
     #[test]
     fn mem_reordered_aliasing_stores_unsound_is_refuted_with_probe() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "mem_reordered_aliasing_stores_unsound_is_refuted_with_probe",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         let a = MemAddr::base("p");
@@ -8033,6 +8085,10 @@ mod tests {
     #[test]
     fn mem_reordered_distinct_stores_sound_refines() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "mem_reordered_distinct_stores_sound_refines",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         let a = MemAddr::at("p", 0);
@@ -8156,6 +8212,10 @@ mod tests {
     #[test]
     fn mem_unknown_alias_with_disjointness_precondition_refines() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "mem_unknown_alias_with_disjointness_precondition_refines",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         let p = MemAddr::base("p");
@@ -8425,6 +8485,10 @@ mod tests {
     #[test]
     fn mem2_spurious_bridge_store_at_distinct_offset_is_refuted_with_probe() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "mem2_spurious_bridge_store_at_distinct_offset_is_refuted_with_probe",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         let source = vec![
@@ -8527,6 +8591,10 @@ mod tests {
     #[test]
     fn mem_field_load_at_layout_offset_refines() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "mem_field_load_at_layout_offset_refines",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         // `o.b.x` resolves to byte offset 16, an 8-byte (i64) leaf.
@@ -8585,6 +8653,10 @@ mod tests {
     #[test]
     fn mem_field_load_wrong_offset_is_refuted_with_probe() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "mem_field_load_wrong_offset_is_refuted_with_probe",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         let fv = SmtExpr::var("fv".to_string(), 64);
@@ -8826,6 +8898,10 @@ mod tests {
     #[test]
     fn correct_select_diamond_refines() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "correct_select_diamond_refines",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         let block = diamond_select_block();

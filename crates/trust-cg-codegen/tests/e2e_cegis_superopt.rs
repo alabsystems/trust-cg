@@ -7,10 +7,12 @@
 // pipeline and expose direct observability for integration tests.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use trust_cg_codegen::pipeline::{
-    CegisPassStats, OptLevel, Pipeline, PipelineConfig, build_add_test_function,
-};
+#[cfg(feature = "verify")]
+use trust_cg_codegen::pipeline::CegisPassStats;
+use trust_cg_codegen::pipeline::{OptLevel, Pipeline, PipelineConfig, build_add_test_function};
+#[cfg(feature = "verify")]
 use trust_cg_ir::regs::X0;
+#[cfg(feature = "verify")]
 use trust_cg_ir::{
     AArch64Opcode, MachFunction, MachInst, MachOperand, RegClass, Signature, Type as IrType, VReg,
 };

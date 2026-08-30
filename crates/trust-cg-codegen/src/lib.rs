@@ -71,6 +71,7 @@ pub mod ay_sat_helper_replacement_contract;
 pub mod branch_forward;
 pub mod coff;
 pub mod compile_artifact_cache_profile;
+pub mod compile_policy;
 pub mod compile_service;
 pub mod compiler;
 pub mod constant_pool;
@@ -84,6 +85,11 @@ pub mod dwarf_info;
 pub mod elf;
 pub mod post_index_late;
 pub use trust_cg_process_env as env_lock;
+pub use trust_cg_process_env::{
+    ARTIFACT_REUSE_ENV_EXEMPT_KEYS, ArtifactReuseEnvironmentSafety, ArtifactReusePermit,
+    COMPILER_CONTROL_ENV_PREFIXES, artifact_reuse_environment_safety,
+    artifact_reuse_environment_safety_from, artifact_reuse_permit,
+};
 pub mod error;
 pub mod exception_handling;
 pub mod frame;
@@ -123,8 +129,9 @@ pub mod wasm;
 pub mod x86_64;
 
 pub use async_compile_service::{
-    AsyncCompilePoll, AsyncCompileService, AsyncCompileServiceConfig, AsyncCompileState,
-    AsyncCompileTicket, AsyncSubmitAccepted, AsyncSubmitReject, AsyncSubmitRejectCode,
+    AsyncCompilePlanTicket, AsyncCompilePoll, AsyncCompileService, AsyncCompileServiceConfig,
+    AsyncCompileState, AsyncCompileTicket, AsyncSubmitAccepted, AsyncSubmitReject,
+    AsyncSubmitRejectCode,
 };
 pub use compile_artifact_cache_profile::{
     COMPILE_ARTIFACT_CACHE_TELEMETRY_ARTIFACT_REUSE_STATUS_CODES,
@@ -149,12 +156,17 @@ pub use compile_artifact_cache_profile::{
     TRUST_COMPILE_ARTIFACT_CACHE_SCHEMA, TRUST_COMPILE_ARTIFACT_CACHE_SCHEMA_VERSION,
     compile_artifact_cache_telemetry_descriptor,
 };
+pub use compile_policy::{
+    COMPILE_POLICY_SCHEMA, COMPILE_POLICY_SCHEMA_VERSION, CompilePolicy, CompilePolicyDigest,
+    CompilePolicyDigests, CompilePolicyError, CompilePolicyPartition, CompilePolicyScope,
+    MAX_COMPILE_POLICY_ENCODING_BYTES,
+};
 pub use compile_service::{
     ArtifactIdentity, ArtifactIdentityInput, ArtifactKind, ArtifactManifestReference,
     ArtifactMetadata, ArtifactPayload, ArtifactProvenance, CancellationToken, CompileDiagnostic,
-    CompileGeneration, CompileGenerationFence, CompileProfile, CompileProfileId, CompileRequest,
-    CompileRequestId, CompileResponse, CompileService, CompileServiceConfig, CompileStatus,
-    CompiledArtifact, CounterSummary, DiagnosticSeverity, EntryPointMetadata,
+    CompileGeneration, CompileGenerationFence, CompilePlan, CompileProfile, CompileProfileId,
+    CompileRequest, CompileRequestId, CompileResponse, CompileService, CompileServiceConfig,
+    CompileStatus, CompiledArtifact, CounterSummary, DiagnosticSeverity, EntryPointMetadata,
     ExecutableArtifactPayload, ExpandedCompileProfile, FunctionArtifactMetadata, InstallIntent,
     InstallMetadata, InstallProofSummary, InstalledArtifact, ObjectArtifactPayload,
     ProofInstallTelemetrySummary, RawExternBinding, SourceKind,
@@ -550,8 +562,9 @@ pub use pgo_runner::{
     run_host_jit_pgo_with_symbols,
 };
 pub use pipeline::{
-    CoreMLOutput, DispatchVerifyMode, FormatMode, InputFormat, PhaseTimings, Pipeline,
-    PipelineConfig, PipelineError, PreparationMetrics, ProofOptimizationCertificateCitation,
+    AArch64ModuleEmission, CegisPassRun, CegisPassStats, CegisRunOutcome, CoreMLOutput,
+    DispatchVerifyMode, FormatMode, InputFormat, PhaseTimings, Pipeline, PipelineConfig,
+    PipelineError, PreparationMetrics, ProofOptimizationCertificateCitation,
     ProofOptimizationConsumedFactCitation, compile_to_object, detect_input_format,
     emit_coreml_program, generate_cpu_only_plan, generate_lsda_for_function, load_module,
     load_module_as, load_module_from_bytes,
@@ -562,7 +575,12 @@ pub use rewrite_admission::{
     REWRITE_ADMISSION_RECORD_SCHEMA_VERSION, RewriteAdmissionDisposition, RewriteAdmissionRecord,
     RewriteAdmissionRejection,
 };
-pub use target::{CallingConvention, Target};
+pub use target::{
+    AArch64IsaFeature, AArch64IsaProfile, AArch64MachineCodeEvidence, AArch64TargetMachine,
+    AdmittedTargetFeatures, CallingConvention, OutputTargetFeatures, RiscVIsaFeature, Target,
+    TargetFeature, TargetFeatureSet, TargetFeatureSetError, TargetIdentity, TargetMachine,
+    TargetMachineError, host_has_aarch64_dotprod, host_has_aarch64_fp16, host_has_aarch64_lse,
+};
 pub use ty_reducer_evidence::{
     TY_REDUCER_EVIDENCE_PACKET_SCHEMA, TY_REDUCER_EVIDENCE_PACKET_SCHEMA_VERSION,
     TyReducerCallbackObservation, TyReducerEvidencePacket, TyReducerEvidenceRow,

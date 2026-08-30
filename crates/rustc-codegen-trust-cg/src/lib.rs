@@ -217,12 +217,18 @@ impl CodegenBackend for TrustCgCodegenBackend {
         // TRUST_CG_MAX_PARALLELISM still takes precedence in the shared policy.
         // `TCG_PROOF_WALK_WORKERS=N` widens the certificate WALK's pool for
         // measurement; the default stays 1 (each worker carries a 32 MiB stack).
-        let walk_workers = std::env::var("TCG_PROOF_WALK_WORKERS")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(1);
-        let _ = trust_cg_verify::resource_limits::configure_proof_verifier_default_worker_limit(walk_workers);
+        let walk_workers =
+            trust_cg_codegen::env_lock::resource_budget::capture_positive_usize_control(
+                trust_cg_codegen::env_lock::resource_budget::TCG_PROOF_WALK_WORKERS_ENV,
+            )
+            .unwrap_or_else(|error| {
+                panic!("invalid Trust Codegen execution resource budget: {error}")
+            })
+            .unwrap_or(std::num::NonZeroUsize::MIN)
+            .get();
+        let _ = trust_cg_verify::resource_limits::configure_proof_verifier_default_worker_limit(
+            walk_workers,
+        );
 
         // Bound rayon's GLOBAL pool before anything can create it implicitly.
         // `trust_ir_build::validate_module` contains an unscoped `par_iter`, so
@@ -2382,7 +2388,7 @@ fn is_dead_std_iterator_reduction_body<'tcx>(tcx: TyCtxt<'tcx>, instance: Instan
     // O2/O3, where the inlined `FlattenCompat::iter_try_fold` call SURVIVES on the
     // general call path — is genuinely REACHED at runtime. Trapping it shipped a
     // reachable `ud2` (deterministic SIGILL vs std exit 32; found by the 2026-07-17
-    // terminal-cell class fuzz, `.fuzz-termcell-repros/p09_flatmap_position_sigill.rs`).
+    // terminal-cell class fuzz, `fuzz/repros/termcell-repros/p09_flatmap_position_sigill.rs`).
     // Untrapped, the unlowerable body takes the DEFERRED verdict: GC-dropped when the
     // bounded intercept fires (nothing references it), whole-compile FAIL-CLOSE when
     // a surviving call references it — exactly the `step_by`/`scan`/`by_ref`
@@ -2395,7 +2401,7 @@ fn is_dead_std_iterator_reduction_body<'tcx>(tcx: TyCtxt<'tcx>, instance: Instan
     // Iterator>::try_fold`'s specialization closure, which ESCAPES the plain-iterator
     // interception — the trapped body was REACHED (deterministic SIGILL, lldb-pinned
     // ud2 at the `try_fold::enumerate::…::check` glue; 2026-07-17 trap-claim hunt,
-    // `.fuzz-termcell-repros/enumerate_findmap_sigill.rs` — the 5th instance of this
+    // `fuzz/repros/termcell-repros/enumerate_findmap_sigill.rs` — the 5th instance of this
     // class after step_by/scan/by_ref/flat_map+position). Untrapped, the unlowerable
     // bodies take the deferred verdict: GC-dropped when an enumerate shape IS
     // intercepted, whole-compile FAIL-CLOSE when a surviving call references them.
@@ -5924,12 +5930,172 @@ fn module_compile_env(tcx: TyCtxt<'_>) -> Result<ModuleCompileEnv, String> {
     })
 }
 
+/// One unit of work accepted by the bounded fixed-module executor.
+type FixedModuleTask = Box<dyn FnOnce() + Send + 'static>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FixedModuleTaskError {
+    Panicked,
+    ExecutorStopped,
+}
+
+/// The result side of one fixed-module task. Each task owns a distinct channel,
+/// so callers can join jobs in emission order even when workers finish them in
+/// another order.
+struct FixedModuleTaskResult<R> {
+    receiver: std::sync::mpsc::Receiver<Result<R, FixedModuleTaskError>>,
+}
+
+impl<R> FixedModuleTaskResult<R> {
+    fn join(self) -> Result<R, FixedModuleTaskError> {
+        self.receiver
+            .recv()
+            .unwrap_or(Err(FixedModuleTaskError::ExecutorStopped))
+    }
+}
+
+/// Reusable process-local executor for entry-wrapper, allocator-shim and
+/// `__trustcg_*` helper compiles.
+///
+/// Fixed-module compilation needs the verifier's 32 MiB stack, but creating one
+/// such OS thread per helper multiplied that reservation by every live helper
+/// variant. This executor creates a fixed number of those stacks and queues all
+/// fixed-module work onto them. The bridge defaults to one worker because Cargo
+/// already parallelizes rustc processes; a positive `TRUST_CG_MAX_PARALLELISM`
+/// explicitly widens the pool, clamped to two workers and host parallelism so
+/// this lane can never recreate the old large-stack amplification.
+struct FixedModuleExecutor {
+    sender: Option<std::sync::mpsc::Sender<FixedModuleTask>>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl FixedModuleExecutor {
+    fn new(worker_count: usize, stack_size: usize) -> Result<Self, String> {
+        let worker_count = worker_count.max(1);
+        let (sender, receiver) = std::sync::mpsc::channel::<FixedModuleTask>();
+        let receiver = Arc::new(std::sync::Mutex::new(receiver));
+        let mut workers = Vec::with_capacity(worker_count);
+
+        for index in 0..worker_count {
+            let receiver = Arc::clone(&receiver);
+            let spawn = std::thread::Builder::new()
+                .name(format!("trust-cg-fixed-worker-{index}"))
+                .stack_size(stack_size)
+                .spawn(move || loop {
+                    let task = receiver
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .recv();
+                    let Ok(task) = task else {
+                        break;
+                    };
+                    // `schedule` catches each operation's panic and reports it
+                    // through that operation's result channel. This outer guard
+                    // keeps the reusable worker alive even if the reporting
+                    // wrapper itself ever panics; the dropped result sender then
+                    // makes the caller fail closed with `ExecutorStopped`.
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task));
+                });
+            match spawn {
+                Ok(worker) => workers.push(worker),
+                Err(err) => {
+                    // Close the queue before joining the workers already
+                    // created, otherwise they would remain blocked in `recv`.
+                    drop(sender);
+                    for worker in workers {
+                        let _ = worker.join();
+                    }
+                    return Err(format!(
+                        "could not spawn fixed-module executor worker {index} of {worker_count}: {err}"
+                    ));
+                }
+            }
+        }
+
+        Ok(Self {
+            sender: Some(sender),
+            workers,
+        })
+    }
+
+    fn schedule<R, F>(&self, operation: F) -> Result<FixedModuleTaskResult<R>, String>
+    where
+        R: Send + 'static,
+        F: FnOnce() -> R + Send + 'static,
+    {
+        let (result_sender, receiver) = std::sync::mpsc::channel();
+        let task = Box::new(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation))
+                .map_err(|_| FixedModuleTaskError::Panicked);
+            let _ = result_sender.send(outcome);
+        });
+        let Some(sender) = self.sender.as_ref() else {
+            return Err("fixed-module executor has stopped".to_owned());
+        };
+        sender
+            .send(task)
+            .map_err(|_| "fixed-module executor queue disconnected".to_owned())?;
+        Ok(FixedModuleTaskResult { receiver })
+    }
+}
+
+impl Drop for FixedModuleExecutor {
+    fn drop(&mut self) {
+        // Closing the queue lets every idle worker leave `recv`; joining avoids
+        // detaching large-stack workers from a short-lived test/local executor.
+        self.sender.take();
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
+const DEFAULT_FIXED_MODULE_WORKERS: usize = 1;
+const MAX_FIXED_MODULE_WORKERS: usize = 2;
+
+fn fixed_module_worker_limit() -> usize {
+    trust_cg_codegen::resource_limits::artifact_neutral_large_stack_slot_limit(
+        std::num::NonZeroUsize::new(DEFAULT_FIXED_MODULE_WORKERS)
+            .expect("fixed-module worker default must be positive"),
+        std::num::NonZeroUsize::new(MAX_FIXED_MODULE_WORKERS)
+            .expect("fixed-module worker maximum must be positive"),
+    )
+    .get()
+}
+
+static FIXED_MODULE_EXECUTOR: std::sync::OnceLock<Result<FixedModuleExecutor, String>> =
+    std::sync::OnceLock::new();
+
+fn fixed_module_executor() -> Result<&'static FixedModuleExecutor, String> {
+    match FIXED_MODULE_EXECUTOR.get_or_init(|| {
+        FixedModuleExecutor::new(
+            fixed_module_worker_limit(),
+            trust_cg_verify::resource_limits::PROOF_VERIFIER_STACK_SIZE,
+        )
+    }) {
+        Ok(executor) => Ok(executor),
+        Err(err) => Err(err.clone()),
+    }
+}
+
+/// Flush optional thread-local compiler diagnostics after each reusable-worker
+/// task. The old one-thread-per-module implementation got this for free when
+/// each thread exited; process-lifetime workers need an explicit task boundary.
+/// A guard keeps panic paths observable too.
+struct FixedModuleTimingFlush;
+
+impl Drop for FixedModuleTimingFlush {
+    fn drop(&mut self) {
+        trust_cg_codegen::pipeline::flush_current_thread_timing_logs();
+    }
+}
+
 /// A fixed module (entry wrapper, allocator shim, `__trustcg_*` helper) being
-/// compiled off the main thread, or already compiled inline.
+/// compiled on the bounded executor, or already compiled inline.
 enum FixedModuleJob {
-    Spawned {
+    Scheduled {
         cgu_name: String,
-        handle: std::thread::JoinHandle<Result<CompiledModule, String>>,
+        result: FixedModuleTaskResult<Result<CompiledModule, String>>,
     },
     Done(Result<CompiledModule, String>),
 }
@@ -5938,12 +6104,18 @@ impl FixedModuleJob {
     fn join(self) -> Result<CompiledModule, String> {
         match self {
             FixedModuleJob::Done(result) => result,
-            FixedModuleJob::Spawned { cgu_name, handle } => handle.join().unwrap_or_else(|_| {
-                Err(format!(
+            FixedModuleJob::Scheduled { cgu_name, result } => match result.join() {
+                Ok(result) => result,
+                Err(FixedModuleTaskError::Panicked) => Err(format!(
                     "rustc_codegen_trust_cg: the compile thread for fixed module `{cgu_name}` \
                      panicked; failing the crate closed (TCG_NO_HELPER_OVERLAP=1 compiles it inline)"
-                ))
-            }),
+                )),
+                Err(FixedModuleTaskError::ExecutorStopped) => Err(format!(
+                    "rustc_codegen_trust_cg: the bounded fixed-module executor stopped before \
+                     `{cgu_name}` produced a result; failing the crate closed \
+                     (TCG_NO_HELPER_OVERLAP=1 compiles it inline)"
+                )),
+            },
         }
     }
 }
@@ -5957,10 +6129,11 @@ fn helper_overlap_enabled() -> bool {
 
 /// Compile a fixed module whose trust-ir is already built. With overlap on, the
 /// compile (adapter + validate, prepare, pre-warm, certificate walk, object
-/// write) runs on its own thread with the proof-verifier stack, overlapping the
-/// main thread's MIR lowering and the user CGUs' batch; the result is joined
-/// where the module used to be compiled, so `modules` keeps its order. The
-/// certificate walk still serialises on the one-worker verifier pool.
+/// write) runs on the bounded fixed-module executor, overlapping the main
+/// thread's MIR lowering and the user CGUs' batch without allocating one 32 MiB
+/// stack per helper. The result is joined where the module used to be compiled,
+/// so `modules` keeps its order. The certificate walk still serialises on the
+/// one-worker verifier pool by default.
 fn spawn_fixed_module_compile(
     tcx: TyCtxt<'_>,
     cgu_name: &str,
@@ -5987,19 +6160,25 @@ fn spawn_fixed_module_compile(
         ));
     }
     let name = cgu_name.to_owned();
-    let thread_name = format!("trust-cg-fixed-{cgu_name}");
-    match std::thread::Builder::new()
-        .name(thread_name)
-        .stack_size(trust_cg_verify::resource_limits::PROOF_VERIFIER_STACK_SIZE)
-        .spawn(move || {
-            compile_trust_ir_module_object_in_env(&env, module, &name, kind, false, object_path)
-        }) {
-        Ok(handle) => FixedModuleJob::Spawned {
+    let executor = match fixed_module_executor() {
+        Ok(executor) => executor,
+        Err(err) => {
+            return FixedModuleJob::Done(Err(format!(
+                "rustc_codegen_trust_cg: could not create the bounded fixed-module executor \
+                 for `{cgu_name}`: {err} (TCG_NO_HELPER_OVERLAP=1 compiles it inline)"
+            )))
+        }
+    };
+    match executor.schedule(move || {
+        let _timing_flush = FixedModuleTimingFlush;
+        compile_trust_ir_module_object_in_env(&env, module, &name, kind, false, object_path)
+    }) {
+        Ok(result) => FixedModuleJob::Scheduled {
             cgu_name: cgu_name.to_owned(),
-            handle,
+            result,
         },
         Err(err) => FixedModuleJob::Done(Err(format!(
-            "rustc_codegen_trust_cg: could not spawn the compile thread for fixed module \
+            "rustc_codegen_trust_cg: could not schedule the compile for fixed module \
              `{cgu_name}`: {err} (TCG_NO_HELPER_OVERLAP=1 compiles it inline)"
         ))),
     }
@@ -13306,6 +13485,37 @@ fn semantic_backedge_threading_vc<'tcx>(
             }
             bindings.push((vid, name, ty.bits()));
         }
+    }
+    // Loop-invariant FUNCTION ARGUMENTS. A plain scalar argument's entry
+    // param value is `ValueId(arg.index())` (see the entry-block lowering)
+    // and nothing ever redefines an entry param, so a latch reading it must
+    // line up with the spec's same-named free input. Without this binding
+    // the argument is a free opaque in the symexec model, and every VC
+    // whose spec mentions the argument refutes its OWN missing binding
+    // (`l1 == __tir_v1` with l1 free — the SSA-071 false-REFUTED class:
+    // the check rejected correct trust-ir for `a0 = i0 & p2`-style latch
+    // updates). Same fail-closed argument as the invariant-locals block
+    // above: a wrong binding can only make the equality FAIL. Args that
+    // are loop-carried sit in `slots` (skipped); args reassigned before
+    // the loop bind the stale entry value, which fails closed exactly as
+    // the unbound case did; non-scalar/ZST/fat-pointer args fail
+    // `vc_scalar_ty` and are skipped.
+    for arg in body.args_iter() {
+        if slots.iter().any(|s| s.local == arg) {
+            continue;
+        }
+        let name = vc_local_name(arg);
+        if stmts.iter().any(|st| st.dst == name) {
+            continue; // reassigned on the latch path — not invariant there
+        }
+        let Ok(ty) = vc_scalar_ty(local_rust_ty(ctx, body, arg)) else {
+            continue;
+        };
+        let vid = ValueId::new(arg.index() as u32);
+        if bindings.iter().any(|(v, _, _)| *v == vid) {
+            continue;
+        }
+        bindings.push((vid, name, ty.bits()));
     }
     let model = trust_cg_verify::loop_backedge_symexec::model_back_edge_args(
         func,
@@ -86107,6 +86317,141 @@ mod tests {
         }
     }
     use super::*;
+
+    #[test]
+    fn fixed_module_worker_limit_uses_shared_strict_host_bounded_policy() {
+        trust_cg_codegen::env_lock::with_env_overrides_removed(
+            &[trust_cg_codegen::resource_limits::TRUST_CG_MAX_PARALLELISM_ENV],
+            || assert_eq!(fixed_module_worker_limit(), 1),
+        );
+
+        let available = std::thread::available_parallelism().map_or(1, usize::from);
+        trust_cg_codegen::env_lock::with_env_overrides(
+            &[(
+                trust_cg_codegen::resource_limits::TRUST_CG_MAX_PARALLELISM_ENV,
+                " 3 ",
+            )],
+            || assert_eq!(fixed_module_worker_limit(), available.min(2)),
+        );
+        trust_cg_codegen::env_lock::with_env_overrides(
+            &[(
+                trust_cg_codegen::resource_limits::TRUST_CG_MAX_PARALLELISM_ENV,
+                "1",
+            )],
+            || assert_eq!(fixed_module_worker_limit(), 1),
+        );
+
+        for invalid in ["0", "bad"] {
+            trust_cg_codegen::env_lock::with_env_overrides(
+                &[(
+                    trust_cg_codegen::resource_limits::TRUST_CG_MAX_PARALLELISM_ENV,
+                    invalid,
+                )],
+                || assert!(std::panic::catch_unwind(fixed_module_worker_limit).is_err()),
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_module_executor_caps_concurrency_and_preserves_result_identity() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const JOBS: usize = 6;
+        let executor = FixedModuleExecutor::new(2, 2 * 1024 * 1024).unwrap();
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let (started_sender, started_receiver) = std::sync::mpsc::channel();
+        let mut results = Vec::new();
+
+        for id in 0..JOBS {
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            let release = Arc::clone(&release);
+            let started_sender = started_sender.clone();
+            results.push(
+                executor
+                    .schedule(move || {
+                        let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now, Ordering::SeqCst);
+                        started_sender.send(id).unwrap();
+
+                        let (released, wake) = &*release;
+                        let mut released = released
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        while !*released {
+                            released = wake
+                                .wait(released)
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        }
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        id
+                    })
+                    .unwrap(),
+            );
+        }
+        drop(started_sender);
+
+        // Both workers are now occupied and blocked. A third job cannot start
+        // until one of those two releases, regardless of host scheduling.
+        let mut first = vec![
+            started_receiver
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap(),
+            started_receiver
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap(),
+        ];
+        first.sort_unstable();
+        assert_eq!(first, vec![0, 1]);
+        assert!(matches!(
+            started_receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+
+        {
+            let (released, wake) = &*release;
+            *released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            wake.notify_all();
+        }
+
+        // Joining the per-job handles in submission order keeps result identity
+        // deterministic even though the two workers may complete out of order.
+        let joined: Vec<_> = results
+            .into_iter()
+            .map(|result| result.join().unwrap())
+            .collect();
+        assert_eq!(joined, (0..JOBS).collect::<Vec<_>>());
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn fixed_module_executor_reports_panics_and_remains_usable() {
+        let executor = FixedModuleExecutor::new(1, 2 * 1024 * 1024).unwrap();
+        let panicked = executor
+            .schedule(|| -> usize { panic!("synthetic fixed-module panic") })
+            .unwrap();
+        assert_eq!(panicked.join(), Err(FixedModuleTaskError::Panicked));
+
+        let following = executor.schedule(|| 7usize).unwrap();
+        assert_eq!(following.join(), Ok(7));
+    }
+
+    #[test]
+    fn fixed_module_task_disconnect_fails_closed() {
+        let (sender, receiver) =
+            std::sync::mpsc::channel::<Result<usize, FixedModuleTaskError>>();
+        drop(sender);
+        let result = FixedModuleTaskResult { receiver };
+        assert_eq!(
+            result.join(),
+            Err(FixedModuleTaskError::ExecutorStopped)
+        );
+    }
 
     #[test]
     fn aggregate_copy_refinement_lane_bound_is_closed_and_fixed() {

@@ -685,23 +685,55 @@ fn guard_correctness_structure_n1024_s2_q4() {
 // UNCONDITIONAL-STORE GATE (the store's block must dominate the latch)
 // ---------------------------------------------------------------------------
 
-/// Build the strided marking loop with an EXTRA in-body conditional in front of
-/// the store block:
+/// Where the in-body conditional's OTHER edge goes.
+#[derive(Clone, Copy, PartialEq)]
+enum Side {
+    /// REJOINS the loop at `latch`: `if c { base[iv] = v; }` — the store does
+    /// NOT dominate the latch.
+    Latch,
+    /// LEAVES the loop into a DIVERGING panic block (`Bl panic; Brk`, no `Ret`
+    /// reachable): the p7 residual bounds-check shape under `panic=abort`.
+    Panic,
+    /// LEAVES the loop into the function's `Ret` block: a `break`.
+    Ret,
+    /// LEAVES the loop into a block that merely `B`s to the `Ret` block: a
+    /// `break` whose exit is only reachable TRANSITIVELY.
+    RetViaTrampoline,
+    /// LEAVES the loop into a block holding a lone `TailCall f` (external
+    /// symbol, NO successors, NO `Ret` anywhere): the `break; f(..)` whose
+    /// `Bl f; Ret` `TailCallOptimization` — which runs BEFORE this pass —
+    /// already folded, deleting the `Ret`. Control resumes in `f`.
+    TailCallExit,
+}
+
+/// Where the in-body conditional sits relative to the store.
+#[derive(Clone, Copy, PartialEq)]
+enum CondAt {
+    /// `chk` runs BEFORE the store: `if !c { <side> } base[iv] = v`.
+    BeforeStore,
+    /// `chk` runs AFTER the store: `base[iv] = v; if !c { <side> }`. The store
+    /// then dominates the latch for EVERY `Side`.
+    AfterStore,
+}
+
+/// Build the strided marking loop with an EXTRA in-body conditional either in
+/// front of or behind the store block:
 ///
 /// ```text
 /// bb0:    setup; B header
-/// header: iv_c = copy iv; cmp iv_c, Nreg; b.lo chk; B exit
-/// chk:    cmp iv, guard; b.lo st; B <side>
-/// st:     addr = base + iv; *addr = val; B latch
+/// header: iv_c = copy iv; cmp iv_c, Nreg; b.lo <first>; B exit
+/// chk:    cmp iv, guard; b.lo <next>; B <side>
+/// st:     addr = base + iv; *addr = val; B <next>
 /// latch:  next = iv + stride; iv = copy next; B header
 /// exit:   ret
+/// panic:  bl panic; brk            (no successors, no ret)
+/// tramp:  B exit
+/// tail:   tailcall f               (no successors, no ret)
 /// ```
 ///
-/// * `skip_store == true`  -> `<side>` REJOINS the loop at `latch`, i.e.
-///   `if c { base[iv] = v; }` — the store does NOT dominate the latch.
-/// * `skip_store == false` -> `<side>` LEAVES the loop (the p7 residual
-///   bounds-check shape) — the store block still dominates the latch.
-fn build_guarded_store(skip_store: bool) -> MachFunction {
+/// `BeforeStore` orders `header -> chk -> st -> latch`; `AfterStore` orders
+/// `header -> st -> chk -> latch`.
+fn build_guarded_store(at: CondAt, side: Side) -> MachFunction {
     use AArch64Opcode::*;
     let mut func = MachFunction::new("k".to_string(), Signature::new(vec![], vec![]));
     let bb0 = func.entry;
@@ -710,7 +742,20 @@ fn build_guarded_store(skip_store: bool) -> MachFunction {
     let st = func.create_block();
     let latch = func.create_block();
     let exit = func.create_block();
-    let side = if skip_store { latch } else { exit };
+    let panic = func.create_block();
+    let tramp = func.create_block();
+    let tail = func.create_block();
+    let side_blk = match side {
+        Side::Latch => latch,
+        Side::Panic => panic,
+        Side::Ret => exit,
+        Side::RetViaTrampoline => tramp,
+        Side::TailCallExit => tail,
+    };
+    let (first, after_chk, after_st) = match at {
+        CondAt::BeforeStore => (chk, st, latch),
+        CondAt::AfterStore => (st, latch, chk),
+    };
 
     let push = |func: &mut MachFunction, blk: BlockId, op, ops| {
         let id = func.push_inst(MachInst::new(op, ops));
@@ -727,16 +772,16 @@ fn build_guarded_store(skip_store: bool) -> MachFunction {
 
     push(&mut func, header, MovR, vec![x(12), x(10)]);
     push(&mut func, header, CmpRR, vec![x(12), x(11)]);
-    push(&mut func, header, BCond, vec![i(CC_LO), bl(chk)]);
+    push(&mut func, header, BCond, vec![i(CC_LO), bl(first)]);
     push(&mut func, header, B, vec![bl(exit)]);
 
     push(&mut func, chk, CmpRR, vec![x(10), x(14)]);
-    push(&mut func, chk, BCond, vec![i(CC_LO), bl(st)]);
-    push(&mut func, chk, B, vec![bl(side)]);
+    push(&mut func, chk, BCond, vec![i(CC_LO), bl(after_chk)]);
+    push(&mut func, chk, B, vec![bl(side_blk)]);
 
     push(&mut func, st, AddRR, vec![x(20), x(0), x(10)]);
     push(&mut func, st, StrbRI, vec![w(3), x(20), i(0)]);
-    push(&mut func, st, B, vec![bl(latch)]);
+    push(&mut func, st, B, vec![bl(after_st)]);
 
     push(&mut func, latch, AddRR, vec![x(21), x(10), x(2)]);
     push(&mut func, latch, MovR, vec![x(10), x(21)]);
@@ -744,13 +789,26 @@ fn build_guarded_store(skip_store: bool) -> MachFunction {
 
     push(&mut func, exit, Ret, vec![]);
 
+    push(&mut func, panic, Bl, vec![i(0)]);
+    push(&mut func, panic, Brk, vec![]);
+
+    push(&mut func, tramp, B, vec![bl(exit)]);
+
+    push(
+        &mut func,
+        tail,
+        TailCall,
+        vec![MachOperand::Symbol("f".to_string())],
+    );
+
     func.add_edge(bb0, header);
-    func.add_edge(header, chk);
+    func.add_edge(header, first);
     func.add_edge(header, exit);
-    func.add_edge(chk, st);
-    func.add_edge(chk, side);
-    func.add_edge(st, latch);
+    func.add_edge(chk, after_chk);
+    func.add_edge(chk, side_blk);
+    func.add_edge(st, after_st);
     func.add_edge(latch, header);
+    func.add_edge(tramp, exit);
     func
 }
 
@@ -759,7 +817,7 @@ fn bails_on_conditional_store_that_rejoins_the_latch() {
     // `while q <u N { if c { base[q] = v; } q += s; }` — the store block does NOT
     // dominate the latch, so unrolling it would perform writes the source skips.
     // This is the shape that miscompiled p7-with-an-inner-`if` end-to-end.
-    let mut func = build_guarded_store(true);
+    let mut func = build_guarded_store(CondAt::BeforeStore, Side::Latch);
     let before = count_op(&func, AArch64Opcode::StrbRI);
     let (changed, fired) = run(&mut func);
     assert!(
@@ -774,20 +832,204 @@ fn bails_on_conditional_store_that_rejoins_the_latch() {
 }
 
 #[test]
-fn fires_when_side_edge_leaves_the_loop_and_store_dominates_latch() {
+fn fires_when_side_edge_diverges_and_store_dominates_latch() {
     // The p7 residual bounds-check shape: the in-body branch's other edge LEAVES
-    // the loop, so the store block still dominates the latch and runs on every
-    // header->latch path. Must still fire (this is the pass's whole target).
-    let mut func = build_guarded_store(false);
+    // the loop into a DIVERGING panic block, so the store block still dominates
+    // the latch and runs on every header->latch path, and no `Ret` is reachable
+    // through the side edge. Must still fire (this is the pass's whole target),
+    // whether the check sits before or after the store.
+    for at in [CondAt::BeforeStore, CondAt::AfterStore] {
+        let mut func = build_guarded_store(at, Side::Panic);
+        let (changed, fired) = run(&mut func);
+        assert!(
+            changed && fired == 1,
+            "p7 diverging side-edge shape must still unroll"
+        );
+        assert_eq!(
+            count_op(&func, AArch64Opcode::StrbRI),
+            5,
+            "scalar store + 4 unrolled"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NO-EARLY-NORMAL-EXIT GATE (no non-header body block may exit toward a `Ret`)
+// ---------------------------------------------------------------------------
+
+/// Every combination of an early NORMAL exit (the side edge reaches a `Ret`,
+/// directly or through a trampoline) and its position relative to the store
+/// must bail, byte-identically.
+fn assert_bails_on_early_normal_exit(at: CondAt, side: Side, why: &str) {
+    let mut func = build_guarded_store(at, side);
+    let before = count_op(&func, AArch64Opcode::StrbRI);
+    let blocks_before = func.blocks.len();
     let (changed, fired) = run(&mut func);
-    assert!(
-        changed && fired == 1,
-        "p7 side-edge shape must still unroll"
-    );
+    assert!(!changed && fired == 0, "{why}: must NOT be unrolled");
     assert_eq!(
         count_op(&func, AArch64Opcode::StrbRI),
-        5,
-        "scalar store + 4 unrolled"
+        before,
+        "{why}: no replicated stores emitted"
+    );
+    assert_eq!(func.blocks.len(), blocks_before, "{why}: no blocks spliced");
+}
+
+#[test]
+fn bails_on_break_after_the_store() {
+    // `while q <u N { base[q] = v; if c { break; } q += s; }` — the store block
+    // DOMINATES the latch (every completed iteration stored), so the dominance
+    // gate alone ADMITS this loop; yet the source stops after the breaking
+    // iteration's single store while the unrolled block would perform all four.
+    assert_bails_on_early_normal_exit(CondAt::AfterStore, Side::Ret, "break after the store");
+}
+
+#[test]
+fn bails_on_break_before_the_store() {
+    // `while q <u N { if c { break; } base[q] = v; q += s; }` — same defect with
+    // the test in front: the unrolled block never evaluates `c` for lanes 1..3.
+    assert_bails_on_early_normal_exit(CondAt::BeforeStore, Side::Ret, "break before the store");
+}
+
+#[test]
+fn bails_when_the_early_exit_reaches_ret_transitively() {
+    // The side edge lands on a block that only `B`s to the `Ret` block. A
+    // direct-successor check would call it diverging; the reachability walk
+    // must not.
+    for at in [CondAt::BeforeStore, CondAt::AfterStore] {
+        assert_bails_on_early_normal_exit(at, Side::RetViaTrampoline, "break via trampoline");
+    }
+}
+
+#[test]
+fn bails_on_break_folded_into_a_tail_call() {
+    // `while q <u N { base[q] = v; if c { break; } q += s; } f(..)` after
+    // `TailCallOptimization` (which runs BEFORE this pass in the O2/O3 chains):
+    // the break-exit block holds a lone `TailCall f` — NO `Ret` anywhere in
+    // the region — yet control resumes in `f`, where the three extra unrolled
+    // stores are observable. A "no `Ret` reachable" divergence test admits
+    // this; the whitelist must not, in either order.
+    for at in [CondAt::BeforeStore, CondAt::AfterStore] {
+        assert_bails_on_early_normal_exit(at, Side::TailCallExit, "break into a tail call");
+    }
+}
+
+#[test]
+fn tail_call_exit_fixture_has_no_ret_reachable() {
+    // Pin the fixture's premise: from the tail-call exit block NO `Ret` is
+    // reachable, so the defect really is the predicate, not the fixture.
+    let func = build_guarded_store(CondAt::AfterStore, Side::TailCallExit);
+    let tail = block_with(&func, AArch64Opcode::TailCall);
+    assert!(
+        func.block(tail).succs.is_empty(),
+        "tail-call block has no successors"
+    );
+    assert!(
+        !func
+            .block(tail)
+            .insts
+            .iter()
+            .any(|&id| func.inst(id).opcode == AArch64Opcode::Ret),
+        "tail-call block holds no `Ret`"
+    );
+    assert!(
+        exit_diverges(&func, tail).is_err(),
+        "a lone `TailCall` is a NORMAL exit"
+    );
+}
+
+#[test]
+fn exit_diverges_is_a_whitelist() {
+    // A sink that merely ends in a call (no trap), a sink ending in an indirect
+    // `Br`, and an EMPTY sink are all unmodeled: none diverges.
+    use AArch64Opcode::*;
+    let mut func = MachFunction::new("k".to_string(), Signature::new(vec![], vec![]));
+    let call_only = func.create_block();
+    let indirect = func.create_block();
+    let empty = func.create_block();
+    let trap_pseudo = func.create_block();
+    let guarded_trap = func.create_block();
+    let guarded_target = func.create_block();
+    let push = |func: &mut MachFunction, blk: BlockId, op, ops| {
+        let id = func.push_inst(MachInst::new(op, ops));
+        func.append_inst(blk, id);
+    };
+    push(&mut func, call_only, Bl, vec![i(0)]);
+    push(&mut func, indirect, Br, vec![x(9)]);
+    push(&mut func, trap_pseudo, Bl, vec![i(0)]);
+    push(&mut func, trap_pseudo, TrapOverflow, vec![]);
+    // A CONDITIONAL `TrapOverflow cc, Block(t)` falls through: not a sink trap.
+    push(
+        &mut func,
+        guarded_trap,
+        TrapOverflow,
+        vec![i(CC_LO), bl(guarded_target)],
+    );
+    push(&mut func, guarded_target, Ret, vec![]);
+    func.add_edge(guarded_trap, guarded_target);
+
+    assert!(exit_diverges(&func, call_only).is_err(), "bare call sink");
+    assert!(
+        exit_diverges(&func, indirect).is_err(),
+        "indirect `Br` sink"
+    );
+    assert!(exit_diverges(&func, empty).is_err(), "empty sink");
+    assert!(
+        exit_diverges(&func, guarded_trap).is_err(),
+        "guarded trap reaches `Ret`"
+    );
+    assert!(
+        exit_diverges(&func, trap_pseudo).is_ok(),
+        "`Bl abort; TrapOverflow` (select_trap's `unreachable`) diverges"
+    );
+}
+
+/// The block holding the first instruction with opcode `op`.
+fn block_with(func: &MachFunction, op: AArch64Opcode) -> BlockId {
+    func.blocks
+        .iter()
+        .position(|b| b.insts.iter().any(|&id| func.inst(id).opcode == op))
+        .map(|idx| BlockId(idx as u32))
+        .unwrap_or_else(|| panic!("no block holds {op:?}"))
+}
+
+#[test]
+fn exit_diverges_walks_successors() {
+    // Normal: the `Ret` block, and transitively through the trampoline;
+    // diverging: the panic block (no successors, ends in `Brk`).
+    let func = build_guarded_store(CondAt::AfterStore, Side::RetViaTrampoline);
+    let exit = func
+        .blocks
+        .iter()
+        .position(|b| {
+            b.insts
+                .iter()
+                .any(|&id| func.inst(id).opcode == AArch64Opcode::Ret)
+        })
+        .map(|idx| BlockId(idx as u32))
+        .expect("ret block");
+    let panic = func
+        .blocks
+        .iter()
+        .position(|b| {
+            b.insts
+                .iter()
+                .any(|&id| func.inst(id).opcode == AArch64Opcode::Brk)
+        })
+        .map(|idx| BlockId(idx as u32))
+        .expect("panic block");
+    let tramp = func
+        .blocks
+        .iter()
+        .enumerate()
+        .find(|(_, b)| b.succs == vec![exit] && b.insts.len() == 1)
+        .map(|(idx, _)| BlockId(idx as u32))
+        .expect("trampoline block");
+    assert!(exit_diverges(&func, exit).is_err());
+    assert!(exit_diverges(&func, tramp).is_err());
+    assert!(exit_diverges(&func, panic).is_ok());
+    assert!(
+        exit_diverges(&func, func.entry).is_err(),
+        "the loop itself can return"
     );
 }
 
@@ -908,7 +1150,14 @@ fn second_run_is_a_no_op_for_every_firing_variant() {
                 })
             }),
         ),
-        ("guarded-store", Box::new(|| build_guarded_store(false))),
+        (
+            "guarded-store-check-before",
+            Box::new(|| build_guarded_store(CondAt::BeforeStore, Side::Panic)),
+        ),
+        (
+            "guarded-store-check-after",
+            Box::new(|| build_guarded_store(CondAt::AfterStore, Side::Panic)),
+        ),
     ];
     for (label, build) in cases {
         let mut func = build();

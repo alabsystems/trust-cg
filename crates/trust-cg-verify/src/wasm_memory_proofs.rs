@@ -211,6 +211,10 @@ mod tests {
     #[test]
     fn model_consistency_proven_formally() {
         if !crate::ay_bridge::z3_available() {
+            crate::formal_gap::skip_test(
+                "model_consistency_proven_formally",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         for ob in all_model_consistency_proofs() {
@@ -222,6 +226,10 @@ mod tests {
     #[test]
     fn gep_elements_disjoint_proven_formally() {
         if !crate::ay_bridge::z3_available() {
+            crate::formal_gap::skip_test(
+                "gep_elements_disjoint_proven_formally",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         prove_or_certification_gap_skip(&proof_gep_elements_disjoint());

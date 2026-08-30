@@ -18,7 +18,7 @@
 #     - soundness_manifest      (THE meta-gate: every invariant has a live
 #                                fail-closed test; every B-* id present)
 #     - coverage_gate_tests     (accepted/deferred inventory: AArch64 156/248
-#                                with 92 named RED rows; x86-64 167/196 with 29,
+#                                with 92 named RED rows; x86-64 168/197 with 29,
 #                                RISC-V 14/17 with 3, WebAssembly 111/113 with 2
 #                                (f32.const/f64.const: a raw IEEE-754 immediate
 #                                is not a LEB128; see SOUNDNESS_CHECK.md for

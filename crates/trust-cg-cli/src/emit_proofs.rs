@@ -218,32 +218,6 @@ fn write_cert_file(
     fs::write(path, body)
 }
 
-/// Emit `.smt2` and `.cert` files for every certificate in `certs` under
-/// `<out_dir>/<Category>/<rule_name>.{smt2,cert}`.
-///
-/// Returns a summary count. Errors creating directories or writing files
-/// are propagated to the caller.
-#[allow(dead_code)]
-pub fn emit_proof_files(
-    out_dir: &Path,
-    certs: &[CodegenCertificate],
-) -> std::io::Result<EmitSummary> {
-    if certs.is_empty() {
-        return Ok(EmitSummary::default());
-    }
-
-    fs::create_dir_all(out_dir)?;
-
-    // Build the obligation index once per invocation; ProofDatabase::new()
-    // is pure construction and not cached, so we avoid rebuilding it per
-    // certificate (several thousand entries).
-    let db = ProofDatabase::new();
-    let index = build_obligation_index(&db);
-    let all = db.all();
-
-    emit_per_rule_proof_files(out_dir, certs, &index, all)
-}
-
 /// Emit per-rule proof files plus function-level lowering/trust sidecars.
 ///
 /// The sidecar path is intentionally fail-closed: every included codegen
@@ -586,7 +560,17 @@ mod tests {
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&tmp);
-        let s = emit_proof_files(&tmp, &[]).expect("empty ok");
+        let s = emit_proof_files_with_lowering_sidecars(
+            &tmp,
+            &[],
+            LoweringSidecarInputs {
+                target: "x86_64-unknown-linux-gnu",
+                trust_ir_bytes: &[],
+                machine_code_bytes: &[],
+                compiler_config_bytes: &[],
+            },
+        )
+        .expect("empty ok");
         assert_eq!(s.smt2_written, 0);
         assert_eq!(s.cert_written, 0);
         let _ = fs::remove_dir_all(&tmp);

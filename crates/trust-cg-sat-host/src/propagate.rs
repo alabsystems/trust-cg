@@ -361,19 +361,6 @@ enum ChosenProvider {
 }
 
 impl ChosenProvider {
-    /// Kind tag for diagnostics. Matches the values of
-    /// `JIT_KERNEL_SCAN` / `JIT_KERNEL_WITH_DECISIONS` /
-    /// `JIT_KERNEL_WATCHED_LITERAL` so the caller can compare without
-    /// re-reading `JIT_KERNEL_CHOICE`.
-    #[allow(dead_code)]
-    fn kind_tag(&self) -> u8 {
-        match self {
-            ChosenProvider::Scan(_) => JIT_KERNEL_SCAN,
-            ChosenProvider::WithDecisions(_) => JIT_KERNEL_WITH_DECISIONS,
-            ChosenProvider::WatchedLiteral(_) => JIT_KERNEL_WATCHED_LITERAL,
-        }
-    }
-
     /// Whether this provider can back the primary path (i.e. accept a
     /// fresh decision-literal slice and produce a deterministic result
     /// without leaking state across invocations). Only `Scan` cannot.
@@ -791,61 +778,6 @@ unsafe fn snapshot_initial_values(s: *mut sys::solver) -> Vec<i8> {
         };
     }
     values
-}
-
-/// Read the **full** trail (everything from `S->falseStack` up to
-/// `S->assigned`) and pack each literal into the
-/// `(var << 1) | polarity` format that `JitBcpWithDecisionsProvider`
-/// expects.
-///
-/// The PRIMARY_JIT_MODE replacement path needs the entire trail (not
-/// just the unprocessed `processed..assigned` suffix) so the kernel's
-/// decode phase reproduces MicroSAT's exact current assignment before
-/// running BCP. Without the already-processed prefix, the kernel's
-/// initial unit-clause step would re-derive parse-time unit
-/// assignments from scratch and re-emit them through
-/// `implied_literals_out`, which would cause us to push duplicates
-/// back onto MicroSAT's `falseStack`.
-///
-/// The polarity convention mirrors `snapshot_unprocessed_trail_as_decisions`:
-/// a `falseStack` entry `l > 0` (DIMACS literal `+v` is false →
-/// var = false) encodes as `(v << 1) | 1`; an entry `l < 0`
-/// (`-v` is false → var = true) encodes as `(v << 1) | 0`.
-///
-/// # Safety
-///
-/// `s` must point to a live, post-`parse` solver. `falseStack` and
-/// `assigned` must both be in-bounds of the same allocated stack
-/// region. The function reads `(assigned - falseStack)` `c_int` values
-/// starting at `falseStack`.
-#[allow(dead_code)]
-unsafe fn snapshot_full_trail_as_decisions(s: *mut sys::solver) -> Vec<u32> {
-    // SAFETY: precondition - `s` is live; `falseStack` and `assigned`
-    // are valid pointers into the same allocation.
-    let solver_ref = unsafe { &*s };
-    let stack_base = solver_ref.falseStack;
-    let assigned = solver_ref.assigned;
-    if stack_base.is_null() || assigned.is_null() {
-        return Vec::new();
-    }
-    let count =
-        (assigned as isize - stack_base as isize) / (core::mem::size_of::<c_int>() as isize);
-    if count <= 0 {
-        return Vec::new();
-    }
-    let mut decisions: Vec<u32> = Vec::with_capacity(count as usize);
-    for i in 0..count {
-        // SAFETY: `0 <= i < count` and `stack_base[0..count]` lies in
-        // the valid falseStack region by the precondition.
-        let lit = unsafe { *stack_base.offset(i) };
-        if lit == 0 {
-            continue;
-        }
-        let var = lit.unsigned_abs();
-        let polarity = if lit > 0 { 1u32 } else { 0u32 };
-        decisions.push((var << 1) | polarity);
-    }
-    decisions
 }
 
 /// MicroSAT's `IMPLIED` enum value (from `microsat.c`):
@@ -2637,14 +2569,32 @@ pub unsafe extern "C" fn trust_cg_propagate(s: *mut sys::solver) -> c_int {
 }
 
 // ===========================================================================
-// Deferred empty-lemma conflict path.
+// Empty-lemma conflict path (`docs/empty_lemma_bug_design.md`, option (c)).
 //
-//   * Implement `native_find_first_conflict_clause` (currently
-//     `unimplemented!()`).
-//   * Rewire `try_jit_replace_native`'s `result == 1` arm
-//     (the surrender block at the DL >= 1 conflict branch).
-//   * Flip `JIT_ANALYZE_DRIVER_FORCE` default to `true` and enable the explicit
-//     campaign gate for the tests below.
+// This path is LIVE. The three steps it was originally deferred behind
+// have all landed:
+//
+//   * `native_find_first_conflict_clause` (below) is implemented: a
+//     read-only walk of MicroSAT's own watch lists that picks the same
+//     conflict clause native `propagate` would have picked.
+//   * `try_jit_replace_native`'s DL >= 1 conflict arm (`jit_result == 1`,
+//     `at_root_level == false`) no longer surrenders on a JIT-reported
+//     conflict: it takes the JIT's clause when
+//     `jit_conflict_clause_is_native_first` confirms it is native's first
+//     choice, otherwise falls back to the walk below, then drives native
+//     `analyze` + `assign` on that clause and continues through
+//     `microsat_native_propagate`. What still surrenders (returns `None`,
+//     native runs the call): the function's own preconditions at its top —
+//     no primary-capable provider, a `Scan` provider, or an implied-literals
+//     / implied-reasons buffer overflow — and, inside that arm, a walk that
+//     finds NO conflict at the captured trail offset (JIT/native
+//     disagreement; reported under `TRUST_CG_PROPAGATE_VERBOSE`).
+//   * `JIT_ANALYZE_DRIVER_FORCE` defaults to `true` (see the static near
+//     the top of this file); `false` restores the pre-extension-5
+//     root-authoritative gate for A/B benches.
+//
+// The unit test `native_find_first_conflict_clause_matches_microsat_propagate`
+// below pins the walk against native `propagate`'s clause choice.
 // ===========================================================================
 
 /// MicroSAT's `END` enum value (from `microsat.c`:

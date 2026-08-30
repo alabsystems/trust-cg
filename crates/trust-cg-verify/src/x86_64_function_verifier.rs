@@ -145,6 +145,28 @@ enum X86SourceOp {
     /// register-count CL form (Shl/Shr/SarRR) and immediate-count form
     /// (Shl/Shr/SarRI).
     Shift(trust_cg_lower::instructions::Opcode),
+    /// Variable-count rotate-left (`RolRCl` — ROL r/m64, CL). The two-address
+    /// `[dst, src1]` shape of the RR shifts (count implicit in CL, bound to a
+    /// fresh symbol exactly as theirs is), but NOT the `Shift` family: the
+    /// SOURCE side is the bridge's `bitmanip_rotate` expansion — the very idiom
+    /// the Stage-2 peephole deletes —
+    ///
+    /// ```text
+    ///     eff   = c & (w-1)
+    ///     compl = (0 - eff) & (w-1)
+    ///     S     = (x << eff) | (x >>u compl)
+    /// ```
+    ///
+    /// and the MACHINE side is the independent hardware-masked
+    /// `encode_rol_rcl_masked` (complement via `(w - m) & (w-1)`, OR halves in
+    /// the OPPOSITE order — structurally distinct, so not an X==X). TOTAL:
+    /// every shift amount is `< w` by construction and `m = 0` gives
+    /// `x | x = x` on both sides, so unlike `Shift` there is NO load-bearing
+    /// `count < width` precondition. Refutations: ROR-for-ROL (swapped
+    /// halves), a dropped wrap half, an UNMASKED machine count (diverges at
+    /// `c >= w`), a wrong mask (`& 31` at 64-bit), and SHL-for-ROL all
+    /// REFUTE — see the rotl_var controls in `tests/reconstruction_x86.rs`.
+    RotlVar,
     /// Unary integer negate (trust_ir `Ineg`), via `encode_trust_ir_neg`.
     Neg,
     /// Unary bitwise NOT (trust_ir `Bnot`), via `encode_trust_ir_bnot`.
@@ -488,6 +510,10 @@ fn x86_opcode_to_source_op(opcode: X86Opcode) -> Option<(X86SourceOp, X86AluArit
         O::ShlRR | O::ShlRI => Some((X86SourceOp::Shift(Opcode::Ishl), X86AluArity::Binary)),
         O::ShrRR | O::ShrRI => Some((X86SourceOp::Shift(Opcode::Ushr), X86AluArity::Binary)),
         O::SarRR | O::SarRI => Some((X86SourceOp::Shift(Opcode::Sshr), X86AluArity::Binary)),
+        // Variable-count rotate: its OWN family, not Shift — the source is the
+        // bridge's masked shl/shr/or rotate idiom (total, precondition-free),
+        // not a bare trust_ir shift with the count<width precondition.
+        O::RolRCl => Some((X86SourceOp::RotlVar, X86AluArity::Binary)),
 
         // ---- Extends (unary, width-changing). from_bits fixed by the opcode. ----
         O::Movzx => Some((X86SourceOp::Uextend { from_bits: 8 }, X86AluArity::Unary)),
@@ -863,6 +889,12 @@ fn x86_emitted_op_class(inst: &X86ISelInst) -> Option<OpClass> {
         },
         X86SourceOp::Bitwise(_) | X86SourceOp::Not => Some(OpClass::Bitwise),
         X86SourceOp::Shift(_) => Some(OpClass::Shift),
+        // The variable rotate is classed with the shifts (there is no rotate
+        // OpClass; ROL is the wrap-around member of the C1/D3 shift group).
+        // NOTE for Stage 2: the peephole's provenance anchor is the rotate
+        // idiom's OR — if the anchor stamps as Bitwise, extend the
+        // compatibility matrix by triage rather than reclassifying here.
+        X86SourceOp::RotlVar => Some(OpClass::Shift),
         X86SourceOp::Neg => Some(OpClass::IntNeg),
         // Universal glue: exempt from the class check (never from integrity).
         X86SourceOp::Sextend { .. }
@@ -1156,6 +1188,9 @@ pub fn reconstruct_alu_obligation(inst: &X86ISelInst) -> Option<ProofObligation>
                 return None;
             }
             return reconstruct_x86_mem_rmw(inst, op, from_opcode);
+        }
+        X86SourceOp::RotlVar => {
+            return reconstruct_x86_rotl_var(inst, from_opcode);
         }
         X86SourceOp::InPlaceIncDec { is_inc } => {
             return reconstruct_x86_inc_dec(inst, *is_inc, from_opcode);
@@ -2142,6 +2177,104 @@ fn reconstruct_x86_mem_rmw(
         trust_ir_expr,
         aarch64_expr: machine_expr,
         inputs,
+        preconditions: vec![],
+        fp_inputs: vec![],
+        category: Some(crate::lowering_proof::TransvalCheckKind::InstructionLowering),
+        machine_side_provenance: MachineSideProvenance::Reconstructed {
+            from_opcode,
+            arity: 2,
+        },
+    })
+}
+
+/// Reconstruct a variable-count rotate-left (`RolRCl` — ROL r/m64, CL).
+/// Schema: `[dst, src1]` — the RR-shift two-address shape, count implicit in
+/// CL and bound to a FRESH symbol (`recon_src2`, the runtime CL value),
+/// exactly as the CL shifts bind theirs.
+///
+/// * SOURCE  = the bridge's `bitmanip_rotate` expansion (the very idiom the
+///   Stage-2 peephole deletes), in bridge order
+///   (`rustc-codegen-trust-cg/src/lib.rs` `bitmanip_rotate`):
+///
+///   ```text
+///       eff   = c & (w-1)
+///       compl = (0 - eff) & (w-1)
+///       S     = (x << eff) | (x >>u compl)
+///   ```
+///
+///   built from the trust_ir `Band`/`Isub`/`Ishl`/`Ushr`/`Bor` encoders;
+/// * MACHINE = the REAL emitted opcode's hardware-masked rotate encoder
+///   [`encode_rol_rcl_masked`]: `m = c & (w-1)`, then
+///   `(x >>u ((w - m) & (w-1))) | (x << m)` — OR halves in the OPPOSITE
+///   order and the complement via `(w - m) & (w-1)` rather than the source's
+///   `(0 - eff) & (w-1)`, so the obligation is structurally distinct (not the
+///   vacuous X==X `ProofObligation::is_degenerate` catches).
+///
+/// TOTAL — NO preconditions: every shift amount on both sides is `< w` by
+/// construction, and `m = 0` gives `x | x = x` on both sides. This is
+/// strictly stronger than the `Shift` lane, whose `count < width`
+/// precondition is load-bearing. The machine half is keyed off `inst.opcode`
+/// (not the table), so a table-vs-emission mismatch REFUTES; ROR-for-ROL,
+/// a dropped wrap half, an unmasked machine count (`c >= w` diverges), a
+/// wrong mask width, and SHL-for-ROL all REFUTE (rotl_var controls in
+/// `tests/reconstruction_x86.rs`).
+fn reconstruct_x86_rotl_var(inst: &X86ISelInst, from_opcode: String) -> Option<ProofObligation> {
+    use crate::trust_ir_semantics::{
+        encode_trust_ir_binop, encode_trust_ir_bitwise_binop, encode_trust_ir_shift,
+    };
+    use crate::x86_64_semantics::encode_rol_rcl_masked;
+    use trust_cg_lower::instructions::Opcode;
+
+    if inst.operands.len() != 2 {
+        return None;
+    }
+    let dst = inst.operands.first()?;
+    let dst_width = x86_operand_reg_width_bits(dst)?;
+    // src1 must be a register at the destination width.
+    if x86_operand_reg_width_bits(&inst.operands[1])? != dst_width {
+        return None;
+    }
+    let size = x86_width_to_operand_size(dst_width);
+    let ty = x86_width_to_type(dst_width)?;
+
+    let sym_x = SmtExpr::var("recon_src1", dst_width);
+    // Implicit CL count: a fresh symbol (the runtime rotate amount).
+    let sym_c = SmtExpr::var("recon_src2", dst_width);
+    let w_mask = SmtExpr::bv_const(u64::from(dst_width - 1), dst_width);
+
+    // SOURCE: the bridge idiom, in bridge order.
+    let eff =
+        encode_trust_ir_bitwise_binop(&Opcode::Band, ty.clone(), sym_c.clone(), w_mask.clone());
+    let neg = encode_trust_ir_binop(
+        &Opcode::Isub,
+        ty.clone(),
+        SmtExpr::bv_const(0, dst_width),
+        eff.clone(),
+    );
+    let compl = encode_trust_ir_bitwise_binop(&Opcode::Band, ty.clone(), neg, w_mask);
+    let lo = encode_trust_ir_shift(&Opcode::Ishl, ty.clone(), sym_x.clone(), eff);
+    let hi = encode_trust_ir_shift(&Opcode::Ushr, ty.clone(), sym_x.clone(), compl);
+    let trust_ir_expr = encode_trust_ir_bitwise_binop(&Opcode::Bor, ty, lo, hi);
+
+    // MACHINE: the REAL emitted opcode's hardware-masked rotate — keyed off
+    // inst.opcode, NOT the source-op table, so a wrong-op emission REFUTES.
+    let machine_expr = match inst.opcode {
+        X86Opcode::RolRCl => encode_rol_rcl_masked(size, sym_x, sym_c),
+        _ => return None,
+    };
+
+    Some(ProofObligation {
+        name: format!(
+            "RECONSTRUCTED x86_64 RotlVar_{dst_width} -> {:?} (masked shl/shr/or idiom vs hardware-masked ROL, real-operand)",
+            inst.opcode
+        ),
+        trust_ir_expr,
+        aarch64_expr: machine_expr,
+        inputs: vec![
+            ("recon_src1".to_string(), dst_width),
+            ("recon_src2".to_string(), dst_width),
+        ],
+        // TOTAL: deliberately NO count<width precondition — both sides mask.
         preconditions: vec![],
         fp_inputs: vec![],
         category: Some(crate::lowering_proof::TransvalCheckKind::InstructionLowering),
@@ -3889,6 +4022,10 @@ pub fn representative_reconstructable_inst(opcode: X86Opcode) -> Option<X86ISelI
         //      representative_reconstructable_insts). ----
         X86SourceOp::CondMove => vec![r64(0), r64(1), X86ISelOperand::CondCode(X86CondCode::E)],
 
+        // ---- Variable rotate: [dst, src1] (count in implicit CL, exactly the
+        //      RR-shift shape). ----
+        X86SourceOp::RotlVar => vec![r64(0), r64(1)],
+
         // Unary Neg/Not: [dst, src].
         _ if arity == X86AluArity::Unary => vec![r64(0), r64(1)],
         // RR shift form: [dst, src1] (count in implicit CL).
@@ -4185,6 +4322,16 @@ impl X86FunctionVerifier {
             // but it is NOT a shift: it wraps bits round instead of discarding
             // them, so it binds to its own `RotL_I*` proofs.
             RolRI => Some("RotL_I"),
+            // The VARIABLE-count rotate deliberately has NO named-DB row: it
+            // is covered by the per-instruction RECONSTRUCTION route
+            // (`X86SourceOp::RotlVar` — the bridge's masked shl/shr/or idiom
+            // vs the hardware-masked ROL encoder, total and
+            // precondition-free), the same exceptionless posture as the
+            // XorMR/AddMR RMW quartet. Returning a query string here would
+            // add nothing: the reconstruction is the stronger, real-operand
+            // obligation, and the coverage gate credits it through
+            // `x86_reconstruction_discharges_valid`.
+            RolRCl => None,
             ShlRR | ShlRI => Some("Ishl_I"),
             ShrRR | ShrRI => Some("Ushr_I"),
             SarRR | SarRI => Some("Sshr_I"),

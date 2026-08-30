@@ -2571,6 +2571,347 @@ mod tuning_tests {
         );
     }
 
+    // ------------------------------------------------------------------
+    // LENS-1 adversarial tests: kill-at-def through the newly whitelisted
+    // producers (plain logical + shifted-second-source forms).
+    // ------------------------------------------------------------------
+
+    /// Build the canonical loop-carried latch (carrier v0, invariant v1,
+    /// producer defining v2, latch copy v0<-v2) with an arbitrary producer
+    /// opcode and use list. Mirrors kill_at_def_rn_only_producer_slot_gating.
+    fn adv_latch_func(producer: u16, producer_uses: Vec<MachOperand>) -> MachFunction {
+        let insts = vec![
+            mk(
+                1,
+                vec![MachOperand::VReg(v32(0))],
+                vec![MachOperand::Imm(0)],
+            ),
+            mk(
+                1,
+                vec![MachOperand::VReg(v32(1))],
+                vec![MachOperand::Imm(9)],
+            ),
+            mk(producer, vec![MachOperand::VReg(v32(2))], producer_uses),
+            // Filler between producer and latch copy (see the slot-gating
+            // test: without it the conflated-position model fuses the
+            // carrier's kill and redef into one multi-position range).
+            mk(2, vec![], vec![MachOperand::VReg(v32(1))]),
+            mk(
+                IR_COPY_OPCODE,
+                vec![MachOperand::VReg(v32(0))],
+                vec![MachOperand::VReg(v32(2))],
+            ),
+            MachInst {
+                opcode: 0xBB,
+                defs: vec![],
+                uses: vec![
+                    MachOperand::VReg(v32(0)),
+                    MachOperand::VReg(v32(1)),
+                    MachOperand::Block(BlockId(1)),
+                    MachOperand::Block(BlockId(2)),
+                ],
+                implicit_defs: vec![],
+                implicit_uses: vec![],
+                flags: InstFlags::IS_BRANCH.union(InstFlags::IS_TERMINATOR),
+                tied_operands: vec![],
+            },
+            mk(2, vec![], vec![MachOperand::VReg(v32(0))]),
+        ];
+        MachFunction {
+            name: "adv_latch".into(),
+            insts,
+            blocks: vec![
+                MachBlock {
+                    insts: vec![InstId(0), InstId(1)],
+                    preds: vec![],
+                    succs: vec![BlockId(1)],
+                    loop_depth: 0,
+                },
+                MachBlock {
+                    insts: vec![InstId(2), InstId(3), InstId(4), InstId(5)],
+                    preds: vec![BlockId(0), BlockId(1)],
+                    succs: vec![BlockId(1), BlockId(2)],
+                    loop_depth: 1,
+                },
+                MachBlock {
+                    insts: vec![InstId(6)],
+                    preds: vec![BlockId(1)],
+                    succs: vec![],
+                    loop_depth: 0,
+                },
+            ],
+            block_order: vec![BlockId(0), BlockId(1), BlockId(2)],
+            entry_block: BlockId(0),
+            next_vreg: 3,
+            next_stack_slot: 0,
+            stack_slots: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn adv_run(func: &MachFunction) -> CoalesceResult {
+        let mut intervals = compute_live_intervals(func).intervals;
+        coalesce_copies_tuned(func, &mut intervals, &CoalesceTuning::aarch64())
+    }
+
+    /// EVERY shifted-second-source producer must merge with the carrier in
+    /// the un-shifted Rn slot (uses[0]) and refuse with the carrier in the
+    /// shifted Rm slot (uses[1]) — not just the EorRRLsr the in-tree test
+    /// pins. A wrong slot index for any one opcode would surface here.
+    #[test]
+    fn adv_all_six_shifted_producers_slot_gating() {
+        use trust_cg_ir::inst::AArch64Opcode as A;
+        for op in [
+            A::AddRRShift,
+            A::AddRRShiftLsr,
+            A::SubRRShift,
+            A::EorRRShift,
+            A::EorRRLsl,
+            A::EorRRLsr,
+        ] {
+            // Carrier v0 in Rn (uses[0]): merge.
+            let func = adv_latch_func(
+                op as u16,
+                vec![
+                    MachOperand::VReg(v32(0)),
+                    MachOperand::VReg(v32(1)),
+                    MachOperand::Imm(11),
+                ],
+            );
+            let tuned = adv_run(&func);
+            assert_eq!(
+                tuned.copies_removed, 1,
+                "{op:?}: Rn-slot carrier must merge"
+            );
+            assert_eq!(tuned.rewrites.get(&v32(2)), Some(&v32(0)), "{op:?}");
+
+            // Carrier v0 in Rm (uses[1]): refuse.
+            let func = adv_latch_func(
+                op as u16,
+                vec![
+                    MachOperand::VReg(v32(1)),
+                    MachOperand::VReg(v32(0)),
+                    MachOperand::Imm(11),
+                ],
+            );
+            let tuned = adv_run(&func);
+            assert_eq!(
+                tuned.copies_removed, 0,
+                "{op:?}: Rm-slot carrier must fail closed"
+            );
+        }
+    }
+
+    /// Carrier in BOTH slots (`eor t, d, d, lsl #k`): uses[1] resolves to the
+    /// carrier, so the gate must refuse.
+    #[test]
+    fn adv_carrier_in_both_slots_refused() {
+        use trust_cg_ir::inst::AArch64Opcode as A;
+        let func = adv_latch_func(
+            A::EorRRLsl as u16,
+            vec![
+                MachOperand::VReg(v32(0)),
+                MachOperand::VReg(v32(0)),
+                MachOperand::Imm(3),
+            ],
+        );
+        let tuned = adv_run(&func);
+        assert_eq!(tuned.copies_removed, 0);
+    }
+
+    /// Malformed shifted producer with a missing / non-vreg uses[1] must fail
+    /// closed rather than panic or merge.
+    #[test]
+    fn adv_malformed_rm_slot_fails_closed() {
+        use trust_cg_ir::inst::AArch64Opcode as A;
+        // uses[1] absent entirely.
+        let func = adv_latch_func(A::EorRRLsr as u16, vec![MachOperand::VReg(v32(0))]);
+        let tuned = adv_run(&func);
+        assert_eq!(tuned.copies_removed, 0, "missing uses[1] must fail closed");
+
+        // uses[1] is an Imm, not a vreg.
+        let func = adv_latch_func(
+            A::AddRRShift as u16,
+            vec![
+                MachOperand::VReg(v32(0)),
+                MachOperand::Imm(7),
+                MachOperand::Imm(11),
+            ],
+        );
+        let tuned = adv_run(&func);
+        assert_eq!(tuned.copies_removed, 0, "non-vreg uses[1] must fail closed");
+    }
+
+    /// Plain logical immediate forms (`AndRI`/`OrrRI`/`EorRI`, uses =
+    /// [Rn, Imm]) merge through the only register slot: the in-place
+    /// `and d, d, #m` is a single read-then-write word.
+    #[test]
+    fn adv_logical_immediate_forms_merge() {
+        use trust_cg_ir::inst::AArch64Opcode as A;
+        for op in [A::AndRI, A::OrrRI, A::EorRI] {
+            let func = adv_latch_func(
+                op as u16,
+                vec![MachOperand::VReg(v32(0)), MachOperand::Imm(0xff)],
+            );
+            let tuned = adv_run(&func);
+            assert_eq!(
+                tuned.copies_removed, 1,
+                "{op:?}: Rn-slot carrier must merge"
+            );
+            assert_eq!(tuned.rewrites.get(&v32(2)), Some(&v32(0)), "{op:?}");
+        }
+    }
+
+    /// Plain (un-shifted) logical register forms are NOT slot-gated: the
+    /// carrier may sit in either source (both `eor d, d, x` and
+    /// `eor d, x, d` are single read-then-write words with no shifter
+    /// recurrence), and both slots must merge.
+    #[test]
+    fn adv_plain_logical_rr_both_slots_merge() {
+        use trust_cg_ir::inst::AArch64Opcode as A;
+        for op in [A::AndRR, A::OrrRR, A::EorRR] {
+            for (rn, rm) in [(0u32, 1u32), (1, 0)] {
+                let func = adv_latch_func(
+                    op as u16,
+                    vec![MachOperand::VReg(v32(rn)), MachOperand::VReg(v32(rm))],
+                );
+                let tuned = adv_run(&func);
+                assert_eq!(
+                    tuned.copies_removed,
+                    1,
+                    "{op:?} carrier in uses[{}] must merge",
+                    if rn == 0 { 0 } else { 1 }
+                );
+            }
+        }
+    }
+
+    /// Width mixing: a Gpr64 carrier fed by a Gpr32-class producer chain (or
+    /// vice versa) must never coalesce — the class check refuses before any
+    /// kill-at-def reasoning. The rewrite must not conflate W and X views.
+    #[test]
+    fn adv_w_x_class_mix_refused() {
+        use trust_cg_ir::inst::AArch64Opcode as A;
+        let v64 = |id| VReg {
+            id,
+            class: RegClass::Gpr64,
+        };
+        // Same shape as adv_latch_func but the copy dst (carrier) is Gpr64
+        // while the producer def v2 is Gpr32.
+        let insts = vec![
+            mk(
+                1,
+                vec![MachOperand::VReg(v64(0))],
+                vec![MachOperand::Imm(0)],
+            ),
+            mk(
+                1,
+                vec![MachOperand::VReg(v32(1))],
+                vec![MachOperand::Imm(9)],
+            ),
+            mk(
+                A::EorRR as u16,
+                vec![MachOperand::VReg(v32(2))],
+                vec![MachOperand::VReg(v64(0)), MachOperand::VReg(v32(1))],
+            ),
+            mk(2, vec![], vec![MachOperand::VReg(v32(1))]),
+            mk(
+                IR_COPY_OPCODE,
+                vec![MachOperand::VReg(v64(0))],
+                vec![MachOperand::VReg(v32(2))],
+            ),
+            MachInst {
+                opcode: 0xBB,
+                defs: vec![],
+                uses: vec![
+                    MachOperand::VReg(v64(0)),
+                    MachOperand::VReg(v32(1)),
+                    MachOperand::Block(BlockId(1)),
+                    MachOperand::Block(BlockId(2)),
+                ],
+                implicit_defs: vec![],
+                implicit_uses: vec![],
+                flags: InstFlags::IS_BRANCH.union(InstFlags::IS_TERMINATOR),
+                tied_operands: vec![],
+            },
+            mk(2, vec![], vec![MachOperand::VReg(v64(0))]),
+        ];
+        let func = MachFunction {
+            name: "adv_wx".into(),
+            insts,
+            blocks: vec![
+                MachBlock {
+                    insts: vec![InstId(0), InstId(1)],
+                    preds: vec![],
+                    succs: vec![BlockId(1)],
+                    loop_depth: 0,
+                },
+                MachBlock {
+                    insts: vec![InstId(2), InstId(3), InstId(4), InstId(5)],
+                    preds: vec![BlockId(0), BlockId(1)],
+                    succs: vec![BlockId(1), BlockId(2)],
+                    loop_depth: 1,
+                },
+                MachBlock {
+                    insts: vec![InstId(6)],
+                    preds: vec![BlockId(1)],
+                    succs: vec![],
+                    loop_depth: 0,
+                },
+            ],
+            block_order: vec![BlockId(0), BlockId(1), BlockId(2)],
+            entry_block: BlockId(0),
+            next_vreg: 3,
+            next_stack_slot: 0,
+            stack_slots: std::collections::BTreeMap::new(),
+        };
+        let tuned = adv_run(&func);
+        assert_eq!(
+            tuned.copies_removed, 0,
+            "cross-class W/X copy must never coalesce"
+        );
+        assert!(tuned.rewrites.is_empty());
+    }
+
+    /// Rewrite integrity: after apply_coalescing the producer keeps its
+    /// operand ROLES — the carrier stays in the exact source slot it occupied
+    /// and only vreg NAMES change (no operand reordering that could flip a
+    /// non-commutative SubRRShift).
+    #[test]
+    fn adv_rewrite_preserves_operand_slots() {
+        use trust_cg_ir::inst::AArch64Opcode as A;
+        // sub t, x1, x0? No: carrier must be Rn for the merge to be allowed.
+        // v2 = SubRRShift(v0 /*minuend, carrier*/, v1 /*shifted subtrahend*/, #11)
+        let mut func = adv_latch_func(
+            A::SubRRShift as u16,
+            vec![
+                MachOperand::VReg(v32(0)),
+                MachOperand::VReg(v32(1)),
+                MachOperand::Imm(11),
+            ],
+        );
+        let mut intervals = compute_live_intervals(&func).intervals;
+        let tuned = coalesce_copies_tuned(&func, &mut intervals, &CoalesceTuning::aarch64());
+        assert_eq!(tuned.copies_removed, 1);
+        apply_coalescing(&mut func, &tuned.removals, &tuned.rewrites);
+        let producer = &func.insts[2];
+        // def renamed v2 -> v0 (in-place), uses UNCHANGED in both slot and name.
+        assert_eq!(producer.defs, vec![MachOperand::VReg(v32(0))]);
+        assert_eq!(
+            producer.uses,
+            vec![
+                MachOperand::VReg(v32(0)),
+                MachOperand::VReg(v32(1)),
+                MachOperand::Imm(11),
+            ],
+            "SubRRShift sources must keep their slots: d = d - (x << 11)"
+        );
+        // The latch copy is gone from the block.
+        assert!(
+            !func.blocks[1].insts.contains(&InstId(4)),
+            "latch copy must be removed"
+        );
+    }
+
     /// Normalization: hardened `AddRI d, s, #0` and same-class `MovR` become
     /// real copies; a width-mismatched `MOVWrr` over Gpr64 (a truncation
     /// idiom) must NOT be rewritten.

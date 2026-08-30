@@ -75,7 +75,7 @@ x86_opcode_table! {
     AddRR, AddRI, AddRM, SubRR, SubRI, SubRM, AdcRR, SbbRR, ImulRR, ImulRRI, ImulRM, Idiv, Div, Mul, Neg, Inc, Dec,
     Cdq, Cqo,
     AndRR, AndRI, OrRR, OrRI, XorRR, XorRI, Not,
-    ShlRR, ShlRI, ShrRR, ShrRI, SarRR, SarRI, RolRI,
+    ShlRR, ShlRI, ShrRR, ShrRI, SarRR, SarRI, RolRI, RolRCl,
     MovRR, MovRR32, MovRI, MovRM8, MovRM16, MovRM32, MovRM, MovMR8, MovMR16, MovMR32, MovMR,
     MovRM8Sib, MovMR8Sib,
     VolatileMovRM8, VolatileMovRM16, VolatileMovRM32, VolatileMovRM,
@@ -431,7 +431,7 @@ fn strat_rip_rel() -> impl Strategy<Value = OpPair> {
 fn strat_shift_rr() -> impl Strategy<Value = OpPair> {
     use X86Opcode::*;
     (
-        prop_oneof![Just(ShlRR), Just(ShrRR), Just(SarRR)],
+        prop_oneof![Just(ShlRR), Just(ShrRR), Just(SarRR), Just(RolRCl)],
         gpr64_strategy(),
     )
         .prop_map(|(op, dst)| (op, X86InstOperands::r(dst)))

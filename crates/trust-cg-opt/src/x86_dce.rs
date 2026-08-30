@@ -244,8 +244,9 @@ pub(crate) fn redef_reads_operand0(inst: &X86ISelInst) -> bool {
         // Immediate / shift-immediate families: tied iff 2 operands
         // ([d, imm]); the 3-operand form is [d, s, imm].
         AddRI | SubRI | AndRI | OrRI | XorRI | ShlRI | ShrRI | SarRI => inst.operands.len() == 2,
-        // Register-count shifts: tied iff 2 operands ([d, count]).
-        ShlRR | ShrRR | SarRR => inst.operands.len() == 2,
+        // Register-count shifts (and the CL-count rotate): tied iff 2
+        // operands ([d, src]).
+        ShlRR | ShrRR | SarRR | RolRCl => inst.operands.len() == 2,
         // Neg/Not/Inc/Dec ([d]) and the RM ALU forms ([d, mem]) always
         // read their destination.
         _ => true,
@@ -546,8 +547,13 @@ fn condition_flag_overwrite(inst: &X86ISelInst) -> FlagOverwrite {
         | XorRR | XorRI | CmpRR | CmpRI | CmpRI8 | CmpRM | TestRR | TestRI | TestRM | Ucomisd
         | Ucomiss | Popcnt => Full,
 
+        // RolRCl is Partial like the CL shifts (writes only CF/OF, and only
+        // when the runtime CL count is nonzero — never a Full overwrite).
+        // RolRI reaches Partial via the x86_writes_flags fallback below.
         Inc | Dec | ImulRR | ImulRRI | ImulRM | ImulRMSib | Idiv | Div | Mul | ShlRR | ShlRI
-        | ShrRR | ShrRI | SarRR | SarRI | Bsf | Bsr | Tzcnt | Lzcnt | BtRI | Cmpxchg => Partial,
+        | ShrRR | ShrRI | SarRR | SarRI | RolRCl | Bsf | Bsr | Tzcnt | Lzcnt | BtRI | Cmpxchg => {
+            Partial
+        }
 
         _ if x86_writes_flags(inst.opcode) => Partial,
         _ => None,
@@ -677,6 +683,7 @@ fn first_operand_is_def_and_use(inst: &X86ISelInst) -> bool {
             | ShlRR
             | ShrRR
             | SarRR
+            | RolRCl
     )
 }
 

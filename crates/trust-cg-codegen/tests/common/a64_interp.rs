@@ -312,19 +312,6 @@ impl A64Interp {
         self.v_hi[i] = 0;
     }
 
-    /// Set an FP argument register (h0..h31) from a raw 16-bit half-float bit
-    /// pattern, zero-extended into the V register.
-    pub fn set_h_bits(&mut self, i: usize, bits: u16) {
-        self.v[i] = bits as u64;
-        self.v_hi[i] = 0;
-    }
-
-    /// Set a full 128-bit V register (q0..q31) from lo/hi 64-bit halves.
-    pub fn set_q(&mut self, i: usize, lo: u64, hi: u64) {
-        self.v[i] = lo;
-        self.v_hi[i] = hi;
-    }
-
     /// Set an FP register from a raw D-width (64-bit) bit pattern.
     pub fn set_d_bits(&mut self, i: usize, bits: u64) {
         self.v[i] = bits;
@@ -1497,12 +1484,4 @@ where
     let mut interp = A64Interp::new(text.bytes).with_branch_relocs(relocs);
     setup(&mut interp);
     interp.run(entry)
-}
-
-/// Interpret `sym` and return the low 32 bits sign-interpreted as i32.
-pub fn run_i32<F>(obj: &[u8], sym: &str, setup: F) -> Result<i32, A64Error>
-where
-    F: FnOnce(&mut A64Interp),
-{
-    run_func(obj, sym, setup).map(|x0| x0 as u32 as i32)
 }

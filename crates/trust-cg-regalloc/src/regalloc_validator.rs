@@ -4281,13 +4281,6 @@ fn first_slot(ops: &[RegAllocOperand]) -> Option<StackSlotId> {
     })
 }
 
-/// Set of all locations currently bound to a vreg (utility for diagnostics /
-/// future extensions; kept public-in-module for the test harness).
-#[allow(dead_code)]
-fn bound_locations(locations: &BTreeMap<VReg, Location>) -> BTreeSet<Location> {
-    locations.values().copied().collect()
-}
-
 // trust-cg-regalloc/regalloc_validator_tests.rs - tests for the RA validator
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>

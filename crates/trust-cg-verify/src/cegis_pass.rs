@@ -159,6 +159,73 @@ fn sorted_feature_strings(features: &[String]) -> Vec<&str> {
 // Configuration
 // ---------------------------------------------------------------------------
 
+/// Cache-key schema for the complete set of inputs that can affect a CEGIS
+/// search result.
+///
+/// This is deliberately separate from the payload codec version: changing a
+/// matcher, enumeration order, solver contract, or schedule policy can change
+/// which proven rewrites a bounded search discovers without changing the
+/// serialized entry layout. Such a change must bump this revision.
+pub const CEGIS_SEARCH_SEMANTICS_REVISION: u32 = 1;
+
+/// Version of the outer-executor schedule identity bound into CEGIS keys.
+///
+/// A wall-clock-bounded search is sensitive to the amount of concurrent work
+/// sharing its CPU. The schedule is therefore an artifact input until the
+/// search moves to deterministic fuel rather than elapsed time.
+pub const CEGIS_SEARCH_SCHEDULE_VERSION: u32 = 1;
+
+/// Effective outer-executor schedule for one CEGIS invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CegisSearchScheduleIdentity {
+    effective_parallelism: u32,
+}
+
+impl CegisSearchScheduleIdentity {
+    /// A search running outside a parallel executor.
+    pub const fn serial() -> Self {
+        Self {
+            effective_parallelism: 1,
+        }
+    }
+
+    /// Explicit schedule identity for an embedding that already resolved its
+    /// worker plan.
+    pub const fn with_effective_parallelism(effective_parallelism: u32) -> Self {
+        Self {
+            effective_parallelism: if effective_parallelism == 0 {
+                1
+            } else {
+                effective_parallelism
+            },
+        }
+    }
+
+    /// Resolve the Rayon executor currently driving this call.
+    ///
+    /// Outside a Rayon worker the CEGIS pass itself is serial, so the identity
+    /// is one. Inside module/file fanout, `current_num_threads` is the exact
+    /// width of the pool whose workers contend for the wall-clock search.
+    pub fn current_execution() -> Self {
+        if rayon::current_thread_index().is_none() {
+            return Self::serial();
+        }
+        let effective_parallelism = u32::try_from(rayon::current_num_threads()).unwrap_or(u32::MAX);
+        Self::with_effective_parallelism(effective_parallelism)
+    }
+
+    /// Number of workers in the effective outer schedule.
+    pub const fn effective_parallelism(self) -> u32 {
+        self.effective_parallelism
+    }
+}
+
+impl Default for CegisSearchScheduleIdentity {
+    fn default() -> Self {
+        Self::serial()
+    }
+}
+
 /// Configuration for [`CegisSuperoptPass`].
 ///
 /// The pass is effectively disabled when `budget_sec == 0`, which is the
@@ -178,6 +245,12 @@ pub struct CegisSuperoptConfig {
     pub features: Vec<String>,
     /// Optimization level (0-3, used for cache keying).
     pub opt_level: u8,
+    /// Effective outer-executor schedule (used for cache keying).
+    ///
+    /// This is result-affecting while `budget_sec` and `per_query_ms` are
+    /// wall-clock limits: a wider outer fanout can change which candidates or
+    /// solver queries finish before those limits.
+    pub search_schedule: CegisSearchScheduleIdentity,
     /// Optional cache backend. If `None`, the pass runs but never caches.
     pub cache: Option<Arc<dyn CacheBackend>>,
     /// Optional structured compilation trace collector. When set, the pass
@@ -198,6 +271,7 @@ impl CegisSuperoptConfig {
             cpu: String::new(),
             features: Vec::new(),
             opt_level: 2,
+            search_schedule: CegisSearchScheduleIdentity::serial(),
             cache: None,
             trace: None,
         }
@@ -225,6 +299,7 @@ impl std::fmt::Debug for CegisSuperoptConfig {
             .field("cpu", &self.cpu)
             .field("features", &self.features)
             .field("opt_level", &self.opt_level)
+            .field("search_schedule", &self.search_schedule)
             .field("cache", &self.cache.as_ref().map(|_| "<CacheBackend>"))
             .field("trace", &self.trace.as_ref().map(|t| t.level()))
             .finish()
@@ -461,6 +536,82 @@ pub struct ProvenRewrite {
     pub layer: RewriteLayer,
 }
 
+/// Whether a cache entry represents a complete search of every candidate the
+/// configured policy was entitled to inspect.
+///
+/// Only [`Self::Complete`] may be published or replayed. The other variants
+/// are retained as typed internal outcomes so a deadline, query timeout,
+/// verifier failure, or panic cannot be mistaken for a proven negative result.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CegisSearchCompletion {
+    /// Search has not reached a publishable terminal state.
+    #[default]
+    NotCompleted,
+    /// Every candidate was considered and every query reached a definitive
+    /// result.
+    Complete,
+    /// The per-function wall-clock deadline stopped enumeration.
+    DeadlineExceeded,
+    /// A solver query timed out or exhausted its iteration budget.
+    QueryIncomplete,
+    /// The verifier returned an operational error.
+    VerifierError,
+    /// The verifier panicked and the pass contained the unwind.
+    VerifierPanicked,
+}
+
+impl CegisSearchCompletion {
+    fn record(&mut self, outcome: Self) {
+        if *self == Self::Complete && outcome != Self::Complete {
+            *self = outcome;
+        }
+    }
+
+    /// Whether this outcome is safe to persist and replay as a complete search.
+    pub const fn is_complete(self) -> bool {
+        matches!(self, Self::Complete)
+    }
+}
+
+/// Typed terminal result of one CEGIS pass invocation.
+///
+/// An incomplete search never exposes mutations: cache misses run against a
+/// private working copy and publish it only after every layer reaches
+/// [`CegisSearchCompletion::Complete`]. The legacy [`MachinePass`] boolean API
+/// maps `Disabled` and `Incomplete` to `false`.
+#[must_use = "an incomplete CEGIS transaction must be handled explicitly"]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CegisRunOutcome {
+    /// The configured budget was zero, so the pass did not run.
+    Disabled,
+    /// Every candidate received a definitive result and mutations, if any,
+    /// were committed atomically.
+    Complete {
+        /// Whether the committed result changed the machine function.
+        committed: bool,
+    },
+    /// Deadline/query/verifier failure aborted the transaction.
+    Incomplete {
+        /// Fail-closed reason reported by the search.
+        completion: CegisSearchCompletion,
+    },
+}
+
+impl CegisRunOutcome {
+    /// Whether a complete transaction changed the machine function.
+    pub const fn committed(self) -> bool {
+        matches!(self, Self::Complete { committed: true })
+    }
+
+    /// The incomplete reason, if the transaction was rolled back.
+    pub const fn incomplete_reason(self) -> Option<CegisSearchCompletion> {
+        match self {
+            Self::Incomplete { completion } => Some(completion),
+            Self::Disabled | Self::Complete { .. } => None,
+        }
+    }
+}
+
 /// Serializable cache entry stored under the per-function cache key.
 ///
 /// Encoded by [`crate::cegis_cache_codec`], which owns the byte layout and the
@@ -478,6 +629,8 @@ pub struct ProvenRewrite {
 pub struct CegisCacheEntry {
     /// Format version. Bump when fields change.
     pub version: u32,
+    /// Typed completion state. Only `Complete` entries are publishable.
+    pub completion: CegisSearchCompletion,
     /// All rewrites proven equivalent on this function.
     pub proven_rewrites: Vec<ProvenRewrite>,
     /// Number of candidate sites attempted.
@@ -514,26 +667,43 @@ impl CegisCacheEntry {
     ///   that reaches this cache was conditional on code Trust does not own.
     ///   v5 blobs do not carry the v6 magic and are rejected structurally,
     ///   before any field is parsed.
+    /// - v7: entries carry an explicit completion state. This invalidates v6
+    ///   entries because the old writer cached partial/empty prefixes after a
+    ///   deadline, query timeout, verifier error, or panic.
     ///
     /// Older entries are silently rejected as a miss; this is semantics-
     /// preserving because the pass simply re-runs enumeration on the next
     /// invocation.
-    pub const VERSION: u32 = 6;
+    pub const VERSION: u32 = 7;
 
     /// Fresh empty entry with the current version.
     pub fn empty() -> Self {
         Self {
             version: Self::VERSION,
+            completion: CegisSearchCompletion::Complete,
+            ..Default::default()
+        }
+    }
+
+    fn search_in_progress() -> Self {
+        Self {
+            version: Self::VERSION,
+            completion: CegisSearchCompletion::NotCompleted,
             ..Default::default()
         }
     }
 
     /// Encode to cache bytes.
     ///
-    /// Fails only if a sequence exceeds the `u32` wire length prefix, which a
-    /// well-formed entry cannot reach. The one caller that writes to a backend
-    /// drops the put on an error rather than failing the compilation.
+    /// Fails if the search is incomplete or if a sequence exceeds the `u32`
+    /// wire length prefix. The one caller that writes to a backend drops the
+    /// put on an error rather than failing the compilation.
     pub fn encode(&self) -> Result<Vec<u8>, CacheCodecError> {
+        if !self.completion.is_complete() {
+            return Err(CacheCodecError::IncompleteSearch {
+                completion: self.completion,
+            });
+        }
         crate::cegis_cache_codec::encode_entry(self)
     }
 
@@ -545,7 +715,8 @@ impl CegisCacheEntry {
     /// hit replays recorded rewrites **without** re-running CEGIS — so every
     /// ambiguity resolves to a miss. See [`crate::cegis_cache_codec`].
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        crate::cegis_cache_codec::decode_entry(bytes)
+        let entry = crate::cegis_cache_codec::decode_entry(bytes)?;
+        entry.completion.is_complete().then_some(entry)
     }
 }
 
@@ -641,6 +812,61 @@ pub struct CegisSuperoptTestHooks {
     pub verifier_result: Option<CegisResult>,
 }
 
+impl CegisSuperoptTestHooks {
+    fn affects_execution(&self) -> bool {
+        self.force_expired_deadline
+            || self.force_layer_a_equal_cost
+            || self.force_layer_b_equal_cost
+            || self.verifier_result.is_some()
+    }
+
+    fn write_cache_identity(&self, h: &mut StableHasher) {
+        if !self.affects_execution() {
+            h.write_u8(0);
+            return;
+        }
+
+        h.write_u8(1);
+        h.write_u8(u8::from(self.force_expired_deadline));
+        h.write_u8(u8::from(self.force_layer_a_equal_cost));
+        h.write_u8(u8::from(self.force_layer_b_equal_cost));
+        match self.verifier_result.as_ref() {
+            None => h.write_u8(0),
+            Some(CegisResult::Equivalent {
+                proof_hash,
+                iterations,
+            }) => {
+                h.write_u8(1);
+                h.write_u64(*proof_hash);
+                h.write_u64(u64::try_from(*iterations).unwrap_or(u64::MAX));
+            }
+            Some(CegisResult::NotEquivalent {
+                counterexample,
+                found_by_concrete,
+            }) => {
+                h.write_u8(2);
+                h.write_u8(u8::from(*found_by_concrete));
+                let mut values = counterexample.values.iter().collect::<Vec<_>>();
+                values.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+                h.write_u64(u64::try_from(values.len()).unwrap_or(u64::MAX));
+                for (name, value) in values {
+                    h.write_str(name);
+                    h.write_u64(*value);
+                }
+            }
+            Some(CegisResult::Timeout) => h.write_u8(3),
+            Some(CegisResult::MaxIterationsReached { counterexamples }) => {
+                h.write_u8(4);
+                h.write_u64(u64::try_from(*counterexamples).unwrap_or(u64::MAX));
+            }
+            Some(CegisResult::Error(message)) => {
+                h.write_u8(5);
+                h.write_str(message);
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The pass
 // ---------------------------------------------------------------------------
@@ -661,6 +887,9 @@ pub struct CegisSuperoptPass {
     test_hooks: CegisSuperoptTestHooks,
     failed_proof_counterexamples: FailedProofCounterexampleCorpus,
     failed_proof_counterexample_scope: Option<(SourceRegionIdentity, TargetAbiLayoutIdentity)>,
+    // Deterministic adversarial control used only by transaction tests. It is
+    // private and separately keyed so it cannot carry production authority.
+    test_incomplete_after_first_commit: bool,
 }
 
 impl CegisSuperoptPass {
@@ -672,6 +901,7 @@ impl CegisSuperoptPass {
             test_hooks: CegisSuperoptTestHooks::default(),
             failed_proof_counterexamples: FailedProofCounterexampleCorpus::empty(),
             failed_proof_counterexample_scope: None,
+            test_incomplete_after_first_commit: false,
         }
     }
 
@@ -712,6 +942,16 @@ impl CegisSuperoptPass {
         self
     }
 
+    /// Force the first proven mutation to terminate as an incomplete query.
+    ///
+    /// This exists only for deterministic adversarial transaction tests. Its
+    /// cache identity is disjoint from production and all other hook states.
+    #[doc(hidden)]
+    pub fn with_test_incomplete_after_first_commit(mut self) -> Self {
+        self.test_incomplete_after_first_commit = true;
+        self
+    }
+
     /// Return the collected statistics.
     pub fn stats(&self) -> &CegisPassStats {
         &self.stats
@@ -720,10 +960,12 @@ impl CegisSuperoptPass {
     /// Compute the deterministic per-function cache key.
     ///
     /// Hashes:
+    /// - CEGIS key/search/payload schema identity
+    /// - wall-clock/query budgets and effective outer-executor schedule
     /// - function name (framed)
     /// - number of instructions (framed)
     /// - each instruction's opcode Debug repr + operand count
-    /// - block layout (entry + block_order)
+    /// - block layout (entry + block_order + each live block's instruction ids)
     /// - opt_level, target_triple, cpu, features
     ///
     /// The resulting key is the same structure used by
@@ -731,6 +973,25 @@ impl CegisSuperoptPass {
     /// between whole-module and per-function entries.
     pub fn compute_function_key(&self, func: &MachFunction) -> CacheKey {
         let mut h = StableHasher::new();
+        h.write_str("trust-cg.verify.aarch64-cegis-function-cache");
+        h.write_str(env!("CARGO_PKG_VERSION"));
+        h.write_u32(CEGIS_SEARCH_SEMANTICS_REVISION);
+        h.write_u32(CEGIS_SEARCH_SCHEDULE_VERSION);
+        h.write_u32(CegisCacheEntry::VERSION);
+        h.write_u64(self.config.budget_sec);
+        h.write_u64(self.config.per_query_ms);
+        h.write_u32(self.config.search_schedule.effective_parallelism());
+        // `with_test_hooks` is public so integration tests can exercise the
+        // cache protocol.  A forced `Equivalent` result must never publish
+        // under the production key, where a later compiler could replay it as
+        // real proof authority.  Keep active hooks in a disjoint, exact
+        // namespace so two different synthetic outcomes cannot alias either.
+        self.test_hooks.write_cache_identity(&mut h);
+        // Preserve the production key when this test-only control is absent;
+        // active controls still receive a disjoint namespace.
+        if self.test_incomplete_after_first_commit {
+            h.write_str("test:incomplete-after-first-commit");
+        }
         h.write_str(&func.name);
         h.write_u64(func.insts.len() as u64);
         for inst in &func.insts {
@@ -752,6 +1013,11 @@ impl CegisSuperoptPass {
         h.write_u64(func.block_order.len() as u64);
         for b in &func.block_order {
             h.write_u64(b.0 as u64);
+            let block = func.block(*b);
+            h.write_u64(block.insts.len() as u64);
+            for inst in &block.insts {
+                h.write_u64(inst.0 as u64);
+            }
         }
         let module_hash = h.finish128();
         CacheKey::new(
@@ -810,18 +1076,18 @@ impl CegisSuperoptPass {
         func: &mut MachFunction,
         deadline: Instant,
         failed_proof_scope: Option<(&SourceRegionIdentity, &TargetAbiLayoutIdentity)>,
-    ) -> (bool, CegisCacheEntry, bool, bool) {
-        let mut entry = CegisCacheEntry::empty();
+    ) -> (bool, CegisCacheEntry, CegisSearchCompletion, bool) {
+        let mut entry = CegisCacheEntry::search_in_progress();
         let mut committed = false;
+        let mut completion = CegisSearchCompletion::Complete;
         let mut used_failed_proof_seed = false;
 
         if ProvenRuleDb::seed_layer_a().is_empty() {
-            return (false, entry, false, false);
+            return (false, entry, completion, false);
         }
 
         let cost_model = AppleSiliconCostModel::new(CostModelGen::M1);
         let mut cegis = CegisLoop::new(1, self.config.per_query_ms);
-        let mut exhausted = false;
 
         'blocks: for block_id in func.block_order.clone() {
             let inst_ids = func.block(block_id).insts.clone();
@@ -829,7 +1095,10 @@ impl CegisSuperoptPass {
 
             for inst_id in inst_ids {
                 if Instant::now() >= deadline {
-                    exhausted = true;
+                    // A deadline is also control flow: unlike a query failure,
+                    // it stops this layer and must remain visible even if an
+                    // earlier query was already incomplete.
+                    completion = CegisSearchCompletion::DeadlineExceeded;
                     break 'blocks;
                 }
 
@@ -906,17 +1175,22 @@ impl CegisSuperoptPass {
                                     layer: RewriteLayer::A,
                                 });
                                 committed = true;
+                                if self.test_incomplete_after_first_commit {
+                                    completion.record(CegisSearchCompletion::QueryIncomplete);
+                                }
                             }
                             Ok(CegisResult::NotEquivalent { .. }) => {
                                 self.stats.rejected += 1;
                                 entry.rejected += 1;
                             }
                             Ok(CegisResult::Timeout | CegisResult::MaxIterationsReached { .. }) => {
+                                completion.record(CegisSearchCompletion::QueryIncomplete);
                                 self.stats.timeouts += 1;
                                 self.stats.rejected += 1;
                                 entry.rejected += 1;
                             }
                             Ok(CegisResult::Error(message)) => {
+                                completion.record(CegisSearchCompletion::VerifierError);
                                 if std::env::var_os("TCG_SOLVE_TRACE").is_some() {
                                     eprintln!(
                                         "TCG_SOLVE_TRACE cegis_error layer=A message={message}"
@@ -927,12 +1201,17 @@ impl CegisSuperoptPass {
                                 entry.rejected += 1;
                             }
                             Err(_) => {
+                                completion.record(CegisSearchCompletion::VerifierPanicked);
                                 self.stats.panics += 1;
                                 self.stats.rejected += 1;
                                 entry.rejected += 1;
                             }
                         }
                     }
+                }
+
+                if !completion.is_complete() {
+                    break 'blocks;
                 }
 
                 let current_inst = func.inst(inst_id);
@@ -944,12 +1223,12 @@ impl CegisSuperoptPass {
             }
         }
 
-        if exhausted {
+        if completion == CegisSearchCompletion::DeadlineExceeded {
             self.stats.budget_exhausted += 1;
         }
         self.stats.solver_calls += cegis.stats_solver_calls();
 
-        (committed, entry, exhausted, used_failed_proof_seed)
+        (committed, entry, completion, used_failed_proof_seed)
     }
 
     /// Match a Layer B two-instruction window.
@@ -1057,17 +1336,17 @@ impl CegisSuperoptPass {
         deadline: Instant,
         entry: &mut CegisCacheEntry,
         failed_proof_scope: Option<(&SourceRegionIdentity, &TargetAbiLayoutIdentity)>,
-    ) -> (bool, bool) {
+    ) -> (bool, CegisSearchCompletion, bool) {
         let mut committed = false;
+        let mut completion = CegisSearchCompletion::Complete;
         let mut used_failed_proof_seed = false;
 
         if ProvenRuleDb::seed_layer_b().is_empty() {
-            return (false, false);
+            return (false, completion, false);
         }
 
         let cost_model = AppleSiliconCostModel::new(CostModelGen::M1);
         let mut cegis = CegisLoop::new(1, self.config.per_query_ms);
-        let mut exhausted = false;
 
         'blocks: for block_id in func.block_order.clone() {
             let inst_ids = func.block(block_id).insts.clone();
@@ -1076,7 +1355,7 @@ impl CegisSuperoptPass {
 
             for inst_id in inst_ids {
                 if Instant::now() >= deadline {
-                    exhausted = true;
+                    completion = CegisSearchCompletion::DeadlineExceeded;
                     break 'blocks;
                 }
 
@@ -1163,17 +1442,22 @@ impl CegisSuperoptPass {
                                     layer: RewriteLayer::B,
                                 });
                                 committed = true;
+                                if self.test_incomplete_after_first_commit {
+                                    completion.record(CegisSearchCompletion::QueryIncomplete);
+                                }
                             }
                             Ok(CegisResult::NotEquivalent { .. }) => {
                                 self.stats.rejected += 1;
                                 entry.rejected += 1;
                             }
                             Ok(CegisResult::Timeout | CegisResult::MaxIterationsReached { .. }) => {
+                                completion.record(CegisSearchCompletion::QueryIncomplete);
                                 self.stats.timeouts += 1;
                                 self.stats.rejected += 1;
                                 entry.rejected += 1;
                             }
                             Ok(CegisResult::Error(message)) => {
+                                completion.record(CegisSearchCompletion::VerifierError);
                                 if std::env::var_os("TCG_SOLVE_TRACE").is_some() {
                                     eprintln!(
                                         "TCG_SOLVE_TRACE cegis_error layer=B message={message}"
@@ -1184,12 +1468,17 @@ impl CegisSuperoptPass {
                                 entry.rejected += 1;
                             }
                             Err(_) => {
+                                completion.record(CegisSearchCompletion::VerifierPanicked);
                                 self.stats.panics += 1;
                                 self.stats.rejected += 1;
                                 entry.rejected += 1;
                             }
                         }
                     }
+                }
+
+                if !completion.is_complete() {
+                    break 'blocks;
                 }
 
                 // Update def_map with the CURRENT body (possibly just
@@ -1213,12 +1502,12 @@ impl CegisSuperoptPass {
             }
         }
 
-        if exhausted {
+        if completion == CegisSearchCompletion::DeadlineExceeded {
             self.stats.budget_exhausted += 1;
         }
         self.stats.solver_calls += cegis.stats_solver_calls();
 
-        (committed, used_failed_proof_seed)
+        (committed, completion, used_failed_proof_seed)
     }
 
     fn move_wide_shift(inst: &MachInst, width: u32) -> Option<u32> {
@@ -1392,17 +1681,17 @@ impl CegisSuperoptPass {
         deadline: Instant,
         entry: &mut CegisCacheEntry,
         failed_proof_scope: Option<(&SourceRegionIdentity, &TargetAbiLayoutIdentity)>,
-    ) -> (bool, bool) {
+    ) -> (bool, CegisSearchCompletion, bool) {
         let mut committed = false;
+        let mut completion = CegisSearchCompletion::Complete;
         let mut used_failed_proof_seed = false;
 
         if ProvenRuleDb::seed_layer_c().is_empty() {
-            return (false, false);
+            return (false, completion, false);
         }
 
         let cost_model = AppleSiliconCostModel::new(CostModelGen::M1);
         let mut cegis = CegisLoop::new(1, self.config.per_query_ms);
-        let mut exhausted = false;
 
         'blocks: for block_id in func.block_order.clone() {
             let inst_ids = func.block(block_id).insts.clone();
@@ -1410,7 +1699,7 @@ impl CegisSuperoptPass {
 
             for inst_id in inst_ids {
                 if Instant::now() >= deadline {
-                    exhausted = true;
+                    completion = CegisSearchCompletion::DeadlineExceeded;
                     break 'blocks;
                 }
 
@@ -1482,17 +1771,22 @@ impl CegisSuperoptPass {
                             layer: RewriteLayer::C,
                         });
                         committed = true;
+                        if self.test_incomplete_after_first_commit {
+                            completion.record(CegisSearchCompletion::QueryIncomplete);
+                        }
                     }
                     Ok(CegisResult::NotEquivalent { .. }) => {
                         self.stats.rejected += 1;
                         entry.rejected += 1;
                     }
                     Ok(CegisResult::Timeout | CegisResult::MaxIterationsReached { .. }) => {
+                        completion.record(CegisSearchCompletion::QueryIncomplete);
                         self.stats.timeouts += 1;
                         self.stats.rejected += 1;
                         entry.rejected += 1;
                     }
                     Ok(CegisResult::Error(message)) => {
+                        completion.record(CegisSearchCompletion::VerifierError);
                         if std::env::var_os("TCG_SOLVE_TRACE").is_some() {
                             eprintln!("TCG_SOLVE_TRACE cegis_error layer=C message={message}");
                         }
@@ -1501,10 +1795,15 @@ impl CegisSuperoptPass {
                         entry.rejected += 1;
                     }
                     Err(_) => {
+                        completion.record(CegisSearchCompletion::VerifierPanicked);
                         self.stats.panics += 1;
                         self.stats.rejected += 1;
                         entry.rejected += 1;
                     }
+                }
+
+                if !completion.is_complete() {
+                    break 'blocks;
                 }
             }
 
@@ -1516,12 +1815,12 @@ impl CegisSuperoptPass {
             }
         }
 
-        if exhausted {
+        if completion == CegisSearchCompletion::DeadlineExceeded {
             self.stats.budget_exhausted += 1;
         }
         self.stats.solver_calls += cegis.stats_solver_calls();
 
-        (committed, used_failed_proof_seed)
+        (committed, completion, used_failed_proof_seed)
     }
 
     /// Apply a single cached rewrite to `func` from the serialized replacement
@@ -1795,11 +2094,15 @@ impl CegisSuperoptPass {
         (committed, applied_a, applied_b, applied_other)
     }
 
-    /// Body of `run` split out so that it can be unit-tested without needing
-    /// to implement `MachinePass` in tests.
-    fn run_inner(&mut self, func: &mut MachFunction) -> bool {
+    /// Run one transactional CEGIS search and return its typed terminal state.
+    ///
+    /// Cache misses execute against a private clone. A deadline, query
+    /// timeout, verifier error, or caught verifier panic drops that clone, so
+    /// neither the legacy boolean API nor an artifact owner can observe a
+    /// timing-dependent prefix of rewrites.
+    pub fn run_with_outcome(&mut self, func: &mut MachFunction) -> CegisRunOutcome {
         if !self.config.is_enabled() {
-            return false;
+            return CegisRunOutcome::Disabled;
         }
         self.stats.functions_seen += 1;
 
@@ -1838,6 +2141,7 @@ impl CegisSuperoptPass {
         // Cache hit / miss outcome for trace reporting.
         let mut from_cache = false;
         let mut committed = false;
+        let mut invocation_completion = CegisSearchCompletion::Complete;
         let mut used_failed_proof_seed = false;
 
         // Cache hit path --------------------------------------------------
@@ -1881,50 +2185,81 @@ impl CegisSuperoptPass {
             // Cache miss path ---------------------------------------------
             self.stats.cache_misses += 1;
 
+            // Transaction boundary: all speculative rewrites stay private
+            // until every layer has completed definitively. Cloning once on a
+            // cache miss is small beside solver work and removes wall-clock
+            // scheduling from the emitted artifact.
+            let mut search_func = func.clone();
+
             let deadline = if self.test_hooks.force_expired_deadline {
                 Instant::now()
             } else {
                 Instant::now() + Duration::from_secs(self.config.budget_sec)
             };
-            let (committed_a, mut entry, exhausted_a, used_seed_a) =
-                self.enumerate_and_verify_layer_a(func, deadline, failed_proof_scope);
+            let (committed_a, mut entry, completion_a, used_seed_a) =
+                self.enumerate_and_verify_layer_a(&mut search_func, deadline, failed_proof_scope);
+            let mut completion = completion_a;
             used_failed_proof_seed |= used_seed_a;
             // Layer B runs after Layer A so that any Layer-A-rewrites are
             // visible to the window enumerator (e.g. a MulRR->Movz collapse
             // could unblock a subsequent two-inst fusion).
-            let (committed_b, used_seed_b) = if exhausted_a {
-                (false, false)
+            let (committed_b, completion_b, used_seed_b) = if !completion_a.is_complete() {
+                (false, completion_a, false)
             } else {
-                self.enumerate_and_verify_layer_b(func, deadline, &mut entry, failed_proof_scope)
+                self.enumerate_and_verify_layer_b(
+                    &mut search_func,
+                    deadline,
+                    &mut entry,
+                    failed_proof_scope,
+                )
             };
+            completion.record(completion_b);
             used_failed_proof_seed |= used_seed_b;
-            let (committed_c, used_seed_c) = if exhausted_a {
-                (false, false)
+            let (committed_c, completion_c, used_seed_c) = if !completion.is_complete() {
+                (false, completion, false)
             } else {
-                self.enumerate_and_verify_layer_c(func, deadline, &mut entry, failed_proof_scope)
+                self.enumerate_and_verify_layer_c(
+                    &mut search_func,
+                    deadline,
+                    &mut entry,
+                    failed_proof_scope,
+                )
             };
+            completion.record(completion_c);
             used_failed_proof_seed |= used_seed_c;
-            committed = committed_a || committed_b || committed_c;
+            invocation_completion = completion;
+            let speculative_committed = committed_a || committed_b || committed_c;
+            entry.completion = completion;
 
-            // Persist the (possibly empty) entry so repeat runs see a cache
-            // hit. Seeded failed-proof runs deliberately skip normal cache
-            // writes because the function cache key does not encode the
-            // counterexample corpus identity.
-            if !cache_disabled_by_failed_proof_fuel
-                && !used_failed_proof_seed
-                && let Some(backend) = self.config.cache.as_ref()
-            {
-                match entry.encode() {
-                    Ok(bytes) => {
-                        backend.put(&key, &bytes);
-                        self.stats.cache_puts += 1;
-                    }
-                    Err(_) => {
-                        // Serialization should never fail for a well-formed
-                        // entry; if it does, drop the put silently — the pass
-                        // is still semantically correct, just slower next time.
+            if completion.is_complete() {
+                *func = search_func;
+                committed = speculative_committed;
+
+                // Persist only a COMPLETE search (which may legitimately have
+                // an empty rewrite plan). Seeded failed-proof runs skip normal
+                // cache writes because the key does not encode their corpus.
+                if !cache_disabled_by_failed_proof_fuel
+                    && !used_failed_proof_seed
+                    && let Some(backend) = self.config.cache.as_ref()
+                {
+                    match entry.encode() {
+                        Ok(bytes) => {
+                            backend.put(&key, &bytes);
+                            self.stats.cache_puts += 1;
+                        }
+                        Err(_) => {
+                            // A codec failure costs reuse but cannot change the
+                            // already-proven transaction.
+                        }
                     }
                 }
+            } else {
+                // The working copy is dropped unchanged. Keep proof-attempt
+                // statistics, but do not count speculative layer mutations as
+                // commits to the caller-visible function.
+                committed = false;
+                self.stats.layer_a_committed = layer_a_committed_before;
+                self.stats.layer_b_committed = layer_b_committed_before;
             }
         }
 
@@ -1996,6 +2331,8 @@ impl CegisSuperoptPass {
                         rule: RuleId(486),
                         reason: if from_cache {
                             "cache-hit: no rewrites replayed".to_string()
+                        } else if !invocation_completion.is_complete() {
+                            format!("incomplete CEGIS transaction: {invocation_completion:?}")
                         } else if d_candidates == 0 {
                             "no candidate sites matched".to_string()
                         } else {
@@ -2012,7 +2349,13 @@ impl CegisSuperoptPass {
             trace.emit(TracePassId::new(payload), kind, Vec::new(), justification);
         }
 
-        committed
+        if invocation_completion.is_complete() {
+            CegisRunOutcome::Complete { committed }
+        } else {
+            CegisRunOutcome::Incomplete {
+                completion: invocation_completion,
+            }
+        }
     }
 }
 
@@ -2022,7 +2365,7 @@ impl MachinePass for CegisSuperoptPass {
     }
 
     fn run(&mut self, func: &mut MachFunction) -> bool {
-        self.run_inner(func)
+        self.run_with_outcome(func).committed()
     }
 }
 
@@ -2058,6 +2401,7 @@ mod tests {
             cpu: "apple-m1".to_string(),
             features: vec!["neon".to_string(), "fp-armv8".to_string()],
             opt_level: 2,
+            search_schedule: CegisSearchScheduleIdentity::serial(),
             cache,
             trace: None,
         }
@@ -2273,9 +2617,66 @@ mod tests {
     }
 
     #[test]
+    fn test_key_separates_every_bounded_search_policy_input() {
+        let func = empty_func("bounded-policy");
+        let baseline = make_config(None, 1);
+        let baseline_key = CegisSuperoptPass::new(baseline.clone()).compute_function_key(&func);
+
+        let mut different_budget = baseline.clone();
+        different_budget.budget_sec = 2;
+        assert_ne!(
+            baseline_key,
+            CegisSuperoptPass::new(different_budget).compute_function_key(&func),
+            "the per-function wall budget can change the discovered prefix"
+        );
+
+        let mut different_query_timeout = baseline.clone();
+        different_query_timeout.per_query_ms += 1;
+        assert_ne!(
+            baseline_key,
+            CegisSuperoptPass::new(different_query_timeout).compute_function_key(&func),
+            "the per-query timeout can change whether a candidate completes"
+        );
+
+        let mut different_schedule = baseline;
+        different_schedule.search_schedule =
+            CegisSearchScheduleIdentity::with_effective_parallelism(4);
+        assert_ne!(
+            baseline_key,
+            CegisSuperoptPass::new(different_schedule).compute_function_key(&func),
+            "outer executor contention can change a wall-clock-bounded result"
+        );
+
+        assert_ne!(CEGIS_SEARCH_SEMANTICS_REVISION, 0);
+        assert_ne!(CEGIS_SEARCH_SCHEDULE_VERSION, 0);
+    }
+
+    #[test]
+    fn test_hooks_cannot_publish_under_a_production_cache_key() {
+        let func = empty_func("test-hook-cache-authority");
+        let config = make_config(None, 10);
+        let production_key = CegisSuperoptPass::new(config.clone()).compute_function_key(&func);
+        let hooked_key = CegisSuperoptPass::new(config)
+            .with_test_hooks(CegisSuperoptTestHooks {
+                verifier_result: Some(CegisResult::Equivalent {
+                    proof_hash: 1,
+                    iterations: 1,
+                }),
+                ..Default::default()
+            })
+            .compute_function_key(&func);
+
+        assert_ne!(
+            production_key, hooked_key,
+            "a forced verifier result must not carry production cache authority"
+        );
+    }
+
+    #[test]
     fn test_cache_entry_roundtrip() {
         let entry = CegisCacheEntry {
             version: CegisCacheEntry::VERSION,
+            completion: CegisSearchCompletion::Complete,
             proven_rewrites: vec![ProvenRewrite {
                 inst_index: 3,
                 proof_hash: 0xDEAD_BEEF,
@@ -2303,6 +2704,7 @@ mod tests {
     fn test_cache_entry_wrong_version_rejected() {
         let entry = CegisCacheEntry {
             version: 999,
+            completion: CegisSearchCompletion::Complete,
             ..Default::default()
         };
         let bytes = entry.encode().expect("encode");
@@ -2314,14 +2716,17 @@ mod tests {
         // v1-v3 entries predate the serialized replacement-body format.
         // v4 predates the #854 Layer C matcher; stale empty entries must not
         // suppress newly-covered bit-reverse mask candidates.
-        // v5 predates the `cegis_cache_codec` wire format. Note this loop can
+        // v5 predates the `cegis_cache_codec` wire format. v6 predates the
+        // explicit completion outcome and could carry an ambiguous partial
+        // prefix. Note this loop can
         // only exercise the *version field* gate, because the current encoder
         // is the only one available here; a genuine v5 MessagePack blob is
         // rejected on the magic instead, and that is covered by
         // `tests/cegis_cache_codec.rs::a_real_v5_messagepack_blob_is_a_miss`.
-        for old_version in [1u32, 2u32, 3u32, 4u32, 5u32] {
+        for old_version in [1u32, 2u32, 3u32, 4u32, 5u32, 6u32] {
             let entry = CegisCacheEntry {
                 version: old_version,
+                completion: CegisSearchCompletion::Complete,
                 ..Default::default()
             };
             let bytes = entry.encode().expect("encode");

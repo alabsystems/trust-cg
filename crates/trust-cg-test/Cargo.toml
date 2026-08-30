@@ -24,19 +24,13 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive", "cargo", "env", "wrap_help"] }
-clap_mangen = "0.2"
 anyhow = { workspace = true }
-thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 schemars = { version = "0.8", features = ["chrono"] }
-tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 indicatif = "0.17"
 chrono = { version = "0.4", features = ["serde"] }
-blake3 = "1"
-# Pin blake3's transitive equality helper to the Rust-1.94-compatible line.
-constant_time_eq = "=0.4.2"
 
 [dev-dependencies]
 insta = { version = "1", features = ["filters"] }

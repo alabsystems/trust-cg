@@ -63,6 +63,7 @@ use trust_cg_ir::x86_64_regs::{
     X86_ALLOCATABLE_XMMS, X86_ARG_GPRS, X86_ARG_XMMS, X86_CALLEE_SAVED_GPRS, X86PReg, XMM0, XMM4,
     XMM5, XMM14, XMM15, x86_containing_gpr64,
 };
+use trust_cg_ir::{Target, TargetFeature};
 
 use trust_cg_lower::function::StackSlotInfo;
 use trust_cg_lower::instructions::Block as LirBlock;
@@ -453,11 +454,10 @@ struct X86EncodedFunc {
 /// (per-function regalloc+encode, then deterministic in-order reassembly) of
 /// [`X86Pipeline::compile_module_impl`], BEFORE Phase-2 object emission.
 ///
-/// CT-8 (encode reuse): the proof-certificate lane needs exactly this
-/// assembly for the object relocation INVENTORY, and the final object
-/// emission needs it again — carrying it as a value lets
-/// `Compiler::compile_x86_64` run the dominant regalloc+encode ONCE and feed
-/// both consumers, instead of the historical redundant full re-encode.
+/// This is the authoritative handoff between the expensive target backend and
+/// cheap consumers of its result. The compiler can derive metrics from it,
+/// optionally inventory relocations for proofs, and finally emit the object
+/// without repeating register allocation, frame lowering, or encoding.
 pub(crate) struct X86AssembledModule {
     /// Per-function encodings + fixups, in FUNCTION ORDER.
     encoded: Vec<X86EncodedFunc>,
@@ -466,20 +466,48 @@ pub(crate) struct X86AssembledModule {
     combined_code: Vec<u8>,
     /// COFF-only combined `.rdata` (lifted const pools); empty otherwise.
     combined_rdata: Vec<u8>,
+    /// Stable `CompilationMetrics::code_size_bytes` value: the byte length of
+    /// the historical RawBytes module layout (instruction bytes, inline
+    /// constant pools, and its inter-function padding). Computed from this
+    /// assembly's per-function outputs without a second backend traversal.
+    raw_code_size: usize,
     /// The effective output format the assembly was built for.
     effective_format: X86OutputFormat,
 }
 
 impl X86AssembledModule {
-    /// Length of the concatenated `__text` / `.text` bytes (function code
-    /// plus non-COFF inline const pools) — the module's raw code size,
-    /// excluding any object wrapper overhead. This is byte-for-byte what the
-    /// RawBytes output format would return for the same functions, but
-    /// readable from an assembly built under ANY output format (the compiler
-    /// uses it for EH-carrying modules, which RawBytes refuses).
+    /// Stable raw encoded module length used by
+    /// `CompilationMetrics::code_size_bytes`, excluding object wrapper
+    /// overhead. This preserves the pre-handoff metric contract even for COFF,
+    /// whose native object moves constant pools from text into `.rdata`.
     pub(crate) fn code_size(&self) -> usize {
-        self.combined_code.len()
+        self.raw_code_size
     }
+}
+
+// Counts the expensive per-function backend entry only in unit-test builds.
+// The counter is thread-local so concurrently-running tests cannot perturb one
+// another; focused assertions use the serial module path, whose encode closure
+// executes on the calling test thread.
+#[cfg(test)]
+std::thread_local! {
+    static TEST_X86_FUNCTION_BACKEND_INVOCATIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_test_x86_function_backend_invocations() {
+    TEST_X86_FUNCTION_BACKEND_INVOCATIONS.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn test_x86_function_backend_invocations() -> usize {
+    TEST_X86_FUNCTION_BACKEND_INVOCATIONS.get()
+}
+
+#[cfg(test)]
+fn record_test_x86_function_backend_invocation() {
+    TEST_X86_FUNCTION_BACKEND_INVOCATIONS.with(|count| count.set(count.get() + 1));
 }
 
 /// x86-64 frame facts captured before pseudo expansion and object emission.
@@ -606,6 +634,19 @@ impl X86TargetFeature {
             Self::Avx => "avx",
             Self::Avx2 => "avx2",
         }
+    }
+}
+
+impl TargetFeature for X86TargetFeature {
+    const ARCHITECTURE: Target = Target::X86_64;
+    const ALL: &'static [Self] = &X86TargetFeature::ALL;
+
+    fn stable_bit(self) -> u64 {
+        u64::from(X86TargetFeatures::bit(self))
+    }
+
+    fn name(self) -> &'static str {
+        X86TargetFeature::name(self)
     }
 }
 
@@ -1573,16 +1614,6 @@ fn bind_x86_dead_volatile_load_defs(
     Ok(())
 }
 
-#[allow(dead_code)]
-fn x86_spill_slot_size_align(class: RegClass) -> (u32, u32) {
-    match class {
-        RegClass::Gpr32 | RegClass::Fpr32 => (4, 4),
-        RegClass::Fpr128 => (16, 16),
-        _ => (8, 8),
-    }
-}
-
-#[allow(dead_code)]
 fn x86_spill_load_opcode(class: RegClass) -> X86Opcode {
     match class {
         RegClass::Gpr32 => X86Opcode::MovRM32,
@@ -1593,7 +1624,6 @@ fn x86_spill_load_opcode(class: RegClass) -> X86Opcode {
     }
 }
 
-#[allow(dead_code)]
 fn x86_spill_store_opcode(class: RegClass) -> X86Opcode {
     match class {
         RegClass::Gpr32 => X86Opcode::MovMR32,
@@ -2438,7 +2468,9 @@ fn resolve_inst_operands(inst: &X86ISelInst, alloc: &HashMap<VReg, X86PReg>) -> 
                 }
             }
         }
-        X86Opcode::ShlRR | X86Opcode::ShrRR | X86Opcode::SarRR => {
+        // CL-count shifts AND the CL-count rotate: single explicit register
+        // operand (the count lives in the implicit CL).
+        X86Opcode::ShlRR | X86Opcode::ShrRR | X86Opcode::SarRR | X86Opcode::RolRCl => {
             if let Some(op) = inst.operands.first() {
                 ops.dst = resolve_operand(op, alloc);
             }
@@ -3067,6 +3099,18 @@ fn is_x86_shift_rr(opcode: X86Opcode) -> bool {
     )
 }
 
+/// The CL-count ROTATE — deliberately NOT folded into [`is_x86_shift_rr`]:
+/// the two families share the D3 group and the tied `[dst, src]` operand
+/// SHAPE, but their FLAG masks differ (ROL writes only CF/OF; the shifts
+/// define CF/PF/ZF/SF and undefine AF/OF). Audited 2026-08-28: the sole
+/// caller of `is_x86_shift_rr` (`x86_two_address_lhs_operand_index`) is
+/// shape-only, so the rotate ORs in beside it there; keeping the predicates
+/// separate means any FUTURE flag-sensitive caller of `is_x86_shift_rr`
+/// cannot silently inherit the rotate's different flag semantics.
+fn is_x86_rotate_rcl(opcode: X86Opcode) -> bool {
+    matches!(opcode, X86Opcode::RolRCl)
+}
+
 fn is_x86_explicit_source_unary(opcode: X86Opcode) -> bool {
     matches!(opcode, X86Opcode::Neg | X86Opcode::Not)
 }
@@ -3085,7 +3129,9 @@ fn x86_two_address_lhs_operand_index(inst: &X86ISelInst) -> Option<usize> {
     }
 
     if inst.operands.len() == 2
-        && (is_x86_shift_rr(inst.opcode) || is_x86_explicit_source_unary(inst.opcode))
+        && (is_x86_shift_rr(inst.opcode)
+            || is_x86_rotate_rcl(inst.opcode)
+            || is_x86_explicit_source_unary(inst.opcode))
     {
         return Some(1);
     }
@@ -3488,7 +3534,8 @@ fn x86_inst_implicit_gpr64_roots(
             push_root(uses, x86_64_regs::RAX);
             push_root(defs, x86_64_regs::RDX);
         }
-        X86Opcode::ShlRR | X86Opcode::ShrRR | X86Opcode::SarRR => {
+        // CL-count shifts AND the CL-count rotate read the count from CL.
+        X86Opcode::ShlRR | X86Opcode::ShrRR | X86Opcode::SarRR | X86Opcode::RolRCl => {
             push_root(uses, x86_64_regs::RCX);
         }
         X86Opcode::Idiv | X86Opcode::Div => {
@@ -3839,7 +3886,10 @@ fn compute_x86_gpr64_live_out(
 /// which is exactly the case the rewrite is meant to serve. It is a guaranteed
 /// one-instruction reduction with no effect on allocation.
 ///
-/// Returns true if the caller should delete the copy at `copy_pos`.
+/// Returns `b` together with the add's own `[dst, src1, src2]` operands
+/// (cloned, so the caller repackages exactly what was matched and never has
+/// to re-destructure the instruction) when the caller should delete the copy
+/// at `copy_pos`.
 ///
 /// # Soundness
 ///
@@ -3861,7 +3911,7 @@ fn x86_try_collapse_bridge_into_lea(
     d_root: X86PReg,
     a_root: X86PReg,
     alloc: &HashMap<VReg, X86PReg>,
-) -> Option<X86PReg> {
+) -> Option<(X86PReg, [X86ISelOperand; 3])> {
     if !bridge_into_lea_enabled() {
         return None;
     }
@@ -3897,13 +3947,15 @@ fn x86_try_collapse_bridge_into_lea(
     if !x86_add_flags_dead_after(insts, copy_pos + 1) {
         return None;
     }
-    Some(b)
+    Some((b, [o0.clone(), o1.clone(), o2.clone()]))
 }
 
 /// Immediate-step analogue of [`x86_try_collapse_bridge_into_lea`]:
 /// `mov d,a ; add d,d,IMM`  =>  `lea d,[a+IMM]`.
 ///
-/// Returns the immediate when the caller should delete the copy at `copy_pos`.
+/// Returns the immediate together with the add's own `[dst, src1]` operands
+/// (cloned; the caller repackages exactly what was matched) when the caller
+/// should delete the copy at `copy_pos`.
 ///
 /// # Why this arm exists
 ///
@@ -3939,7 +3991,7 @@ fn x86_try_collapse_bridge_into_lea_imm(
     d_root: X86PReg,
     a_root: X86PReg,
     alloc: &HashMap<VReg, X86PReg>,
-) -> Option<i32> {
+) -> Option<(i32, [X86ISelOperand; 2])> {
     if !bridge_into_lea_enabled() {
         return None;
     }
@@ -3971,7 +4023,7 @@ fn x86_try_collapse_bridge_into_lea_imm(
     if !x86_add_flags_dead_after(insts, copy_pos + 1) {
         return None;
     }
-    Some(k32)
+    Some((k32, [o0.clone(), o1.clone()]))
 }
 
 /// RFLAGS written at `idx` are dead: no reader before a FULL redefinition.
@@ -4782,9 +4834,11 @@ fn coalesce_x86_redundant_movrr_copies(
                     ) {
                         delete[pos] = true;
                         total += 1;
-                    } else if let Some(b_reg) = x86_try_collapse_bridge_into_lea(
-                        &insts, pos, pdst, psrc, pdst_root, psrc_root, alloc,
-                    ) {
+                    } else if let Some((b_reg, [dst_op, a_op, b_op])) =
+                        x86_try_collapse_bridge_into_lea(
+                            &insts, pos, pdst, psrc, pdst_root, psrc_root, alloc,
+                        )
+                    {
                         // `mov d,a ; add d,d,b`  =>  `lea d,[a+b]`; drop the bridge.
                         //
                         // ⚑ REUSE THE ADD'S OWN OPERANDS. Rebuilding these from raw
@@ -4797,12 +4851,10 @@ fn coalesce_x86_redundant_movrr_copies(
                         // on 7 of the 18 bench programs at -O2/-O3. Operands 0/1/2
                         // are already exactly `d`, `a` and `b` (see the predicate),
                         // so the faithful rewrite changes the opcode and repackages
-                        // the two sources — it never re-spells them.
+                        // the two sources — it never re-spells them. The predicate
+                        // hands back the operands it matched at `insts[pos + 1]`,
+                        // so there is no second destructure here to disagree with it.
                         let add_idx = pos + 1;
-                        let [dst_op, a_op, b_op] = insts[add_idx].operands.as_slice() else {
-                            unreachable!("the predicate matched a three-operand AddRR");
-                        };
-                        let (dst_op, a_op, b_op) = (dst_op.clone(), a_op.clone(), b_op.clone());
                         insts[add_idx].opcode = X86Opcode::LeaSib;
                         insts[add_idx].flags = X86Opcode::LeaSib.default_flags();
                         insts[add_idx].operands = vec![
@@ -4822,7 +4874,7 @@ fn coalesce_x86_redundant_movrr_copies(
                         }
                         delete[pos] = true;
                         total += 1;
-                    } else if let Some(k) = x86_try_collapse_bridge_into_lea_imm(
+                    } else if let Some((k, [dst_op, a_op])) = x86_try_collapse_bridge_into_lea_imm(
                         &insts, pos, pdst, psrc, pdst_root, psrc_root, alloc,
                     ) {
                         // `mov d,a ; add d,d,IMM`  =>  `lea d,[a+IMM]`; drop the bridge.
@@ -4835,11 +4887,9 @@ fn coalesce_x86_redundant_movrr_copies(
                         // failing CLOSED on 7 of 18 programs (cfa78287). Operand 1
                         // is already exactly `a`, so the faithful rewrite changes the
                         // opcode and repackages that one source; it never re-spells it.
+                        // As in the register arm, the predicate hands back the
+                        // operands it matched at `insts[pos + 1]`.
                         let add_idx = pos + 1;
-                        let [dst_op, a_op, _imm_op] = insts[add_idx].operands.as_slice() else {
-                            unreachable!("the predicate matched a three-operand AddRI");
-                        };
-                        let (dst_op, a_op) = (dst_op.clone(), a_op.clone());
                         insts[add_idx].opcode = X86Opcode::Lea;
                         insts[add_idx].flags = X86Opcode::Lea.default_flags();
                         insts[add_idx].operands = vec![
@@ -5841,11 +5891,42 @@ fn fixup_formal_arg_parallel_copy(
     // 1. Identify the leading formal-argument prologue. Stack-passed formals
     //    can be interleaved with later register-passed formals from another
     //    register bank, so keep scanning through stack loads.
+    //
+    //    Interleaved split-replay CONNECTORS are ORDER BARRIERS, not
+    //    sinkable prefix residue. A connector reads a formal's assigned preg
+    //    at the exact position the allocator modeled; when a recursive split
+    //    lets two formals legally share one preg over disjoint ranges, an
+    //    intake copy AFTER the connector may overwrite that preg. Sinking
+    //    the connector below the whole resolved group (the pre-2026-08-29
+    //    behavior) made it read the LATER formal's value — a silent O0
+    //    miscompile (seed-19149 repro, fuzz/repros/foldlane-repros/). The prefix
+    //    is therefore partitioned into SEGMENTS at each connector; each
+    //    segment is resolved as its own parallel-copy group and the
+    //    sequential segment/connector order is preserved exactly as the
+    //    replay emitted it. Within-segment reordering stays invisible
+    //    outside the segment, which is the whole soundness argument.
+    struct FormalCopySegment {
+        gpr: Vec<PhysRegCopy>,
+        xmm: Vec<PhysRegCopy>,
+        barrier: Option<X86ISelInst>,
+    }
     let mut prefix_len: usize = 0;
-    let mut gpr_copies: Vec<PhysRegCopy> = Vec::new();
-    let mut xmm_copies: Vec<PhysRegCopy> = Vec::new();
+    // `segments` holds the CLOSED segments in scan order; `open_segment` is
+    // the one currently being filled. It is closed (barrier recorded, pushed)
+    // at each connector and once more after the scan, so `segments` ends up
+    // exactly as if it had been appended to in place — without an
+    // `Option` on "the last segment", which is always this binding.
+    let mut segments: Vec<FormalCopySegment> = Vec::new();
+    let mut open_segment = FormalCopySegment {
+        gpr: Vec::new(),
+        xmm: Vec::new(),
+        barrier: None,
+    };
     let mut spilled_formals: Vec<(VReg, X86PReg, u32)> = Vec::new();
-    let mut post_preserve_prefix: Vec<X86ISelInst> = Vec::new();
+    // (inst, is_connector): scan-order residue sunk below the group on the
+    // duplicate-free path. Keeping loads and connectors interleaved in scan
+    // order preserves the pre-existing behavior exactly on that path.
+    let mut post_preserve_prefix: Vec<(X86ISelInst, bool)> = Vec::new();
     let mut scan_len: usize = 0;
     for inst in &block.insts {
         if prefix_len >= formal_count_limit {
@@ -5853,7 +5934,7 @@ fn fixup_formal_arg_parallel_copy(
         }
         match classify_formal_arg_mov(inst, alloc) {
             Some((dst, src, X86Opcode::MovRR)) => {
-                gpr_copies.push(PhysRegCopy {
+                open_segment.gpr.push(PhysRegCopy {
                     dst,
                     src,
                     opcode: X86Opcode::MovRR,
@@ -5861,7 +5942,7 @@ fn fixup_formal_arg_parallel_copy(
                 prefix_len += 1;
             }
             Some((dst, src, X86Opcode::MovRR32)) => {
-                gpr_copies.push(PhysRegCopy {
+                open_segment.gpr.push(PhysRegCopy {
                     dst,
                     src,
                     opcode: X86Opcode::MovRR32,
@@ -5871,7 +5952,7 @@ fn fixup_formal_arg_parallel_copy(
             Some((dst, src, X86Opcode::MovsdRR))
             | Some((dst, src, X86Opcode::MovssRR))
             | Some((dst, src, X86Opcode::MovdqaRR)) => {
-                xmm_copies.push(PhysRegCopy {
+                open_segment.xmm.push(PhysRegCopy {
                     dst,
                     src,
                     opcode: inst.opcode,
@@ -5881,7 +5962,7 @@ fn fixup_formal_arg_parallel_copy(
             Some(_) => break, // unreachable: classify_formal_arg_mov filters opcodes
             None => {
                 if is_formal_stack_arg_load(inst) {
-                    post_preserve_prefix.push(inst.clone());
+                    post_preserve_prefix.push((inst.clone(), false));
                     prefix_len += 1;
                 } else if let Some((vreg, src, slot, _opcode)) =
                     classify_spilled_formal_arg_mov(inst, installed_spills)
@@ -5889,7 +5970,16 @@ fn fixup_formal_arg_parallel_copy(
                     spilled_formals.push((vreg, src, slot));
                     prefix_len += 1;
                 } else if prefix_len > 0 && is_interleaved_split_replay_copy(inst) {
-                    post_preserve_prefix.push(inst.clone());
+                    post_preserve_prefix.push((inst.clone(), true));
+                    open_segment.barrier = Some(inst.clone());
+                    segments.push(std::mem::replace(
+                        &mut open_segment,
+                        FormalCopySegment {
+                            gpr: Vec::new(),
+                            xmm: Vec::new(),
+                            barrier: None,
+                        },
+                    ));
                 } else {
                     break;
                 }
@@ -5897,13 +5987,243 @@ fn fixup_formal_arg_parallel_copy(
         }
         scan_len += 1;
     }
+    // Close the trailing segment (possibly empty, exactly as the in-place
+    // form left a trailing empty segment after a final connector).
+    segments.push(open_segment);
 
     if prefix_len == 0 {
         return Ok(());
     }
 
-    // 2. Resolve each partition independently. GPR and XMM share no physical
-    //    storage, so they cannot form cross-class cycles.
+    // 2. Choose the resolution strategy from the prefix's dst structure.
+    //
+    //    DUPLICATE-FREE prefix (the common case): the whole prefix is a
+    //    true parallel copy — resolve GLOBALLY and sink connectors below
+    //    the group (the pre-existing behavior). Sinking is sound here
+    //    because a connector's source preg is written at most once in the
+    //    prefix (by its own formal's intake), so after the group it still
+    //    holds that formal's value. Global resolution is REQUIRED, not
+    //    just allowed: an intake reading an incoming arg preg may need to
+    //    execute before an earlier-positioned intake overwrites that arg
+    //    preg (the WindowsX64 RDX shape pinned by
+    //    test_fixup_formal_arg_parallel_copy_scans_interleaved_split_copy)
+    //    — a connector must not act as a barrier for that reordering.
+    //
+    //    DUPLICATE dsts (two formals legally sharing one preg over
+    //    disjoint split ranges): the prefix is inherently SEQUENTIAL and
+    //    must be resolved segment-wise with connectors as barriers.
+    //    Cross-segment hazards (a later segment's source overlapping an
+    //    earlier segment's or barrier's destination) cannot be fixed by
+    //    local reordering — fail closed rather than miscompile.
+    let all_gpr: Vec<PhysRegCopy> = segments
+        .iter()
+        .flat_map(|s| s.gpr.iter().copied())
+        .collect();
+    // The seed-19149 hazard exists ONLY when an intake FOLLOWS a connector
+    // in scan order (a later-range formal re-defining a preg the connector
+    // reads). When every connector trails every intake — the overwhelmingly
+    // common shape, including duplicate-dst prefixes from dead-arg preg
+    // reuse — global resolution with scan-order residue sinking is correct:
+    // connectors read per-preg FINAL group values (identical to the
+    // original sequence's values once dead duplicates are dropped), and
+    // loads/connectors keep their mutual order (a connector may read a
+    // stack-load's dst, e.g. `movw 16(%rbp),%dx` feeding `movl %edx,%r8d`
+    // — the s23006 shape a barrier-always design miscompiled).
+
+    let barrier_pregs = |inst: &X86ISelInst| -> (Option<X86PReg>, Option<X86PReg>) {
+        match inst.operands.as_slice() {
+            [X86ISelOperand::PReg(d), X86ISelOperand::PReg(s)] => (Some(*d), Some(*s)),
+            [X86ISelOperand::VReg(d), X86ISelOperand::VReg(s)] => {
+                (alloc.get(d).copied(), alloc.get(s).copied())
+            }
+            [X86ISelOperand::PReg(d), X86ISelOperand::VReg(s)] => (Some(*d), alloc.get(s).copied()),
+            [X86ISelOperand::VReg(d), X86ISelOperand::PReg(s)] => (alloc.get(d).copied(), Some(*s)),
+            _ => (None, None),
+        }
+    };
+
+    // Barriers are needed iff some LATER intake's dst overlaps a
+    // connector's SOURCE preg (the actual overwrite). An intake after a
+    // connector with non-overlapping registers is fine on the global path:
+    // the sunk connector still reads its formal's once-written preg (the
+    // WindowsX64 preserve-RDX shape, which REQUIRES global reordering).
+    // A connector whose source cannot be resolved through `alloc` is
+    // treated as hazardous when any intake follows it (conservative).
+    let needs_barriers = {
+        let mut hazard = false;
+        for (i, seg) in segments.iter().enumerate() {
+            let Some(barrier) = &seg.barrier else {
+                continue;
+            };
+            let (_, barrier_src) = barrier_pregs(barrier);
+            for later in &segments[i + 1..] {
+                for copy in later.gpr.iter().chain(later.xmm.iter()) {
+                    match barrier_src {
+                        Some(src) => {
+                            if x86_64_regs::x86_regs_overlap(copy.dst, src) {
+                                hazard = true;
+                            }
+                        }
+                        None => hazard = true,
+                    }
+                }
+            }
+        }
+        hazard
+    };
+
+    if needs_barriers {
+        // Segment-wise path (rare: recursive-split connectors interleaved
+        // INSIDE the intake group). Stack-arg loads cannot be ordered
+        // against barriers without per-instruction dependence analysis —
+        // fail closed on the combination rather than guess.
+        if post_preserve_prefix
+            .iter()
+            .any(|(_, is_connector)| !is_connector)
+        {
+            return Err(formal_gpr_copy_error(
+                "formal-arg prefix mixes intake-interleaved split connectors \
+                 with stack-arg loads; refusing to reorder (fail-closed)",
+            ));
+        }
+        // A duplicate dst WITHIN one segment means the
+        // earlier write is DEAD: the allocator only reuses a preg across
+        // disjoint ranges, every intake source is an ENTRY arg-preg value
+        // (never a written assigned preg), connectors force a segment
+        // split, and spilled-formal saves read arg pregs directly — so
+        // nothing can observe the earlier value before the later write.
+        // Keep only the LAST write per destination (dead-arg preg reuse,
+        // e.g. an unused formal whose preg is recycled by a later one).
+        for seg in &mut segments {
+            for bank in [&mut seg.gpr, &mut seg.xmm] {
+                let mut keep = vec![true; bank.len()];
+                for (i, a) in bank.iter().enumerate() {
+                    if bank[i + 1..]
+                        .iter()
+                        .any(|b| x86_64_regs::x86_regs_overlap(a.dst, b.dst))
+                    {
+                        keep[i] = false;
+                    }
+                }
+                // `keep` was built with one entry per copy, so the zip is exact.
+                *bank = bank
+                    .iter()
+                    .zip(keep)
+                    .filter(|(_, keep)| *keep)
+                    .map(|(copy, _)| *copy)
+                    .collect();
+            }
+        }
+        // Cross-segment hazard check: every later-segment intake source
+        // must still hold its ENTRY value when its segment runs, and every
+        // barrier chain reg must survive untouched by later segments.
+        for (i, earlier) in segments.iter().enumerate() {
+            let mut earlier_dsts: Vec<X86PReg> = earlier.gpr.iter().map(|c| c.dst).collect();
+            if let Some(b) = &earlier.barrier
+                && let (Some(d), _) = barrier_pregs(b)
+            {
+                earlier_dsts.push(d);
+            }
+            for later in &segments[i + 1..] {
+                let later_srcs = later.gpr.iter().map(|c| c.src);
+                for src in later_srcs {
+                    if earlier_dsts
+                        .iter()
+                        .any(|d| x86_64_regs::x86_regs_overlap(*d, src))
+                    {
+                        return Err(formal_gpr_copy_error(
+                            "formal-arg copy prefix with shared destination pregs has a \
+                             cross-segment source hazard; refusing to reorder (fail-closed)",
+                        ));
+                    }
+                }
+                // (Later barriers writing pregs an earlier segment wrote is
+                // NOT a hazard: the emitted order — earlier segment, then
+                // later barrier — matches the original sequence's order.
+                // Barrier-to-barrier chains are likewise preserved.)
+            }
+        }
+        // GPR scratch must avoid every segment's copies AND every
+        // connector's pregs (a value a connector carries across segments
+        // must survive any segment's cycle-breaking).
+        let mut scratch_avoid = all_gpr.clone();
+        for seg in &segments {
+            if let Some(b) = &seg.barrier {
+                let (d, s) = barrier_pregs(b);
+                if let (Some(d), Some(s)) = (d, s) {
+                    scratch_avoid.push(PhysRegCopy {
+                        dst: d,
+                        src: s,
+                        opcode: b.opcode,
+                    });
+                }
+            }
+        }
+        let gpr_scratch = select_gpr_parallel_copy_scratch(&scratch_avoid)?;
+        let xmm_scratch = match abi {
+            X86CallAbi::SystemV => XMM15,
+            X86CallAbi::WindowsX64 => XMM4,
+        };
+        let tail: Vec<X86ISelInst> = block.insts.drain(scan_len..).collect();
+        block.insts.clear();
+        emit_spilled_formal_saves(block, &spilled_formals, abi);
+        for seg in segments {
+            let resolved_gpr = resolve_gpr_physreg_parallel_copy(&seg.gpr, gpr_scratch)?;
+            let resolved_xmm = resolve_xmm_physreg_parallel_copy(&seg.xmm, xmm_scratch);
+            for copy in resolved_gpr.into_iter().chain(resolved_xmm) {
+                block.insts.push(X86ISelInst::new(
+                    copy.opcode,
+                    vec![
+                        X86ISelOperand::PReg(copy.dst),
+                        X86ISelOperand::PReg(copy.src),
+                    ],
+                ));
+            }
+            if let Some(barrier) = seg.barrier {
+                block.insts.push(barrier);
+            }
+        }
+        block.insts.extend(
+            post_preserve_prefix
+                .into_iter()
+                .filter_map(|(inst, is_connector)| (!is_connector).then_some(inst)),
+        );
+        block.insts.extend(tail);
+        return Ok(());
+    }
+
+    // Global path: one group, connectors + loads sunk below it in scan
+    // order exactly as before. Duplicate destinations (dead-arg preg
+    // reuse: the allocator recycles an unused formal's preg) are dropped
+    // keep-last BEFORE resolution — the resolver's distinct-dst invariant
+    // was previously unchecked and duplicate inputs made its schedule
+    // undefined. The earlier write is dead: intake sources are entry
+    // arg-preg values, and with no intake after any connector, nothing
+    // reads the shared preg between the two writes.
+    let mut gpr_copies = all_gpr;
+    let mut xmm_copies: Vec<PhysRegCopy> = segments
+        .iter()
+        .flat_map(|s| s.xmm.iter().copied())
+        .collect();
+    for bank in [&mut gpr_copies, &mut xmm_copies] {
+        let mut keep = vec![true; bank.len()];
+        for (i, a) in bank.iter().enumerate() {
+            if bank[i + 1..]
+                .iter()
+                .any(|b| x86_64_regs::x86_regs_overlap(a.dst, b.dst))
+            {
+                keep[i] = false;
+            }
+        }
+        // `keep` was built with one entry per copy, so the zip is exact.
+        *bank = bank
+            .iter()
+            .zip(keep)
+            .filter(|(_, keep)| *keep)
+            .map(|(copy, _)| *copy)
+            .collect();
+    }
+
     let gpr_scratch = select_gpr_parallel_copy_scratch(&gpr_copies)?;
     let resolved_gpr = resolve_gpr_physreg_parallel_copy(&gpr_copies, gpr_scratch)?;
     let xmm_scratch = match abi {
@@ -5921,6 +6241,30 @@ fn fixup_formal_arg_parallel_copy(
     //    are preserved because their destinations may be argument registers.
     let tail: Vec<X86ISelInst> = block.insts.drain(scan_len..).collect();
     block.insts.clear();
+    emit_spilled_formal_saves(block, &spilled_formals, abi);
+    for copy in resolved_gpr.into_iter().chain(resolved_xmm) {
+        block.insts.push(X86ISelInst::new(
+            copy.opcode,
+            vec![
+                X86ISelOperand::PReg(copy.dst),
+                X86ISelOperand::PReg(copy.src),
+            ],
+        ));
+    }
+    block
+        .insts
+        .extend(post_preserve_prefix.into_iter().map(|(inst, _)| inst));
+    block.insts.extend(tail);
+    Ok(())
+}
+
+/// Emit the spill-slot saves for spilled formal arguments (shared by both
+/// resolution paths of [`fixup_formal_arg_parallel_copy`]).
+fn emit_spilled_formal_saves(
+    block: &mut trust_cg_lower::x86_64_isel::X86ISelBlock,
+    spilled_formals: &[(VReg, X86PReg, u32)],
+    abi: X86CallAbi,
+) {
     for (vreg, src, slot) in spilled_formals {
         let scratch = match x86_reg_bank_for_class(vreg.class) {
             Some(X86RegBank::Gpr) => x86_spill_gpr_scratch_regs(vreg.class)[0],
@@ -5929,34 +6273,13 @@ fn fixup_formal_arg_parallel_copy(
         };
         block.insts.push(X86ISelInst::new(
             x86_spill_formal_copy_opcode(vreg.class),
-            vec![X86ISelOperand::PReg(scratch), X86ISelOperand::PReg(src)],
+            vec![X86ISelOperand::PReg(scratch), X86ISelOperand::PReg(*src)],
         ));
         block.insts.push(X86ISelInst::new(
             x86_spill_store_opcode(vreg.class),
-            vec![x86_spill_stack_mem(slot), X86ISelOperand::PReg(scratch)],
+            vec![x86_spill_stack_mem(*slot), X86ISelOperand::PReg(scratch)],
         ));
     }
-    for copy in resolved_gpr {
-        block.insts.push(X86ISelInst::new(
-            copy.opcode,
-            vec![
-                X86ISelOperand::PReg(copy.dst),
-                X86ISelOperand::PReg(copy.src),
-            ],
-        ));
-    }
-    for copy in resolved_xmm {
-        block.insts.push(X86ISelInst::new(
-            copy.opcode,
-            vec![
-                X86ISelOperand::PReg(copy.dst),
-                X86ISelOperand::PReg(copy.src),
-            ],
-        ));
-    }
-    block.insts.extend(post_preserve_prefix);
-    block.insts.extend(tail);
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -7951,21 +8274,48 @@ fn run_guard_carrier_canary(
     cond: trust_cg_ir::x86_64_ops::X86CondCode,
 ) -> Result<(), X86PipelineError> {
     use std::sync::OnceLock;
-    use trust_cg_verify::pass_validators::{
-        GuardCarrierExpansionValidator, GuardCarrierKind, PassValidation, PassValidator,
-    };
+    use trust_cg_verify::pass_validators::GuardCarrierKind;
 
-    static BOUNDS: OnceLock<Result<(), String>> = OnceLock::new();
-    static SHIFT: OnceLock<Result<(), String>> = OnceLock::new();
-    static NULLZ: OnceLock<Result<(), String>> = OnceLock::new();
-    static DIVZ: OnceLock<Result<(), String>> = OnceLock::new();
+    static BOUNDS: OnceLock<Result<trust_cg_ir::x86_64_ops::X86CondCode, String>> = OnceLock::new();
+    static SHIFT: OnceLock<Result<trust_cg_ir::x86_64_ops::X86CondCode, String>> = OnceLock::new();
+    static NULLZ: OnceLock<Result<trust_cg_ir::x86_64_ops::X86CondCode, String>> = OnceLock::new();
+    static DIVZ: OnceLock<Result<trust_cg_ir::x86_64_ops::X86CondCode, String>> = OnceLock::new();
     let cell = match kind {
         GuardCarrierKind::Bounds => &BOUNDS,
         GuardCarrierKind::ShiftRange => &SHIFT,
         GuardCarrierKind::NullIfZero => &NULLZ,
         GuardCarrierKind::DivZero => &DIVZ,
     };
-    cell.get_or_init(|| {
+    validate_guard_carrier_canary_cached(cell, kind, cond).map_err(|reason| {
+        X86PipelineError::ISel(format!(
+            "guard-carrier {kind:?} expansion canary REJECTED the emitted condition code \
+             {cond:?} — the Jcc would not trap on exactly the intended set (a wrong cc \
+             silently inverts/drops the guard): {reason}"
+        ))
+    })
+}
+
+/// Validate and memoize one guard carrier's exact emitted condition.
+///
+/// The real 32/64-bit widths are unconditional authority requirements. The i8
+/// row is useful exhaustive auxiliary evidence, but is never allowed to
+/// substitute for the emitted widths merely because no local AY executable is
+/// installed: portable embedded certificates discharge the wide rows before
+/// solver discovery, while a missing/inapplicable certificate fails closed.
+///
+/// The memo records the condition it validated. Caching only by guard kind
+/// would let a later, changed condition reuse an earlier `Ok(())` and silently
+/// bypass this translation-validation boundary.
+fn validate_guard_carrier_canary_cached(
+    cell: &std::sync::OnceLock<Result<trust_cg_ir::x86_64_ops::X86CondCode, String>>,
+    kind: trust_cg_verify::pass_validators::GuardCarrierKind,
+    cond: trust_cg_ir::x86_64_ops::X86CondCode,
+) -> Result<(), String> {
+    use trust_cg_verify::pass_validators::{
+        GuardCarrierExpansionValidator, PassValidation, PassValidator,
+    };
+
+    let cached = cell.get_or_init(|| {
         // The wide lanes are backed by portable committed certificates and
         // therefore do not require a live AY installation. A cert miss still
         // enters the live funnel and fails closed when AY is unavailable.
@@ -7980,16 +8330,17 @@ fn run_guard_carrier_canary(
                 return Err(format!("{obligation_name}: {reason}"));
             }
         }
-        Ok(())
-    })
-    .clone()
-    .map_err(|reason| {
-        X86PipelineError::ISel(format!(
-            "guard-carrier {kind:?} expansion canary REJECTED the emitted condition code \
-             {cond:?} — the Jcc would not trap on exactly the intended set (a wrong cc \
-             silently inverts/drops the guard): {reason}"
-        ))
-    })
+        Ok(cond)
+    });
+
+    match cached {
+        Ok(validated) if *validated == cond => Ok(()),
+        Ok(validated) => Err(format!(
+            "guard-carrier {kind:?} canary was memoized for condition {validated:?}, \
+             then requested for different condition {cond:?}"
+        )),
+        Err(reason) => Err(reason.clone()),
+    }
 }
 
 /// OPT-8 kill switch: branch-layout optimization (the `X86BranchLayout` pass
@@ -8110,20 +8461,45 @@ fn x86_ra_full_pool_enabled() -> bool {
 
 /// Production rule policy for the OPT-8 branch-layout pass.
 ///
-/// Default: the loop-latch rewrite ONLY (profile-independent — a loop always
-/// benefits from one fewer branch per iteration; measured p2_collatz -32%,
-/// b1_mispredict -13%). The fall-through inversion for non-loop two-way
-/// exits is a profile-FREE heuristic ("layout-successor == hot") that
-/// regressed a real match-heavy program (p6_branch_match +4.3%), so it is
-/// DEFERRED off by default. Opt in for A/B experiments with
-/// `TCG_BRANCH_LAYOUT_FALLTHROUGH=1`.
+/// Default: the three profile-independent rewrites — loop-latch (a loop
+/// always benefits from one fewer branch per iteration; measured p2_collatz
+/// -32%, b1_mispredict -13%), cold-trap fall-through inversion (the jmp sink
+/// is a never-taken `Ud2`), and loop-exit fall-through inversion (the jmp
+/// rides a genuine loop-exit edge, executed at most once per loop entry,
+/// while the in-loop jcc edge executes on nearly every iteration). The
+/// generic fall-through inversion for non-loop two-way exits is a
+/// profile-FREE heuristic ("layout-successor == hot") that regressed a real
+/// match-heavy program (p6_branch_match +4.3%), so it is DEFERRED off by
+/// default; the loop-exit rule is its p6-safe subset (loop membership is the
+/// hotness evidence — a match dispatch has no loop-exit edge). Opt in for
+/// A/B experiments with `TCG_BRANCH_LAYOUT_FALLTHROUGH=1`; forensic
+/// rollbacks: `TCG_NO_X86_COLD_TRAP_LAYOUT`, `TCG_NO_X86_LOOP_EXIT_LAYOUT`.
+///
+/// Rule 4 — COLD-ARM SINKING (`cold_arm_sink_rule`) — is OPT-IN for its
+/// soak: `TCG_X86_COLD_ARM_SINK=1` enables it. It is the first `block_order`
+/// mutation in the x86 lane and its profitability is a ratio argument (the
+/// call-bearing diamond arm is the cold path), not a strict-dominance
+/// argument like the three default-on rules — the X86CmovSwap opt-in-soak
+/// precedent applies. After the paired A/B the intended flip shape is a
+/// `TCG_NO_X86_COLD_ARM_SINK` kill switch with the rule default-ON.
+/// Accept counter: `TCG_X86_COLD_ARM_SINK_LOG=1` (one stderr line per sink —
+/// zero-fire trap discipline).
+///
+/// All switches are read through `crate::env_lock`, so tests configure them
+/// with thread-local override scopes (no process-env mutation).
 fn x86_branch_layout_config() -> trust_cg_opt::X86BranchLayoutConfig {
     trust_cg_opt::X86BranchLayoutConfig {
         latch_rule: true,
-        fallthrough_rule: std::env::var_os("TCG_BRANCH_LAYOUT_FALLTHROUGH").is_some(),
+        fallthrough_rule: crate::env_lock::var_os("TCG_BRANCH_LAYOUT_FALLTHROUGH").is_some(),
         // Cold-trap fall-through inversion (bounds/null/abort exits): profile-
         // free-correct, default ON. `TCG_NO_X86_COLD_TRAP_LAYOUT` opts out.
-        cold_trap_rule: std::env::var_os("TCG_NO_X86_COLD_TRAP_LAYOUT").is_none(),
+        cold_trap_rule: crate::env_lock::var_os("TCG_NO_X86_COLD_TRAP_LAYOUT").is_none(),
+        // Loop-exit fall-through inversion (the p6-safe subset of the
+        // deferred fallthrough rule): profile-independent, default ON.
+        // `TCG_NO_X86_LOOP_EXIT_LAYOUT` opts out.
+        loop_exit_rule: crate::env_lock::var_os("TCG_NO_X86_LOOP_EXIT_LAYOUT").is_none(),
+        // Cold-arm sinking: OPT-IN (soak) — see the doc comment above.
+        cold_arm_sink_rule: crate::env_lock::var_os("TCG_X86_COLD_ARM_SINK").is_some(),
     }
 }
 
@@ -8289,31 +8665,46 @@ fn admit_x86_strength_reduce_recurrence(width: u32, step: i64, stride: i64) -> b
     admitted
 }
 
-/// Fail-closed proof admission for the peephole's memory-destination RMW
-/// fusion (b1 RMW arc Stage 2): admit CREATING a fused
-/// `XorMR`/`AddMR`/`XorMRSib`/`AddMRSib` ONLY when that opcode's
-/// representative reconstruction obligations discharge `Valid` — the SAME
-/// `x86_reconstruction_discharges_valid` criterion the coverage gate credits
-/// the opcode with (`coverage_gate.rs::audit_x86`). If the Stage-1
-/// reconstruction arm were ever missing, mis-tabled, or failing to discharge,
-/// this returns `false`, the peephole never rewrites, and the opcode is never
-/// emitted: architecture-enforced fail-closed, not convention.
+/// Fail-closed proof admission for the peepholes that CONSTRUCT a
+/// reconstruction-lane opcode: the memory-destination RMW fusion (b1 RMW arc
+/// Stage 2 — `XorMR`/`AddMR`/`XorMRSib`/`AddMRSib`) and the variable-count
+/// rotate collapse (p6 rotate arc Stage 2 — `RolRCl`). Admit CREATING the
+/// opcode ONLY when its representative reconstruction obligations discharge
+/// `Valid` — the SAME `x86_reconstruction_discharges_valid` criterion the
+/// coverage gate credits the opcode with (`coverage_gate.rs::audit_x86`). If
+/// the Stage-1 reconstruction arm were ever missing, mis-tabled, or failing
+/// to discharge, this returns `false`, the peephole never rewrites, and the
+/// opcode is never emitted: architecture-enforced fail-closed, not
+/// convention.
 ///
 /// Admission gate, not a rejection gate: `false` leaves the (correct,
-/// itself proof-covered) load/ALU/store triple in place and the compile
-/// proceeds unoptimized — it never fails the compile. Injected into
+/// itself proof-covered) generic shape — the load/ALU/store triple, the
+/// shl/shr/or rotate expansion — in place and the compile proceeds
+/// unoptimized; it never fails the compile. Injected into
 /// `X86Peephole::new` because trust-cg-opt must not depend on trust-cg-verify
 /// (same callback-injection pattern as `admit_x86_ifconv_cc_inversion` /
 /// `admit_x86_strength_reduce_recurrence`). Memoized per opcode; the
 /// underlying discharge is additionally deduped by the content-keyed
 /// obligation memo inside trust-cg-verify.
-fn admit_x86_mem_rmw(opcode: trust_cg_ir::X86Opcode) -> bool {
+fn admit_x86_reconstructed_opcode(opcode: trust_cg_ir::X86Opcode) -> bool {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
 
     static ADMITTED: OnceLock<Mutex<HashMap<trust_cg_ir::X86Opcode, bool>>> = OnceLock::new();
     let memo = ADMITTED.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(&admitted) = memo.lock().expect("mem-rmw admission memo").get(&opcode) {
+    // INVARIANT (panic-audit C): `lock()` fails only if the mutex is POISONED,
+    // i.e. a thread panicked while holding it. Both critical sections below
+    // are a single `HashMap::get` / `HashMap::insert` with a derived-`Hash`
+    // key and a `bool` value — no user code, no closure, nothing that can
+    // unwind — and the verifier call that CAN fail runs between them with the
+    // guard already dropped. So neither `expect` is reachable; they are not
+    // softened into `PoisonError::into_inner` because a poisoned admission
+    // memo is exactly the state a verified backend must never read past.
+    if let Some(&admitted) = memo
+        .lock()
+        .expect("reconstructed-opcode admission memo")
+        .get(&opcode)
+    {
         return admitted;
     }
     let admitted = trust_cg_verify::x86_64_function_verifier::reconstruction_discharges_valid(
@@ -8321,7 +8712,7 @@ fn admit_x86_mem_rmw(opcode: trust_cg_ir::X86Opcode) -> bool {
         &trust_cg_verify::VerificationConfig::default(),
     );
     memo.lock()
-        .expect("mem-rmw admission memo")
+        .expect("reconstructed-opcode admission memo")
         .insert(opcode, admitted);
     admitted
 }
@@ -8959,38 +9350,6 @@ fn expand_x86_shift_range_check_carriers_after_canary(
     }
 
     Ok(())
-}
-
-/// Generate the `__eh_frame` section bytes for an x86-64 function.
-///
-/// Creates a DWARF CIE + FDE describing the System V AMD64 ABI prologue:
-/// PUSH RBP; MOV RBP, RSP; PUSH callee-saved regs; SUB RSP, frame_size.
-///
-/// The resulting bytes are suitable for the `__TEXT,__eh_frame` Mach-O section.
-///
-/// # Arguments
-/// - `callee_saved`: Callee-saved registers pushed after RBP (in push order).
-/// - `frame_size`: Bytes allocated via SUB RSP for locals/spills (may be 0).
-/// - `code_len`: Total encoded code length in bytes.
-/// - `symbol_index`: Symbol table index for the function (for relocations).
-///
-#[allow(dead_code)]
-fn generate_eh_frame_section(
-    callee_saved: &[X86PReg],
-    frame_size: u32,
-    code_len: u32,
-    symbol_index: u32,
-) -> Vec<u8> {
-    let mut section = DwarfCfiSection::new_x86_64();
-    let fde = x86_64_fde_from_prologue(
-        callee_saved,
-        frame_size,
-        0, // function_offset (placeholder, relocated by linker)
-        code_len,
-        symbol_index,
-    );
-    section.add_fde(fde);
-    section.to_bytes()
 }
 
 /// Resolved, post-layout x86 exception-handling descriptors for one function.
@@ -11055,8 +11414,16 @@ impl X86PipelineConfig {
 
     /// Runtime-detected host profile for in-process x86-64 JIT execution.
     pub fn host_jit() -> Self {
+        Self::host_jit_with_features(X86TargetFeatures::host())
+    }
+
+    /// Host-JIT profile using an already captured target-feature set.
+    ///
+    /// Compile planners use this to bind identity and execution to one CPU
+    /// feature snapshot without repeating runtime feature detection.
+    pub fn host_jit_with_features(target_features: X86TargetFeatures) -> Self {
         Self {
-            target_features: X86TargetFeatures::host(),
+            target_features,
             ..Self::default()
         }
     }
@@ -11088,9 +11455,15 @@ impl X86PipelineConfig {
     /// LinearScan cannot allocate within the x86 spill-replay budget, so
     /// completeness is preserved.
     pub fn host_jit_fast() -> Self {
+        Self::host_jit_fast_with_features(X86TargetFeatures::host())
+    }
+
+    /// Latency-tuned host-JIT profile using an already captured target-feature
+    /// set.
+    pub fn host_jit_fast_with_features(target_features: X86TargetFeatures) -> Self {
         Self {
             regalloc_mode: X86RegAllocMode::Full(AllocStrategy::LinearScan),
-            ..Self::host_jit()
+            ..Self::host_jit_with_features(target_features)
         }
     }
 
@@ -12214,7 +12587,7 @@ fn first_operand_is_def_and_use(inst: &X86ISelInst) -> bool {
         Bswap | Cmovcc | Cmovcc32 | Xchg | Cmpxchg | Cmpxchg8 | Cmpxchg16 | Pblendvb => true,
         Pinsrd | Pinsrq => inst.operands.len() == 3,
         AddRM | SubRM | ImulRM | ImulRMSib | ShlRI | ShrRI | SarRI => inst.operands.len() == 2,
-        ShlRR | ShrRR | SarRR => inst.operands.len() == 1,
+        ShlRR | ShrRR | SarRR | RolRCl => inst.operands.len() == 1,
         _ => false,
     }
 }
@@ -12388,7 +12761,8 @@ fn add_x86_fixed_implicit_operands(
             push_unique_x86_preg(implicit_uses, x86_64_regs::RAX);
             push_unique_x86_preg(implicit_defs, x86_64_regs::RDX);
         }
-        X86Opcode::ShlRR | X86Opcode::ShrRR | X86Opcode::SarRR => {
+        // CL-count shifts AND the CL-count rotate read the count from CL.
+        X86Opcode::ShlRR | X86Opcode::ShrRR | X86Opcode::SarRR | X86Opcode::RolRCl => {
             push_unique_x86_preg(implicit_uses, x86_64_regs::RCX);
         }
         X86Opcode::Idiv | X86Opcode::Div => {
@@ -12766,20 +13140,49 @@ fn build_x86_spill_remat_map(func: &X86ISelFunction) -> HashMap<VReg, X86SpillRe
                 continue;
             };
             for inst in &block.insts {
-                if inst.opcode != X86Opcode::MovRR
-                    || inst.flags != inst.opcode.default_flags()
-                    || inst.proof_origin.is_some()
-                {
+                if inst.flags != inst.opcode.default_flags() || inst.proof_origin.is_some() {
                     continue;
                 }
-                if let [X86ISelOperand::VReg(d), X86ISelOperand::VReg(s)] = inst.operands.as_slice()
-                    && d.class == s.class
-                    && def_count.get(d).copied() == Some(1)
-                    && !map.contains_key(d)
-                    && let Some(&expr) = map.get(s)
-                {
-                    map.insert(*d, expr);
-                    added = true;
+                match inst.opcode {
+                    X86Opcode::MovRR => {
+                        if let [X86ISelOperand::VReg(d), X86ISelOperand::VReg(s)] =
+                            inst.operands.as_slice()
+                            && d.class == s.class
+                            && def_count.get(d).copied() == Some(1)
+                            && !map.contains_key(d)
+                            && let Some(&expr) = map.get(s)
+                        {
+                            map.insert(*d, expr);
+                            added = true;
+                        }
+                    }
+                    // Derived-address hop: `Lea d, [s + k]` where `s` is
+                    // itself a rematerializable frame address makes `d` the
+                    // same frame address at `disp + k` — a pure single-def
+                    // function of a function-invariant value. This is the
+                    // hole that starved h2's `&v.len`/`&v.cap` chains (the
+                    // root `Lea [StackSlot+0]` was in the map; every field
+                    // address `Lea [root+8/16]` and its MovRR copies were
+                    // not). Gpr64-only on both sides — a 32-bit LEA would
+                    // truncate the address.
+                    X86Opcode::Lea => {
+                        if let [
+                            X86ISelOperand::VReg(d),
+                            X86ISelOperand::MemAddr { base, disp },
+                        ] = inst.operands.as_slice()
+                            && let X86ISelOperand::VReg(s) = base.as_ref()
+                            && d.class == RegClass::Gpr64
+                            && s.class == RegClass::Gpr64
+                            && def_count.get(d).copied() == Some(1)
+                            && !map.contains_key(d)
+                            && let Some(&X86SpillRemat::FrameAddr { slot, disp: d0 }) = map.get(s)
+                            && let Some(sum) = d0.checked_add(*disp)
+                        {
+                            map.insert(*d, X86SpillRemat::FrameAddr { slot, disp: sum });
+                            added = true;
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -12821,6 +13224,13 @@ fn x86_spill_remat_enabled() -> bool {
     std::env::var_os("TCG_NO_X86_SPILL_REMAT").is_none()
 }
 
+/// Frame-address memory-operand fold (see `rewrite_x86_spilled_operand`'s
+/// `MemAddr` arm): DEFAULT-ON, narrow opt-out for isolation A/Bs. The
+/// `TCG_NO_X86_SPILL_REMAT` umbrella also disables it (empty remat map).
+fn x86_spill_addr_fold_enabled() -> bool {
+    std::env::var_os("TCG_NO_X86_SPILL_ADDR_FOLD").is_none()
+}
+
 fn rewrite_x86_spilled_operand(
     op: &mut X86ISelOperand,
     installed_spills: &HashMap<VReg, u32>,
@@ -12856,7 +13266,27 @@ fn rewrite_x86_spilled_operand(
             }
             *op = X86ISelOperand::PReg(scratch);
         }
-        X86ISelOperand::MemAddr { base, .. } => {
+        X86ISelOperand::MemAddr { base, disp } => {
+            // Frame-address FOLD: a spilled base vreg whose sole def is a
+            // frame address folds straight into the operand — the effective
+            // address `(RBP + off(slot) + d0) + disp` is bit-identical to
+            // `MemAddr{ StackSlot(slot), d0 + disp }`, which frame lowering
+            // resolves RBP-relative. No reload, no scratch register, and no
+            // LEA either — this deliberately sidesteps the 2026-07-16
+            // remat negative (lea contends with ALU ports on ALU-bound
+            // loops; this emits NOTHING). Kill: TCG_NO_X86_SPILL_ADDR_FOLD
+            // (the TCG_NO_X86_SPILL_REMAT umbrella also kills it, since the
+            // remat map is empty when remat is disabled).
+            if x86_spill_addr_fold_enabled()
+                && let X86ISelOperand::VReg(v) = base.as_ref()
+                && installed_spills.contains_key(v)
+                && let Some(&X86SpillRemat::FrameAddr { slot, disp: d0 }) = remat_map.get(v)
+                && let Some(sum) = d0.checked_add(*disp)
+            {
+                **base = X86ISelOperand::StackSlot(slot);
+                *disp = sum;
+                return Ok(());
+            }
             rewrite_x86_spilled_operand(
                 base,
                 installed_spills,
@@ -13021,6 +13451,19 @@ fn x86_two_address_spilled_pair(
     // Aliasing only helps (and is only required) when dst and lhs are distinct
     // vregs that are both spilled to the stack.
     if dst == lhs {
+        return None;
+    }
+    // dst == rhs (e.g. `AddRR vX, vY, vX` from copy coalescing merging the
+    // result with one source): aliasing dst with LHS would force the rhs
+    // reload into the SAME scratch — the rhs reload then clobbers the lhs
+    // value before the op reads it (the s31226 silent O0 miscompile:
+    // `movl p3->r10d; movl p2->r10d; addl r10d,r10d` computed p2+p2 for
+    // p3+p2). Decline; the per-operand path gives dst/rhs one scratch and
+    // lhs another, and fixup_two_address then repairs the preg-level
+    // dst/rhs alias (commutative swap, or scratch-copy fail-closed).
+    if inst.operands.iter().enumerate().any(|(i, op)| {
+        i != 0 && i != lhs_index && matches!(op, X86ISelOperand::VReg(v) if v == dst)
+    }) {
         return None;
     }
     if installed_spills.contains_key(dst) && installed_spills.contains_key(lhs) {
@@ -13256,6 +13699,34 @@ fn materialize_x86_spills(
         let mut new_insts = Vec::with_capacity(block.insts.len() + installed_spills.len() * 2);
 
         for inst in &block.insts {
+            // A self-copy `MovRR v, v` of a SPILLED vreg is the identity on
+            // the slot: materializing it emits reload + store of the same
+            // slot (the identity move between them is later dropped by the
+            // MovRR coalescer, leaving a bare dead load/store pair — h2's
+            // ~6M-per-run `mov -0x70(%rbp),%r10; mov %r10,-0x70(%rbp)`).
+            // The slot already holds the value (the reload itself proves a
+            // dominating store exists), so elide the whole instruction.
+            // Produced by regalloc copy coalescing rewriting a phi copy's
+            // operands to the same vreg post-opt. Non-spilled self-copies
+            // keep the existing coalescer path (byte-identical stream).
+            // Kill: TCG_NO_X86_DEAD_SPILL_COPY.
+            if matches!(
+                inst.opcode,
+                X86Opcode::MovRR
+                    | X86Opcode::MovRR32
+                    | X86Opcode::MovssRR
+                    | X86Opcode::MovsdRR
+                    | X86Opcode::MovdqaRR
+            ) && inst.flags == inst.opcode.default_flags()
+                && inst.proof_origin.is_none()
+                && let [X86ISelOperand::VReg(d), X86ISelOperand::VReg(s)] = inst.operands.as_slice()
+                && d == s
+                && installed_spills.contains_key(d)
+                && std::env::var_os("TCG_NO_X86_DEAD_SPILL_COPY").is_none()
+            {
+                continue;
+            }
+
             let mut rewritten = inst.clone();
             let mut state = X86SpillScratchState::new(abi);
             let mut loads = Vec::new();
@@ -13284,6 +13755,12 @@ fn materialize_x86_spills(
                 &mut state,
                 &mut loads,
             )?;
+            // The presequence emits an internally-ordered mini-sequence
+            // (its LEA consumes a scratch that may then be legitimately
+            // reused); the collision net below applies only to the plain
+            // operand-rewrite loads, which are all emitted contiguously
+            // before the instruction.
+            let presequence_loads = loads.len();
 
             for idx in 0..rewritten.operands.len() {
                 if try_fold_x86_spilled_packed_rhs(inst, &mut rewritten, idx, installed_spills) {
@@ -13302,6 +13779,30 @@ fn materialize_x86_spills(
                 )?;
             }
 
+            // Fail-closed net: no two reloads/recomputes for ONE instruction
+            // may target overlapping scratch registers — a collision means a
+            // later reload silently clobbers an earlier operand's value (the
+            // s31226 class: dst/lhs aliasing plus a dst==rhs operand put two
+            // different slots into R10). The decline in
+            // x86_two_address_spilled_pair prevents the known shape; this
+            // check turns any UNKNOWN shape of the same class into a compile
+            // error instead of wrong code.
+            for (i, a) in loads.iter().enumerate().skip(presequence_loads) {
+                for b in &loads[i + 1..] {
+                    if let (Some(X86ISelOperand::PReg(pa)), Some(X86ISelOperand::PReg(pb))) =
+                        (a.operands.first(), b.operands.first())
+                        && x86_64_regs::x86_regs_overlap(*pa, *pb)
+                    {
+                        return Err(X86PipelineError::RegAlloc(format!(
+                            "spill materialization scheduled two reloads into \
+                             overlapping scratch {pa:?}/{pb:?} for one \
+                             instruction ({:?}) — operand values would collide \
+                             (fail-closed)",
+                            rewritten.opcode
+                        )));
+                    }
+                }
+            }
             evidence.reload_count += loads.len();
             new_insts.extend(loads);
             new_insts.push(rewritten);
@@ -13871,10 +14372,13 @@ impl X86Pipeline {
                 trust_cg_opt::X86LoopInvariantCodeMotion::pure_only(),
             ))
             .with_pass(Box::new(trust_cg_opt::X86CopyPropagation))
-            // RMW fusion inside the peephole is admission-gated on the REAL
-            // reconstruction discharge (fail-closed `|_| false` default in
+            // The RMW fusion and the variable-rotate collapse inside the
+            // peephole are admission-gated on the REAL reconstruction
+            // discharge (fail-closed `|_| false` default in
             // `X86Peephole::default`).
-            .with_pass(Box::new(trust_cg_opt::X86Peephole::new(admit_x86_mem_rmw)))
+            .with_pass(Box::new(trust_cg_opt::X86Peephole::new(
+                admit_x86_reconstructed_opcode,
+            )))
             .with_pass(Box::new(trust_cg_opt::X86DeadCodeElimination));
         if x86_if_convert_enabled() {
             pm = pm.with_pass(Box::new(trust_cg_opt::X86IfConvert::new(
@@ -13986,9 +14490,12 @@ impl X86Pipeline {
             .with_pass(Box::new(trust_cg_opt::X86BlockMerge::new()))
             .with_pass(Box::new(trust_cg_opt::X86CopyPropagation))
             .with_pass(Box::new(trust_cg_opt::X86CommonSubexpressionElimination))
-            // RMW fusion inside the peephole is admission-gated on the REAL
-            // reconstruction discharge — see `admit_x86_mem_rmw`.
-            .with_pass(Box::new(trust_cg_opt::X86Peephole::new(admit_x86_mem_rmw)));
+            // The RMW fusion and the variable-rotate collapse inside the
+            // peephole are admission-gated on the REAL reconstruction
+            // discharge — see `admit_x86_reconstructed_opcode`.
+            .with_pass(Box::new(trust_cg_opt::X86Peephole::new(
+                admit_x86_reconstructed_opcode,
+            )));
         // Dominated-identical-compare bounds-check elimination (safety-critical,
         // sound by construction). Runs AFTER the peephole's cmp+setcc+zero-test
         // +Jcc fusion, which collapses the frontend's materialized-boolean
@@ -14043,6 +14550,24 @@ impl X86Pipeline {
         // from. Added ONLY under the opt-in gate so the default pass schedule is
         // byte-identical (the `optimization_passes_run == 16` pin holds). See
         // `trust_cg_opt::x86_two_addr_expand`.
+        //
+        // 🛑 DEFAULT-ON REFUTED at THREE gate granularities (2026-08-29):
+        // (1) EVERYWHERE (a74e7cd6 A/B): m2_call_heavy −18% and small
+        //     m1/p6/h4 wins, but p7_sieve +43% absolute and p8 +15% —
+        //     expansion copies the coalescer does not fold in tight
+        //     call-free loops. (2) BLOCK-LEVEL call gate: p7/p8 fully
+        //     protected (on==off) but m2's win vanished too — its
+        //     profitable expansions sit in call-free blocks. (3) INNERMOST-
+        //     LOOP call gate: p7 regressed again (+50%: its loop is
+        //     call-dense at this pass's position) and m2's win STILL
+        //     missing — its expansions live in loops that are call-free
+        //     at every granularity. The win/loss structure is a property
+        //     of specific allocation outcomes, NOT decomposable on static
+        //     call evidence; do not propose a fourth call-shaped gate.
+        //     The pass (with its last-use profitability proofs, the loop
+        //     gate, and TCG_X86_TWOADDR_EXPAND_ALL) remains available
+        //     opt-in for future levers with a different admission story
+        //     (e.g. a post-RA measured-copy-count feedback gate).
         if crate::env_lock::var_os("TCG_X86_TWOADDR_EXPAND").is_some() {
             pm = pm.with_pass(Box::new(trust_cg_opt::X86TwoAddressExpand));
         }
@@ -15474,50 +15999,6 @@ impl X86Pipeline {
         self.compile_module_impl(functions, true, globals, false)
     }
 
-    /// Compile multiple functions that have already had the selected x86
-    /// optimization policy applied.
-    pub(crate) fn compile_module_after_x86_passes(
-        &self,
-        functions: &[X86ISelFunction],
-    ) -> Result<Vec<u8>, X86PipelineError> {
-        self.compile_module_impl(functions, false, &[], false)
-    }
-
-    /// [`Self::compile_module_after_x86_passes`] with module-level data globals.
-    pub(crate) fn compile_module_after_x86_passes_with_globals(
-        &self,
-        functions: &[X86ISelFunction],
-        globals: &[crate::pipeline::ObjectGlobal],
-    ) -> Result<Vec<u8>, X86PipelineError> {
-        self.compile_module_impl(functions, false, globals, false)
-    }
-
-    /// CT-5: parallel-encode variant of [`Self::compile_module_after_x86_passes`].
-    ///
-    /// Fans the per-function register-allocation + encoding out across a bounded
-    /// rayon pool when there are enough functions to justify it, then reassembles
-    /// byte-identically in function order. Selected by `Compiler::compile_x86_64`
-    /// when `CompilerConfig::parallel` is set; the serial method above stays the
-    /// default so the `parallel: false` posture (and every existing caller) is
-    /// unchanged.
-    pub(crate) fn compile_module_after_x86_passes_parallel(
-        &self,
-        functions: &[X86ISelFunction],
-    ) -> Result<Vec<u8>, X86PipelineError> {
-        self.compile_module_impl(functions, false, &[], true)
-    }
-
-    /// [`Self::compile_module_after_x86_passes_parallel`] with module-level data
-    /// globals — the parallel-encode variant of
-    /// [`Self::compile_module_after_x86_passes_with_globals`].
-    pub(crate) fn compile_module_after_x86_passes_with_globals_parallel(
-        &self,
-        functions: &[X86ISelFunction],
-        globals: &[crate::pipeline::ObjectGlobal],
-    ) -> Result<Vec<u8>, X86PipelineError> {
-        self.compile_module_impl(functions, false, globals, true)
-    }
-
     // CT-8: the production path now composes `assemble_module_after_x86_passes`
     // + `relocation_inventory_report_for_assembled` so the assembly is shared
     // with the final object emission; this one-shot wrapper is retained as the
@@ -15536,37 +16017,17 @@ impl X86Pipeline {
         self.relocation_inventory_report_for_assembled(&assembled, globals, object_name)
     }
 
-    /// CT-8 (encode reuse): [`Self::assemble_module`] for post-pass
-    /// functions — the proof-cert lane's entry, paired with
-    /// [`Self::relocation_inventory_report_for_assembled`] (inventory rows)
-    /// and [`Self::emit_assembled_module`] (final object), so the dominant
-    /// per-function regalloc+encode runs ONCE for both consumers.
-    #[cfg(feature = "verify")]
+    /// Authoritative [`Self::assemble_module`] entry for post-pass functions.
+    ///
+    /// Available with and without `verify`: metrics, optional proof inventory,
+    /// and object emission must all consume this one assembly so the dominant
+    /// per-function backend runs once per module.
     pub(crate) fn assemble_module_after_x86_passes(
         &self,
         functions: &[X86ISelFunction],
         parallel: bool,
     ) -> Result<X86AssembledModule, X86PipelineError> {
         self.assemble_module(functions, false, parallel)
-    }
-
-    /// Concatenated code-byte size ([`X86AssembledModule::code_size`]) the
-    /// module's object will carry, from a full assemble under THIS pipeline's
-    /// real output format.
-    ///
-    /// Used by the compiler's code-size metric for EH-carrying
-    /// (`panic=unwind`) modules, which the RawBytes size probe correctly
-    /// refuses (raw bytes cannot carry the LSDA/FDE sidecar). Unlike
-    /// [`Self::assemble_module_after_x86_passes`] this is available without
-    /// the `verify` feature (the proofs-off lane needs the metric too).
-    pub(crate) fn module_code_size_after_x86_passes(
-        &self,
-        functions: &[X86ISelFunction],
-        parallel: bool,
-    ) -> Result<usize, X86PipelineError> {
-        Ok(self
-            .assemble_module(functions, false, parallel)?
-            .code_size())
     }
 
     /// Relocation-inventory report for an ALREADY-assembled module (CT-8).
@@ -15675,8 +16136,7 @@ impl X86Pipeline {
     /// Inventory rows for the relocations the module WOULD emit.
     ///
     /// `globals` carries the module's data globals for two reasons, both
-    /// mirroring the real emission path
-    /// ([`Self::compile_module_after_x86_passes_with_globals`]):
+    /// mirroring the real emission path ([`Self::emit_assembled_module`]):
     ///
     /// 1. DEFINED-SET: the writer resolves a `GlobalRef` against function AND
     ///    data symbols (a vtable or static is a same-module `__DATA`/`.data`
@@ -16004,6 +16464,8 @@ impl X86Pipeline {
         X86PipelineError,
     > {
         let encode_one = |func: &X86ISelFunction| {
+            #[cfg(test)]
+            record_test_x86_function_backend_invocation();
             if run_x86_passes {
                 self.compile_function_with_fixups_and_frame(func)
             } else {
@@ -16085,6 +16547,7 @@ impl X86Pipeline {
         let mut encoded: Vec<X86EncodedFunc> = Vec::with_capacity(functions.len());
         let mut combined_code: Vec<u8> = Vec::new();
         let mut combined_rdata: Vec<u8> = Vec::new();
+        let mut raw_code_size = 0usize;
 
         for (
             func,
@@ -16114,10 +16577,17 @@ impl X86Pipeline {
             // The kill switch returns both this padding and object-section
             // alignment to the 16-byte convention.
             if x86_jcc_align_enabled() {
-                align_code_vec_with_nops(&mut combined_code, 1 << x86_text_align_log2());
+                let alignment = 1 << x86_text_align_log2();
+                align_code_vec_with_nops(&mut combined_code, alignment);
+                // Preserve the old RawBytes metrics layout independently of
+                // COFF's native text/rdata split. RawBytes places each pool
+                // immediately after its function, so its next-function
+                // alignment can differ from native COFF `.text` alignment.
+                raw_code_size = (raw_code_size + alignment - 1) & !(alignment - 1);
             }
             let text_offset = combined_code.len() as u64;
             combined_code.extend_from_slice(&code);
+            raw_code_size += code.len() + const_pool.len();
             let code_len = checked_x86_code_len(&func.name, code.len())?;
             let mut const_pool_rdata_offset = 0;
             if effective_format == X86OutputFormat::Coff {
@@ -16146,10 +16616,16 @@ impl X86Pipeline {
             });
         }
 
+        debug_assert!(
+            effective_format == X86OutputFormat::Coff || raw_code_size == combined_code.len(),
+            "non-COFF native assembly must match the RawBytes metric layout"
+        );
+
         Ok(X86AssembledModule {
             encoded,
             combined_code,
             combined_rdata,
+            raw_code_size,
             effective_format,
         })
     }
@@ -16172,6 +16648,7 @@ impl X86Pipeline {
             encoded,
             combined_code,
             combined_rdata,
+            raw_code_size: _,
             effective_format,
         } = assembled;
         if encoded.is_empty() {
@@ -16195,10 +16672,9 @@ impl X86Pipeline {
                 // displacements stay zero, and symbol-address (`GlobalRef` /
                 // `ExternRef`) RIP-relative disp32 fields likewise stay zero
                 // placeholders, exactly like CALL: RawBytes is non-linkable
-                // output used by tests and by the `compile_x86_64` code-size
-                // probe, never executed directly. The real symbol-address
-                // relocations are emitted by the MachO / ELF / COFF paths
-                // below.
+                // output used by raw-module callers and layout-parity tests.
+                // The real symbol-address relocations are emitted by the
+                // MachO / ELF / COFF paths below.
                 Ok(combined_code)
             }
             X86OutputFormat::MachO => self.emit_module_macho(&encoded, &combined_code, globals),
@@ -19761,6 +20237,27 @@ mod tests {
         assert_eq!(X86PipelineConfig::default().target_features, current);
         assert_eq!(X86PipelineConfig::current().target_features, current);
         assert_eq!(X86PipelineConfig::generic_x86_64().target_features, generic);
+        assert_eq!(
+            X86PipelineConfig::host_jit_with_features(generic).target_features,
+            generic
+        );
+        let captured_fast = X86PipelineConfig::host_jit_fast_with_features(generic);
+        assert_eq!(captured_fast.target_features, generic);
+        assert_eq!(
+            captured_fast.regalloc_mode,
+            X86RegAllocMode::Full(AllocStrategy::LinearScan)
+        );
+
+        let admitted = trust_cg_ir::AdmittedTargetFeatures::try_from_features([
+            X86TargetFeature::Sse41,
+            X86TargetFeature::Sse42,
+        ])
+        .unwrap();
+        assert_eq!(admitted.bits(), 0b110);
+        let machine = trust_cg_ir::TargetMachine::try_new(Target::X86_64, admitted).unwrap();
+        let required =
+            trust_cg_ir::OutputTargetFeatures::try_from_output([X86TargetFeature::Sse42]).unwrap();
+        machine.validate_output_features(required).unwrap();
     }
 
     #[test]
@@ -20279,6 +20776,89 @@ mod tests {
                 "{op:?} must produce a UD2 trap block"
             );
         }
+    }
+
+    /// A successful canary memo is authority for the exact condition it
+    /// checked, not a blanket approval for every later expansion of that guard
+    /// kind in the same process.
+    ///
+    /// Solver-independent: the cell is seeded with the memo a validated run
+    /// leaves behind, so this pins the drift check itself rather than the
+    /// host's ability to discharge the wide rows.
+    #[test]
+    fn guard_carrier_canary_memo_rejects_correct_then_wrong_condition() {
+        use trust_cg_ir::x86_64_ops::X86CondCode;
+        use trust_cg_verify::pass_validators::GuardCarrierKind;
+
+        let cell = std::sync::OnceLock::new();
+        cell.set(Ok(X86CondCode::E))
+            .expect("fresh cell accepts the validated memo");
+
+        validate_guard_carrier_canary_cached(&cell, GuardCarrierKind::DivZero, X86CondCode::E)
+            .expect("the memoized condition must replay as validated");
+
+        let error =
+            validate_guard_carrier_canary_cached(&cell, GuardCarrierKind::DivZero, X86CondCode::NE)
+                .expect_err(
+                    "a cached correct condition must not authorize a later wrong condition",
+                );
+        assert!(
+            error.contains("different condition") && error.contains("NE"),
+            "unexpected error: {error}"
+        );
+
+        // A memoized rejection stays a rejection for every later request.
+        let rejected = std::sync::OnceLock::new();
+        rejected
+            .set(Err("canary refuted".to_string()))
+            .expect("fresh cell accepts the rejected memo");
+        let error = validate_guard_carrier_canary_cached(
+            &rejected,
+            GuardCarrierKind::DivZero,
+            X86CondCode::E,
+        )
+        .expect_err("a memoized rejection must not be re-admitted");
+        assert!(
+            error.contains("canary refuted"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// End-to-end form of the memo check through the real validator. Hosts
+    /// whose portable certificate set is a fail-closed miss (checker-byte
+    /// drift) and that have no live AY cannot discharge the wide rows; that
+    /// exact `solver unknown` outcome is reported and skipped, while any other
+    /// rejection (a refutation) still fails.
+    #[test]
+    fn guard_carrier_canary_memo_end_to_end_rejects_drifted_condition() {
+        use trust_cg_ir::x86_64_ops::X86CondCode;
+        use trust_cg_verify::pass_validators::GuardCarrierKind;
+
+        let cell = std::sync::OnceLock::new();
+        if let Err(reason) =
+            validate_guard_carrier_canary_cached(&cell, GuardCarrierKind::DivZero, X86CondCode::E)
+        {
+            assert!(
+                reason.contains("fail-closed: solver unknown ("),
+                "the exact DivZero expansion must validate or be unknowable here, not refuted: \
+                 {reason}"
+            );
+            eprintln!(
+                "SKIP guard_carrier_canary_memo_end_to_end_rejects_drifted_condition: this host \
+                 cannot discharge the wide canary rows: {reason}"
+            );
+            return;
+        }
+
+        let error =
+            validate_guard_carrier_canary_cached(&cell, GuardCarrierKind::DivZero, X86CondCode::NE)
+                .expect_err(
+                    "a cached correct condition must not authorize a later wrong condition",
+                );
+        assert!(
+            error.contains("different condition"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
@@ -21671,6 +22251,397 @@ mod tests {
         );
     }
 
+    /// The production branch-layout rule policy and the loop-exit kill
+    /// switch. All the switches are read through `crate::env_lock`, so the
+    /// thread-local override scopes below are deterministic under parallel
+    /// tests (no process-env mutation — see `trust_cg_process_env`).
+    #[test]
+    fn x86_branch_layout_config_loop_exit_kill_switch() {
+        // Default (switches absent): the three profile-independent rules are
+        // ON, the refuted profile-guess fallthrough rule is OFF.
+        crate::env_lock::with_env_overrides_removed(
+            &[
+                "TCG_NO_X86_LOOP_EXIT_LAYOUT",
+                "TCG_NO_X86_COLD_TRAP_LAYOUT",
+                "TCG_BRANCH_LAYOUT_FALLTHROUGH",
+            ],
+            || {
+                let c = x86_branch_layout_config();
+                assert!(c.latch_rule, "latch rule is unconditionally on");
+                assert!(c.cold_trap_rule, "cold-trap rule is default-on");
+                assert!(c.loop_exit_rule, "loop-exit rule is default-on");
+                assert!(!c.fallthrough_rule, "fallthrough rule is deferred off");
+            },
+        );
+        // Kill switch: TCG_NO_X86_LOOP_EXIT_LAYOUT disables EXACTLY the
+        // loop-exit rule (forensic rollback / A-B comparison).
+        crate::env_lock::with_env_overrides(&[("TCG_NO_X86_LOOP_EXIT_LAYOUT", "1")], || {
+            let c = x86_branch_layout_config();
+            assert!(
+                !c.loop_exit_rule,
+                "kill switch must disable the loop-exit rule"
+            );
+            assert!(c.latch_rule, "latch rule unaffected by the kill switch");
+            assert!(
+                c.cold_trap_rule,
+                "cold-trap rule unaffected by the kill switch"
+            );
+        });
+    }
+
+    /// OPT-8 production wiring, end-to-end at O1: the DEFAULT schedule (with
+    /// the validator-backed `admit_x86_cc_inversion` callback) applies the
+    /// LOOP-EXIT rule to a top-tested loop header — the loop-exit edge moves
+    /// onto the (rarely-taken) `jcc` and the in-loop edge rides the `jmp` to
+    /// the layout successor (elided at encode), so the loop pays a
+    /// fall-through instead of a taken branch on nearly every iteration.
+    /// With `TCG_NO_X86_LOOP_EXIT_LAYOUT` set (thread-local override), the
+    /// same schedule leaves the header untouched.
+    #[test]
+    fn o1_schedule_inverts_top_tested_loop_header_and_honors_kill_switch() {
+        let (b0, b1, b2, b3) = (Block(0), Block(1), Block(2), Block(3));
+        // b0 preheader -> b1 header (`cmp; jcc B b2; jmp b3` — exit edge on
+        // the JMP) -> b2 body+latch (`add; jmp b1`) -> b3 exit.
+        let build = || {
+            let sig = Signature {
+                params: vec![],
+                returns: vec![Type::I64],
+            };
+            let mut func = X86ISelFunction::new("loop_exit_o1".to_string(), sig);
+            for b in [b0, b1, b2, b3] {
+                func.ensure_block(b);
+            }
+            func.push_inst(
+                b0,
+                X86ISelInst::new(
+                    X86Opcode::MovRI,
+                    vec![
+                        X86ISelOperand::PReg(x86_64_regs::RAX),
+                        X86ISelOperand::Imm(0),
+                    ],
+                ),
+            );
+            func.push_inst(
+                b0,
+                X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(b1)]),
+            );
+            func.push_inst(
+                b1,
+                X86ISelInst::new(
+                    X86Opcode::CmpRI,
+                    vec![
+                        X86ISelOperand::PReg(x86_64_regs::RAX),
+                        X86ISelOperand::Imm(10),
+                    ],
+                ),
+            );
+            func.push_inst(
+                b1,
+                X86ISelInst::new(
+                    X86Opcode::Jcc,
+                    vec![
+                        X86ISelOperand::CondCode(X86CondCode::B),
+                        X86ISelOperand::Block(b2),
+                    ],
+                ),
+            );
+            func.push_inst(
+                b1,
+                X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(b3)]),
+            );
+            func.push_inst(
+                b2,
+                X86ISelInst::new(
+                    X86Opcode::AddRI,
+                    vec![
+                        X86ISelOperand::PReg(x86_64_regs::RAX),
+                        X86ISelOperand::Imm(1),
+                    ],
+                ),
+            );
+            func.push_inst(
+                b2,
+                X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(b1)]),
+            );
+            func.push_inst(b3, X86ISelInst::new(X86Opcode::Ret, vec![]));
+            func.blocks.get_mut(&b0).unwrap().successors = vec![b1];
+            func.blocks.get_mut(&b1).unwrap().successors = vec![b2, b3];
+            func.blocks.get_mut(&b2).unwrap().successors = vec![b1];
+            func
+        };
+        let run_o1 = |func: &mut X86ISelFunction| {
+            let pipeline = X86Pipeline::new(X86PipelineConfig {
+                opt_level: trust_cg_opt::OptLevel::O1,
+                emit_frame: false,
+                regalloc_mode: X86RegAllocMode::Simplified,
+                ..X86PipelineConfig::default()
+            });
+            let _ = pipeline.run_x86_optimization_passes(func);
+        };
+
+        crate::env_lock::with_env_overrides_removed(&["TCG_NO_X86_LOOP_EXIT_LAYOUT"], || {
+            let mut func = build();
+            run_o1(&mut func);
+            let header = &func.blocks[&b1].insts;
+            let n = header.len();
+            assert_eq!(
+                header[n - 2].operands,
+                vec![
+                    X86ISelOperand::CondCode(X86CondCode::AE),
+                    X86ISelOperand::Block(b3),
+                ],
+                "loop exit must ride the inverted jcc (B -> AE)"
+            );
+            assert_eq!(
+                header[n - 1].operands,
+                vec![X86ISelOperand::Block(b2)],
+                "in-loop edge rides the jmp to the layout successor (elided at encode)"
+            );
+        });
+
+        crate::env_lock::with_env_overrides(&[("TCG_NO_X86_LOOP_EXIT_LAYOUT", "1")], || {
+            let mut func = build();
+            run_o1(&mut func);
+            let header = &func.blocks[&b1].insts;
+            let n = header.len();
+            assert_eq!(
+                header[n - 2].operands,
+                vec![
+                    X86ISelOperand::CondCode(X86CondCode::B),
+                    X86ISelOperand::Block(b2),
+                ],
+                "kill switch: header jcc must be untouched"
+            );
+            assert_eq!(
+                header[n - 1].operands,
+                vec![X86ISelOperand::Block(b3)],
+                "kill switch: header jmp must be untouched"
+            );
+        });
+    }
+
+    /// The cold-arm sink rule (rule 4) is OPT-IN for its soak:
+    /// `TCG_X86_COLD_ARM_SINK` absent => OFF (and the three default-on rules
+    /// unaffected); present => ON (and again nothing else moves). Read
+    /// through `crate::env_lock` — thread-local override scopes, no
+    /// process-env mutation.
+    #[test]
+    fn x86_branch_layout_config_cold_arm_sink_opt_in() {
+        crate::env_lock::with_env_overrides_removed(&["TCG_X86_COLD_ARM_SINK"], || {
+            let c = x86_branch_layout_config();
+            assert!(
+                !c.cold_arm_sink_rule,
+                "cold-arm sinking must be OFF without the opt-in"
+            );
+            assert!(c.latch_rule, "latch rule unaffected");
+            assert!(c.cold_trap_rule, "cold-trap rule unaffected");
+            assert!(c.loop_exit_rule, "loop-exit rule unaffected");
+            assert!(!c.fallthrough_rule, "fallthrough rule stays deferred off");
+        });
+        crate::env_lock::with_env_overrides(&[("TCG_X86_COLD_ARM_SINK", "1")], || {
+            let c = x86_branch_layout_config();
+            assert!(
+                c.cold_arm_sink_rule,
+                "TCG_X86_COLD_ARM_SINK=1 must enable the sink rule"
+            );
+            assert!(c.latch_rule, "latch rule unaffected by the opt-in");
+            assert!(c.cold_trap_rule, "cold-trap rule unaffected by the opt-in");
+            assert!(c.loop_exit_rule, "loop-exit rule unaffected by the opt-in");
+            assert!(
+                !c.fallthrough_rule,
+                "the refuted fallthrough rule must NOT ride in on the opt-in"
+            );
+        });
+    }
+
+    /// Rule 4 end-to-end at O1: with `TCG_X86_COLD_ARM_SINK=1` the DEFAULT
+    /// schedule sinks an intra-loop diamond's call arm out of the loop span —
+    /// a pure `block_order` permutation (the hard-terminated latch needs no
+    /// seam jmp) after which the diamond's `jmp <kept arm>` targets the
+    /// layout successor (elided at encode: the hot, call-free arm falls
+    /// through every iteration). The permuted function must still satisfy
+    /// the pipeline layout validator. Without the opt-in the same schedule
+    /// leaves the layout untouched (kill-switch isolation).
+    #[test]
+    fn o1_schedule_sinks_cold_call_arm_only_when_opted_in() {
+        let (b0, b1, b2, b3, b4, b5) = (Block(0), Block(1), Block(2), Block(3), Block(4), Block(5));
+        // b0 preheader -> b1 diamond entry (`cmp; jcc E b2; jmp b3`) ->
+        // b2 COLD call arm (add; call; add; jmp b4) -> b3 hot arm (add;
+        // jmp b4) -> b4 join + rotated latch (`cmp; jcc L b1; jmp b5`) ->
+        // b5 exit. PReg operands throughout: fixed-register contracts are
+        // ABI-observable, so the O1 cleanups (LICM/copy-prop/peephole/DCE)
+        // leave the arm's four instructions in place for branch layout.
+        let build = || {
+            let sig = Signature {
+                params: vec![],
+                returns: vec![Type::I64],
+            };
+            let mut func = X86ISelFunction::new("cold_arm_sink_o1".to_string(), sig);
+            for b in [b0, b1, b2, b3, b4, b5] {
+                func.ensure_block(b);
+            }
+            func.push_inst(
+                b0,
+                X86ISelInst::new(
+                    X86Opcode::MovRI,
+                    vec![
+                        X86ISelOperand::PReg(x86_64_regs::RAX),
+                        X86ISelOperand::Imm(0),
+                    ],
+                ),
+            );
+            func.push_inst(
+                b0,
+                X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(b1)]),
+            );
+            func.push_inst(
+                b1,
+                X86ISelInst::new(
+                    X86Opcode::CmpRI,
+                    vec![
+                        X86ISelOperand::PReg(x86_64_regs::RAX),
+                        X86ISelOperand::Imm(3),
+                    ],
+                ),
+            );
+            func.push_inst(
+                b1,
+                X86ISelInst::new(
+                    X86Opcode::Jcc,
+                    vec![
+                        X86ISelOperand::CondCode(X86CondCode::E),
+                        X86ISelOperand::Block(b2),
+                    ],
+                ),
+            );
+            func.push_inst(
+                b1,
+                X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(b3)]),
+            );
+            func.push_inst(
+                b2,
+                X86ISelInst::new(
+                    X86Opcode::AddRI,
+                    vec![
+                        X86ISelOperand::PReg(x86_64_regs::RAX),
+                        X86ISelOperand::Imm(2),
+                    ],
+                ),
+            );
+            func.push_inst(b2, X86ISelInst::new(X86Opcode::Call, vec![]));
+            func.push_inst(
+                b2,
+                X86ISelInst::new(
+                    X86Opcode::AddRI,
+                    vec![
+                        X86ISelOperand::PReg(x86_64_regs::RAX),
+                        X86ISelOperand::Imm(2),
+                    ],
+                ),
+            );
+            func.push_inst(
+                b2,
+                X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(b4)]),
+            );
+            func.push_inst(
+                b3,
+                X86ISelInst::new(
+                    X86Opcode::AddRI,
+                    vec![
+                        X86ISelOperand::PReg(x86_64_regs::RAX),
+                        X86ISelOperand::Imm(1),
+                    ],
+                ),
+            );
+            func.push_inst(
+                b3,
+                X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(b4)]),
+            );
+            func.push_inst(
+                b4,
+                X86ISelInst::new(
+                    X86Opcode::CmpRI,
+                    vec![
+                        X86ISelOperand::PReg(x86_64_regs::RAX),
+                        X86ISelOperand::Imm(10),
+                    ],
+                ),
+            );
+            func.push_inst(
+                b4,
+                X86ISelInst::new(
+                    X86Opcode::Jcc,
+                    vec![
+                        X86ISelOperand::CondCode(X86CondCode::L),
+                        X86ISelOperand::Block(b1),
+                    ],
+                ),
+            );
+            func.push_inst(
+                b4,
+                X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(b5)]),
+            );
+            func.push_inst(b5, X86ISelInst::new(X86Opcode::Ret, vec![]));
+            func.blocks.get_mut(&b0).unwrap().successors = vec![b1];
+            func.blocks.get_mut(&b1).unwrap().successors = vec![b2, b3];
+            func.blocks.get_mut(&b2).unwrap().successors = vec![b4];
+            func.blocks.get_mut(&b3).unwrap().successors = vec![b4];
+            func.blocks.get_mut(&b4).unwrap().successors = vec![b1, b5];
+            func
+        };
+        let run_o1 = |func: &mut X86ISelFunction| {
+            let pipeline = X86Pipeline::new(X86PipelineConfig {
+                opt_level: trust_cg_opt::OptLevel::O1,
+                emit_frame: false,
+                regalloc_mode: X86RegAllocMode::Simplified,
+                ..X86PipelineConfig::default()
+            });
+            let _ = pipeline.run_x86_optimization_passes(func);
+        };
+
+        crate::env_lock::with_env_overrides(&[("TCG_X86_COLD_ARM_SINK", "1")], || {
+            let mut func = build();
+            run_o1(&mut func);
+            assert_eq!(
+                func.block_order,
+                vec![b0, b1, b3, b4, b2, b5],
+                "opted in: the call arm must sink past the loop span"
+            );
+            // The diamond terminators are untouched (no cc inversion — the
+            // sink is layout-only): still `jcc E b2; jmp b3`, with b3 now the
+            // layout successor so the jmp elides at encode.
+            let entry = &func.blocks[&b1].insts;
+            let n = entry.len();
+            assert_eq!(
+                entry[n - 2].operands,
+                vec![
+                    X86ISelOperand::CondCode(X86CondCode::E),
+                    X86ISelOperand::Block(b2),
+                ],
+                "sink must not invert or retarget the jcc"
+            );
+            assert_eq!(
+                entry[n - 1].operands,
+                vec![X86ISelOperand::Block(b3)],
+                "sink must not retarget the jmp"
+            );
+            // The permuted layout satisfies the pipeline validator the
+            // sink's self-check mirrors.
+            validate_x86_function_layout(&func)
+                .expect("post-sink layout must pass the pipeline layout validator");
+        });
+
+        crate::env_lock::with_env_overrides_removed(&["TCG_X86_COLD_ARM_SINK"], || {
+            let mut func = build();
+            run_o1(&mut func);
+            assert_eq!(
+                func.block_order,
+                vec![b0, b1, b2, b3, b4, b5],
+                "without the opt-in the layout must be untouched"
+            );
+        });
+    }
+
     /// The production admission callback: every true hardware complement is
     /// admitted (validator-proven + chain-checked); any mismatched pair is
     /// refused outright.
@@ -21690,28 +22661,32 @@ mod tests {
         }
     }
 
-    /// The production RMW-fusion admission callback: the four Stage-1 RMW
-    /// opcodes are admitted because (and ONLY because) their representative
-    /// reconstruction obligations discharge `Valid` — the same criterion the
-    /// coverage gate credits them with. Anything else is refused outright
-    /// (fail-closed: no reconstruction arm, no emission).
+    /// The production reconstruction-opcode admission callback: the four
+    /// Stage-1 RMW opcodes AND the variable-count rotate are admitted because
+    /// (and ONLY because) their representative reconstruction obligations
+    /// discharge `Valid` — the same criterion the coverage gate credits them
+    /// with. Anything else is refused outright (fail-closed: no
+    /// reconstruction arm, no emission).
     #[test]
-    fn admit_x86_mem_rmw_admits_only_reconstruction_covered_rmw_opcodes() {
+    fn admit_x86_reconstructed_opcode_admits_only_reconstruction_covered_opcodes() {
         for op in [
             X86Opcode::XorMR,
             X86Opcode::AddMR,
             X86Opcode::XorMRSib,
             X86Opcode::AddMRSib,
+            // The rotate-arc Stage-2 peephole rides the SAME callback: RolRCl
+            // must stay admitted or the variable-rotate collapse dies silently.
+            X86Opcode::RolRCl,
         ] {
             assert!(
-                admit_x86_mem_rmw(op),
+                admit_x86_reconstructed_opcode(op),
                 "{op:?} lost its Stage-1 reconstruction discharge"
             );
         }
         // Non-reconstructable opcodes are refused (fail-closed), and the
         // memoized second query keeps the admitted verdict.
-        assert!(!admit_x86_mem_rmw(X86Opcode::Ret));
-        assert!(admit_x86_mem_rmw(X86Opcode::XorMRSib));
+        assert!(!admit_x86_reconstructed_opcode(X86Opcode::Ret));
+        assert!(admit_x86_reconstructed_opcode(X86Opcode::XorMRSib));
     }
 
     #[test]
@@ -24955,6 +25930,138 @@ mod tests {
             bytes[rdata_symbol + 16],
             crate::coff::IMAGE_SYM_CLASS_STATIC
         );
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "macos",
+        target_os = "windows"
+    ))]
+    #[test]
+    fn test_assembled_module_handoff_preserves_raw_metric_and_host_bytes() {
+        let mut first = build_x86_const_test_function();
+        first.name = "handoff_first".to_string();
+        let mut second = build_x86_const_test_function();
+        second.name = "handoff_second".to_string();
+        let functions = [first, second];
+        let call_abi = if cfg!(target_os = "windows") {
+            X86CallAbi::WindowsX64
+        } else {
+            X86CallAbi::SystemV
+        };
+        let host_format = if cfg!(target_os = "macos") {
+            X86OutputFormat::MachO
+        } else if cfg!(target_os = "windows") {
+            X86OutputFormat::Coff
+        } else {
+            X86OutputFormat::Elf
+        };
+        let config_for = |output_format| X86PipelineConfig {
+            output_format,
+            opt_level: trust_cg_opt::OptLevel::O0,
+            emit_frame: false,
+            regalloc_mode: X86RegAllocMode::Simplified,
+            call_abi,
+            ..X86PipelineConfig::default()
+        };
+
+        // Exact RawBytes parity with the pre-handoff one-shot composition.
+        let raw_pipeline = X86Pipeline::new(config_for(X86OutputFormat::RawBytes));
+        let raw_reference = raw_pipeline
+            .compile_module_impl(&functions, false, &[], false)
+            .expect("one-shot RawBytes reference should compile");
+        let raw_assembled = raw_pipeline
+            .assemble_module_after_x86_passes(&functions, false)
+            .expect("split RawBytes assembly should compile");
+        assert_eq!(raw_assembled.code_size(), raw_reference.len());
+        let raw_handoff = raw_pipeline
+            .emit_assembled_module(raw_assembled, &[])
+            .expect("split RawBytes emission should compile");
+        assert_eq!(raw_handoff, raw_reference);
+
+        // Exact host-object parity, while the metric remains the historical
+        // RawBytes length derived from this same native assembly.
+        let host_pipeline = X86Pipeline::new(config_for(host_format));
+        let host_reference = host_pipeline
+            .compile_module_impl(&functions, false, &[], false)
+            .expect("one-shot host-object reference should compile");
+        let host_assembled = host_pipeline
+            .assemble_module_after_x86_passes(&functions, false)
+            .expect("split host-object assembly should compile");
+        assert_eq!(host_assembled.code_size(), raw_reference.len());
+        let host_handoff = host_pipeline
+            .emit_assembled_module(host_assembled, &[])
+            .expect("split host-object emission should compile");
+        assert_eq!(host_handoff, host_reference);
+    }
+
+    #[test]
+    fn test_coff_assembled_module_preserves_raw_code_size_metric() {
+        let build_func = |name: &str, value: f64| {
+            let sig = Signature {
+                params: vec![],
+                returns: vec![],
+            };
+            let mut func = X86ISelFunction::new(name.to_string(), sig);
+            let entry = Block(0);
+            func.ensure_block(entry);
+            func.const_pool_entries.push(X86ISelConstPoolEntry {
+                data: value.to_le_bytes().to_vec(),
+                align: 8,
+            });
+            let dst = VReg::new(0, RegClass::Fpr64);
+            func.next_vreg = 1;
+            func.push_inst(
+                entry,
+                X86ISelInst::new(
+                    X86Opcode::MovsdRipRel,
+                    vec![X86ISelOperand::VReg(dst), X86ISelOperand::ConstPoolEntry(0)],
+                ),
+            );
+            func.push_inst(entry, X86ISelInst::new(X86Opcode::Ret, vec![]));
+            func
+        };
+        let functions = [build_func("cp0", 1.25), build_func("cp1", 2.5)];
+        let config_for = |output_format| X86PipelineConfig {
+            output_format,
+            opt_level: trust_cg_opt::OptLevel::O0,
+            emit_frame: false,
+            regalloc_mode: X86RegAllocMode::Simplified,
+            call_abi: X86CallAbi::WindowsX64,
+            ..X86PipelineConfig::default()
+        };
+
+        let raw_pipeline = X86Pipeline::new(config_for(X86OutputFormat::RawBytes));
+        let raw_assembled = raw_pipeline
+            .assemble_module_after_x86_passes(&functions, false)
+            .expect("RawBytes reference assembly should succeed");
+        let raw_bytes = raw_pipeline
+            .emit_assembled_module(raw_assembled, &[])
+            .expect("RawBytes reference emission should succeed");
+
+        let coff_pipeline = X86Pipeline::new(config_for(X86OutputFormat::Coff));
+        let coff_assembled = coff_pipeline
+            .assemble_module_after_x86_passes(&functions, false)
+            .expect("COFF native assembly should succeed");
+        assert_eq!(
+            coff_assembled.code_size(),
+            raw_bytes.len(),
+            "native COFF assembly must retain the established RawBytes code-size metric"
+        );
+        assert!(
+            coff_assembled.code_size() > coff_assembled.combined_code.len(),
+            "COFF metric must include constant pools even though native emission lifts them to .rdata"
+        );
+        let coff_bytes = coff_pipeline
+            .emit_assembled_module(coff_assembled, &[])
+            .expect("the same COFF assembly should emit successfully");
+        assert!(find_coff_section(&coff_bytes, ".text").is_some());
+        assert!(find_coff_section(&coff_bytes, ".rdata").is_some());
     }
 
     #[test]
@@ -31017,6 +32124,7 @@ mod tests {
             (X86Opcode::ShlRR, vec![]),
             (X86Opcode::ShrRR, vec![]),
             (X86Opcode::SarRR, vec![]),
+            (X86Opcode::RolRCl, vec![]),
             (X86Opcode::Idiv, vec![]),
             (X86Opcode::Idiv, gpr32_first_operand()),
             (X86Opcode::Div, vec![]),
@@ -31189,6 +32297,170 @@ mod tests {
     }
 
     #[test]
+    fn test_two_address_spilled_pair_declines_dst_rhs_alias() {
+        // The s31226 shape: `AddRR vX, vY, vX` (copy coalescing merged the
+        // result with the RHS source) with everything spilled. Aliasing
+        // dst with LHS would force the rhs reload into the same scratch,
+        // clobbering the lhs value (`movl p3->r10d; movl p2->r10d;
+        // addl r10d,r10d` computed p2+p2 where p3+p2 was required).
+        let vx = VReg::new(0, RegClass::Gpr64);
+        let vy = VReg::new(1, RegClass::Gpr64);
+        let inst = X86ISelInst::new(
+            X86Opcode::AddRR,
+            vec![
+                X86ISelOperand::VReg(vx),
+                X86ISelOperand::VReg(vy),
+                X86ISelOperand::VReg(vx),
+            ],
+        );
+        let installed = HashMap::from([(vx, 0u32), (vy, 1u32)]);
+        assert!(
+            x86_two_address_spilled_pair(&inst, &installed).is_none(),
+            "dst==rhs must decline the dst/lhs scratch aliasing"
+        );
+        // The healthy three-address shape still aliases.
+        let vz = VReg::new(2, RegClass::Gpr64);
+        let healthy = X86ISelInst::new(
+            X86Opcode::AddRR,
+            vec![
+                X86ISelOperand::VReg(vx),
+                X86ISelOperand::VReg(vy),
+                X86ISelOperand::VReg(vz),
+            ],
+        );
+        assert_eq!(
+            x86_two_address_spilled_pair(&healthy, &installed),
+            Some((vx, vy))
+        );
+    }
+
+    #[test]
+    fn test_materialize_spills_dst_rhs_alias_uses_two_scratches() {
+        use trust_cg_ir::x86_64_regs::{R10, R11};
+        // Function-level pin of the s31226 fix: the all-spilled
+        // `AddRR vX, vY, vX` must reload vY into a DIFFERENT scratch than
+        // vX so the add reads both true values. fixup_two_address then
+        // repairs the preg-level dst/rhs alias downstream (commutative
+        // swap) — here we only pin the materializer's scratch assignment.
+        let mut func = minimal_func("dst_rhs_alias_spill");
+        let entry = Block(0);
+        let vx = VReg::new(0, RegClass::Gpr64);
+        let vy = VReg::new(1, RegClass::Gpr64);
+        func.next_vreg = 2;
+        func.stack_slots.push(StackSlotInfo::new(8, 8));
+        func.stack_slots.push(StackSlotInfo::new(8, 8));
+        func.push_inst(
+            entry,
+            X86ISelInst::new(
+                X86Opcode::AddRR,
+                vec![
+                    X86ISelOperand::VReg(vx),
+                    X86ISelOperand::VReg(vy),
+                    X86ISelOperand::VReg(vx),
+                ],
+            ),
+        );
+        func.push_inst(entry, X86ISelInst::new(X86Opcode::Ret, vec![]));
+        let installed = HashMap::from([(vx, 0u32), (vy, 1u32)]);
+        materialize_x86_spills(&mut func, &installed, X86CallAbi::SystemV).unwrap();
+
+        let insts = &func.blocks[&entry].insts;
+        let reload_dsts: Vec<X86PReg> = insts
+            .iter()
+            .take_while(|i| i.opcode == X86Opcode::MovRM)
+            .map(|i| match &i.operands[0] {
+                X86ISelOperand::PReg(p) => *p,
+                other => panic!("reload dst must be a preg, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            reload_dsts.len(),
+            2,
+            "both source values need a reload: {insts:?}"
+        );
+        assert_ne!(
+            reload_dsts[0], reload_dsts[1],
+            "the two reloads must not share a scratch (the s31226 clobber)"
+        );
+        assert!(reload_dsts.contains(&R10) && reload_dsts.contains(&R11));
+        let add = insts
+            .iter()
+            .find(|i| i.opcode == X86Opcode::AddRR)
+            .expect("the add survives");
+        let ops: Vec<&X86ISelOperand> = add.operands.iter().collect();
+        assert!(
+            matches!(
+                (ops[0], ops[1], ops[2]),
+                (
+                    X86ISelOperand::PReg(d),
+                    X86ISelOperand::PReg(l),
+                    X86ISelOperand::PReg(r)
+                ) if d == r && *l != *d
+            ),
+            "add must read two distinct scratches with dst==rhs: {add:?}"
+        );
+    }
+
+    #[test]
+    fn test_materialize_dst_rhs_alias_noncommutative_fixup_end_to_end() {
+        use trust_cg_ir::x86_64_regs::{R10, R11};
+        // The non-commutative sibling of the s31226 shape: `SubRR vX,vY,vX`
+        // (x = y - x) all-spilled. The materializer gives dst/rhs one
+        // scratch and lhs another; fixup_two_address must then repair the
+        // preg-level dst==rhs alias via its scratch-copy path, and its
+        // scratch selector must avoid both spill scratches (it avoids the
+        // operand set AND every allocated preg — pinned here end-to-end).
+        let mut func = minimal_func("dst_rhs_alias_noncommutative");
+        let entry = Block(0);
+        let vx = VReg::new(0, RegClass::Gpr64);
+        let vy = VReg::new(1, RegClass::Gpr64);
+        func.next_vreg = 2;
+        func.stack_slots.push(StackSlotInfo::new(8, 8));
+        func.stack_slots.push(StackSlotInfo::new(8, 8));
+        func.push_inst(
+            entry,
+            X86ISelInst::new(
+                X86Opcode::SubRR,
+                vec![
+                    X86ISelOperand::VReg(vx),
+                    X86ISelOperand::VReg(vy),
+                    X86ISelOperand::VReg(vx),
+                ],
+            ),
+        );
+        func.push_inst(entry, X86ISelInst::new(X86Opcode::Ret, vec![]));
+        let installed = HashMap::from([(vx, 0u32), (vy, 1u32)]);
+        materialize_x86_spills(&mut func, &installed, X86CallAbi::SystemV).unwrap();
+
+        // The materializer itself keeps the values apart (two scratches):
+        let reloads: Vec<X86PReg> = func.blocks[&entry]
+            .insts
+            .iter()
+            .take_while(|i| i.opcode == X86Opcode::MovRM)
+            .filter_map(|i| match i.operands.first() {
+                Some(X86ISelOperand::PReg(p)) => Some(*p),
+                _ => None,
+            })
+            .collect();
+        assert!(reloads.contains(&R10) && reloads.contains(&R11));
+
+        // Downstream, fixup_two_address FAIL-CLOSES on this shape: its
+        // scratch candidate pool is exactly the reserved spill scratches,
+        // and both are operands here — so it refuses loudly instead of
+        // picking a live register. Sound (no silent wrong code is
+        // reachable); a completeness gap only if a real program ever hits
+        // an all-spilled non-commutative dst==rhs, in which case this
+        // pinned error message says exactly what to widen.
+        let alloc: HashMap<VReg, X86PReg> = HashMap::new();
+        let err = fixup_two_address(&mut func, &alloc, X86CallAbi::SystemV)
+            .expect_err("all-spilled non-commutative dst/rhs alias fail-closes");
+        assert!(
+            format!("{err:?}").contains("cannot repair dst/rhs alias"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
     fn test_spill_remat_map_recognizes_single_def_const() {
         let mut func = minimal_func("remat_const");
         let entry = Block(0);
@@ -31270,6 +32542,191 @@ mod tests {
             map.get(&copy),
             Some(X86SpillRemat::FrameAddr { slot: 5, disp: 0 })
         ));
+    }
+
+    #[test]
+    fn test_spill_remat_map_chases_lea_hop_of_frame_addr() {
+        // Lea root [StackSlot+0]; Lea derived [root+16]; MovRR copy — the h2
+        // `&v.len` shape. Both the derived field address and its copy must
+        // resolve to FrameAddr{slot, 16} through the fixpoint.
+        let mut func = minimal_func("remat_lea_hop");
+        let entry = Block(0);
+        let root = VReg::new(0, RegClass::Gpr64);
+        let derived = VReg::new(1, RegClass::Gpr64);
+        let copy = VReg::new(2, RegClass::Gpr64);
+        func.next_vreg = 3;
+        func.push_inst(
+            entry,
+            X86ISelInst::new(
+                X86Opcode::Lea,
+                vec![
+                    X86ISelOperand::VReg(root),
+                    X86ISelOperand::MemAddr {
+                        base: Box::new(X86ISelOperand::StackSlot(5)),
+                        disp: 0,
+                    },
+                ],
+            ),
+        );
+        func.push_inst(
+            entry,
+            X86ISelInst::new(
+                X86Opcode::Lea,
+                vec![
+                    X86ISelOperand::VReg(derived),
+                    X86ISelOperand::MemAddr {
+                        base: Box::new(X86ISelOperand::VReg(root)),
+                        disp: 16,
+                    },
+                ],
+            ),
+        );
+        func.push_inst(
+            entry,
+            X86ISelInst::new(
+                X86Opcode::MovRR,
+                vec![X86ISelOperand::VReg(copy), X86ISelOperand::VReg(derived)],
+            ),
+        );
+        func.push_inst(entry, X86ISelInst::new(X86Opcode::Ret, vec![]));
+        let map = build_x86_spill_remat_map(&func);
+        assert!(matches!(
+            map.get(&derived),
+            Some(X86SpillRemat::FrameAddr { slot: 5, disp: 16 })
+        ));
+        assert!(matches!(
+            map.get(&copy),
+            Some(X86SpillRemat::FrameAddr { slot: 5, disp: 16 })
+        ));
+    }
+
+    #[test]
+    fn test_spill_remat_map_lea_hop_requires_gpr64() {
+        // A 32-bit destination would truncate the frame address.
+        let mut func = minimal_func("remat_lea_hop_narrow");
+        let entry = Block(0);
+        let root = VReg::new(0, RegClass::Gpr64);
+        let derived = VReg::new(1, RegClass::Gpr32);
+        func.next_vreg = 2;
+        func.push_inst(
+            entry,
+            X86ISelInst::new(
+                X86Opcode::Lea,
+                vec![
+                    X86ISelOperand::VReg(root),
+                    X86ISelOperand::MemAddr {
+                        base: Box::new(X86ISelOperand::StackSlot(5)),
+                        disp: 0,
+                    },
+                ],
+            ),
+        );
+        func.push_inst(
+            entry,
+            X86ISelInst::new(
+                X86Opcode::Lea,
+                vec![
+                    X86ISelOperand::VReg(derived),
+                    X86ISelOperand::MemAddr {
+                        base: Box::new(X86ISelOperand::VReg(root)),
+                        disp: 16,
+                    },
+                ],
+            ),
+        );
+        func.push_inst(entry, X86ISelInst::new(X86Opcode::Ret, vec![]));
+        assert!(!build_x86_spill_remat_map(&func).contains_key(&derived));
+    }
+
+    #[test]
+    fn test_spill_remat_map_lea_hop_disp_overflow_declines() {
+        let mut func = minimal_func("remat_lea_hop_overflow");
+        let entry = Block(0);
+        let root = VReg::new(0, RegClass::Gpr64);
+        let derived = VReg::new(1, RegClass::Gpr64);
+        func.next_vreg = 2;
+        func.push_inst(
+            entry,
+            X86ISelInst::new(
+                X86Opcode::Lea,
+                vec![
+                    X86ISelOperand::VReg(root),
+                    X86ISelOperand::MemAddr {
+                        base: Box::new(X86ISelOperand::StackSlot(5)),
+                        disp: i32::MAX,
+                    },
+                ],
+            ),
+        );
+        func.push_inst(
+            entry,
+            X86ISelInst::new(
+                X86Opcode::Lea,
+                vec![
+                    X86ISelOperand::VReg(derived),
+                    X86ISelOperand::MemAddr {
+                        base: Box::new(X86ISelOperand::VReg(root)),
+                        disp: 1,
+                    },
+                ],
+            ),
+        );
+        func.push_inst(entry, X86ISelInst::new(X86Opcode::Ret, vec![]));
+        assert!(!build_x86_spill_remat_map(&func).contains_key(&derived));
+    }
+
+    #[test]
+    fn test_materialize_spills_folds_frame_addr_into_memaddr_base() {
+        // A spilled frame-address vreg used as a memory base folds straight
+        // into the operand: no reload, no scratch, no lea.
+        let v0 = VReg::new(0, RegClass::Gpr64);
+        let remat_map = HashMap::from([(v0, X86SpillRemat::FrameAddr { slot: 3, disp: 16 })]);
+        let installed = HashMap::from([(v0, 7u32)]);
+        let mut state = X86SpillScratchState::new(X86CallAbi::SystemV);
+        let mut loads = Vec::new();
+        let mut op = X86ISelOperand::MemAddr {
+            base: Box::new(X86ISelOperand::VReg(v0)),
+            disp: 8,
+        };
+        rewrite_x86_spilled_operand(
+            &mut op, &installed, &remat_map, &mut state, &mut loads, true, false,
+        )
+        .unwrap();
+        assert!(loads.is_empty(), "fold emits nothing");
+        assert_eq!(
+            op,
+            X86ISelOperand::MemAddr {
+                base: Box::new(X86ISelOperand::StackSlot(3)),
+                disp: 24,
+            }
+        );
+    }
+
+    #[test]
+    fn test_materialize_spills_elides_self_copy_of_spilled_vreg() {
+        // `MovRR v, v` of a spilled vreg is the identity on the slot; the
+        // reload+store pair it would materialize is pure waste (h2's ~6M
+        // dead load/store pair).
+        let mut func = minimal_func("self_copy_spilled");
+        let entry = Block(0);
+        let v0 = VReg::new(0, RegClass::Gpr64);
+        func.next_vreg = 1;
+        func.push_inst(
+            entry,
+            X86ISelInst::new(
+                X86Opcode::MovRR,
+                vec![X86ISelOperand::VReg(v0), X86ISelOperand::VReg(v0)],
+            ),
+        );
+        func.push_inst(entry, X86ISelInst::new(X86Opcode::Ret, vec![]));
+        let installed = HashMap::from([(v0, 7u32)]);
+        materialize_x86_spills(&mut func, &installed, X86CallAbi::SystemV).unwrap();
+        let insts = &func.blocks.get(&entry).unwrap().insts;
+        assert_eq!(
+            insts.iter().map(|i| i.opcode).collect::<Vec<_>>(),
+            vec![X86Opcode::Ret],
+            "the self-copy and its reload/store must be gone"
+        );
     }
 
     #[test]
@@ -32994,6 +34451,112 @@ mod tests {
         assert!(
             overwrite_rdx < split_copy,
             "split copy must execute after its formal source has been materialized"
+        );
+        assert_eq!(insts.last().unwrap().opcode, X86Opcode::Ret);
+    }
+
+    #[test]
+    fn test_fixup_formal_arg_parallel_copy_shared_preg_keeps_connector_order() {
+        // The seed-19149 miscompile shape: recursive splitting lets TWO
+        // formals legally share one preg over disjoint ranges (v0 and v5
+        // both in RBX), with the split connector between their intakes.
+        // Sinking the connector below the whole resolved group made it read
+        // v5's value; the segment-wise path must keep it BEFORE v5's
+        // intake overwrites RBX.
+        use trust_cg_ir::x86_64_regs::{R8, R9, R12, R13, R14, R15, RAX, RBX, RCX, RDI, RDX, RSI};
+
+        let sig = Signature {
+            params: vec![Type::I64; 6],
+            returns: vec![],
+        };
+        let mut func = X86ISelFunction::new("fixup_formal_shared_preg_connector".to_string(), sig);
+        let entry = Block(0);
+        func.ensure_block(entry);
+
+        let vregs: Vec<VReg> = (0..6).map(|i| VReg::new(i, RegClass::Gpr64)).collect();
+        let connector_dst = VReg::new(6, RegClass::Gpr64);
+        func.next_vreg = 7;
+
+        let arg_pregs = [RDI, RSI, RDX, RCX, R8, R9];
+        for i in 0..3 {
+            func.push_inst(
+                entry,
+                X86ISelInst::new(
+                    X86Opcode::MovRR,
+                    vec![
+                        X86ISelOperand::VReg(vregs[i]),
+                        X86ISelOperand::PReg(arg_pregs[i]),
+                    ],
+                ),
+            );
+        }
+        // The split connector: v0's live range moves out of RBX here.
+        func.push_inst(
+            entry,
+            X86ISelInst::new(
+                X86Opcode::MovRR,
+                vec![
+                    X86ISelOperand::VReg(connector_dst),
+                    X86ISelOperand::VReg(vregs[0]),
+                ],
+            ),
+        );
+        for i in 3..6 {
+            func.push_inst(
+                entry,
+                X86ISelInst::new(
+                    X86Opcode::MovRR,
+                    vec![
+                        X86ISelOperand::VReg(vregs[i]),
+                        X86ISelOperand::PReg(arg_pregs[i]),
+                    ],
+                ),
+            );
+        }
+        func.push_inst(entry, X86ISelInst::new(X86Opcode::Ret, vec![]));
+
+        let mut alloc = HashMap::new();
+        alloc.insert(vregs[0], RBX);
+        alloc.insert(vregs[1], R13);
+        alloc.insert(vregs[2], R14);
+        alloc.insert(vregs[3], R15);
+        alloc.insert(vregs[4], RAX);
+        alloc.insert(vregs[5], RBX); // shares RBX with v0 — disjoint ranges
+        alloc.insert(connector_dst, R12);
+
+        fixup_formal_arg_parallel_copy(&mut func, &alloc, &HashMap::new(), X86CallAbi::SystemV)
+            .expect("shared-preg prefix with clean segments must resolve");
+
+        let insts = &func.blocks[&entry].insts;
+        let connector = insts
+            .iter()
+            .position(|inst| {
+                inst.opcode == X86Opcode::MovRR
+                    && inst.operands
+                        == vec![
+                            X86ISelOperand::VReg(connector_dst),
+                            X86ISelOperand::VReg(vregs[0]),
+                        ]
+            })
+            .expect("connector retained");
+        let v0_intake = insts
+            .iter()
+            .position(|inst| {
+                inst.opcode == X86Opcode::MovRR
+                    && inst.operands == vec![X86ISelOperand::PReg(RBX), X86ISelOperand::PReg(RDI)]
+            })
+            .expect("v0 intake into RBX");
+        let v5_intake = insts
+            .iter()
+            .position(|inst| {
+                inst.opcode == X86Opcode::MovRR
+                    && inst.operands == vec![X86ISelOperand::PReg(RBX), X86ISelOperand::PReg(R9)]
+            })
+            .expect("v5 intake into RBX");
+        assert!(
+            v0_intake < connector && connector < v5_intake,
+            "connector must sit between the two RBX intakes \
+             (v0@{v0_intake} connector@{connector} v5@{v5_intake})"
         );
         assert_eq!(insts.last().unwrap().opcode, X86Opcode::Ret);
     }

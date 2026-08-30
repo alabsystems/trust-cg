@@ -27,6 +27,13 @@ fn count(func: &MachFunction, op: AArch64Opcode) -> usize {
         .count()
 }
 
+/// Existing transform-shape tests model an AArch64 target with FEAT_DotProd.
+/// Keep that target assumption explicit while production constructors stay
+/// fail-closed.
+fn dotprod_pass() -> NeonBytesumPass {
+    NeonBytesumPass::new().with_aarch64_dotprod(true)
+}
+
 /// How the reduction body should be built.
 #[derive(Clone, Copy, PartialEq)]
 enum Body {
@@ -170,13 +177,13 @@ fn build_bytesum_loop(body: Body, n: i64) -> MachFunction {
 /// zero-trip vector loop per iteration (p7_sieve: +44 instructions x3, the
 /// fixpoint never converged). A second run must change nothing.
 fn assert_idempotent(mut func: MachFunction, label: &str) {
-    let mut pass = NeonBytesumPass::new();
+    let mut pass = dotprod_pass();
     assert!(pass.run(&mut func), "{label}: first run should vectorize");
     assert_eq!(pass.fired(), 1, "{label}");
     let after_first = func.insts.len();
     let blocks_after_first = func.blocks.len();
     for again in 2..=4 {
-        let mut pass = NeonBytesumPass::new();
+        let mut pass = dotprod_pass();
         assert!(
             !pass.run(&mut func),
             "{label}: run {again} re-vectorized the remainder loop"
@@ -204,7 +211,9 @@ fn assert_idempotent(mut func: MachFunction, label: &str) {
 fn o3_fixpoint_converges_without_regrowth() {
     use crate::pipeline::{OptLevel, OptimizationPipeline};
     let mut func = build_countif_loop(1, false, false, 4096);
-    let mut pm = OptimizationPipeline::new(OptLevel::O3).build_pass_manager();
+    let mut pm = OptimizationPipeline::new(OptLevel::O3)
+        .with_aarch64_dotprod(true)
+        .build_pass_manager();
     let stats = pm.run_to_fixpoint(&mut func, 4);
     assert!(
         stats.iterations < 4,
@@ -225,6 +234,19 @@ fn o3_fixpoint_converges_without_regrowth() {
 }
 
 #[test]
+fn default_pass_is_inert_without_dotprod_capability() {
+    let mut func = build_bytesum_loop(Body::Sum, 4096);
+    let insts_before = func.insts.len();
+    let blocks_before = func.blocks.len();
+    let mut pass = NeonBytesumPass::new();
+    assert!(!pass.run(&mut func));
+    assert_eq!(pass.fired(), 0);
+    assert_eq!(count(&func, AArch64Opcode::NeonUdotV), 0);
+    assert_eq!(func.insts.len(), insts_before);
+    assert_eq!(func.blocks.len(), blocks_before);
+}
+
+#[test]
 fn second_run_is_a_no_op_on_popcount_sum() {
     assert_idempotent(build_bytesum_loop(Body::Popcount, 4096), "popcount");
 }
@@ -242,7 +264,7 @@ fn second_run_is_a_no_op_on_count_if() {
 #[test]
 fn fires_on_byte_popcount_sum_u64() {
     let mut func = build_bytesum_loop(Body::Popcount, 4096);
-    let mut pass = NeonBytesumPass::new();
+    let mut pass = dotprod_pass();
     assert!(
         pass.run(&mut func),
         "should vectorize acc(u64) += popcount(a[i])"
@@ -291,7 +313,7 @@ fn fires_on_byte_popcount_sum_u64() {
 #[test]
 fn fires_on_plain_byte_sum_u64() {
     let mut func = build_bytesum_loop(Body::Sum, 4096);
-    let mut pass = NeonBytesumPass::new();
+    let mut pass = dotprod_pass();
     assert!(
         pass.run(&mut func),
         "should vectorize acc(u64) += a[i] as u64"
@@ -325,7 +347,7 @@ fn wide_trip_bound_uses_movz_movk_chain() {
     // bound is 99_873 = 0x1_8621 (lo = 0x8621, hi = 0x1).
     let n: i64 = 100_000;
     let mut func = build_bytesum_loop(Body::Sum, n);
-    let mut pass = NeonBytesumPass::new();
+    let mut pass = dotprod_pass();
     assert!(pass.run(&mut func), "should vectorize the large-N byte sum");
     assert_eq!(pass.fired(), 1);
 
@@ -405,7 +427,7 @@ fn wide_trip_bound_uses_movz_movk_chain() {
 #[test]
 fn bails_when_array_is_stored() {
     let mut func = build_bytesum_loop(Body::PopcountStore, 4096);
-    let mut pass = NeonBytesumPass::new();
+    let mut pass = dotprod_pass();
     assert!(
         !pass.run(&mut func),
         "must BAIL: a store makes the loop not read-only"
@@ -416,7 +438,7 @@ fn bails_when_array_is_stored() {
 #[test]
 fn bails_on_signed_byte() {
     let mut func = build_bytesum_loop(Body::SignedByte, 4096);
-    let mut pass = NeonBytesumPass::new();
+    let mut pass = dotprod_pass();
     assert!(
         !pass.run(&mut func),
         "must BAIL: Sxtb sign-extend is not a byte-local term"
@@ -428,7 +450,7 @@ fn bails_on_signed_byte() {
 fn bails_when_bound_exceeds_overflow_safe_max() {
     // A popcount bound >= 2^28 could overflow the i32 `.4S` partials -> BAIL.
     let mut func = build_bytesum_loop(Body::Popcount, MAX_BOUND_POP);
-    let mut pass = NeonBytesumPass::new();
+    let mut pass = dotprod_pass();
     assert!(
         !pass.run(&mut func),
         "must BAIL at the .4S overflow-safe bound"
@@ -575,7 +597,7 @@ fn build_countif_loop(inc_imm: i64, use_cbnz: bool, signed: bool, n: i64) -> Mac
 #[test]
 fn fires_on_count_if_eq_zero_u64() {
     let mut func = build_countif_loop(1, false, false, 4096);
-    let mut pass = NeonBytesumPass::new();
+    let mut pass = dotprod_pass();
     assert!(
         pass.run(&mut func),
         "should vectorize count-if `if a[i]==0 {{ c+=1 }}`"
@@ -629,7 +651,7 @@ fn fires_on_count_if_eq_zero_u64() {
 fn bails_on_count_if_ne_zero() {
     // Cbnz increments on the NON-zero arm (`!= 0`) — out of the `== 0` scope.
     let mut func = build_countif_loop(1, true, false, 4096);
-    let mut pass = NeonBytesumPass::new();
+    let mut pass = dotprod_pass();
     assert!(
         !pass.run(&mut func),
         "must BAIL: `!= 0` predicate is not yet supported"
@@ -641,7 +663,7 @@ fn bails_on_count_if_ne_zero() {
 fn bails_on_count_if_plus_two() {
     // The guarded arm adds +2, not +1 — not a count.
     let mut func = build_countif_loop(2, false, false, 4096);
-    let mut pass = NeonBytesumPass::new();
+    let mut pass = dotprod_pass();
     assert!(
         !pass.run(&mut func),
         "must BAIL: non-+1 increment is not a count"
@@ -653,7 +675,7 @@ fn bails_on_count_if_plus_two() {
 fn bails_on_count_if_signed_byte() {
     // A signed `Sxtb` byte load is neither whitelisted nor a byte-local term.
     let mut func = build_countif_loop(1, false, true, 4096);
-    let mut pass = NeonBytesumPass::new();
+    let mut pass = dotprod_pass();
     assert!(!pass.run(&mut func), "must BAIL: signed byte load");
     assert_eq!(count(&func, AArch64Opcode::NeonCmeqV), 0);
 }
@@ -674,7 +696,7 @@ fn bails_on_count_if_runtime_bound() {
             );
         }
     }
-    let mut pass = NeonBytesumPass::new();
+    let mut pass = dotprod_pass();
     assert!(
         !pass.run(&mut func),
         "must BAIL: runtime bound is not `.4S`-overflow-safe"
@@ -690,7 +712,7 @@ fn count_if_ones_mask_is_all_lanes() {
     // would undercount. Assert exactly one `NeonMovi #1` (Fpr128) is emitted and
     // that EVERY `NeonAndV` reads it as its mask operand.
     let mut func = build_countif_loop(1, false, false, 4096);
-    let mut pass = NeonBytesumPass::new();
+    let mut pass = dotprod_pass();
     assert!(pass.run(&mut func));
 
     let ones: Vec<VReg> = func
@@ -845,7 +867,7 @@ fn build_u32_chain_loop(early_exit: bool, n: i64) -> MachFunction {
 #[test]
 fn fires_on_u32_acc_chain_byte_sum() {
     let mut func = build_u32_chain_loop(false, 4096);
-    let mut pass = NeonBytesumPass::new();
+    let mut pass = dotprod_pass();
     assert!(
         pass.run(&mut func),
         "should vectorize the e07 u32-acc chain byte sum"
@@ -913,7 +935,7 @@ fn bails_on_data_early_exit_chain() {
     // would reduce past the break point -> MUST BAIL (the chain gate rejects
     // the non-`iv<N` branch). Without the gate this shape would MISCOMPILE.
     let mut func = build_u32_chain_loop(true, 4096);
-    let mut pass = NeonBytesumPass::new();
+    let mut pass = dotprod_pass();
     assert!(
         !pass.run(&mut func),
         "must BAIL: data-dependent early exit in the chain"
@@ -949,7 +971,7 @@ fn bytesum_bails_below_its_128b_width() {
     // 64 <= N < 128: too small for one full 8-accumulator iteration -> BAIL.
     for n in [64, 100, 127] {
         let mut func = build_u32_chain_loop(false, n);
-        let mut pass = NeonBytesumPass::new();
+        let mut pass = dotprod_pass();
         assert!(
             !pass.run(&mut func),
             "ByteSum N={} < width 128 must stay scalar",
@@ -959,7 +981,7 @@ fn bytesum_bails_below_its_128b_width() {
     }
     // Same gate on the u64-acc shape.
     let mut func = build_bytesum_loop(Body::Sum, 127);
-    let mut pass = NeonBytesumPass::new();
+    let mut pass = dotprod_pass();
     assert!(!pass.run(&mut func), "u64 ByteSum N=127 must stay scalar");
     assert_eq!(count(&func, AArch64Opcode::NeonUdotV), 0);
 }
@@ -967,7 +989,7 @@ fn bytesum_bails_below_its_128b_width() {
 #[test]
 fn bytesum_fires_at_exactly_its_128b_width() {
     let mut func = build_u32_chain_loop(false, 128);
-    let mut pass = NeonBytesumPass::new();
+    let mut pass = dotprod_pass();
     assert!(pass.run(&mut func), "ByteSum N=128 == width must fire");
     assert_eq!(
         count(&func, AArch64Opcode::NeonUdotV),
@@ -980,7 +1002,7 @@ fn popcount_still_fires_below_128() {
     // The 4-accumulator kinds keep the original 64B width: N in [64, 128)
     // still fires for popcount (codegen for these kinds is unchanged).
     let mut func = build_bytesum_loop(Body::Popcount, 100);
-    let mut pass = NeonBytesumPass::new();
+    let mut pass = dotprod_pass();
     assert!(pass.run(&mut func), "Popcount N=100 >= width 64 must fire");
     assert_eq!(
         count(&func, AArch64Opcode::NeonUdotV),
@@ -991,7 +1013,7 @@ fn popcount_still_fires_below_128() {
 #[test]
 fn countif_still_fires_below_128() {
     let mut func = build_countif_loop(1, false, false, 100);
-    let mut pass = NeonBytesumPass::new();
+    let mut pass = dotprod_pass();
     assert!(pass.run(&mut func), "count-if N=100 >= width 64 must fire");
     assert_eq!(
         count(&func, AArch64Opcode::NeonCmeqV),
@@ -1084,7 +1106,7 @@ fn build_maskcmp_loop(mask: i64, cnst: i64, ne: bool, n: i64, acc_u32: bool) -> 
 fn fires_on_maskcmp_ne_u64() {
     // The UTF-8 code-point-start count `(b & 0xC0) != 0x80`.
     let mut func = build_maskcmp_loop(0xC0, 0x80, true, 1024, false);
-    let mut pass = NeonBytesumPass::new();
+    let mut pass = dotprod_pass();
     assert!(
         pass.run(&mut func),
         "should vectorize acc(u64) += ((a[i] & 0xC0) != 0x80)"
@@ -1144,7 +1166,7 @@ fn fires_on_maskcmp_ne_u64() {
 fn fires_on_maskcmp_eq_u64_no_invert() {
     // `== CONST`: same prefix WITHOUT the NOT inversion.
     let mut func = build_maskcmp_loop(0xC0, 0x80, false, 1024, false);
-    let mut pass = NeonBytesumPass::new();
+    let mut pass = dotprod_pass();
     assert!(pass.run(&mut func), "should vectorize the `== CONST` form");
     assert_eq!(pass.fired(), 1);
     let ur = unroll(TermKind::PredMaskCmp {
@@ -1167,7 +1189,7 @@ fn bails_on_maskcmp_u32_acc() {
     // The masked-compare fold is scoped to a `u64` acc (the `.4S` lane partials
     // zero-extend to u64). A `u32` acc must BAIL fail-closed.
     let mut func = build_maskcmp_loop(0xC0, 0x80, true, 1024, true);
-    let mut pass = NeonBytesumPass::new();
+    let mut pass = dotprod_pass();
     assert!(
         !pass.run(&mut func),
         "must BAIL: maskcmp requires a u64 acc"
@@ -1180,7 +1202,7 @@ fn bails_on_maskcmp_u32_acc() {
 fn bails_on_maskcmp_const_out_of_byte_range() {
     // CONST must be a byte (0..=255): a wider compare is not this idiom.
     let mut func = build_maskcmp_loop(0xC0, 300, true, 1024, false);
-    let mut pass = NeonBytesumPass::new();
+    let mut pass = dotprod_pass();
     assert!(!pass.run(&mut func), "must BAIL: CONST out of byte range");
     assert_eq!(count(&func, AArch64Opcode::NeonCmeqV), 0);
 }
@@ -1189,7 +1211,7 @@ fn bails_on_maskcmp_const_out_of_byte_range() {
 fn bails_on_maskcmp_mask_out_of_byte_range() {
     // MASK must be a byte (0..=255).
     let mut func = build_maskcmp_loop(0x1C0, 0x80, true, 1024, false);
-    let mut pass = NeonBytesumPass::new();
+    let mut pass = dotprod_pass();
     assert!(!pass.run(&mut func), "must BAIL: MASK out of byte range");
     assert_eq!(count(&func, AArch64Opcode::NeonCmeqV), 0);
 }
@@ -1198,7 +1220,7 @@ fn bails_on_maskcmp_mask_out_of_byte_range() {
 fn maskcmp_bails_below_64b_width() {
     // 4 accumulators / 64B per iteration: N < 64 stays fully scalar.
     let mut func = build_maskcmp_loop(0xC0, 0x80, true, 48, false);
-    let mut pass = NeonBytesumPass::new();
+    let mut pass = dotprod_pass();
     assert!(!pass.run(&mut func), "N=48 < width 64 must stay scalar");
     assert_eq!(count(&func, AArch64Opcode::NeonUdotV), 0);
 }
@@ -1314,7 +1336,7 @@ fn build_stencil_loop(ne: bool, iv_init: i64, n: i64, pred_delta: i64) -> MachFu
 fn fires_on_stencil_count_runs_ne() {
     // The RLE "count runs" hot loop: `if a[j] != a[j-1] { runs += 1 }`.
     let mut func = build_stencil_loop(true, 1, 1024, 1);
-    let mut pass = NeonBytesumPass::new();
+    let mut pass = dotprod_pass();
     assert!(
         pass.run(&mut func),
         "should vectorize the byte-stencil count-if `a[j] != a[j-1]`"
@@ -1357,7 +1379,7 @@ fn fires_on_stencil_count_runs_ne() {
 fn fires_on_stencil_count_eq() {
     // The `==` direction (count matching adjacent pairs): no NOT.
     let mut func = build_stencil_loop(false, 1, 1024, 1);
-    let mut pass = NeonBytesumPass::new();
+    let mut pass = dotprod_pass();
     assert!(
         pass.run(&mut func),
         "should vectorize `a[j] == a[j-1]` count"
@@ -1373,7 +1395,7 @@ fn bails_on_stencil_iv_init_not_one() {
     // iv MUST start at 1: a j=0 start would read a[-1] (predecessor OOB) and the
     // scalar loop would PANIC there, so it MUST NOT be silently vectorized.
     let mut func = build_stencil_loop(true, 0, 1024, 1);
-    let mut pass = NeonBytesumPass::new();
+    let mut pass = dotprod_pass();
     assert!(!pass.run(&mut func), "must BAIL: iv does not start at 1");
     assert_eq!(count(&func, AArch64Opcode::NeonExtV), 0);
 }
@@ -1382,7 +1404,7 @@ fn bails_on_stencil_iv_init_not_one() {
 fn bails_on_stencil_non_adjacent_predecessor() {
     // a[j-2] (delta=2) is not the adjacent neighbor the EXT.16B #1 window forms.
     let mut func = build_stencil_loop(true, 1, 1024, 2);
-    let mut pass = NeonBytesumPass::new();
+    let mut pass = dotprod_pass();
     assert!(
         !pass.run(&mut func),
         "must BAIL: non-adjacent stencil a[j-2]"
@@ -1394,7 +1416,7 @@ fn bails_on_stencil_non_adjacent_predecessor() {
 fn bails_on_stencil_below_floor() {
     // The stencil floor is (unroll+1)*16 + 2 = 66; N=48 stays fully scalar.
     let mut func = build_stencil_loop(true, 1, 48, 1);
-    let mut pass = NeonBytesumPass::new();
+    let mut pass = dotprod_pass();
     assert!(
         !pass.run(&mut func),
         "N=48 below the stencil floor must stay scalar"
@@ -1543,7 +1565,7 @@ fn build_hexnibble_loop(variant: Hex, n: i64) -> MachFunction {
 #[test]
 fn fires_on_hex_nibble_sum() {
     let mut func = build_hexnibble_loop(Hex::Fires, 1024);
-    let mut pass = NeonBytesumPass::new();
+    let mut pass = dotprod_pass();
     assert!(
         pass.run(&mut func),
         "should vectorize s += nib(b>>4) + nib(b&15)"
@@ -1592,7 +1614,7 @@ fn fires_on_hex_nibble_sum() {
 fn bails_on_hex_nibble_wrong_const() {
     // The `>= 10` arm selects 88 (not 87) — an inexact hex map must BAIL.
     let mut func = build_hexnibble_loop(Hex::WrongConst, 1024);
-    let mut pass = NeonBytesumPass::new();
+    let mut pass = dotprod_pass();
     assert!(
         !pass.run(&mut func),
         "must BAIL: wrong hex-letter base (88 != 87)"
@@ -1605,7 +1627,7 @@ fn bails_on_hex_nibble_wrong_const() {
 fn bails_on_hex_nibble_wrong_threshold() {
     // The nibble boundary is 11 (not 10) — wrong threshold must BAIL.
     let mut func = build_hexnibble_loop(Hex::WrongThreshold, 1024);
-    let mut pass = NeonBytesumPass::new();
+    let mut pass = dotprod_pass();
     assert!(
         !pass.run(&mut func),
         "must BAIL: wrong nibble threshold (11 != 10)"
@@ -1617,7 +1639,7 @@ fn bails_on_hex_nibble_wrong_threshold() {
 fn bails_on_hex_nibble_stored() {
     // A store makes the loop non-read-only -> BAIL (not a pure reduction).
     let mut func = build_hexnibble_loop(Hex::Stored, 1024);
-    let mut pass = NeonBytesumPass::new();
+    let mut pass = dotprod_pass();
     assert!(!pass.run(&mut func), "must BAIL: the loop stores to memory");
     assert_eq!(count(&func, AArch64Opcode::NeonUshrVImm), 0);
 }
@@ -1626,7 +1648,7 @@ fn bails_on_hex_nibble_stored() {
 fn bails_on_hex_nibble_below_width_floor() {
     // width(HexNibbleSum) = 4*16 = 64; N=48 stays fully scalar.
     let mut func = build_hexnibble_loop(Hex::Fires, 48);
-    let mut pass = NeonBytesumPass::new();
+    let mut pass = dotprod_pass();
     assert!(
         !pass.run(&mut func),
         "N=48 below the width floor must stay scalar"

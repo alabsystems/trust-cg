@@ -5,10 +5,13 @@
 # compares sha256. Using one fixed path matters: rustc hashes the output
 # filename into symbol/metadata, so differing -o names alone change the hash.
 #   usage: dylib_codegen_identity.sh <dylib-A> <dylib-B>
+#   env:   SCRATCH  work dir (default: <repo>/scratchpad, git-ignored)
 set -euo pipefail
+[ "$#" -eq 2 ] || { echo "usage: scripts/dylib_codegen_identity.sh <dylib-A> <dylib-B>" >&2; exit 64; }
 A="$1"; B="$2"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUSTC="$(rustup which --toolchain nightly-2026-04-20 rustc)"
-SCRATCH="${SCRATCH:-/tmp/claude-1000/-home-ayates-trust-cg/06b728f2-f196-4490-9fb3-3291b4078e33/scratchpad}"
+SCRATCH="${SCRATCH:-$REPO_ROOT/scratchpad}"
 W="$SCRATCH/ident"; rm -rf "$W"; mkdir -p "$W"
 export TCG_NO_PROOF_CERTS=1 TCG_REFINE_SOLVER=0
 

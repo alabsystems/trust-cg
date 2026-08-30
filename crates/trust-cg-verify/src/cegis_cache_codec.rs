@@ -73,7 +73,8 @@
 //! UTF-8. Field order is declaration order.
 //!
 //! ```text
-//! entry  := "TCGC" u32:version u64:attempted u64:verified u64:rejected
+//! entry  := "TCGC" u32:version u8:completion
+//!           u64:attempted u64:verified u64:rejected
 //!           u32:n (rewrite * n)
 //! rewrite:= u32:inst_index u64:proof_hash u32:iterations u32:window_len
 //!           u8:layer u32:n (inst * n)
@@ -88,7 +89,9 @@
 //!   `rmp-serde` blob cannot decode here (its first byte is `0x95`, a fixarray
 //!   header, not `T`), and this format's blobs cannot decode there. That is
 //!   deliberate and is why [`crate::cegis_pass::CegisCacheEntry::VERSION`] went
-//!   5 → 6. Nothing reads these bytes except this module.
+//!   5 → 6. Version 7 subsequently added the completion byte so old partial
+//!   search prefixes cannot replay as complete entries. Nothing reads these
+//!   bytes except this module.
 //! * **The reader is stricter than `rmp-serde` about trailing bytes.**
 //!   `rmp_serde::from_slice` decodes the leading value and ignores whatever
 //!   follows; this reader requires the buffer to be consumed exactly. Both
@@ -108,8 +111,8 @@
 use std::fmt;
 
 use crate::cegis_pass::{
-    CegisCacheEntry, MachInstBlob, MachOperandBlob, ProvenRewrite, RegClassBlob, RewriteLayer,
-    SpecialRegBlob,
+    CegisCacheEntry, CegisSearchCompletion, MachInstBlob, MachOperandBlob, ProvenRewrite,
+    RegClassBlob, RewriteLayer, SpecialRegBlob,
 };
 
 /// Leading bytes of every entry. A blob that does not start with these is
@@ -137,11 +140,16 @@ mod tag {
 /// The only way encoding can fail.
 ///
 /// Encoding is otherwise total: every field is a fixed-width scalar or a
-/// length-prefixed sequence. The one representable-but-unencodable case is a
-/// collection or string longer than `u32::MAX`, which cannot occur for a
-/// well-formed entry and is reported rather than truncated.
+/// length-prefixed sequence. Incomplete searches are rejected at the public
+/// entry boundary, and collections or strings longer than `u32::MAX` are
+/// reported rather than truncated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CacheCodecError {
+    /// A deadline/query/verifier failure left a non-publishable search prefix.
+    IncompleteSearch {
+        /// Typed reason the search did not complete.
+        completion: CegisSearchCompletion,
+    },
     /// A sequence or string exceeded the `u32` length prefix.
     TooLong {
         /// Which sequence overflowed.
@@ -154,6 +162,9 @@ pub enum CacheCodecError {
 impl fmt::Display for CacheCodecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::IncompleteSearch { completion } => {
+                write!(f, "CEGIS cache search is incomplete: {completion:?}")
+            }
             Self::TooLong { what, len } => {
                 write!(f, "CEGIS cache {what} length {len} exceeds u32 wire limit")
             }
@@ -501,13 +512,27 @@ fn get_rewrite(r: &mut Reader<'_>) -> Option<ProvenRewrite> {
 pub(crate) fn encode_entry(entry: &CegisCacheEntry) -> Result<Vec<u8>, CacheCodecError> {
     let CegisCacheEntry {
         version,
+        completion,
         proven_rewrites,
         attempted,
         verified,
         rejected,
     } = entry;
+    if !completion.is_complete() {
+        return Err(CacheCodecError::IncompleteSearch {
+            completion: *completion,
+        });
+    }
     let mut w = Writer::new();
     w.u32(*version);
+    w.u8(match completion {
+        CegisSearchCompletion::NotCompleted => 0,
+        CegisSearchCompletion::Complete => 1,
+        CegisSearchCompletion::DeadlineExceeded => 2,
+        CegisSearchCompletion::QueryIncomplete => 3,
+        CegisSearchCompletion::VerifierError => 4,
+        CegisSearchCompletion::VerifierPanicked => 5,
+    });
     w.u64(*attempted);
     w.u64(*verified);
     w.u64(*rejected);
@@ -533,6 +558,18 @@ pub(crate) fn decode_entry(bytes: &[u8]) -> Option<CegisCacheEntry> {
     if version != CegisCacheEntry::VERSION {
         return None;
     }
+    let completion = match r.u8()? {
+        0 => CegisSearchCompletion::NotCompleted,
+        1 => CegisSearchCompletion::Complete,
+        2 => CegisSearchCompletion::DeadlineExceeded,
+        3 => CegisSearchCompletion::QueryIncomplete,
+        4 => CegisSearchCompletion::VerifierError,
+        5 => CegisSearchCompletion::VerifierPanicked,
+        _ => return None,
+    };
+    if !completion.is_complete() {
+        return None;
+    }
     let attempted = r.u64()?;
     let verified = r.u64()?;
     let rejected = r.u64()?;
@@ -541,6 +578,7 @@ pub(crate) fn decode_entry(bytes: &[u8]) -> Option<CegisCacheEntry> {
     r.finish()?;
     Some(CegisCacheEntry {
         version,
+        completion,
         proven_rewrites,
         attempted,
         verified,

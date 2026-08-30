@@ -7520,6 +7520,10 @@ mod tests {
         if std::env::var_os("AY_SOLVER_PATH").is_none()
             || std::env::var_os("TCG_EXTERNAL_CLEAN_CHECKER").is_none()
         {
+            crate::formal_gap::skip_test(
+                "ror_immediate_live_checker_is_verified_or_exact_bv_certificate_gap",
+                crate::formal_gap::NO_EXPLICIT_AUTHORITY_ENV,
+            );
             return;
         }
         assert!(

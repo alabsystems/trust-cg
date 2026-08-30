@@ -17,39 +17,46 @@ use trust_cg_lower::{X86ISelFunction, X86ISelInst, X86ISelOperand};
 use crate::effects::{x86_inst_effect, x86_reads_flags, x86_writes_flags};
 use crate::x86_pass_manager::X86MachinePass;
 
-/// Admission callback for the memory-destination RMW fusion (`rmw_fuse`):
-/// `true` iff the candidate FUSED opcode (`XorMR`/`AddMR`/`XorMRSib`/
-/// `AddMRSib`) is proof-covered on this build. Injected by the constructor
-/// (trust-cg-opt must not depend on trust-cg-verify — same callback-injection
-/// pattern as `X86IfConvert`/`X86StrengthReduce`); the fail-closed default
-/// ([`X86Peephole::default`]) admits NOTHING, so the fusion never fires
+/// Admission callback for the peepholes that CONSTRUCT a reconstruction-lane
+/// opcode: the memory-destination RMW fusion (`rmw_fuse` — `XorMR`/`AddMR`/
+/// `XorMRSib`/`AddMRSib`) and the variable-count rotate collapse
+/// (`rotate_var_idiom` — `RolRCl`). `true` iff the candidate opcode's
+/// representative reconstruction obligation is proof-covered on this build.
+/// Injected by the constructor (trust-cg-opt must not depend on
+/// trust-cg-verify — same callback-injection pattern as
+/// `X86IfConvert`/`X86StrengthReduce`); the fail-closed default
+/// ([`X86Peephole::default`]) admits NOTHING, so neither fusion ever fires
 /// unless a caller explicitly wires the proof-backed admission.
-pub type MemRmwAdmit = fn(X86Opcode) -> bool;
+pub type ReconstructionAdmit = fn(X86Opcode) -> bool;
 
 /// Bounded algebraic-identity peepholes for x86-64 ISel-output functions.
 pub struct X86Peephole {
-    /// Proof admission for the RMW fusion. See [`MemRmwAdmit`].
-    admit_mem_rmw: MemRmwAdmit,
+    /// Proof admission for opcode-constructing fusions. See
+    /// [`ReconstructionAdmit`].
+    admit_reconstructed: ReconstructionAdmit,
 }
 
 impl X86Peephole {
-    /// Create the pass with the given RMW-fusion admission callback.
-    pub fn new(admit_mem_rmw: MemRmwAdmit) -> Self {
-        Self { admit_mem_rmw }
+    /// Create the pass with the given reconstruction-proof admission callback.
+    pub fn new(admit_reconstructed: ReconstructionAdmit) -> Self {
+        Self {
+            admit_reconstructed,
+        }
     }
 
     /// Run x86 peepholes directly on an ISel function.
     pub fn run_on_function(&mut self, func: &mut X86ISelFunction) -> bool {
-        run_impl(func, self.admit_mem_rmw)
+        run_impl(func, self.admit_reconstructed)
     }
 }
 
 impl Default for X86Peephole {
-    /// The CLOSED admission: every peephole except the RMW fusion runs
-    /// unchanged; the RMW fusion never fires (fail-closed on the proof).
+    /// The CLOSED admission: every peephole except the RMW fusion and the
+    /// variable-rotate collapse runs unchanged; the admission-gated fusions
+    /// never fire (fail-closed on the proof).
     fn default() -> Self {
         Self {
-            admit_mem_rmw: |_| false,
+            admit_reconstructed: |_| false,
         }
     }
 }
@@ -60,7 +67,7 @@ impl X86MachinePass for X86Peephole {
     }
 
     fn run(&mut self, func: &mut X86ISelFunction) -> bool {
-        run_impl(func, self.admit_mem_rmw)
+        run_impl(func, self.admit_reconstructed)
     }
 }
 
@@ -78,7 +85,7 @@ pub(crate) enum FlagOverwrite {
     Full,
 }
 
-fn run_impl(func: &mut X86ISelFunction, admit_mem_rmw: MemRmwAdmit) -> bool {
+fn run_impl(func: &mut X86ISelFunction, admit_reconstructed: ReconstructionAdmit) -> bool {
     let mut changed = false;
 
     // Function-scope pass: fold uniquely-defined `MovRI` constants into the
@@ -116,6 +123,24 @@ fn run_impl(func: &mut X86ISelFunction, admit_mem_rmw: MemRmwAdmit) -> bool {
         let live_in = flags_live_in_by_block(func);
         for block_id in func.block_order.clone() {
             if rotate_idiom_run_on_block(func, block_id, &live_in) {
+                changed = true;
+            }
+        }
+    }
+
+    // Multi-instruction pass: VARIABLE-count shl/shr/or expansion -> ROL
+    // r64,CL (Stage 2 of the p6 variable-rotate arc, DEFAULT-ON;
+    // `TCG_NO_X86_ROTATE_VAR_IDIOM` opts out). ADMISSION-GATED on the
+    // injected reconstruction-proof callback exactly like the RMW fusion
+    // below: `RolRCl` is never constructed unless its RotlVar reconstruction
+    // obligation discharges Valid (fail-closed `|_| false` default). Flags
+    // liveness is recomputed because the constant-rotate pass above may have
+    // deleted flag-writing shifts. See `rotate_var_idiom_run_on_block` for
+    // the hand-proof and side conditions.
+    if rotate_var_idiom_enabled() {
+        let live_in = flags_live_in_by_block(func);
+        for block_id in func.block_order.clone() {
+            if rotate_var_idiom_run_on_block(func, block_id, &live_in, admit_reconstructed) {
                 changed = true;
             }
         }
@@ -184,7 +209,7 @@ fn run_impl(func: &mut X86ISelFunction, admit_mem_rmw: MemRmwAdmit) -> bool {
     // for the hand-proof.
     if rmw_fuse_enabled() {
         for block_id in func.block_order.clone() {
-            if rmw_fuse_run_on_block(func, block_id, admit_mem_rmw) {
+            if rmw_fuse_run_on_block(func, block_id, admit_reconstructed) {
                 changed = true;
             }
         }
@@ -1686,6 +1711,527 @@ fn rotate_idiom_run_on_block(
     true
 }
 
+// ---------------------------------------------------------------------------
+// VARIABLE-count rotate idiom -> RolRCl (Stage 2 of the p6 variable-rotate arc)
+// ---------------------------------------------------------------------------
+
+/// Kill switch for the variable-count rotate collapse (any value disables).
+fn rotate_var_idiom_enabled() -> bool {
+    crate::env_lock::var_os("TCG_NO_X86_ROTATE_VAR_IDIOM").is_none()
+}
+
+/// Def sites of FUNCTION-WIDE single-def vregs, storing the FULL defining
+/// instruction: id -> inst. The `rmw_fuse_single_def_sites` shape, but with
+/// the whole instruction so the low-6 chain walk can enforce default flags
+/// and no `proof_origin` on every link it crosses (fail-closed hardening the
+/// opcode/operands pair cannot express).
+fn rotate_var_single_def_insts(
+    func: &X86ISelFunction,
+) -> std::collections::HashMap<u32, X86ISelInst> {
+    use crate::effects::x86_produces_value;
+    let mut sites: std::collections::HashMap<u32, Option<X86ISelInst>> =
+        std::collections::HashMap::new();
+    for block in func.blocks.values() {
+        for inst in &block.insts {
+            if !x86_produces_value(inst.opcode) {
+                continue;
+            }
+            if let Some(X86ISelOperand::VReg(d)) = inst.operands.first() {
+                match sites.entry(d.id) {
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(Some(inst.clone()));
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut e) => {
+                        e.insert(None); // multi-def: disqualified
+                    }
+                }
+            }
+        }
+    }
+    sites
+        .into_iter()
+        .filter_map(|(id, v)| v.map(|v| (id, v)))
+        .collect()
+}
+
+/// Chase `v` through single-def plain `MovRR` copies to a single-def `MovRI`
+/// root, returning the immediate — the same soundness argument as
+/// `fold_unique_const_into_imm_forms`' copy chase: a single-def vreg has one
+/// static value assignment, so any read that observes a defined value
+/// observes exactly the root immediate. Fail-closed on any non-default-flags
+/// or proof-tagged link.
+fn rotate_var_const_of(
+    sites: &std::collections::HashMap<u32, X86ISelInst>,
+    v: VReg,
+) -> Option<i64> {
+    let mut v = v;
+    for _ in 0..16 {
+        let inst = sites.get(&v.id)?;
+        if inst.proof_origin.is_some() || inst.flags != inst.opcode.default_flags() {
+            return None;
+        }
+        match (inst.opcode, inst.operands.as_slice()) {
+            (X86Opcode::MovRI, [X86ISelOperand::VReg(_), X86ISelOperand::Imm(k)]) => {
+                return Some(*k);
+            }
+            (X86Opcode::MovRR, [X86ISelOperand::VReg(_), X86ISelOperand::VReg(s)]) => v = *s,
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// If `inst` (a single-def site) is a LOW-6-BITS-PRESERVING link from its
+/// destination to one source vreg, return that source. Links:
+///
+/// * `MovRR`/`MovRR32` register copies (a 32-bit mov zero-extends: bits 0-5
+///   of the destination equal bits 0-5 of the source in every class pairing);
+/// * `AndRI` whose mask has ALL-ONES low 6 bits;
+/// * `AndRR` where the OTHER operand is a (copy-chased) unique constant with
+///   all-ones low 6 bits.
+///
+/// Anything else — including a non-default-flags or proof-tagged def — is not
+/// a link and stops the walk (fail-closed).
+fn rotate_var_low6_link(
+    sites: &std::collections::HashMap<u32, X86ISelInst>,
+    inst: &X86ISelInst,
+) -> Option<VReg> {
+    if inst.proof_origin.is_some() || inst.flags != inst.opcode.default_flags() {
+        return None;
+    }
+    match (inst.opcode, inst.operands.as_slice()) {
+        (
+            X86Opcode::MovRR | X86Opcode::MovRR32,
+            [X86ISelOperand::VReg(_), X86ISelOperand::VReg(s)],
+        ) => Some(*s),
+        (
+            X86Opcode::AndRI,
+            [
+                X86ISelOperand::VReg(_),
+                X86ISelOperand::VReg(s),
+                X86ISelOperand::Imm(m),
+            ],
+        ) if m & 63 == 63 => Some(*s),
+        (
+            X86Opcode::AndRR,
+            [
+                X86ISelOperand::VReg(_),
+                X86ISelOperand::VReg(a),
+                X86ISelOperand::VReg(b),
+            ],
+        ) => {
+            if rotate_var_const_of(sites, *b).is_some_and(|m| m & 63 == 63) {
+                Some(*a)
+            } else if rotate_var_const_of(sites, *a).is_some_and(|m| m & 63 == 63) {
+                Some(*b)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Walk `start` back through low-6-bits-preserving single-def links. Returns
+/// `(root, feed)`:
+///
+/// * `root` — the walk's fixpoint, used to prove the CL feed and the
+///   complement chain read counts with EQUAL low 6 bits (two deterministic
+///   walks that reach the same single-def root carry the same value there);
+/// * `feed` — the DEEPEST `Gpr64` vreg on the walk, the value the rewrite
+///   moves into RCX. Hardware masks the CL count mod 64 (the Stage-1 masked
+///   machine model `encode_rol_rcl_masked` proves exactly this), so any
+///   low-6-equal feed is exact; choosing the deepest one lets DCE kill the
+///   whole masking chain (the p6 [1]-[6] chain).
+fn rotate_var_low6_walk(
+    sites: &std::collections::HashMap<u32, X86ISelInst>,
+    start: VReg,
+) -> (VReg, VReg) {
+    let mut v = start;
+    let mut feed = start;
+    for _ in 0..16 {
+        let Some(inst) = sites.get(&v.id) else {
+            break;
+        };
+        let Some(next) = rotate_var_low6_link(sites, inst) else {
+            break;
+        };
+        v = next;
+        if v.class == RegClass::Gpr64 {
+            feed = v;
+        }
+    }
+    (v, feed)
+}
+
+/// Does this operand mention any register aliasing RCX (RCX/ECX/CX/CL)?
+fn rotate_var_operand_mentions_rcx(op: &X86ISelOperand) -> bool {
+    use trust_cg_ir::x86_64_regs::{RCX, x86_regs_overlap};
+    match op {
+        X86ISelOperand::PReg(p) => x86_regs_overlap(*p, RCX),
+        X86ISelOperand::MemAddr { base, .. } => rotate_var_operand_mentions_rcx(base),
+        X86ISelOperand::SibMemAddr { base, index, .. } => {
+            rotate_var_operand_mentions_rcx(base) || rotate_var_operand_mentions_rcx(index)
+        }
+        _ => false,
+    }
+}
+
+/// Does this instruction read or write any part of RCX — explicitly (a PReg
+/// operand, including inside a memory address) or implicitly (the CL-count
+/// shift/rotate family)? Calls and other side-effecting instructions are
+/// refused separately by the window purity predicate.
+fn rotate_var_touches_rcx(inst: &X86ISelInst) -> bool {
+    inst.operands.iter().any(rotate_var_operand_mentions_rcx)
+        || matches!(
+            inst.opcode,
+            X86Opcode::ShlRR | X86Opcode::ShrRR | X86Opcode::SarRR | X86Opcode::RolRCl
+        )
+}
+
+/// Window purity for a NON-member instruction inside the matched span:
+/// pure register ALU (no branch/call/terminator/return/pseudo/memory/
+/// side-effect), no flag READ (the rewrite deletes flag-writing members, so
+/// an interleaved reader would observe a different flag state), and no RCX
+/// contact (CL must carry the kept mov's value unmodified into the rotate).
+fn rotate_var_window_ok(inst: &X86ISelInst) -> bool {
+    imul_fuse_window_ok(inst) && !x86_reads_flags(inst.opcode) && !rotate_var_touches_rcx(inst)
+}
+
+/// VARIABLE-COUNT ROTATE IDIOM -> `RolRCl`. Collapses the bridge's
+/// `bitmanip_rotate` expansion of `x.rotate_left(c)` with a RUNTIME count
+///
+/// ```text
+///   eff   = AndRI(c, 63)          ; or any low-6-preserving chain (v2)
+///   neg   = SubRR(z, eff')        ; z a uniquely-defined MovRI 0
+///   compl = AndRI(neg, 63)
+///   MovRR PReg(RCX) <- eff        ; kept (source may be rewritten, see below)
+///   lo    = ShlRR [lo, x]
+///   MovRR PReg(RCX) <- compl
+///   hi    = ShrRR [hi, x]
+///   d     = OrRR(lo, hi)          ==>  d = RolRCl [d, x]
+/// ```
+///
+/// into the single `ROL r64, CL` (plus the kept CL mov), 64-bit `Gpr64` only.
+///
+/// SOUNDNESS. The value identity is the Stage-2 admission's own obligation
+/// (`X86SourceOp::RotlVar`, TOTAL — no preconditions): for ANY CL value `c`,
+/// `ROL64(x, c & 63)` IS `(x << (c & 63)) | (x >>u ((0 - (c & 63)) & 63))`.
+/// The side conditions establish only that the eight instructions really are
+/// that shape for ONE count value:
+///
+/// * the SHL's count is `CL1 & 63` (hardware CL masking) where `CL1` is the
+///   value the kept mov loads;
+/// * the SHR's count is `compl = (0 - (e & 63)) & 63` where `e` low-6-equals
+///   `CL1`: both are chased through deterministic low-6-preserving single-def
+///   chains ([`rotate_var_low6_walk`]) that must reach the SAME root, whose
+///   def count is <= 1 (one static value; modular arithmetic gives
+///   `(0 - e) & 63 == (0 - (e & 63)) & 63`);
+/// * `lo`/`hi`/`neg`/`compl` are each single-def function-wide and used ONLY
+///   inside the pattern (the rmw_fuse whole-function deadness precedent), so
+///   the deletions leave no half-live state;
+/// * `x` is not (re)defined inside the window — the rotate reads it at the
+///   OR's position instead of the shifts';
+/// * no non-member in the window touches RCX or reads flags, and THE FLAGS
+///   ARE DEAD AT THE OR (`flags_dead_at`, as `rotate_idiom`): `OR` defines
+///   SF/ZF/PF where `RolRCl` writes only CF/OF (and only when the count is
+///   nonzero) — `post_ra_dataflow` models the rotate's real flag effect and
+///   fails closed if this is ever wrong.
+///
+/// The kept CL mov's source is rewritten to the DEEPEST `Gpr64` link of the
+/// count chain (v2): sound because every link preserves the low 6 bits, each
+/// link is single-def, and the root's def dominates every chain read
+/// (definite initialization at the ORIGINAL reads is the frontend's existing
+/// obligation — the `fold_unique_const_into_imm_forms` argument). In p6 this
+/// retires the entire 6-instruction masking chain via DCE and reproduces the
+/// binary-patch ceiling (`mov %rdi,%rcx; rolq %cl,%r8`).
+///
+/// ADMISSION (owner doctrine, exceptionless): `RolRCl` is only constructed
+/// when `admit(RolRCl)` — the injected, memoized
+/// `reconstruction_discharges_valid` callback. No admission, no rewrite; the
+/// (itself proof-covered) generic expansion stays.
+fn rotate_var_idiom_run_on_block(
+    func: &mut X86ISelFunction,
+    block_id: trust_cg_lower::instructions::Block,
+    live_in: &std::collections::HashMap<trust_cg_lower::instructions::Block, bool>,
+    admit: ReconstructionAdmit,
+) -> bool {
+    use trust_cg_ir::x86_64_regs::RCX;
+
+    let sites = rotate_var_single_def_insts(func);
+    let (fn_uses, fn_defs) = function_use_def_counts(func);
+    // Shared reborrow for the whole MATCH phase (the closure below needs the
+    // function for `flags_dead_at` while `insts` is borrowed); the mutable
+    // APPLY phase begins only after both borrows end.
+    let func_ref: &X86ISelFunction = func;
+    let Some(block) = func_ref.blocks.get(&block_id) else {
+        return false;
+    };
+    let insts = &block.insts;
+
+    struct Edit {
+        or_idx: usize,
+        d: VReg,
+        x: VReg,
+        mov1_idx: usize,
+        feed: Option<VReg>, // Some => rewrite the kept CL mov's source
+        doomed: Vec<usize>, // shl, shr, second CL mov, in-block neg/compl defs
+    }
+    let mut edits: Vec<Edit> = Vec::new();
+    let mut consumed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+    let clean = |w: &X86ISelInst| w.proof_origin.is_none() && w.flags == w.opcode.default_flags();
+    let single_def_single_use = |v: VReg| {
+        fn_defs.get(&v).copied().unwrap_or(0) == 1 && fn_uses.get(&v).copied().unwrap_or(0) == 1
+    };
+    // Nearest RCX-touching instruction strictly before `pos`.
+    let nearest_rcx_touch_before =
+        |pos: usize| (0..pos).rev().find(|&j| rotate_var_touches_rcx(&insts[j]));
+    // `MovRR PReg(RCX) <- vreg64` — the kept/deleted CL setup form.
+    let cl_mov_src = |w: &X86ISelInst| -> Option<VReg> {
+        if w.opcode != X86Opcode::MovRR || !clean(w) {
+            return None;
+        }
+        match w.operands.as_slice() {
+            [X86ISelOperand::PReg(p), X86ISelOperand::VReg(s)]
+                if *p == RCX && s.class == RegClass::Gpr64 =>
+            {
+                Some(*s)
+            }
+            _ => None,
+        }
+    };
+
+    for i in 0..insts.len() {
+        let or = &insts[i];
+        if or.opcode != X86Opcode::OrRR || or.operands.len() != 3 || !clean(or) {
+            continue;
+        }
+        let [
+            X86ISelOperand::VReg(d),
+            X86ISelOperand::VReg(a),
+            X86ISelOperand::VReg(b),
+        ] = or.operands.as_slice()
+        else {
+            continue;
+        };
+        if d.class != RegClass::Gpr64 {
+            continue;
+        }
+        let (d, a, b) = (*d, *a, *b);
+
+        // OR commutes: try both operand orders for (lo, hi).
+        let matched = [(a, b), (b, a)].into_iter().find_map(|(lo, hi)| {
+            if lo.class != RegClass::Gpr64 || hi.class != RegClass::Gpr64 {
+                return None;
+            }
+            // The shift defs, found at lo/hi's unique in-block def position.
+            let shl_idx = (0..i).find(|&j| local_fold_defines_vreg(&insts[j], lo))?;
+            let shr_idx = (0..i).find(|&j| local_fold_defines_vreg(&insts[j], hi))?;
+            let shl = &insts[shl_idx];
+            let shr = &insts[shr_idx];
+            if shl.opcode != X86Opcode::ShlRR || shr.opcode != X86Opcode::ShrRR {
+                return None;
+            }
+            if !clean(shl) || !clean(shr) {
+                return None;
+            }
+            let (
+                [X86ISelOperand::VReg(_), X86ISelOperand::VReg(x1)],
+                [X86ISelOperand::VReg(_), X86ISelOperand::VReg(x2)],
+            ) = (shl.operands.as_slice(), shr.operands.as_slice())
+            else {
+                return None;
+            };
+            if x1 != x2 || x1.class != RegClass::Gpr64 {
+                return None;
+            }
+            let x = *x1;
+            // lo/hi live ONLY inside the pattern (def = the shift, use = OR).
+            if !single_def_single_use(lo) || !single_def_single_use(hi) {
+                return None;
+            }
+            // CL setups: the NEAREST RCX contact above each shift must be the
+            // MovRR-to-RCX form. The implicit CL read of ShlRR itself makes
+            // an out-of-order match (mov2 before the SHL, SHR before the SHL,
+            // a clobber between mov and shift) surface as a wrong-form
+            // nearest hit — refused.
+            let mov1_idx = nearest_rcx_touch_before(shl_idx)?;
+            let f1 = cl_mov_src(&insts[mov1_idx])?;
+            let mov2_idx = nearest_rcx_touch_before(shr_idx)?;
+            if mov2_idx <= shl_idx || mov2_idx == mov1_idx {
+                return None;
+            }
+            let compl = cl_mov_src(&insts[mov2_idx])?;
+            // The complement chain: compl = AndRI(neg, 63) — the EXACT mask
+            // 63 is load-bearing (`(0-e) & 31` is a DIFFERENT rotate count);
+            // neg = SubRR(z, e) with z a uniquely-defined constant 0. Both
+            // are function-wide single-def and consumed only here.
+            if !single_def_single_use(compl) || fn_defs.get(&f1).copied().unwrap_or(0) > 1 {
+                return None;
+            }
+            let compl_def = sites.get(&compl.id)?;
+            if compl_def.opcode != X86Opcode::AndRI || !clean(compl_def) {
+                return None;
+            }
+            let [
+                X86ISelOperand::VReg(_),
+                X86ISelOperand::VReg(neg),
+                X86ISelOperand::Imm(63),
+            ] = compl_def.operands.as_slice()
+            else {
+                return None;
+            };
+            let neg = *neg;
+            if !single_def_single_use(neg) {
+                return None;
+            }
+            let neg_def = sites.get(&neg.id)?;
+            if neg_def.opcode != X86Opcode::SubRR || !clean(neg_def) {
+                return None;
+            }
+            let [
+                X86ISelOperand::VReg(_),
+                X86ISelOperand::VReg(z),
+                X86ISelOperand::VReg(e),
+            ] = neg_def.operands.as_slice()
+            else {
+                return None;
+            };
+            if rotate_var_const_of(&sites, *z) != Some(0) {
+                return None;
+            }
+            // Count equality: the CL feed and the complement input must chase
+            // to the SAME <=1-def root through low-6-preserving links.
+            let (root_cl, feed) = rotate_var_low6_walk(&sites, f1);
+            let (root_e, _) = rotate_var_low6_walk(&sites, *e);
+            if root_cl != root_e || fn_defs.get(&root_cl).copied().unwrap_or(0) > 1 {
+                return None;
+            }
+            // The proof admission gate (condition P): no admission, no
+            // rewrite — the opcode is never constructed.
+            if !admit(X86Opcode::RolRCl) {
+                return None;
+            }
+            // In-block defs of neg/compl are pattern members and deleted
+            // outright (DCE runs after this pass, but the rotate_idiom
+            // deletion discipline keeps the block canonical immediately).
+            let mut doomed = vec![shl_idx, shr_idx, mov2_idx];
+            let mut members = vec![mov1_idx, shl_idx, mov2_idx, shr_idx, i];
+            for v in [neg, compl] {
+                if let Some(j) = (0..i).find(|&j| local_fold_defines_vreg(&insts[j], v)) {
+                    doomed.push(j);
+                    members.push(j);
+                }
+            }
+            // Window discipline over every NON-member from the earliest
+            // member to the OR: pure ALU, no flag read, no RCX contact, and
+            // no (potential) def of any register the pattern reasons about.
+            // The earliest member is the minimum over `members`, folded from
+            // `mov1_idx` — itself a member — so the result is exactly
+            // `min(members)` with no empty case to assert against.
+            let scan_start = members.iter().copied().fold(mov1_idx, usize::min);
+            let watched = [x, f1, feed, compl, neg, *e];
+            for (k, w) in insts.iter().enumerate().take(i).skip(scan_start) {
+                if members.contains(&k) {
+                    continue;
+                }
+                if !rotate_var_window_ok(w) {
+                    return None;
+                }
+                if watched.iter().any(|&v| local_fold_defines_vreg(w, v)) {
+                    return None;
+                }
+            }
+            // RCX after the pattern now holds the CL feed instead of compl.
+            // Pre-RA nothing reads CL without a same-block setup mov (the
+            // isel emits the mov/shift pair adjacently, and call arg regs are
+            // populated by their own arg-setup movs), but enforce it anyway:
+            // walking forward from the OR, any RCX contact before a definite
+            // full-RCX overwrite refuses the match. Block end / terminator is
+            // safe — pre-RA physical CL uses are strictly block-local.
+            for w in &insts[i + 1..] {
+                let full_rcx_overwrite = matches!(
+                    w.opcode,
+                    X86Opcode::MovRR | X86Opcode::MovRR32 | X86Opcode::MovRI
+                ) && matches!(
+                    w.operands.first(),
+                    Some(X86ISelOperand::PReg(p))
+                        if trust_cg_ir::x86_64_regs::x86_regs_overlap(*p, RCX)
+                );
+                if full_rcx_overwrite {
+                    break;
+                }
+                if rotate_var_touches_rcx(w) {
+                    return None;
+                }
+            }
+            // Flags must be dead at the OR (identical infra to rotate_idiom).
+            if !flags_dead_at(func_ref, live_in, block_id, i) {
+                return None;
+            }
+            if members.iter().any(|j| consumed.contains(j)) {
+                return None;
+            }
+            consumed.extend(members.iter().copied());
+            Some(Edit {
+                or_idx: i,
+                d,
+                x,
+                mov1_idx,
+                feed: (feed != f1).then_some(feed),
+                doomed,
+            })
+        });
+        if let Some(edit) = matched {
+            edits.push(edit);
+        }
+    }
+
+    if edits.is_empty() {
+        return false;
+    }
+
+    if crate::env_lock::var_os("TCG_X86_ROTATE_VAR_LOG").is_some() {
+        eprintln!(
+            "x86-rotate-var-idiom: collapsed {} variable rotate(s) in `{}` block #{:?}",
+            edits.len(),
+            func.name,
+            block_id.0,
+        );
+    }
+
+    // Rewrite the ORs (and CL feeds) in place, then DELETE the dead members —
+    // indices stay valid because deletion happens strictly after every
+    // in-place write, in descending order.
+    //
+    // INVARIANT (panic audit, class A): `func.blocks.get(&block_id)` returned
+    // `Some` at the top of this function (the `else { return false }` guard),
+    // and between that guard and here `func` is only ever read — the shared
+    // `func_ref` reborrow for the match phase and `func.name` in the log line
+    // — so no block was inserted or removed and the same key is still
+    // present. The lookup cannot be hoisted into the guard itself: the match
+    // closure needs the WHOLE function immutably (`flags_dead_at(func_ref,
+    // ..)`) while `insts` is borrowed, which a live `&mut` block would forbid.
+    let block = func.blocks.get_mut(&block_id).expect("block existed above");
+    let mut doomed: Vec<usize> = Vec::new();
+    for edit in edits {
+        block.insts[edit.or_idx] = X86ISelInst::new(
+            X86Opcode::RolRCl,
+            vec![X86ISelOperand::VReg(edit.d), X86ISelOperand::VReg(edit.x)],
+        );
+        if let Some(feed) = edit.feed {
+            block.insts[edit.mov1_idx].operands[1] = X86ISelOperand::VReg(feed);
+        }
+        doomed.extend(edit.doomed);
+    }
+    doomed.sort_unstable();
+    for idx in doomed.into_iter().rev() {
+        block.insts.remove(idx);
+    }
+    true
+}
+
 fn and_pow2_bt_branch_run_on_block(
     func: &mut X86ISelFunction,
     block_id: trust_cg_lower::instructions::Block,
@@ -2009,6 +2555,8 @@ fn dce_style_first_operand_is_use(inst: &X86ISelInst) -> bool {
             | ShlRR
             | ShrRR
             | SarRR
+            // Rotate-by-CL: same tied [dst, src] shape as the CL shifts.
+            | RolRCl
     ) || (matches!(inst.opcode, AddRR | SubRR | ImulRR | AndRR | OrRR | XorRR)
         && inst.operands.len() == 2)
 }
@@ -2698,11 +3246,17 @@ fn rmw_fuse_w2_ok(inst: &X86ISelInst) -> bool {
 fn rmw_fuse_run_on_block(
     func: &mut X86ISelFunction,
     block_id: trust_cg_lower::instructions::Block,
-    admit: MemRmwAdmit,
+    admit: ReconstructionAdmit,
 ) -> bool {
     let sites = rmw_fuse_single_def_sites(func);
     let (fn_uses, fn_defs) = function_use_def_counts(func);
-    let Some(block) = func.blocks.get(&block_id) else {
+    // The block is looked up ONCE, mutably, and held for the whole pass: the
+    // match phase below reads it through the shared `insts` reborrow (every
+    // function-wide fact it needs — `sites`, `fn_uses`, `fn_defs` — is an
+    // owned snapshot computed above), and the apply phase writes through the
+    // same binding once `insts` is dead. There is therefore no second lookup
+    // whose failure would have to be asserted against.
+    let Some(block) = func.blocks.get_mut(&block_id) else {
         return false;
     };
     let insts = &block.insts;
@@ -2915,7 +3469,6 @@ fn rmw_fuse_run_on_block(
         delete.insert(f.alu_idx);
         replace.insert(f.store_idx, f.replacement);
     }
-    let block = func.blocks.get_mut(&block_id).expect("block existed above");
     let old = std::mem::take(&mut block.insts);
     let mut rebuilt = Vec::with_capacity(old.len());
     for (idx, inst) in old.into_iter().enumerate() {
@@ -3057,21 +3610,24 @@ fn simplify_inst_gated(
                 3 | 5 | 9 if constmul_lea_enabled() && dst != src => Some(PeepholeEdit::Replace(
                     lea_sib_scaled(dst, src, (imm - 1) as u8),
                 )),
+                // d = s*7 as TWO dependent LEAs: d = s + s*2 (=3s), then
+                // d = s + d*2 (=7s), reusing d as the temporary (d != s).
+                // 2 cycles, ZERO reg-reg movs, no flags written. The prior
+                // ShlRI+SubRR shape measured NULL on p5: the two-address
+                // SHL forces a MovRR onto the loop-carried path and mov
+                // elimination under pressure gives that cycle right back.
                 7 if constmul_lea_enabled() && dst != src => Some(PeepholeEdit::ReplaceTwo(
+                    lea_sib_scaled(dst, src, 2),
                     X86ISelInst::new(
-                        X86Opcode::ShlRI,
+                        X86Opcode::LeaSib,
                         vec![
                             X86ISelOperand::VReg(dst),
-                            X86ISelOperand::VReg(src),
-                            X86ISelOperand::Imm(3),
-                        ],
-                    ),
-                    X86ISelInst::new(
-                        X86Opcode::SubRR,
-                        vec![
-                            X86ISelOperand::VReg(dst),
-                            X86ISelOperand::VReg(dst),
-                            X86ISelOperand::VReg(src),
+                            X86ISelOperand::SibMemAddr {
+                                base: Box::new(X86ISelOperand::VReg(src)),
+                                index: Box::new(X86ISelOperand::VReg(dst)),
+                                scale: 2,
+                                disp: 0,
+                            },
                         ],
                     ),
                 )),
@@ -3365,8 +3921,21 @@ fn flags_written_here_are_dead(insts: &[X86ISelInst], index: usize) -> bool {
         }
 
         match condition_flag_overwrite(inst) {
-            FlagOverwrite::None => {}
-            FlagOverwrite::Partial => return false,
+            // A PARTIAL flag writer reads nothing and only shrinks the set
+            // of insts[index]'s flags still observable, so the scan may
+            // continue through it: the deadness claim still rests on
+            // reaching a FULL overwrite before any reader. (Bailing here
+            // was fail-closed but over-conservative — a RolRI emitted by
+            // our own rotate_idiom sat between p5's ImulRRI $7 and its
+            // XorRR full overwrite, vetoing the constmul reduction on the
+            // loop-carried critical path.) TCG_X86_STRICT_PARTIAL_FLAGS
+            // reverts to the old bail for isolation A/Bs.
+            FlagOverwrite::Partial
+                if std::env::var_os("TCG_X86_STRICT_PARTIAL_FLAGS").is_some() =>
+            {
+                return false;
+            }
+            FlagOverwrite::None | FlagOverwrite::Partial => {}
             FlagOverwrite::Full => return true,
         }
 
@@ -3390,8 +3959,12 @@ pub(crate) fn condition_flag_overwrite(inst: &X86ISelInst) -> FlagOverwrite {
         | XorRR | XorRI | CmpRR | CmpRI | CmpRI8 | CmpRM | TestRR | TestRI | TestRM | Ucomisd
         | Ucomiss | Popcnt => Full,
 
+        // RolRCl is Partial like the CL shifts (writes only CF/OF, and only
+        // when the runtime CL count is nonzero — never a Full overwrite).
         Inc | Dec | ImulRR | ImulRRI | ImulRM | ImulRMSib | Idiv | Div | Mul | ShlRR | ShlRI
-        | ShrRR | ShrRI | SarRR | SarRI | Bsf | Bsr | Tzcnt | Lzcnt | BtRI | Cmpxchg => Partial,
+        | ShrRR | ShrRI | SarRR | SarRI | RolRCl | Bsf | Bsr | Tzcnt | Lzcnt | BtRI | Cmpxchg => {
+            Partial
+        }
 
         _ if x86_writes_flags(inst.opcode) => Partial,
         _ => None,
@@ -6573,10 +7146,15 @@ mod tests {
             entry_opcodes(&live_out_func),
             vec![X86Opcode::MovRI, X86Opcode::Ret]
         );
+        // The partial writer (Inc) reads no flags, so the deadness scan
+        // continues through it to the CmpRI full overwrite: the zero-idiom
+        // rewrite fires. (This pinned fail-closed-at-partial before the
+        // scan was widened; a reader between would still decline — see
+        // constmul_declines_when_reader_follows_partial_writer.)
         assert_eq!(
             entry_opcodes(&partial_func),
             vec![
-                X86Opcode::MovRI,
+                X86Opcode::XorRR,
                 X86Opcode::Inc,
                 X86Opcode::TestRR,
                 X86Opcode::Ret,
@@ -6584,7 +7162,7 @@ mod tests {
         );
         assert_eq!(
             entry_insts(&partial_func)[0].operands,
-            vec![vreg(1), X86ISelOperand::Imm(0)]
+            vec![vreg(1), vreg(1)]
         );
     }
 
@@ -10553,6 +11131,284 @@ mod tests {
         });
     }
 
+    // -----------------------------------------------------------------------
+    // Variable-count rotate idiom (TCG_NO_X86_ROTATE_VAR_IDIOM) — called
+    // directly, bypassing the env gate; the admission callback is |_| true
+    // except where the admission gate itself is under test.
+    // -----------------------------------------------------------------------
+
+    fn rcx() -> X86ISelOperand {
+        X86ISelOperand::PReg(trust_cg_ir::x86_64_regs::RCX)
+    }
+
+    /// The v1 bridge `bitmanip_rotate` expansion in one block. Ids: c=1 x=2
+    /// z=3 eff=4 neg=5 compl=6 lo=7 hi=8 d=9 out=10.
+    fn rotate_var_v1_shape() -> Vec<X86ISelInst> {
+        vec![
+            X86ISelInst::new(X86Opcode::MovRI, vec![vreg(3), imm(0)]),
+            X86ISelInst::new(X86Opcode::AndRI, vec![vreg(4), vreg(1), imm(63)]),
+            X86ISelInst::new(X86Opcode::SubRR, vec![vreg(5), vreg(3), vreg(4)]),
+            X86ISelInst::new(X86Opcode::AndRI, vec![vreg(6), vreg(5), imm(63)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![rcx(), vreg(4)]),
+            X86ISelInst::new(X86Opcode::ShlRR, vec![vreg(7), vreg(2)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![rcx(), vreg(6)]),
+            X86ISelInst::new(X86Opcode::ShrRR, vec![vreg(8), vreg(2)]),
+            X86ISelInst::new(X86Opcode::OrRR, vec![vreg(9), vreg(7), vreg(8)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(10), vreg(9)]),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]
+    }
+
+    fn run_rotate_var(func: &mut X86ISelFunction, admit: ReconstructionAdmit) -> bool {
+        let live_in = flags_live_in_by_block(func);
+        rotate_var_idiom_run_on_block(func, Block(0), &live_in, admit)
+    }
+
+    /// Source operands of every remaining `MovRR/... -> PReg(RCX)` CL setup.
+    fn cl_mov_sources(func: &X86ISelFunction) -> Vec<X86ISelOperand> {
+        entry_insts(func)
+            .iter()
+            .filter(|w| {
+                matches!(
+                    w.operands.first(),
+                    Some(X86ISelOperand::PReg(p)) if *p == trust_cg_ir::x86_64_regs::RCX
+                )
+            })
+            .map(|w| w.operands[1].clone())
+            .collect()
+    }
+
+    #[test]
+    fn rotate_var_v1_full_expansion_fuses() {
+        let mut func = make_func(rotate_var_v1_shape());
+        assert!(run_rotate_var(&mut func, |_| true));
+        let ops = entry_opcodes(&func);
+        assert!(ops.contains(&X86Opcode::RolRCl), "{ops:?}");
+        for gone in [X86Opcode::ShlRR, X86Opcode::ShrRR, X86Opcode::SubRR] {
+            assert!(!ops.contains(&gone), "{gone:?} must be deleted: {ops:?}");
+        }
+        // The compl AndRI is deleted with its chain; eff's AndRI is left
+        // (now dead) for the DCE pass that follows the peephole.
+        assert_eq!(
+            ops.iter().filter(|&&o| o == X86Opcode::AndRI).count(),
+            1,
+            "{ops:?}"
+        );
+        // Exactly ONE CL mov remains, and the v1 count chain is a single
+        // low-6-transparent AndRI, so the feed walks back to the RAW count.
+        assert_eq!(cl_mov_sources(&func), vec![vreg(1)]);
+        // The rotate carries the Stage-1 pre-RA operand schema: [dst, src].
+        let rol = entry_insts(&func)
+            .iter()
+            .find(|w| w.opcode == X86Opcode::RolRCl)
+            .unwrap();
+        assert_eq!(rol.operands.as_slice(), &[vreg(9), vreg(2)]);
+    }
+
+    #[test]
+    fn rotate_var_opaque_count_chain_keeps_eff_feed() {
+        // eff's own def is NOT a low-6 link (mask 62): the walk stops at eff,
+        // the kept CL mov is untouched, and the collapse still fires — the
+        // reconstruction obligation is TOTAL in CL, so any feed is exact as
+        // long as both count chains share its low 6 bits (here e == f1).
+        let mut shape = rotate_var_v1_shape();
+        shape[1] = X86ISelInst::new(X86Opcode::AndRI, vec![vreg(4), vreg(1), imm(62)]);
+        let mut func = make_func(shape);
+        assert!(run_rotate_var(&mut func, |_| true));
+        assert!(entry_opcodes(&func).contains(&X86Opcode::RolRCl));
+        assert_eq!(cl_mov_sources(&func), vec![vreg(4)]);
+    }
+
+    #[test]
+    fn rotate_var_p6_block4_chain_fuses_to_raw_feed() {
+        // The EXACT p6 Block(4) pre-RA shape (x86-cse dump, design §2), with
+        // the two LICM-hoisted uniquely-defined constants at the block top.
+        // The v2 low-6 chain walk must feed CL the RAW count (v25) so the
+        // whole [1]-[6] masking chain dies to DCE — the binary-patch ceiling.
+        let mut func = make_func(vec![
+            X86ISelInst::new(X86Opcode::MovRI, vec![vreg(63), imm(0)]),
+            X86ISelInst::new(X86Opcode::MovRI, vec![vreg(59), imm(0xFFFF_FFFF)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(53), vreg(25)]),
+            X86ISelInst::new(X86Opcode::AndRI, vec![vreg(55), vreg(53), imm(63)]),
+            X86ISelInst::new(X86Opcode::MovRR32, vec![vreg32(56), vreg(55)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(57), vreg(7)]),
+            X86ISelInst::new(X86Opcode::MovRR32, vec![vreg(58), vreg32(56)]),
+            X86ISelInst::new(X86Opcode::AndRR, vec![vreg(60), vreg(58), vreg(59)]),
+            X86ISelInst::new(X86Opcode::AndRI, vec![vreg(62), vreg(60), imm(63)]),
+            X86ISelInst::new(X86Opcode::SubRR, vec![vreg(64), vreg(63), vreg(62)]),
+            X86ISelInst::new(X86Opcode::AndRI, vec![vreg(65), vreg(64), imm(63)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![rcx(), vreg(62)]),
+            X86ISelInst::new(X86Opcode::ShlRR, vec![vreg(66), vreg(57)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![rcx(), vreg(65)]),
+            X86ISelInst::new(X86Opcode::ShrRR, vec![vreg(67), vreg(57)]),
+            X86ISelInst::new(X86Opcode::OrRR, vec![vreg(68), vreg(66), vreg(67)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(70), vreg(68)]),
+            X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(Block(0))]),
+        ]);
+        assert!(run_rotate_var(&mut func, |_| true));
+        let ops = entry_opcodes(&func);
+        assert!(ops.contains(&X86Opcode::RolRCl), "{ops:?}");
+        for gone in [X86Opcode::ShlRR, X86Opcode::ShrRR, X86Opcode::SubRR] {
+            assert!(!ops.contains(&gone), "{gone:?} must be deleted: {ops:?}");
+        }
+        assert_eq!(cl_mov_sources(&func), vec![vreg(25)]);
+        let rol = entry_insts(&func)
+            .iter()
+            .find(|w| w.opcode == X86Opcode::RolRCl)
+            .unwrap();
+        assert_eq!(rol.operands.as_slice(), &[vreg(68), vreg(57)]);
+    }
+
+    #[test]
+    fn rotate_var_raw_count_feed_fuses() {
+        // CL is fed the RAW count directly; only the complement path masks.
+        // Hardware masks CL mod 64 (the Stage-1 masked machine model), and
+        // (0 - c) & 63 == (0 - (c & 63)) & 63, so both chains share the root
+        // c itself.
+        let mut func = make_func(vec![
+            X86ISelInst::new(X86Opcode::MovRI, vec![vreg(3), imm(0)]),
+            X86ISelInst::new(X86Opcode::SubRR, vec![vreg(5), vreg(3), vreg(1)]),
+            X86ISelInst::new(X86Opcode::AndRI, vec![vreg(6), vreg(5), imm(63)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![rcx(), vreg(1)]),
+            X86ISelInst::new(X86Opcode::ShlRR, vec![vreg(7), vreg(2)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![rcx(), vreg(6)]),
+            X86ISelInst::new(X86Opcode::ShrRR, vec![vreg(8), vreg(2)]),
+            X86ISelInst::new(X86Opcode::OrRR, vec![vreg(9), vreg(7), vreg(8)]),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        assert!(run_rotate_var(&mut func, |_| true));
+        assert!(entry_opcodes(&func).contains(&X86Opcode::RolRCl));
+        assert_eq!(cl_mov_sources(&func), vec![vreg(1)]);
+    }
+
+    #[test]
+    fn rotate_var_refuses_flags_live_at_or() {
+        // A Jcc consuming the OR's flags: RolRCl leaves SF/ZF/PF untouched
+        // where OR defines them — the rewrite must refuse.
+        let mut shape = rotate_var_v1_shape();
+        shape.truncate(9); // drop the trailing copy + Ret
+        shape.push(X86ISelInst::new(
+            X86Opcode::Jcc,
+            vec![
+                X86ISelOperand::CondCode(X86CondCode::E),
+                X86ISelOperand::Block(Block(0)),
+            ],
+        ));
+        shape.push(X86ISelInst::new(X86Opcode::Ret, vec![]));
+        let mut func = make_func(shape);
+        assert!(!run_rotate_var(&mut func, |_| true));
+        assert!(!entry_opcodes(&func).contains(&X86Opcode::RolRCl));
+    }
+
+    #[test]
+    fn rotate_var_refuses_x_redefined_in_window() {
+        // x is overwritten between the shifts: the rotate would read the NEW
+        // value at the OR's position.
+        let mut shape = rotate_var_v1_shape();
+        shape.insert(6, X86ISelInst::new(X86Opcode::MovRI, vec![vreg(2), imm(5)]));
+        let mut func = make_func(shape);
+        assert!(!run_rotate_var(&mut func, |_| true));
+    }
+
+    #[test]
+    fn rotate_var_refuses_multi_use_lo() {
+        // lo has a second reader: deleting the SHL would leave it undefined.
+        let mut shape = rotate_var_v1_shape();
+        shape.insert(
+            9,
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(11), vreg(7)]),
+        );
+        let mut func = make_func(shape);
+        assert!(!run_rotate_var(&mut func, |_| true));
+    }
+
+    #[test]
+    fn rotate_var_refuses_missing_compl_mask() {
+        // The second CL mov reads the raw negation (no AndRI 63): not the
+        // proven complement shape.
+        let mut shape = rotate_var_v1_shape();
+        shape.remove(3); // drop compl = AndRI(neg, 63)
+        shape[5].operands[1] = vreg(5); // CL2 <- neg directly
+        let mut func = make_func(shape);
+        assert!(!run_rotate_var(&mut func, |_| true));
+    }
+
+    #[test]
+    fn rotate_var_refuses_wrong_compl_mask_31() {
+        // (0 - e) & 31 is a DIFFERENT rotate count than (0 - e) & 63.
+        let mut shape = rotate_var_v1_shape();
+        shape[3] = X86ISelInst::new(X86Opcode::AndRI, vec![vreg(6), vreg(5), imm(31)]);
+        let mut func = make_func(shape);
+        assert!(!run_rotate_var(&mut func, |_| true));
+    }
+
+    #[test]
+    fn rotate_var_refuses_rcx_clobber_between_cl_mov_and_shift() {
+        // An RCX write between the CL setup and its shift: the count the SHL
+        // consumed is not the kept mov's value.
+        let mut shape = rotate_var_v1_shape();
+        shape.insert(5, X86ISelInst::new(X86Opcode::MovRI, vec![rcx(), imm(7)]));
+        let mut func = make_func(shape);
+        assert!(!run_rotate_var(&mut func, |_| true));
+    }
+
+    #[test]
+    fn rotate_var_refuses_rcx_reader_after_or() {
+        // A later CL consumer without its own RCX setup would observe the
+        // feed value instead of compl after the rewrite (the deleted second
+        // CL mov no longer executes) — the forward scan must refuse.
+        let mut shape = rotate_var_v1_shape();
+        shape.insert(
+            9,
+            X86ISelInst::new(X86Opcode::ShlRR, vec![vreg(12), vreg(13)]),
+        );
+        let mut func = make_func(shape);
+        assert!(!run_rotate_var(&mut func, |_| true));
+    }
+
+    #[test]
+    fn rotate_var_admission_gate_is_fail_closed() {
+        // The proof admission callback is consulted with EXACTLY RolRCl; a
+        // closed or wrong-opcode admission never fires.
+        let mut closed = make_func(rotate_var_v1_shape());
+        assert!(!run_rotate_var(&mut closed, |_| false));
+        let mut wrong = make_func(rotate_var_v1_shape());
+        assert!(!run_rotate_var(&mut wrong, |op| op == X86Opcode::RolRI));
+        let mut exact = make_func(rotate_var_v1_shape());
+        assert!(run_rotate_var(&mut exact, |op| op == X86Opcode::RolRCl));
+        assert!(entry_opcodes(&exact).contains(&X86Opcode::RolRCl));
+    }
+
+    #[test]
+    fn rotate_var_default_pass_admission_is_closed() {
+        // `X86Peephole::default()` carries the closed `|_| false` admission:
+        // the full pass never creates a RolRCl without an injected proof gate.
+        let mut func = make_func(rotate_var_v1_shape());
+        X86Peephole::default().run_on_function(&mut func);
+        assert!(
+            !entry_opcodes(&func).contains(&X86Opcode::RolRCl),
+            "closed default admission must never create RolRCl"
+        );
+    }
+
+    #[test]
+    fn rotate_var_kill_switch_and_default_on() {
+        // Full-pass runs under the lock-guarded env shim: default-ON fuses
+        // (with an open admission), TCG_NO_X86_ROTATE_VAR_IDIOM=1 disables.
+        crate::env_lock::with_env_overrides_removed(&["TCG_NO_X86_ROTATE_VAR_IDIOM"], || {
+            assert!(rotate_var_idiom_enabled());
+            let mut func = make_func(rotate_var_v1_shape());
+            X86Peephole::new(|_| true).run_on_function(&mut func);
+            assert!(entry_opcodes(&func).contains(&X86Opcode::RolRCl));
+        });
+        crate::env_lock::with_env_overrides(&[("TCG_NO_X86_ROTATE_VAR_IDIOM", "1")], || {
+            assert!(!rotate_var_idiom_enabled());
+            let mut func = make_func(rotate_var_v1_shape());
+            X86Peephole::new(|_| true).run_on_function(&mut func);
+            assert!(!entry_opcodes(&func).contains(&X86Opcode::RolRCl));
+        });
+    }
+
     #[test]
     fn zeroidiom_gate_declines_unread_zero_and_allows_read_zero() {
         // Unread MovRI-0 must stay MovRI (DCE-removable) under the gate;
@@ -10733,7 +11589,9 @@ mod tests {
     }
 
     #[test]
-    fn constmul_seven_becomes_shl_sub() {
+    fn constmul_seven_becomes_two_leas() {
+        // d = 7s as lea d,[s+s*2] (=3s) then lea d,[s+d*2] (=7s): 2 cycles,
+        // no reg-reg mov on the chain, d doubles as the temporary.
         let mut func = make_func(vec![
             X86ISelInst::new(X86Opcode::ImulRRI, vec![vreg(2), vreg(1), imm(7)]),
             X86ISelInst::new(X86Opcode::MovRR, vec![vreg(9), vreg(2)]),
@@ -10742,15 +11600,34 @@ mod tests {
         let mut pass = X86Peephole::default();
         assert!(pass.run(&mut func));
         let insts = entry_insts(&func);
-        let shl = insts
+        let first = insts
             .iter()
-            .position(|i| i.opcode == X86Opcode::ShlRI)
-            .expect("SHL d,s,3");
-        assert_eq!(insts[shl].operands[0], vreg(2));
-        assert_eq!(insts[shl].operands[1], vreg(1));
-        assert_eq!(insts[shl + 1].opcode, X86Opcode::SubRR, "then SUB d,d,s");
-        assert_eq!(insts[shl + 1].operands[1], vreg(2));
-        assert_eq!(insts[shl + 1].operands[2], vreg(1));
+            .position(|i| i.opcode == X86Opcode::LeaSib)
+            .expect("lea d,[s+s*2]");
+        assert_eq!(insts[first].operands[0], vreg(2));
+        assert_eq!(
+            insts[first].operands[1],
+            X86ISelOperand::SibMemAddr {
+                base: Box::new(vreg(1)),
+                index: Box::new(vreg(1)),
+                scale: 2,
+                disp: 0,
+            }
+        );
+        assert_eq!(
+            insts[first + 1].opcode,
+            X86Opcode::LeaSib,
+            "then lea d,[s+d*2]"
+        );
+        assert_eq!(
+            insts[first + 1].operands[1],
+            X86ISelOperand::SibMemAddr {
+                base: Box::new(vreg(1)),
+                index: Box::new(vreg(2)),
+                scale: 2,
+                disp: 0,
+            }
+        );
         assert!(!entry_opcodes(&func).contains(&X86Opcode::ImulRRI));
     }
 
@@ -10785,6 +11662,49 @@ mod tests {
         let mut pass = X86Peephole::default();
         pass.run(&mut func);
         assert!(entry_opcodes(&func).contains(&X86Opcode::ImulRRI));
+    }
+
+    #[test]
+    fn constmul_seven_fires_through_partial_flag_writer() {
+        // The p5_struct_acc hot-block shape: a RolRI (partial CF/OF writer,
+        // reads no flags) sits between the IMUL and the XorRR full
+        // overwrite. The deadness scan must continue THROUGH the partial
+        // writer and fire on the full overwrite.
+        let mut func = make_func(vec![
+            X86ISelInst::new(X86Opcode::ImulRRI, vec![vreg(2), vreg(1), imm(7)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(3), vreg(2)]),
+            X86ISelInst::new(X86Opcode::RolRI, vec![vreg(4), vreg(3), imm(9)]),
+            X86ISelInst::new(X86Opcode::XorRR, vec![vreg(5), vreg(6), vreg(4)]),
+        ]);
+        let mut pass = X86Peephole::default();
+        assert!(pass.run(&mut func));
+        let ops = entry_opcodes(&func);
+        assert!(ops.contains(&X86Opcode::LeaSib), "7x fires: {ops:?}");
+        assert!(!ops.contains(&X86Opcode::ImulRRI));
+    }
+
+    #[test]
+    fn constmul_declines_when_reader_follows_partial_writer() {
+        // A flags reader after the partial writer with NO full overwrite in
+        // between: the reader could still observe the IMUL's SF/ZF/PF, so
+        // the scan must still fail closed.
+        let mut func = make_func(vec![
+            X86ISelInst::new(X86Opcode::ImulRRI, vec![vreg(2), vreg(1), imm(7)]),
+            X86ISelInst::new(X86Opcode::RolRI, vec![vreg(4), vreg(3), imm(9)]),
+            X86ISelInst::new(
+                X86Opcode::Jcc,
+                vec![
+                    X86ISelOperand::CondCode(X86CondCode::S),
+                    X86ISelOperand::Block(Block(0)),
+                ],
+            ),
+        ]);
+        let mut pass = X86Peephole::default();
+        pass.run(&mut func);
+        assert!(
+            entry_opcodes(&func).contains(&X86Opcode::ImulRRI),
+            "reader past a partial writer must keep the IMUL"
+        );
     }
 
     #[test]

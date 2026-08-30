@@ -857,51 +857,6 @@ impl MetalKernelEmitter {
         self.emit_matmul_scalar(out, m, k, n);
     }
 
-    /// Emit the aligned tiled 8x8 matmul using `simdgroup_matrix`.
-    ///
-    /// Precondition: caller has verified M, K, N are all multiples of 8.
-    /// A grid-bounds early-return is still emitted so rounded-up dispatch
-    /// grids (e.g. `MetalDispatchParams::for_2d`) stay safe.
-    #[allow(dead_code)]
-    fn emit_matmul_simdgroup(&self, out: &mut String, m: u64, k: u64, n: u64) {
-        let ty = &self.elem_type;
-        out.push_str("#include <metal_simdgroup_matrix>\n\n");
-        out.push_str(&format!(
-            "kernel void trust_cg_matmul_{node}(\n\
-             \x20   const device {ty}* A  [[buffer(0)]],\n\
-             \x20   const device {ty}* B  [[buffer(1)]],\n\
-             \x20   device {ty}* C        [[buffer(2)]],\n\
-             \x20   uint2 gid [[thread_position_in_grid]])\n\
-             {{\n\
-             \x20   const uint M = {m}u;\n\
-             \x20   const uint K = {k}u;\n\
-             \x20   const uint N = {n}u;\n\
-             \x20   uint row = gid.y;\n\
-             \x20   uint col = gid.x;\n\
-             \x20   if (row >= M || col >= N) return;\n\
-             \x20   simdgroup_matrix<{ty}, 8, 8> acc;\n\
-             \x20   acc = make_filled_simdgroup_matrix<{ty}, 8, 8>(0.0{suffix});\n\
-             \x20   for (uint kk = 0; kk < K; kk += 8) {{\n\
-             \x20       simdgroup_matrix<{ty}, 8, 8> a_tile, b_tile;\n\
-             \x20       simdgroup_load(a_tile, A + row * K + kk, K);\n\
-             \x20       simdgroup_load(b_tile, B + kk * N + col, N);\n\
-             \x20       simdgroup_multiply_accumulate(acc, a_tile, b_tile, acc);\n\
-             \x20   }}\n\
-             \x20   simdgroup_store(acc, C + row * N + col, N);\n\
-             }}\n",
-            node = self.node_id,
-            ty = ty,
-            m = m,
-            k = k,
-            n = n,
-            suffix = if *ty == MslElementType::Half {
-                "h"
-            } else {
-                "f"
-            },
-        ));
-    }
-
     /// Emit a scalar per-thread matmul kernel for shapes not divisible by 8.
     ///
     /// One thread owns one output element `C[row, col]`. The per-thread

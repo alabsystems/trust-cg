@@ -185,8 +185,12 @@ pub enum ISelError {
         "block {block} already contains instructions at first selection — a synthesized block (switch BST node / trap block) aliased a real LIR block id; refusing to merge control flow (fail-closed, A64-4/JIT-2 class)"
     )]
     BlockAlreadyPopulated { block: u32 },
-    #[error("unsupported type for Fconst: {0:?} (expected F32 or F64)")]
+    #[error("unsupported type for Fconst: {0:?} (expected F16, F32, or F64)")]
     UnsupportedFconstType(Type),
+    #[error(
+        "AArch64 FEAT_FP16 is not admitted for {operation}; the generic AArch64 baseline may only transport f16 values and convert f16 <-> f32/f64"
+    )]
+    Aarch64Fp16NotAdmitted { operation: &'static str },
     #[error("unsupported opcode for AArch64 ISel: {0}")]
     UnsupportedOpcode(String),
     #[error("unsupported integer type for {op}: {ty:?}")]
@@ -1648,6 +1652,20 @@ pub struct InstructionSelector {
     /// (`lower_formal_arguments`) both read this field, so they cannot drift
     /// apart within a function. See [`AArch64AbiVariant`].
     abi_variant: AArch64AbiVariant,
+    /// Whether the resolved target profile authorizes ARMv8.1-A LSE atomics.
+    ///
+    /// Generic AArch64 deliberately defaults to `false`. `AtomicRmw` and
+    /// `CmpXchg` currently lower through LSE instructions; until a proven LL/SC
+    /// retry-loop lowering exists they must fail closed unless the owning
+    /// codegen pipeline explicitly admits LSE for its target or JIT host.
+    lse_enabled: bool,
+    /// Whether the resolved target profile authorizes FEAT_FP16 scalar forms.
+    ///
+    /// AArch64's base FP extension includes half-precision loads/stores and
+    /// `FCVT H <-> S/D`, but not scalar half arithmetic, comparisons, integer
+    /// conversions, or `FMOV` forms. Those instructions must fail closed on a
+    /// generic target unless the owning pipeline explicitly admits FEAT_FP16.
+    fp16_enabled: bool,
     /// Per-block flags-consuming compare fold plan (icmp -> C/FCSEL). Computed
     /// by [`Self::detect_select_cond_folds`] at the start of each block, keyed
     /// on the block-local instruction index, consulted by `select_csel` and by
@@ -1715,6 +1733,8 @@ impl InstructionSelector {
             formal_args_block: None,
             sret_return_ptr: None,
             abi_variant: AArch64AbiVariant::default(),
+            lse_enabled: false,
+            fp16_enabled: false,
             select_cond_fold_analysis: SelectCondFoldAnalysis::default(),
         }
     }
@@ -1726,6 +1746,22 @@ impl InstructionSelector {
     /// callee sides must agree. See [`AArch64AbiVariant`].
     pub fn set_abi_variant(&mut self, variant: AArch64AbiVariant) {
         self.abi_variant = variant;
+    }
+
+    /// Admit ARMv8.1-A LSE instructions for this selection run.
+    ///
+    /// This is a target capability, not an optimization preference. Callers
+    /// must bind the resolved value into any reusable artifact identity.
+    pub fn set_lse_enabled(&mut self, enabled: bool) {
+        self.lse_enabled = enabled;
+    }
+
+    /// Admit FEAT_FP16 scalar instructions for this selection run.
+    ///
+    /// This is a target capability, not an optimization preference. Callers
+    /// must bind the resolved value into any reusable artifact identity.
+    pub fn set_fp16_enabled(&mut self, enabled: bool) {
+        self.fp16_enabled = enabled;
     }
 
     /// Seed whole-function value use counts from a complete LIR function.
@@ -2388,6 +2424,88 @@ impl InstructionSelector {
         }
     }
 
+    /// Return the FEAT_FP16 scalar family required by `inst`, if any.
+    ///
+    /// This is deliberately type-sensitive. The same machine opcode encodes
+    /// baseline S/D forms and extension-only H forms, so an opcode-only gate
+    /// would either reject portable f32/f64 programs or admit illegal f16
+    /// machine code. Base AArch64 does support half loads/stores and `FCVT`
+    /// between H and S/D; `FPExt` and `FPTrunc` therefore do not appear here.
+    fn fp16_native_operation_with<F>(inst: &Instruction, value_type: F) -> Option<&'static str>
+    where
+        F: Fn(&Value) -> Option<Type>,
+    {
+        let arg_is_f16 = |index: usize| {
+            inst.args
+                .get(index)
+                .and_then(&value_type)
+                .is_some_and(|ty| ty == Type::F16)
+        };
+        let result_is_f16 = |index: usize| {
+            inst.results
+                .get(index)
+                .and_then(&value_type)
+                .is_some_and(|ty| ty == Type::F16)
+        };
+
+        match &inst.opcode {
+            Opcode::Fconst { ty: Type::F16, .. } => Some("FMOV-immediate/GPR-to-H f16 constant"),
+            Opcode::Select { .. } if arg_is_f16(1) => Some("FMOV H<->W f16 select"),
+            Opcode::Fadd if arg_is_f16(0) => Some("FADD H"),
+            Opcode::Fsub if arg_is_f16(0) => Some("FSUB H"),
+            Opcode::Fmul if arg_is_f16(0) => Some("FMUL H"),
+            Opcode::Fdiv if arg_is_f16(0) => Some("FDIV H"),
+            Opcode::Fma | Opcode::Fmuladd if arg_is_f16(0) => Some("FMADD H"),
+            Opcode::Fmin if arg_is_f16(0) => Some("FMINNM H"),
+            Opcode::Fmax if arg_is_f16(0) => Some("FMAXNM H"),
+            Opcode::Fneg if arg_is_f16(0) => Some("FNEG H"),
+            Opcode::Fabs if arg_is_f16(0) => Some("FABS H"),
+            Opcode::Fsqrt if arg_is_f16(0) => Some("FSQRT H"),
+            Opcode::Ffloor if arg_is_f16(0) => Some("FRINTM H"),
+            Opcode::Fceil if arg_is_f16(0) => Some("FRINTP H"),
+            Opcode::Ftrunc if arg_is_f16(0) => Some("FRINTZ H"),
+            Opcode::Fcmp { .. } if arg_is_f16(0) => Some("FCMP H"),
+            Opcode::FcvtToInt { .. } if arg_is_f16(0) => Some("FCVTZS H"),
+            Opcode::FcvtToUint { .. } if arg_is_f16(0) => Some("FCVTZU H"),
+            Opcode::FcvtFromInt { src_ty } => {
+                let produces_f16 = result_is_f16(0)
+                    || (inst.results.first().and_then(&value_type).is_none()
+                        && Self::default_int_to_float_result_type(src_ty) == Type::F16);
+                produces_f16.then_some("SCVTF H")
+            }
+            Opcode::FcvtFromUint { src_ty } => {
+                let produces_f16 = result_is_f16(0)
+                    || (inst.results.first().and_then(&value_type).is_none()
+                        && Self::default_int_to_float_result_type(src_ty) == Type::F16);
+                produces_f16.then_some("UCVTF H")
+            }
+            Opcode::Bitcast { to_ty }
+                if (*to_ty == Type::F16 || arg_is_f16(0))
+                    && !(*to_ty == Type::F16 && arg_is_f16(0)) =>
+            {
+                Some("FMOV H<->W/H f16 bitcast")
+            }
+            _ => None,
+        }
+    }
+
+    fn ensure_fp16_instruction_admitted_with<F>(
+        &self,
+        inst: &Instruction,
+        value_type: F,
+    ) -> Result<(), ISelError>
+    where
+        F: Fn(&Value) -> Option<Type>,
+    {
+        if self.fp16_enabled {
+            return Ok(());
+        }
+        match Self::fp16_native_operation_with(inst, value_type) {
+            Some(operation) => Err(ISelError::Aarch64Fp16NotAdmitted { operation }),
+            None => Ok(()),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Top-level selection
     // -----------------------------------------------------------------------
@@ -2535,6 +2653,16 @@ impl InstructionSelector {
                 digest: inst.lowering_digest(),
                 trust_ir_inst: self.current_trust_ir_origin,
             };
+            // A fold can skip the source FCMP and re-emit it at its Select
+            // consumer. Check that skipped source instruction against the
+            // already-selected value types before the skip, so the fold cannot
+            // bypass FEAT_FP16 admission. FCMP operands dominate the compare,
+            // so their types are present even though its boolean result is not.
+            if self.select_cond_fold_analysis.is_skipped(i) {
+                self.ensure_fp16_instruction_admitted_with(inst, |value| {
+                    self.value_types.get(value).cloned()
+                })?;
+            }
             if self.overflow_analysis.is_skipped(i)
                 || self.smulh_analysis.is_skipped(i)
                 || self.bitreverse_analysis.is_skipped(i)
@@ -2571,6 +2699,9 @@ impl InstructionSelector {
 
     /// Select a single trust_ir instruction, emitting ISelInsts into the block.
     fn select_instruction(&mut self, inst: &Instruction, block: Block) -> Result<(), ISelError> {
+        self.ensure_fp16_instruction_admitted_with(inst, |value| {
+            self.value_types.get(value).cloned()
+        })?;
         match &inst.opcode {
             // Constants
             Opcode::Iconst {
@@ -3579,23 +3710,41 @@ impl InstructionSelector {
         }
 
         // The AArch64 scalar FMOV-immediate form only encodes a small set of
-        // values (±2^[-3..4] × 1.defgh). For any other value the 8-bit immediate
-        // encoder silently returns 0, which decodes to +2.0 — a miscompile. So
-        // emit FmovImm only for encodable values; otherwise materialize the IEEE
-        // bit pattern in a GPR and FMOV it into the FP register. (F16 keeps the
-        // FmovImm path: its non-encodable handling is a separate, rarer concern.)
-        if ty == Type::F16 || Self::fmov_imm8_encodable(imm) {
+        // values (±2^[-3..4] × 1.defgh). Emit it only for an exactly encodable
+        // value; otherwise materialize the IEEE bits in a GPR and FMOV them
+        // into the FPR. The encoder independently rejects an unencodable FImm,
+        // so a selector regression cannot silently turn into the imm8=0
+        // encoding (+2.0).
+        //
+        // F16 needs one extra step: the LIR stores its literal in an f64
+        // carrier, so quantize that value directly to IEEE binary16 (RNE) and
+        // use the QUANTIZED value for the encodability decision. Testing the
+        // original f64 would wrongly reject a value such as `1.0 + epsilon`
+        // that rounds to the encodable half value 1.0; feeding the original to
+        // FmovImm would be worse, because the hardware can only materialize the
+        // rounded half value.
+        let f16_bits_and_value = (ty == Type::F16).then(|| {
+            let bits = Self::f64_to_binary16_bits(imm);
+            (bits, Self::binary16_bits_to_f64(bits))
+        });
+        let immediate_value = f16_bits_and_value.map_or(imm, |(_, value)| value);
+
+        if Self::fmov_imm8_encodable(immediate_value) {
             self.emit(
                 block,
                 ISelInst::new(
                     AArch64Opcode::FmovImm,
-                    vec![ISelOperand::VReg(dst), ISelOperand::FImm(imm)],
+                    vec![ISelOperand::VReg(dst), ISelOperand::FImm(immediate_value)],
                 ),
             );
         } else {
             let (bits, gpr_class) = match ty {
+                Type::F16 => (
+                    u64::from(f16_bits_and_value.expect("F16 bits computed above").0),
+                    RegClass::Gpr32,
+                ),
                 Type::F32 => (u64::from((imm as f32).to_bits()), RegClass::Gpr32),
-                // F64 (F16 handled above, others rejected above).
+                // F64 (F16/F32 handled above, others rejected above).
                 _ => (imm.to_bits(), RegClass::Gpr64),
             };
             let gpr = self.new_vreg(gpr_class);
@@ -3611,6 +3760,91 @@ impl InstructionSelector {
 
         self.define_value(*result, ISelOperand::VReg(dst), ty);
         Ok(())
+    }
+
+    /// Round an f64 carrier directly to IEEE-754 binary16 bits (round to
+    /// nearest, ties to even).
+    ///
+    /// This avoids an f64 -> f32 -> f16 double-rounding path. NaNs preserve the
+    /// sign and the high payload bits while being quieted; an all-zero narrowed
+    /// payload is forced non-zero.
+    fn f64_to_binary16_bits(value: f64) -> u16 {
+        let bits = value.to_bits();
+        let sign = ((bits >> 48) & 0x8000) as u16;
+        let exponent = ((bits >> 52) & 0x7ff) as i32;
+        let fraction = bits & 0x000f_ffff_ffff_ffff;
+
+        if exponent == 0x7ff {
+            if fraction == 0 {
+                return sign | 0x7c00;
+            }
+            let payload = ((fraction >> 42) as u16 & 0x03ff) | 0x0200;
+            return sign | 0x7c00 | payload;
+        }
+
+        // Every binary64 zero/subnormal is far below the smallest binary16
+        // subnormal (2^-24), so it rounds to signed zero.
+        if exponent == 0 {
+            return sign;
+        }
+
+        let unbiased_exponent = exponent - 1023;
+        let significand = (1u64 << 52) | fraction;
+
+        if unbiased_exponent < -25 {
+            return sign;
+        }
+
+        if unbiased_exponent < -14 {
+            // A binary16 subnormal is `mantissa * 2^-24`. Convert the binary64
+            // significand into that integer scale and round once. At e=-25,
+            // an exact 2^-25 is the tie between zero and the least subnormal;
+            // ties-to-even correctly chooses zero.
+            let shift = (28 - unbiased_exponent) as u32;
+            let mantissa = Self::round_shift_right_ties_even(significand, shift) as u16;
+            return sign | mantissa;
+        }
+
+        if unbiased_exponent > 15 {
+            return sign | 0x7c00;
+        }
+
+        // Normal binary16 keeps the hidden bit plus ten fraction bits.
+        let mut half_exponent = unbiased_exponent;
+        let mut rounded = Self::round_shift_right_ties_even(significand, 42);
+        if rounded == 0x0800 {
+            rounded = 0x0400;
+            half_exponent += 1;
+        }
+        if half_exponent > 15 {
+            return sign | 0x7c00;
+        }
+
+        sign | (((half_exponent + 15) as u16) << 10) | (rounded as u16 & 0x03ff)
+    }
+
+    fn round_shift_right_ties_even(value: u64, shift: u32) -> u64 {
+        debug_assert!((1..64).contains(&shift));
+        let truncated = value >> shift;
+        let remainder_mask = (1u64 << shift) - 1;
+        let remainder = value & remainder_mask;
+        let halfway = 1u64 << (shift - 1);
+        truncated + u64::from(remainder > halfway || (remainder == halfway && truncated & 1 != 0))
+    }
+
+    /// Widen binary16 bits exactly into the f64 carrier used by LIR FImm.
+    fn binary16_bits_to_f64(bits: u16) -> f64 {
+        let negative = bits & 0x8000 != 0;
+        let exponent = ((bits >> 10) & 0x1f) as i32;
+        let fraction = u32::from(bits & 0x03ff);
+        let magnitude = match exponent {
+            0 if fraction == 0 => 0.0,
+            0 => f64::from(fraction) * 2f64.powi(-24),
+            0x1f if fraction == 0 => f64::INFINITY,
+            0x1f => f64::NAN,
+            _ => (1.0 + f64::from(fraction) / 1024.0) * 2f64.powi(exponent - 15),
+        };
+        if negative { -magnitude } else { magnitude }
     }
 
     /// Whether `value` is exactly representable by the AArch64 scalar
@@ -3737,7 +3971,10 @@ impl InstructionSelector {
     /// Build a class-correct register-to-register copy instruction.
     ///
     /// - GPR (and System) copies use `MovR` (`ORR Rd, XZR, Rm` / `MOV`).
-    /// - Scalar FPR copies (H/S/D) use `FmovFprFpr` (`FMOV Hd/Sd/Dd, ..`).
+    /// - Half-precision FPR copies use the baseline `ORR Vd.16B, Vn.16B,
+    ///   Vn.16B` vector-move alias. `FMOV Hd,Hn` requires FEAT_FP16, while
+    ///   bytewise NEON ORR preserves the low half bits without that extension.
+    /// - Scalar S/D copies use `FmovFprFpr` (`FMOV Sd/Dd, ..`).
     /// - Full 128-bit vector copies use `NeonOrrV dst, src, src`
     ///   (`ORR Vd.16B, Vn.16B, Vn.16B`, the architectural `MOV Vd.16B, Vn.16B`
     ///   alias) because scalar `FMOV` has no Q-register form and would
@@ -3752,7 +3989,11 @@ impl InstructionSelector {
             RegClass::Gpr32 | RegClass::Gpr64 | RegClass::System => {
                 Ok(ISelInst::new(AArch64Opcode::MovR, vec![dst, src]))
             }
-            RegClass::Fpr16 | RegClass::Fpr32 | RegClass::Fpr64 => {
+            RegClass::Fpr16 => Ok(ISelInst::new(
+                AArch64Opcode::NeonOrrV,
+                vec![dst, src.clone(), src, ISelOperand::Imm(1)],
+            )),
+            RegClass::Fpr32 | RegClass::Fpr64 => {
                 Ok(ISelInst::new(AArch64Opcode::FmovFprFpr, vec![dst, src]))
             }
             RegClass::Fpr128 => Ok(ISelInst::new(
@@ -9245,6 +9486,14 @@ impl InstructionSelector {
         Self::require_result(inst, "AtomicRmw")?;
 
         Self::require_aarch64_atomic_rmw_lse_coverage(op, &ty, ordering)?;
+        if !self.lse_enabled {
+            return Err(ISelError::UnsupportedAtomicRmw {
+                op,
+                ty,
+                ordering,
+                reason: "LSE target capability is not enabled; generic AArch64 needs a proven LL/SC lowering",
+            });
+        }
 
         let val_val = inst.args[0];
         let addr_val = inst.args[1];
@@ -9473,6 +9722,15 @@ impl InstructionSelector {
                 success,
                 failure,
                 reason: "invalid compare-exchange failure ordering",
+            });
+        }
+
+        if !self.lse_enabled {
+            return Err(ISelError::UnsupportedCmpXchg {
+                ty,
+                success,
+                failure,
+                reason: "LSE target capability is not enabled; generic AArch64 needs a proven LL/SC lowering",
             });
         }
 
@@ -13747,6 +14005,15 @@ impl InstructionSelector {
         let dst_class = reg_class_for_type(to_ty);
         let dst = self.new_vreg(dst_class);
 
+        // A same-type f16 bitcast is a pure bit copy. Use the baseline NEON
+        // vector-move alias rather than the FEAT_FP16-only `FMOV Hd,Hn` form.
+        if src_ty == Type::F16 && *to_ty == Type::F16 {
+            let copy = Self::register_copy_inst(RegClass::Fpr16, ISelOperand::VReg(dst), src)?;
+            self.emit(block, copy);
+            self.define_value(result_val, ISelOperand::VReg(dst), to_ty.clone());
+            return Ok(());
+        }
+
         let opc = match (src_is_fp, dst_is_fp) {
             // GPR -> FPR (integer bits reinterpreted as float)
             (false, true) => AArch64Opcode::FmovGprFpr,
@@ -16769,6 +17036,14 @@ mod tests {
             returns: vec![],
         };
         let mut isel = InstructionSelector::new("test".to_string(), sig);
+        // Most selector unit tests exercise concrete ARMv8.1-A opcode shapes.
+        // Production/default selector construction remains generic and
+        // fail-closed; capability-default coverage below constructs directly.
+        isel.set_lse_enabled(true);
+        // Likewise, the many f16 shape tests below exercise the admitted
+        // FEAT_FP16 path. Dedicated capability tests construct a fresh default
+        // selector and prove that production selection fails closed.
+        isel.set_fp16_enabled(true);
         let entry = Block(0);
         isel.func.ensure_block(entry);
         (isel, entry)
@@ -28084,6 +28359,85 @@ mod tests {
     }
 
     #[test]
+    fn binary16_constant_rounding_is_direct_rne_and_covers_edges() {
+        let qnan = InstructionSelector::f64_to_binary16_bits(f64::NAN);
+        let neg_qnan = InstructionSelector::f64_to_binary16_bits(f64::from_bits(
+            f64::NAN.to_bits() | (1u64 << 63),
+        ));
+        let cases = [
+            (0.0, 0x0000),
+            (-0.0, 0x8000),
+            (0.1, 0x2e66),
+            (65504.0, 0x7bff),
+            (65520.0, 0x7c00),
+            (f64::INFINITY, 0x7c00),
+            (f64::NEG_INFINITY, 0xfc00),
+            (2f64.powi(-14), 0x0400),
+            (2f64.powi(-24), 0x0001),
+            // Exact tie between zero (even) and the least subnormal.
+            (2f64.powi(-25), 0x0000),
+            // Exact tie between 1.0 (even mantissa) and the next half.
+            (1.0 + 2f64.powi(-11), 0x3c00),
+            // Next tie rounds away from the odd mantissa to 0x3c02.
+            (1.0 + 3.0 * 2f64.powi(-11), 0x3c02),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(
+                InstructionSelector::f64_to_binary16_bits(value),
+                expected,
+                "wrong binary16 RNE result for {value:?}"
+            );
+        }
+        assert_eq!(qnan & 0x7c00, 0x7c00);
+        assert_ne!(qnan & 0x03ff, 0, "NaN payload must remain non-zero");
+        assert_ne!(qnan & 0x0200, 0, "narrowed NaN must be quiet");
+        assert_eq!(neg_qnan & 0x8000, 0x8000, "NaN sign must be preserved");
+    }
+
+    #[test]
+    fn unencodable_f16_constants_materialize_exact_half_bits() {
+        for (value, expected_bits) in [
+            (0.0, 0x0000),
+            (-0.0, 0x8000),
+            (0.1, 0x2e66),
+            (f64::INFINITY, 0x7c00),
+            (f64::NEG_INFINITY, 0xfc00),
+            (f64::NAN, 0x7e00),
+        ] {
+            let (mut isel, entry) = make_empty_isel();
+            isel.select_instruction(
+                &Instruction {
+                    opcode: Opcode::Fconst {
+                        ty: Type::F16,
+                        imm: value,
+                    },
+                    args: vec![],
+                    results: vec![Value(0)],
+                },
+                entry,
+            )
+            .unwrap();
+
+            let mfunc = isel.finalize();
+            let insts = &mfunc.blocks[&entry].insts;
+            assert_eq!(insts.len(), 2, "{value:?} should use MOVZ + FMOV H,W");
+            assert_eq!(insts[0].opcode, AArch64Opcode::Movz);
+            assert_eq!(
+                insts[0].operands[1],
+                ISelOperand::Imm(expected_bits),
+                "wrong binary16 payload for {value:?}"
+            );
+            assert_eq!(insts[1].opcode, AArch64Opcode::FmovGprFpr);
+            assert!(
+                insts
+                    .iter()
+                    .all(|inst| inst.opcode != AArch64Opcode::FmovImm),
+                "unencodable {value:?} must never reach FMOV-immediate"
+            );
+        }
+    }
+
+    #[test]
     fn select_fconst_f64() {
         let (mut isel, entry) = make_empty_isel();
         isel.select_instruction(
@@ -29968,6 +30322,439 @@ mod tests {
             matches!(insts[1].operands[0], ISelOperand::VReg(v) if v.class == RegClass::Gpr64),
             "i64 AtomicStore must feed STLR with a Gpr64 source operand"
         );
+    }
+
+    #[test]
+    fn generic_aarch64_rejects_lse_rmw_but_keeps_non_atomic_lowering() {
+        let sig = Signature {
+            params: vec![],
+            returns: vec![],
+        };
+        let mut isel = InstructionSelector::new("generic".to_string(), sig);
+        let entry = Block(0);
+        isel.func.ensure_block(entry);
+        let lhs = isel.new_vreg(RegClass::Gpr64);
+        let rhs = isel.new_vreg(RegClass::Gpr64);
+        isel.define_value(Value(0), ISelOperand::VReg(lhs), Type::I64);
+        isel.define_value(Value(1), ISelOperand::VReg(rhs), Type::I64);
+
+        isel.select_instruction(
+            &Instruction {
+                opcode: Opcode::Iadd,
+                args: vec![Value(0), Value(1)],
+                results: vec![Value(2)],
+            },
+            entry,
+        )
+        .expect("generic AArch64 must continue lowering ordinary instructions");
+
+        let err = isel
+            .select_instruction(
+                &Instruction {
+                    opcode: Opcode::AtomicRmw {
+                        op: AtomicRmwOp::Add,
+                        ty: Type::I64,
+                        ordering: AtomicOrdering::Relaxed,
+                    },
+                    args: vec![Value(0), Value(1)],
+                    results: vec![Value(3)],
+                },
+                entry,
+            )
+            .expect_err("generic AArch64 must not emit an unadmitted LSE instruction");
+        assert!(matches!(
+            err,
+            ISelError::UnsupportedAtomicRmw {
+                reason: "LSE target capability is not enabled; generic AArch64 needs a proven LL/SC lowering",
+                ..
+            }
+        ));
+
+        let func = isel.finalize();
+        assert_eq!(func.blocks[&entry].insts.len(), 1);
+        assert_eq!(func.blocks[&entry].insts[0].opcode, AArch64Opcode::AddRR);
+    }
+
+    #[test]
+    fn fp16_native_admission_classifier_covers_every_scalar_h_family() {
+        let f16_type = |value: &Value| match value.0 {
+            0 | 1 | 2 => Some(Type::F16),
+            3 => Some(Type::B1),
+            4 => Some(Type::I16),
+            5 => Some(Type::F32),
+            6 => Some(Type::I64),
+            _ => None,
+        };
+        let native_h_instructions = vec![
+            Instruction {
+                opcode: Opcode::Fconst {
+                    ty: Type::F16,
+                    imm: 0.1,
+                },
+                args: vec![],
+                results: vec![Value(2)],
+            },
+            Instruction {
+                opcode: Opcode::Select {
+                    cond: IntCC::NotEqual,
+                },
+                args: vec![Value(3), Value(0), Value(1)],
+                results: vec![Value(2)],
+            },
+            Instruction {
+                opcode: Opcode::Fadd,
+                args: vec![Value(0), Value(1)],
+                results: vec![Value(2)],
+            },
+            Instruction {
+                opcode: Opcode::Fsub,
+                args: vec![Value(0), Value(1)],
+                results: vec![Value(2)],
+            },
+            Instruction {
+                opcode: Opcode::Fmul,
+                args: vec![Value(0), Value(1)],
+                results: vec![Value(2)],
+            },
+            Instruction {
+                opcode: Opcode::Fdiv,
+                args: vec![Value(0), Value(1)],
+                results: vec![Value(2)],
+            },
+            Instruction {
+                opcode: Opcode::Fma,
+                args: vec![Value(0), Value(1), Value(0)],
+                results: vec![Value(2)],
+            },
+            Instruction {
+                opcode: Opcode::Fmuladd,
+                args: vec![Value(0), Value(1), Value(0)],
+                results: vec![Value(2)],
+            },
+            Instruction {
+                opcode: Opcode::Fmin,
+                args: vec![Value(0), Value(1)],
+                results: vec![Value(2)],
+            },
+            Instruction {
+                opcode: Opcode::Fmax,
+                args: vec![Value(0), Value(1)],
+                results: vec![Value(2)],
+            },
+            Instruction {
+                opcode: Opcode::Fneg,
+                args: vec![Value(0)],
+                results: vec![Value(2)],
+            },
+            Instruction {
+                opcode: Opcode::Fabs,
+                args: vec![Value(0)],
+                results: vec![Value(2)],
+            },
+            Instruction {
+                opcode: Opcode::Fsqrt,
+                args: vec![Value(0)],
+                results: vec![Value(2)],
+            },
+            Instruction {
+                opcode: Opcode::Ffloor,
+                args: vec![Value(0)],
+                results: vec![Value(2)],
+            },
+            Instruction {
+                opcode: Opcode::Fceil,
+                args: vec![Value(0)],
+                results: vec![Value(2)],
+            },
+            Instruction {
+                opcode: Opcode::Ftrunc,
+                args: vec![Value(0)],
+                results: vec![Value(2)],
+            },
+            Instruction {
+                opcode: Opcode::Fcmp {
+                    cond: FloatCC::Equal,
+                },
+                args: vec![Value(0), Value(1)],
+                results: vec![Value(3)],
+            },
+            Instruction {
+                opcode: Opcode::FcvtToInt { dst_ty: Type::I16 },
+                args: vec![Value(0)],
+                results: vec![Value(4)],
+            },
+            Instruction {
+                opcode: Opcode::FcvtToUint { dst_ty: Type::I16 },
+                args: vec![Value(0)],
+                results: vec![Value(4)],
+            },
+            Instruction {
+                opcode: Opcode::FcvtFromInt { src_ty: Type::I16 },
+                args: vec![Value(4)],
+                results: vec![Value(2)],
+            },
+            Instruction {
+                opcode: Opcode::FcvtFromUint { src_ty: Type::I16 },
+                args: vec![Value(4)],
+                results: vec![Value(2)],
+            },
+            Instruction {
+                opcode: Opcode::Bitcast { to_ty: Type::I16 },
+                args: vec![Value(0)],
+                results: vec![Value(4)],
+            },
+            Instruction {
+                opcode: Opcode::Bitcast { to_ty: Type::F16 },
+                args: vec![Value(4)],
+                results: vec![Value(2)],
+            },
+        ];
+
+        for inst in &native_h_instructions {
+            assert!(
+                InstructionSelector::fp16_native_operation_with(inst, f16_type).is_some(),
+                "missing FEAT_FP16 admission for {:?}",
+                inst.opcode
+            );
+        }
+
+        let baseline_half_instructions = [
+            Instruction {
+                opcode: Opcode::Copy,
+                args: vec![Value(0)],
+                results: vec![Value(2)],
+            },
+            Instruction {
+                opcode: Opcode::Bitcast { to_ty: Type::F16 },
+                args: vec![Value(0)],
+                results: vec![Value(2)],
+            },
+            Instruction {
+                opcode: Opcode::FPExt,
+                args: vec![Value(0)],
+                results: vec![Value(5)],
+            },
+            Instruction {
+                opcode: Opcode::FPTrunc,
+                args: vec![Value(5)],
+                results: vec![Value(2)],
+            },
+            Instruction {
+                opcode: Opcode::Load {
+                    ty: Type::F16,
+                    align: None,
+                },
+                args: vec![Value(6)],
+                results: vec![Value(2)],
+            },
+            Instruction {
+                opcode: Opcode::Store {
+                    ty: Type::F16,
+                    align: None,
+                },
+                args: vec![Value(0), Value(6)],
+                results: vec![],
+            },
+        ];
+        for inst in &baseline_half_instructions {
+            assert_eq!(
+                InstructionSelector::fp16_native_operation_with(inst, f16_type),
+                None,
+                "baseline half transport/conversion was over-gated: {:?}",
+                inst.opcode
+            );
+        }
+    }
+
+    #[test]
+    fn generic_aarch64_rejects_fp16_arithmetic_and_admitted_profile_selects_it() {
+        let sig = Signature {
+            params: vec![Type::F16, Type::F16],
+            returns: vec![Type::F16],
+        };
+        let instruction = Instruction {
+            opcode: Opcode::Fadd,
+            args: vec![Value(0), Value(1)],
+            results: vec![Value(2)],
+        };
+
+        let mut baseline = InstructionSelector::new("generic_f16".to_string(), sig.clone());
+        let entry = Block(0);
+        baseline.lower_formal_arguments(&sig, entry).unwrap();
+        let err = baseline
+            .select_block(entry, std::slice::from_ref(&instruction))
+            .expect_err("generic AArch64 must not emit FADD H");
+        assert!(matches!(
+            err,
+            ISelError::Aarch64Fp16NotAdmitted {
+                operation: "FADD H"
+            }
+        ));
+
+        let mut admitted = InstructionSelector::new("fp16_fadd".to_string(), sig.clone());
+        admitted.set_fp16_enabled(true);
+        admitted.lower_formal_arguments(&sig, entry).unwrap();
+        admitted
+            .select_block(entry, std::slice::from_ref(&instruction))
+            .expect("an admitted FEAT_FP16 profile must select FADD H");
+        let func = admitted.finalize();
+        assert_eq!(func.blocks[&entry].insts[2].opcode, AArch64Opcode::FaddRR);
+    }
+
+    #[test]
+    fn generic_aarch64_allows_baseline_half_precision_conversions() {
+        let entry = Block(0);
+
+        let ext_sig = Signature {
+            params: vec![Type::F16],
+            returns: vec![Type::F32],
+        };
+        let mut ext = InstructionSelector::new("baseline_fcvt_hs".to_string(), ext_sig.clone());
+        ext.lower_formal_arguments(&ext_sig, entry).unwrap();
+        ext.value_types.insert(Value(1), Type::F32);
+        ext.select_block(
+            entry,
+            &[Instruction {
+                opcode: Opcode::FPExt,
+                args: vec![Value(0)],
+                results: vec![Value(1)],
+            }],
+        )
+        .expect("FCVT S,H belongs to baseline AArch64 FP");
+        assert_eq!(
+            ext.finalize().blocks[&entry].insts[1].opcode,
+            AArch64Opcode::FcvtHS
+        );
+
+        let trunc_sig = Signature {
+            params: vec![Type::F32],
+            returns: vec![Type::F16],
+        };
+        let mut trunc = InstructionSelector::new("baseline_fcvt_sh".to_string(), trunc_sig.clone());
+        trunc.lower_formal_arguments(&trunc_sig, entry).unwrap();
+        trunc.value_types.insert(Value(1), Type::F16);
+        trunc
+            .select_block(
+                entry,
+                &[Instruction {
+                    opcode: Opcode::FPTrunc,
+                    args: vec![Value(0)],
+                    results: vec![Value(1)],
+                }],
+            )
+            .expect("FCVT H,S belongs to baseline AArch64 FP");
+        assert_eq!(
+            trunc.finalize().blocks[&entry].insts[1].opcode,
+            AArch64Opcode::FcvtSH
+        );
+    }
+
+    #[test]
+    fn generic_aarch64_uses_baseline_neon_move_for_f16_copy() {
+        let sig = Signature {
+            params: vec![],
+            returns: vec![],
+        };
+        let mut isel = InstructionSelector::new("baseline_f16_copy".to_string(), sig);
+        let entry = Block(0);
+        isel.func.ensure_block(entry);
+        let src = isel.new_vreg(RegClass::Fpr16);
+        isel.define_value(Value(0), ISelOperand::VReg(src), Type::F16);
+
+        isel.select_instruction(
+            &Instruction {
+                opcode: Opcode::Copy,
+                args: vec![Value(0)],
+                results: vec![Value(1)],
+            },
+            entry,
+        )
+        .expect("an f16 bit copy must not require FEAT_FP16");
+
+        let func = isel.finalize();
+        let copy = &func.blocks[&entry].insts[0];
+        assert_eq!(copy.opcode, AArch64Opcode::NeonOrrV);
+        assert_eq!(copy.operands[3], ISelOperand::Imm(1));
+    }
+
+    #[test]
+    fn folded_f16_compare_cannot_bypass_fp16_admission() {
+        let sig = Signature {
+            params: vec![Type::F16, Type::F16, Type::F32, Type::F32],
+            returns: vec![Type::F32],
+        };
+        let mut isel = InstructionSelector::new("folded_f16_fcmp".to_string(), sig.clone());
+        let entry = Block(0);
+        isel.lower_formal_arguments(&sig, entry).unwrap();
+        let instructions = [
+            Instruction {
+                opcode: Opcode::Fcmp {
+                    cond: FloatCC::GreaterThan,
+                },
+                args: vec![Value(0), Value(1)],
+                results: vec![Value(4)],
+            },
+            Instruction {
+                opcode: Opcode::Select {
+                    cond: IntCC::NotEqual,
+                },
+                args: vec![Value(4), Value(2), Value(3)],
+                results: vec![Value(5)],
+            },
+        ];
+        let err = isel
+            .select_block(entry, &instructions)
+            .expect_err("a folded FCMP H must retain its FEAT_FP16 admission check");
+        assert!(matches!(
+            err,
+            ISelError::Aarch64Fp16NotAdmitted {
+                operation: "FCMP H"
+            }
+        ));
+    }
+
+    #[test]
+    fn generic_aarch64_rejects_lse_cmpxchg() {
+        let sig = Signature {
+            params: vec![],
+            returns: vec![],
+        };
+        let mut isel = InstructionSelector::new("generic_cas".to_string(), sig);
+        let entry = Block(0);
+        isel.func.ensure_block(entry);
+        for value in 0..3 {
+            let class = if value == 2 {
+                RegClass::Gpr64
+            } else {
+                RegClass::Gpr32
+            };
+            let ty = if value == 2 { Type::I64 } else { Type::I32 };
+            let vreg = isel.new_vreg(class);
+            isel.define_value(Value(value), ISelOperand::VReg(vreg), ty);
+        }
+
+        let err = isel
+            .select_instruction(
+                &Instruction {
+                    opcode: Opcode::CmpXchg {
+                        ty: Type::I32,
+                        success: AtomicOrdering::SeqCst,
+                        failure: AtomicOrdering::Acquire,
+                    },
+                    args: vec![Value(0), Value(1), Value(2)],
+                    results: vec![Value(3)],
+                },
+                entry,
+            )
+            .expect_err("generic AArch64 must not emit an unadmitted CAS instruction");
+        assert!(matches!(
+            err,
+            ISelError::UnsupportedCmpXchg {
+                reason: "LSE target capability is not enabled; generic AArch64 needs a proven LL/SC lowering",
+                ..
+            }
+        ));
+        assert!(isel.func.blocks[&entry].insts.is_empty());
     }
 
     #[test]

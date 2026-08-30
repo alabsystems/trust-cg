@@ -521,10 +521,6 @@ fn find_exit_test(func: &MachFunction, exiting: BlockId, exit: BlockId) -> Optio
 struct IvInfo {
     /// The loop-carried IV (written in the preheader init and the latch write-back).
     iv: VReg,
-    /// True when the exit test compares `iv+1` (rotated); false when it compares
-    /// `iv` directly (top-/bottom-tested on the carried value).
-    #[allow(dead_code)]
-    test_is_next: bool,
 }
 
 /// Find a unit-stride IV among the latch write-backs whose value the exit test
@@ -576,15 +572,12 @@ fn find_counted_iv(
         if !dom.dominates(next_block, latch) {
             continue;
         }
-        // The exit test must compare this IV (directly or as iv+1).
-        let test_is_next = if exit_test.test == iv {
-            false
-        } else if exit_test.test == iv_next {
-            true
-        } else {
+        // The exit test must compare this IV (directly, or as `iv+1` when the
+        // loop is rotated).
+        if exit_test.test != iv && exit_test.test != iv_next {
             continue;
-        };
-        return Some(IvInfo { iv, test_is_next });
+        }
+        return Some(IvInfo { iv });
     }
     None
 }

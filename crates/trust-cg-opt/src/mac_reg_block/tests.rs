@@ -147,6 +147,30 @@ fn kill_switch_disables_pass() {
     assert_eq!(pass.fired(), 0);
 }
 
+#[test]
+fn no_madd_prefilter_skips_cached_cfg_analyses() {
+    // This counted loop has enough CFG structure to make both analyses do real
+    // work, but no Madd, so no mac-reg-block recognition can possibly succeed.
+    let (mut f, _, _, _) = build_counted_loop(24, 0, 1, false);
+    assert!(!has_live_madd(&f));
+
+    let mut direct_pass = MacRegBlock::new();
+    assert!(!<MacRegBlock as MachinePass>::run(&mut direct_pass, &mut f,));
+    assert_eq!(direct_pass.fired(), 0);
+
+    let mut pass = MacRegBlock::new();
+    let mut analyses = AnalysisCache::new();
+    assert!(!<MacRegBlock as MachinePass>::run_with_analyses(
+        &mut pass,
+        &mut f,
+        &mut analyses,
+    ));
+    assert_eq!(pass.fired(), 0);
+    let stats = analyses.stats();
+    assert_eq!(stats.domtree_computations, 0);
+    assert_eq!(stats.loop_analysis_computations, 0);
+}
+
 /// WRONG-CODE REGRESSION (2026-08-17): recognition used to accept any positive
 /// element scale while `apply` emits 64-bit lanes unconditionally, so an i32
 /// matmul (scale 4) became 64-bit loads at 4-byte strides — two packed i32s per

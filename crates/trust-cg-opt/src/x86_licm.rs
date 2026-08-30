@@ -251,7 +251,7 @@ fn run_impl(
 
     // Pure-call cluster hoist tier (gated default-OFF behind `TCG_PURE_CALL_HOIST`;
     // this pass has NO translation-validation net, so it stays opt-in until its
-    // `.fuzz-purecall/` adversarial corpus is differentially green). Hoists a
+    // `fuzz/repros/purecall/` adversarial corpus is differentially green). Hoists a
     // loop-invariant call to a proven-pure callee out of a loop PROVEN to run
     // >=1 time. Reuses the loops/idom/def_counts computed above — the existing
     // value-producer hoists move instructions between body and preheader but
@@ -537,6 +537,64 @@ fn preheader_insert_pos(block: &trust_cg_lower::X86ISelBlock, header: Block) -> 
         // the header. Appending at the end is on the entering path.
         _ => Some(block.insts.len()),
     }
+}
+
+/// Is it safe to splice a **CALL** into `preheader` at `insert_pos`?
+///
+/// A System V callee may clobber RFLAGS — flags are NOT callee-saved — but
+/// [`x86_writes_flags`] does not list `Call`, so every flag-liveness query in
+/// this pass (and in the passes downstream of it) models a call as
+/// flag-PRESERVING. Nothing else re-checks it, so the call tier must prove the
+/// splice point flag-dead itself. This is the call-tier counterpart of
+/// [`preheader_flag_hoist_safe`], which Lever B already applies to a mere
+/// `imul` — a call clobbers strictly more flag state.
+///
+/// Fail-closed; two conditions:
+///
+/// 1. **In-block.** No instruction at or after `insert_pos` reads RFLAGS.
+///    [`preheader_insert_pos`] only ever admits a bare `Jmp header` tail (or
+///    no terminator at all), so this holds vacuously today — but nothing in
+///    the pass REQUIRES it, and a preheader ending in a bare flag-reading `Jcc`
+///    would put the call between a compare and the branch consuming its flags.
+/// 2. **Out-of-block.** On every path leaving the preheader RFLAGS must be
+///    fully redefined ([`x86_fully_defines_flags`]) before any reader
+///    ([`x86_reads_flags`]) — i.e. the call's flag write is dead on exit. This
+///    is the residual gap: a compare in the preheader whose flags the header
+///    (or a header successor) consumes before re-establishing them.
+///    Bounded: each block is scanned at most once and a full definer cuts the
+///    path.
+fn call_splice_flag_safe(func: &X86ISelFunction, preheader: Block, insert_pos: usize) -> bool {
+    let Some(ph) = func.blocks.get(&preheader) else {
+        return false;
+    };
+    let from = insert_pos.min(ph.insts.len());
+    if ph.insts[from..].iter().any(|i| x86_reads_flags(i.opcode)) {
+        return false;
+    }
+    let mut work: Vec<Block> = ph.successors.clone();
+    let mut seen: HashSet<Block> = HashSet::new();
+    while let Some(b) = work.pop() {
+        if !seen.insert(b) {
+            continue;
+        }
+        let Some(blk) = func.blocks.get(&b) else {
+            return false; // unresolvable successor: refuse
+        };
+        let mut redefined = false;
+        for inst in &blk.insts {
+            if x86_reads_flags(inst.opcode) {
+                return false;
+            }
+            if x86_fully_defines_flags(inst.opcode) {
+                redefined = true;
+                break;
+            }
+        }
+        if !redefined {
+            work.extend(blk.successors.iter().copied());
+        }
+    }
+    true
 }
 
 // ===========================================================================
@@ -953,6 +1011,22 @@ fn hoist_pure_call_clusters(
         }
         return false;
     }
+    // Soundness precondition: a System V callee may CLOBBER RFLAGS (flags are
+    // not callee-saved), and `x86_writes_flags` does NOT list `Call`, so the
+    // flag model treats the spliced cluster as flag-preserving and no later
+    // stage re-checks it. Prove the splice point flag-dead before moving
+    // anything — the call-tier counterpart of `preheader_flag_hoist_safe`,
+    // which Lever B already applies for exactly this reason.
+    if !call_splice_flag_safe(func, preheader, ph_insert_pos) {
+        if dbg && n_pure_calls(func) > 0 {
+            eprintln!(
+                "[pure-call-hoist] header={:?} DECLINE: preheader splice point not flag-dead ({} pure calls in body)",
+                lp.header,
+                n_pure_calls(func)
+            );
+        }
+        return false;
+    }
     if dbg {
         eprintln!(
             "[pure-call-hoist] header={:?} >=1-trip PROVEN, {} pure call(s) in body",
@@ -1193,6 +1267,8 @@ fn first_operand_is_def_and_use(inst: &X86ISelInst) -> bool {
             | ShlRR
             | ShrRR
             | SarRR
+            // Rotate-by-CL: same tied [dst, src] shape as the CL shifts.
+            | RolRCl
             | AdcRR
             | SbbRR
     )
@@ -2382,7 +2458,7 @@ fn verify_preheader_defs_precede_uses(
 /// entire OUTER-invariant inner loop out of its enclosing outer loop so it runs
 /// ONCE instead of every outer iteration. Gated `TCG_REGION_LICM` (default-OFF):
 /// this is a no-TV-net CFG surgery, so it ships disabled until the
-/// `.fuzz-regionlicm/` corpus certifies a default-ON flip (design §5-6).
+/// `fuzz/repros/regionlicm/` corpus certifies a default-ON flip (design §5-6).
 ///
 /// Handles the shape rustc emits (design §1): the inner loop's carried-register
 /// INIT constants and the outer-carried SNAPSHOTS are FUSED into one inner
@@ -3837,7 +3913,7 @@ mod tests {
     use super::*;
 
     use trust_cg_ir::regs::{RegClass, VReg};
-    use trust_cg_ir::x86_64_regs::RAX;
+    use trust_cg_ir::x86_64_regs::{RAX, RDI};
     use trust_cg_lower::function::Signature;
     use trust_cg_lower::types::Type;
 
@@ -5226,5 +5302,195 @@ mod tests {
         let fired = gh_guarded_pass().run_on_function(&mut f);
         assert!(fired, "must fire when the r-guard names a copy of r");
         assert_eq!(inner_load_count(&f), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Pure-call tier: `call_splice_flag_safe` (the R5 flag-clobber guard).
+    //
+    // A callee may clobber RFLAGS but `x86_writes_flags` does not list `Call`,
+    // so the pure-call hoist must itself prove the preheader splice point
+    // flag-dead. These fixtures build a loop whose >=1-trip proof succeeds and
+    // whose body holds a recognizable pure-call cluster, then vary ONLY whether
+    // the header consumes flags the preheader produced before its `Jmp`.
+    // -----------------------------------------------------------------------
+
+    /// ```text
+    ///   bb0 (preheader): v20 = 0 ; v30 = 1 ; v31 = 2 ; v41 = 3
+    ///                    cmp v30, v31            <- flags produced here
+    ///                    jmp bb1
+    ///   bb1 (header)   : [cmovcc v40, v41, B]    <- reads bb0's flags (opt)
+    ///                    mov rdi, v30 ; call pure_fn ; mov v60, rax
+    ///                    v22 = 10 ; cmp v20, v22 ; jb bb1
+    ///   bb2 (exit)     : ret
+    /// ```
+    /// The header guard `0 < 10` resolves concretely, so the loop is PROVEN to
+    /// run >=1 time and the cluster is otherwise hoistable. With
+    /// `reader_in_header`, hoisting the CALL to just before bb0's `jmp` would
+    /// place a flag clobber between the `cmp` and the `cmovcc` that consumes it.
+    fn make_pure_call_loop(reader_in_header: bool) -> X86ISelFunction {
+        use trust_cg_lower::x86_64_isel::{X86CallArgReg, X86CallResultReg};
+
+        let sig = Signature {
+            params: vec![],
+            returns: vec![Type::I64],
+        };
+        let mut func = X86ISelFunction::new("x86_licm_pure_call".to_string(), sig);
+        let (bb0, bb1, bb2) = (Block(0), Block(1), Block(2));
+        for b in [bb0, bb1, bb2] {
+            func.ensure_block(b);
+        }
+        func.next_vreg = 64;
+
+        func.blocks.get_mut(&bb0).unwrap().successors = vec![bb1];
+        func.push_inst(
+            bb0,
+            X86ISelInst::new(X86Opcode::MovRI, vec![vreg(20), imm(0)]),
+        );
+        func.push_inst(
+            bb0,
+            X86ISelInst::new(X86Opcode::MovRI, vec![vreg(30), imm(1)]),
+        );
+        func.push_inst(
+            bb0,
+            X86ISelInst::new(X86Opcode::MovRI, vec![vreg(31), imm(2)]),
+        );
+        func.push_inst(
+            bb0,
+            X86ISelInst::new(X86Opcode::MovRI, vec![vreg(41), imm(3)]),
+        );
+        func.push_inst(
+            bb0,
+            X86ISelInst::new(X86Opcode::CmpRR, vec![vreg(30), vreg(31)]),
+        );
+        func.push_inst(
+            bb0,
+            X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(bb1)]),
+        );
+
+        func.blocks.get_mut(&bb1).unwrap().successors = vec![bb1, bb2];
+        if reader_in_header {
+            func.push_inst(
+                bb1,
+                X86ISelInst::new(
+                    X86Opcode::Cmovcc,
+                    vec![
+                        vreg(40),
+                        vreg(41),
+                        X86ISelOperand::CondCode(trust_cg_ir::X86CondCode::B),
+                    ],
+                ),
+            );
+        }
+        // Pure-call cluster: arg-setup move, CALL, result copy.
+        func.push_inst(
+            bb1,
+            X86ISelInst::new(X86Opcode::MovRR, vec![X86ISelOperand::PReg(RDI), vreg(30)]),
+        );
+        let call = X86ISelInst::new(
+            X86Opcode::Call,
+            vec![X86ISelOperand::Symbol("pure_fn".to_string())],
+        );
+        let mut call_flags = call.flags;
+        call_flags.insert(InstFlags::PURE_CALL_HOISTABLE);
+        let call = X86ISelInst::with_flags(call.opcode, call.operands, call_flags)
+            .with_call_arg_regs(vec![X86CallArgReg::full(RDI)])
+            .with_call_result_regs(vec![X86CallResultReg::new(RAX, 64)]);
+        func.push_inst(bb1, call);
+        func.push_inst(
+            bb1,
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(60), X86ISelOperand::PReg(RAX)]),
+        );
+        // Counted guard: `cmp v20, 10 ; jb bb1` with v20 pinned to 0 on entry.
+        func.push_inst(
+            bb1,
+            X86ISelInst::new(X86Opcode::MovRI, vec![vreg(22), imm(10)]),
+        );
+        func.push_inst(
+            bb1,
+            X86ISelInst::new(X86Opcode::CmpRR, vec![vreg(20), vreg(22)]),
+        );
+        func.push_inst(
+            bb1,
+            X86ISelInst::new(
+                X86Opcode::Jcc,
+                vec![
+                    X86ISelOperand::CondCode(trust_cg_ir::X86CondCode::B),
+                    X86ISelOperand::Block(bb1),
+                ],
+            ),
+        );
+
+        func.push_inst(bb2, X86ISelInst::new(X86Opcode::Ret, vec![]));
+        func.block_order = vec![bb0, bb1, bb2];
+        func
+    }
+
+    fn call_count(func: &X86ISelFunction, b: Block) -> usize {
+        block_insts(func, b)
+            .iter()
+            .filter(|i| i.opcode == X86Opcode::Call)
+            .count()
+    }
+
+    /// Flags produced in the preheader (`cmp`) are consumed in the header
+    /// (`cmovcc`) before any full definer. Splicing the CALL before the
+    /// preheader's `jmp` would clobber those flags — and `x86_writes_flags`
+    /// does not list `Call`, so no downstream pass would notice. The tier must
+    /// decline and leave the cluster in the body.
+    #[test]
+    fn pure_call_hoist_declines_when_preheader_flags_reach_a_header_reader() {
+        let mut func = make_pure_call_loop(true);
+        let mut pass = X86LoopInvariantCodeMotion::pure_only();
+        let _ = pass.run_on_function(&mut func);
+        assert_eq!(
+            call_count(&func, Block(0)),
+            0,
+            "the CALL must NOT be spliced into the preheader between `cmp` and \
+             the header's flag-consuming `cmovcc` (call_splice_flag_safe)"
+        );
+        assert_eq!(
+            call_count(&func, Block(1)),
+            1,
+            "the pure-call cluster must stay in the loop body"
+        );
+        // The cluster stays intact: arg-setup, CALL, result copy in order.
+        let hdr = block_insts(&func, Block(1));
+        let ci = hdr
+            .iter()
+            .position(|i| i.opcode == X86Opcode::Call)
+            .unwrap();
+        assert_eq!(hdr[ci - 1].opcode, X86Opcode::MovRR);
+        assert_eq!(hdr[ci + 1].opcode, X86Opcode::MovRR);
+    }
+
+    /// POSITIVE CONTROL — the identical loop minus the header's flag reader:
+    /// the header's own `cmp` fully redefines RFLAGS before any consumer, so
+    /// the preheader splice point is flag-dead and the cluster must still
+    /// hoist. Guards against the flag check over-gating the tier.
+    #[test]
+    fn pure_call_hoist_admits_a_flag_dead_splice_point() {
+        let mut func = make_pure_call_loop(false);
+        let mut pass = X86LoopInvariantCodeMotion::pure_only();
+        assert!(
+            pass.run_on_function(&mut func),
+            "a flag-dead splice point must still admit the pure-call hoist"
+        );
+        assert_eq!(call_count(&func, Block(1)), 0, "cluster left the body");
+        assert_eq!(
+            call_count(&func, Block(0)),
+            1,
+            "cluster landed in the preheader"
+        );
+        let ph = block_insts(&func, Block(0));
+        let ci = ph.iter().position(|i| i.opcode == X86Opcode::Call).unwrap();
+        // arg-setup mov ; CALL ; result mov ; ... ; jmp header
+        assert_eq!(ph[ci - 1].opcode, X86Opcode::MovRR);
+        assert_eq!(ph[ci - 1].operands[0], X86ISelOperand::PReg(RDI));
+        assert_eq!(ph[ci + 1].opcode, X86Opcode::MovRR);
+        assert_eq!(
+            ph[ci + 1].operands,
+            vec![vreg(60), X86ISelOperand::PReg(RAX)]
+        );
+        assert_eq!(ph.last().unwrap().opcode, X86Opcode::Jmp);
     }
 }

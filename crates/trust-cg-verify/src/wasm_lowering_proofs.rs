@@ -492,6 +492,10 @@ mod tests {
     #[test]
     fn all_wasm_lowerings_proven_formally() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "all_wasm_lowerings_proven_formally",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         for ob in all_wasm_lowering_proofs() {
@@ -504,6 +508,10 @@ mod tests {
     #[test]
     fn shift_proofs_proven_formally() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "shift_proofs_proven_formally",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         for ob in shift_proofs() {
@@ -515,6 +523,10 @@ mod tests {
     #[test]
     fn comparison_proofs_proven_formally() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "comparison_proofs_proven_formally",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         for ob in comparison_proofs() {
@@ -526,6 +538,10 @@ mod tests {
     #[test]
     fn fcmp_proofs_proven_formally() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "fcmp_proofs_proven_formally",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         for ob in fcmp_proofs() {
@@ -558,6 +574,10 @@ mod tests {
     #[test]
     fn formal_discharge_summary() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "formal_discharge_summary",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         let mut proven = 0usize;
@@ -600,6 +620,10 @@ mod tests {
     #[test]
     fn cast_proofs_proven_formally() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "cast_proofs_proven_formally",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         for ob in cast_proofs() {
@@ -638,6 +662,10 @@ mod tests {
     #[test]
     fn statistical_and_formal_agree_on_shift() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "statistical_and_formal_agree_on_shift",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         use crate::lowering_proof::verify_by_evaluation;

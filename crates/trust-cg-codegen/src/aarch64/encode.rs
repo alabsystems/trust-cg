@@ -4504,9 +4504,32 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
             };
             // Extract the FImm value and encode as 8-bit immediate
             let imm8 = match inst.operands.get(1) {
-                Some(MachOperand::FImm(v)) => encode_fmov_imm8(*v),
-                Some(MachOperand::Imm(v)) => (*v as u32) & 0xFF,
-                _ => 0,
+                Some(MachOperand::FImm(v)) => encode_fmov_imm8(*v).ok_or_else(|| {
+                    EncodeError::InvalidOperand {
+                        opcode: inst.opcode,
+                        index: 1,
+                        desc: format!(
+                            "floating value {v:?} is not exactly representable by AArch64 FMOV immediate"
+                        ),
+                    }
+                })?,
+                Some(MachOperand::Imm(v)) if (0..=0xff).contains(v) => *v as u32,
+                Some(other) => {
+                    return Err(EncodeError::InvalidOperand {
+                        opcode: inst.opcode,
+                        index: 1,
+                        desc: format!(
+                            "FMOV immediate requires an encodable FImm or raw imm8 in 0..=255, got {other:?}"
+                        ),
+                    });
+                }
+                None => {
+                    return Err(EncodeError::MissingOperand {
+                        opcode: inst.opcode,
+                        index: 1,
+                        expected: 2,
+                    });
+                }
             };
             Ok(
                 ((0b00011110u32 << 24) | (ftype << 22) | (1 << 21) | (imm8 << 13) | (0b100 << 10))
@@ -4806,9 +4829,9 @@ fn encode_cas(inst: &MachInst, a: u32, r: u32) -> Result<u32, EncodeError> {
 ///
 /// where the mantissa `1.defgh` uses 4 fraction bits.
 ///
-/// Only a small subset of FP values are representable. If the value is not
-/// exactly representable, returns 0 (which encodes +2.0).
-fn encode_fmov_imm8(value: f64) -> u32 {
+/// Only a small subset of FP values are representable. Returns `None` for all
+/// other values; silently substituting field zero would materialize +2.0.
+fn encode_fmov_imm8(value: f64) -> Option<u32> {
     let bits = value.to_bits();
 
     // Extract sign, exponent, mantissa from f64
@@ -4818,7 +4841,7 @@ fn encode_fmov_imm8(value: f64) -> u32 {
 
     // Only the top 4 bits of the mantissa can be non-zero
     if frac & 0x0000_FFFF_FFFF_FFFF != 0 {
-        return 0;
+        return None;
     }
 
     let top4 = ((frac >> 48) & 0xF) as u32;
@@ -4826,7 +4849,7 @@ fn encode_fmov_imm8(value: f64) -> u32 {
     // Exponent must be in range: biased [1020, 1027] for f64 (bias=1023)
     // This maps to unbiased [-3, +4]
     if !(1020..=1027).contains(&exp) {
-        return 0;
+        return None;
     }
 
     // The 3-bit exponent encoding: biased_3 = exp - 1020, range [0, 7]
@@ -4834,7 +4857,7 @@ fn encode_fmov_imm8(value: f64) -> u32 {
     // bit 6 = NOT(biased_3[2]), bits 5:4 = biased_3[1:0]
     let not_b = ((biased_3 >> 2) ^ 1) & 1;
 
-    (sign << 7) | (not_b << 6) | ((biased_3 & 0b11) << 4) | top4
+    Some((sign << 7) | (not_b << 6) | ((biased_3 & 0b11) << 4) | top4)
 }
 
 // ---------------------------------------------------------------------------
@@ -10255,7 +10278,7 @@ mod tests {
         // 1.0 = 0x3FF0_0000_0000_0000
         // exp=1023, biased_3=3=0b011, NOT(b)=1, cc=11, frac_top4=0
         // imm8 = 0_1_11_0000 = 0x70
-        assert_eq!(encode_fmov_imm8(1.0), 0x70);
+        assert_eq!(encode_fmov_imm8(1.0), Some(0x70));
     }
 
     #[test]
@@ -10263,7 +10286,7 @@ mod tests {
         // 2.0 = 0x4000_0000_0000_0000
         // exp=1024, biased_3=4=0b100, NOT(b)=0, cc=00, frac_top4=0
         // imm8 = 0_0_00_0000 = 0x00
-        assert_eq!(encode_fmov_imm8(2.0), 0x00);
+        assert_eq!(encode_fmov_imm8(2.0), Some(0x00));
     }
 
     #[test]
@@ -10271,14 +10294,14 @@ mod tests {
         // 0.5 = 0x3FE0_0000_0000_0000
         // exp=1022, biased_3=2=0b010, NOT(b)=1, cc=10, frac_top4=0
         // imm8 = 0_1_10_0000 = 0x60
-        assert_eq!(encode_fmov_imm8(0.5), 0x60);
+        assert_eq!(encode_fmov_imm8(0.5), Some(0x60));
     }
 
     #[test]
     fn test_encode_fmov_imm8_neg_1_0() {
         // -1.0: sign=1
         // imm8 = 1_1_11_0000 = 0xF0
-        assert_eq!(encode_fmov_imm8(-1.0), 0xF0);
+        assert_eq!(encode_fmov_imm8(-1.0), Some(0xF0));
     }
 
     #[test]
@@ -10286,7 +10309,30 @@ mod tests {
         // 1.5 = 0x3FF8_0000_0000_0000
         // exp=1023, biased_3=3, NOT(b)=1, cc=11, frac_top4=0b1000=8
         // imm8 = 0_1_11_1000 = 0x78
-        assert_eq!(encode_fmov_imm8(1.5), 0x78);
+        assert_eq!(encode_fmov_imm8(1.5), Some(0x78));
+    }
+
+    #[test]
+    fn test_encode_fmov_imm8_rejects_unencodable_values() {
+        for value in [0.0, -0.0, 0.1, f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            assert_eq!(
+                encode_fmov_imm8(value),
+                None,
+                "{value:?} must not silently alias FMOV imm8=0 (+2.0)"
+            );
+
+            let inst = mk(
+                AArch64Opcode::FmovImm,
+                vec![preg(D0), MachOperand::FImm(value)],
+            );
+            assert!(
+                matches!(
+                    encode_instruction(&inst),
+                    Err(EncodeError::InvalidOperand { index: 1, .. })
+                ),
+                "unencodable FImm {value:?} must fail closed"
+            );
+        }
     }
 
     // --- ARM ARM cross-check: logical immediate fixed bits ---

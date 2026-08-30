@@ -29,7 +29,7 @@ use sha2::{Digest, Sha256};
 use crate::compiler::{CompileError, Compiler, CompilerConfig, JitCompilationResult};
 use crate::jit::{ExecutableBuffer, ProfileHookMode};
 use crate::pipeline::OptLevel;
-use crate::target::{Target, TargetSpec};
+use crate::target::{AArch64IsaProfile, Target, TargetSpec};
 
 /// Schema tag for host-JIT PGO reports.
 pub const TRUST_CG_PROFILE_REPORT_SCHEMA_V1: &str = "trust-cg.profile_report.v1";
@@ -1207,13 +1207,38 @@ pub fn pgo_target_cpu(target: Target) -> &'static str {
     }
 }
 
-/// Target features field used in the full PGO cache key.
-pub fn pgo_target_features(target: Target) -> Vec<String> {
+/// Pure projection from resolved host-JIT profiles to the target-feature field
+/// used in the full PGO cache key.
+fn pgo_target_features_for_profiles(
+    target: Target,
+    aarch64_profile: AArch64IsaProfile,
+    x86_profile: crate::x86_64::X86TargetFeatures,
+) -> Vec<String> {
     match target {
-        Target::Aarch64 => vec!["+neon".to_string()],
-        Target::X86_64 => vec!["+sse2".to_string()],
+        Target::Aarch64 => std::iter::once("neon")
+            .chain(aarch64_profile.enabled_feature_names())
+            .map(|feature| format!("+{feature}"))
+            .collect(),
+        Target::X86_64 => std::iter::once("sse2")
+            .chain(x86_profile.enabled_feature_names())
+            .map(|feature| format!("+{feature}"))
+            .collect(),
         Target::Riscv64 => Vec::new(),
     }
+}
+
+/// Target features field used in the full host-JIT PGO cache key.
+///
+/// Profile freshness binds every optional opcode family admitted for this
+/// process on AArch64 and x86-64. This public convenience uses the live host
+/// profiles; request-aware callers should use [`pgo_cache_key`], which consumes
+/// the same captured compiler policy as code generation.
+pub fn pgo_target_features(target: Target) -> Vec<String> {
+    pgo_target_features_for_profiles(
+        target,
+        AArch64IsaProfile::for_host_jit(),
+        crate::x86_64::X86TargetFeatures::host(),
+    )
 }
 
 /// Build the full PGO cache key used by CLI profile-generate/profile-use.
@@ -1222,12 +1247,19 @@ pub fn pgo_cache_key(
     config: &CompilerConfig,
     target_spec: TargetSpec,
 ) -> trust_cg_opt::CacheKey {
+    let compiler = Compiler::new_for_target_spec(config.clone(), target_spec);
+    let resolved_config = compiler.config();
+    let target_features = pgo_target_features_for_profiles(
+        resolved_config.target,
+        compiler.effective_aarch64_jit_isa_profile(),
+        compiler.effective_x86_jit_codegen_profile().target_features,
+    );
     trust_cg_opt::CacheKey::new(
         trust_cg_opt::stable_hash(trust_ir_bytes),
-        pgo_opt_level_num(config.opt_level),
+        pgo_opt_level_num(resolved_config.opt_level),
         pgo_target_triple(target_spec),
-        pgo_target_cpu(config.target).to_string(),
-        pgo_target_features(config.target),
+        pgo_target_cpu(resolved_config.target).to_string(),
+        target_features,
     )
 }
 
@@ -1697,6 +1729,71 @@ fn invoke_profile_target(
 mod tests {
     use super::*;
     use crate::jit_diagnostics::sha256_hex;
+    use crate::target::AArch64IsaFeature;
+
+    #[test]
+    fn aarch64_pgo_target_features_bind_all_resolved_isa_profiles() {
+        let generic_x86 = crate::x86_64::X86TargetFeatures::generic_x86_64();
+        let cases = [
+            (AArch64IsaProfile::BASELINE, vec!["+neon"]),
+            (AArch64IsaProfile::LSE, vec!["+neon", "+lse"]),
+            (AArch64IsaProfile::DOTPROD, vec!["+neon", "+dotprod"]),
+            (AArch64IsaProfile::FP16, vec!["+neon", "+fp16"]),
+            (
+                AArch64IsaProfile::LSE_DOTPROD,
+                vec!["+neon", "+dotprod", "+lse"],
+            ),
+            (
+                AArch64IsaProfile::LSE.with_feature(AArch64IsaFeature::Fp16, true),
+                vec!["+neon", "+fp16", "+lse"],
+            ),
+            (
+                AArch64IsaProfile::DOTPROD.with_feature(AArch64IsaFeature::Fp16, true),
+                vec!["+neon", "+dotprod", "+fp16"],
+            ),
+            (
+                AArch64IsaProfile::APPLE_ARM64,
+                vec!["+neon", "+dotprod", "+fp16", "+lse"],
+            ),
+        ];
+
+        for (profile, expected) in cases {
+            assert_eq!(
+                pgo_target_features_for_profiles(Target::Aarch64, profile, generic_x86),
+                expected,
+                "profile {}",
+                profile.canonical_name()
+            );
+        }
+    }
+
+    #[test]
+    fn x86_pgo_target_features_bind_resolved_codegen_profile() {
+        use crate::x86_64::X86TargetFeature;
+
+        let generic = crate::x86_64::X86TargetFeatures::generic_x86_64();
+        let with_popcnt = generic.with_feature(X86TargetFeature::Popcnt);
+        let aarch64 = AArch64IsaProfile::BASELINE;
+        assert_eq!(
+            pgo_target_features_for_profiles(Target::X86_64, aarch64, generic),
+            vec!["+sse2"]
+        );
+        assert_eq!(
+            pgo_target_features_for_profiles(Target::X86_64, aarch64, with_popcnt),
+            vec!["+sse2", "+popcnt"]
+        );
+    }
+
+    #[test]
+    fn pgo_key_uses_target_spec_as_architecture_authority() {
+        let config = CompilerConfig::jit_fast(Target::Aarch64);
+        let x86 = TargetSpec::parse("x86_64-unknown-linux-gnu").unwrap();
+        let key = pgo_cache_key(b"module", &config, x86);
+        assert_eq!(key.target_triple(), "x86_64-unknown-linux-gnu");
+        assert_eq!(key.cpu(), "generic-x86_64");
+        assert!(key.features().iter().any(|feature| feature == "+sse2"));
+        assert!(!key.features().iter().any(|feature| feature == "+neon"));
+    }
 
     #[test]
     fn profile_sha256_from_path_matches_in_memory_digest() {

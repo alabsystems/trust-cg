@@ -64,8 +64,14 @@
 //! reported ABSENT rather than consulted, and produces one loud, self-
 //! explaining diagnostic naming the build line that fixes it.
 //!
-//! Gated OFF by default: the store is inert unless `TCG_PROOF_CERT_STORE` names
-//! a directory. `TCG_PROOF_CERT_STORE_DEBUG=1` traces consume/mint decisions.
+//! ON by default (since 88f8a7d1). `store_dir` resolves, in order:
+//! `TCG_NO_CERT_STORE` or the global `TCG_NO_PROOF_CACHE` set => the tier is
+//! OFF; else `TCG_PROOF_CERT_STORE` names an explicit directory; else the
+//! per-box default `$XDG_CACHE_HOME/trust-cg/alethe-certs`, falling back to
+//! `$HOME/.cache/trust-cg/alethe-certs`. Even with a directory, consume and
+//! mint are inert while verdict-DB recording is active and whenever no
+//! capable Carcara checker resolves. `TCG_PROOF_CERT_STORE_DEBUG=1` traces
+//! consume/mint decisions.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

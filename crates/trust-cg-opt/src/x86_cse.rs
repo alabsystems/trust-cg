@@ -654,6 +654,8 @@ fn first_operand_is_def_and_use(inst: &X86ISelInst) -> bool {
             | ShlRR
             | ShrRR
             | SarRR
+            // Rotate-by-CL: same tied [dst, src] shape as the CL shifts.
+            | RolRCl
     )
 }
 

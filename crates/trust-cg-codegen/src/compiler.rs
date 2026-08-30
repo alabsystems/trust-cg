@@ -28,7 +28,7 @@
 //! [`Compiler::for_host`] so the target is selected from [`Target::host`].
 
 use std::collections::HashMap;
-use std::sync::atomic::AtomicU64;
+use std::sync::{OnceLock, atomic::AtomicU64};
 use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
@@ -47,7 +47,10 @@ use crate::pipeline::{
     ObjectGlobal, OptLevel, PGO_COUNTER_ARRAY_SYMBOL, PGO_NSITES_SYMBOL, Pipeline, PipelineConfig,
     PipelineError, ProofOptimizationCertificateCitation, guard_kernel_gate_enabled,
 };
-use crate::target::{CallingConvention, Target, TargetOperatingSystem, TargetSpec};
+use crate::target::{
+    AArch64IsaProfile, AArch64MachineCodeEvidence, AArch64TargetMachine, CallingConvention,
+    OutputTargetFeatures, Target, TargetOperatingSystem, TargetSpec,
+};
 use crate::x86_64::{X86MachineCodeEvidence, X86TargetFeatures};
 
 // ---------------------------------------------------------------------------
@@ -217,6 +220,43 @@ pub enum CompileError {
     /// The uniform actual selection could not form a self-consistent profile.
     #[error("x86 host-JIT selected-codegen profile error: {0}")]
     HostJitSelectedCodegenProfile(#[from] HostJitSelectedCodegenProfileError),
+
+    /// AArch64 preparation completed without the final machine-code evidence
+    /// needed to bind executable bytes to the target-machine contract.
+    #[error(
+        "AArch64 JIT function `{function_name}` has no final machine-code target-feature evidence"
+    )]
+    Aarch64MachineCodeEvidenceMissing {
+        /// Function whose preparation omitted evidence, or `<module>` when no
+        /// per-function evidence was supplied at all.
+        function_name: String,
+    },
+
+    /// Per-function AArch64 evidence was produced under a target machine other
+    /// than the one compiling the containing executable buffer.
+    #[error(
+        "AArch64 JIT function `{function_name}` carries machine-code evidence for target `{actual_target}` with admission `{actual_admitted}`, but its pipeline captured target `{expected_target}` with admission `{expected_admitted}`"
+    )]
+    Aarch64MachineCodeEvidencePipelineMismatch {
+        /// Function carrying the mismatched evidence.
+        function_name: String,
+        /// Immutable target identity captured by the module pipeline.
+        expected_target: TargetSpec,
+        /// Immutable target identity captured by the function evidence.
+        actual_target: TargetSpec,
+        /// Feature admission captured by the module pipeline.
+        expected_admitted: AArch64IsaProfile,
+        /// Feature admission captured by the function evidence.
+        actual_admitted: AArch64IsaProfile,
+    },
+
+    /// The validated per-function AArch64 requirements could not form one
+    /// aggregate evidence record for the executable buffer.
+    #[error("AArch64 JIT module machine-code evidence is invalid: {detail}")]
+    Aarch64MachineCodeEvidenceInvalid {
+        /// Target-machine validation failure.
+        detail: String,
+    },
 
     /// Caller attempted to JIT-compile code for an ISA that does not match
     /// the current host process.
@@ -484,6 +524,12 @@ fn jit_unchecked_env_engaged() -> bool {
         .unwrap_or(false)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct JitValidationResolution {
+    mode: JitValidationMode,
+    warning_via_env: Option<bool>,
+}
+
 /// Emit the loud one-time marker when an Unchecked downgrade takes effect, so
 /// executing uncertified bytes can never be silent.
 fn warn_jit_unchecked_engaged(target: Target, via_env: bool) {
@@ -718,6 +764,16 @@ impl CompilerConfig {
     ///
     /// Any resolved `Unchecked` is loudly labeled (a one-time stderr marker).
     pub fn resolve_jit_validation_mode(&self) -> Result<JitValidationMode, CompileError> {
+        let resolution = self
+            .jit_validation_resolution()
+            .map_err(|target| CompileError::JitUncertifiedBytesRequireOptIn { target })?;
+        if let Some(via_env) = resolution.warning_via_env {
+            warn_jit_unchecked_engaged(self.target, via_env);
+        }
+        Ok(resolution.mode)
+    }
+
+    fn jit_validation_resolution(&self) -> Result<JitValidationResolution, Target> {
         let arch_default = arch_default_jit_validation_mode(self.target);
         let env_engaged = jit_unchecked_env_engaged();
 
@@ -730,8 +786,10 @@ impl CompilerConfig {
             && !self.emit_proofs
             && arch_default.requires_jit_verification()
         {
-            warn_jit_unchecked_engaged(self.target, /* via_env */ true);
-            return Ok(JitValidationMode::Unchecked);
+            return Ok(JitValidationResolution {
+                mode: JitValidationMode::Unchecked,
+                warning_via_env: Some(true),
+            });
         }
 
         let configured = self.jit_validation_mode();
@@ -739,17 +797,23 @@ impl CompilerConfig {
             let explicit = self.jit_validation_mode_override == Some(JitValidationMode::Unchecked);
             if arch_default.is_unchecked() {
                 // Legit arch default (aarch64 pending JIT-11); no opt-in needed.
-                Ok(JitValidationMode::Unchecked)
-            } else if explicit || env_engaged {
-                warn_jit_unchecked_engaged(self.target, /* via_env */ !explicit);
-                Ok(JitValidationMode::Unchecked)
-            } else {
-                Err(CompileError::JitUncertifiedBytesRequireOptIn {
-                    target: self.target,
+                Ok(JitValidationResolution {
+                    mode: JitValidationMode::Unchecked,
+                    warning_via_env: None,
                 })
+            } else if explicit || env_engaged {
+                Ok(JitValidationResolution {
+                    mode: JitValidationMode::Unchecked,
+                    warning_via_env: Some(!explicit),
+                })
+            } else {
+                Err(self.target)
             }
         } else {
-            Ok(configured)
+            Ok(JitValidationResolution {
+                mode: configured,
+                warning_via_env: None,
+            })
         }
     }
 
@@ -769,6 +833,14 @@ impl CompilerConfig {
         profile_hooks: crate::jit::ProfileHookMode,
     ) -> Result<crate::jit::JitConfig, CompileError> {
         let validation_mode = self.resolve_jit_validation_mode()?;
+        self.to_jit_config_with_validation_mode(profile_hooks, validation_mode)
+    }
+
+    fn to_jit_config_with_validation_mode(
+        &self,
+        profile_hooks: crate::jit::ProfileHookMode,
+        validation_mode: JitValidationMode,
+    ) -> Result<crate::jit::JitConfig, CompileError> {
         validation_mode.ensure_supported(self.target)?;
         Ok(crate::jit::JitConfig {
             opt_level: self.opt_level,
@@ -875,6 +947,9 @@ pub struct FunctionQualityMetrics {
     /// x86-only low-cost opcode evidence from the final codegen instruction
     /// stream. Non-x86 targets leave this as zeroed/default.
     pub x86_machine_code: X86MachineCodeEvidence,
+    /// AArch64 optional-ISA evidence captured from the final post-register-
+    /// allocation machine stream. Non-AArch64 targets report `None`.
+    pub aarch64_machine_code: Option<AArch64MachineCodeEvidence>,
     /// Phase timings captured during `prepare_function_with_metrics`.
     pub phase_timings: crate::pipeline::PhaseTimings,
 }
@@ -1891,6 +1966,11 @@ pub struct JitCompilationResult {
     /// function's final machine-code evidence. Non-x86 JIT paths report
     /// `None`.
     pub host_jit_selected_codegen_profile: Option<HostJitSelectedCodegenProfile>,
+    /// Aggregate AArch64 optional-ISA evidence for every function in the
+    /// executable buffer. Derived from the already-captured per-function
+    /// evidence without rescanning machine instructions. Non-AArch64 JIT paths
+    /// report `None`.
+    pub aarch64_machine_code: Option<AArch64MachineCodeEvidence>,
     /// JIT-5 validation provenance: the resolved mode, the published-image
     /// hash the certificates bind to, and per-function coverage/cache
     /// provenance. `None` only for legacy result constructions that predate
@@ -1921,8 +2001,53 @@ impl std::fmt::Debug for JitCompilationResult {
                     .as_ref()
                     .map(HostJitSelectedCodegenProfile::profile_sha256),
             )
+            .field("aarch64_machine_code", &self.aarch64_machine_code)
             .finish()
     }
+}
+
+fn aggregate_aarch64_jit_machine_code_evidence<'a>(
+    target_machine: &AArch64TargetMachine,
+    evidence: impl IntoIterator<Item = (&'a str, Option<AArch64MachineCodeEvidence>)>,
+) -> Result<AArch64MachineCodeEvidence, CompileError> {
+    let expected_target = *target_machine.identity();
+    let expected_admitted = target_machine.admitted_features();
+    let mut required_features = OutputTargetFeatures::NONE;
+    let mut saw_function = false;
+
+    for (function_name, evidence) in evidence {
+        saw_function = true;
+        let evidence = evidence.ok_or_else(|| CompileError::Aarch64MachineCodeEvidenceMissing {
+            function_name: function_name.to_owned(),
+        })?;
+        if evidence.target() != expected_target || evidence.admitted_features() != expected_admitted
+        {
+            return Err(CompileError::Aarch64MachineCodeEvidencePipelineMismatch {
+                function_name: function_name.to_owned(),
+                expected_target,
+                actual_target: evidence.target(),
+                expected_admitted: AArch64IsaProfile::from_admitted_target_features(
+                    expected_admitted,
+                ),
+                actual_admitted: AArch64IsaProfile::from_admitted_target_features(
+                    evidence.admitted_features(),
+                ),
+            });
+        }
+        required_features = required_features.union(evidence.required_features());
+    }
+
+    if !saw_function {
+        return Err(CompileError::Aarch64MachineCodeEvidenceMissing {
+            function_name: "<module>".to_owned(),
+        });
+    }
+
+    AArch64MachineCodeEvidence::try_new(target_machine, required_features).map_err(|error| {
+        CompileError::Aarch64MachineCodeEvidenceInvalid {
+            detail: error.to_string(),
+        }
+    })
 }
 
 fn validate_x86_host_jit_selected_codegen_features<'a>(
@@ -3089,7 +3214,33 @@ fn x86_host_jit_abi() -> trust_cg_lower::x86_64_isel::X86CallAbi {
 /// both profiles pass the same always-on regalloc translation validator, so
 /// this changes only latency and code quality, never correctness.
 fn x86_jit_linearscan_regalloc_enabled() -> bool {
-    std::env::var_os("TCG_NO_X86_JIT_LINEARSCAN").is_none()
+    crate::env_lock::var_os("TCG_NO_X86_JIT_LINEARSCAN").is_none()
+}
+
+/// Effective host-dependent x86 JIT choices captured on a [`Compiler`]'s first
+/// JIT-policy demand.
+///
+/// Keeping these together gives compilation and identity/provenance consumers
+/// one immutable answer even if another thread later mutates a legacy ambient
+/// kill switch. New callers should prefer typed [`CompilerConfig`] controls;
+/// this snapshot is the migration boundary for the remaining environment knob.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EffectiveX86JitCodegenProfile {
+    pub(crate) target_features: X86TargetFeatures,
+    pub(crate) fast_regalloc: bool,
+}
+
+fn effective_x86_jit_codegen_profile(config: &CompilerConfig) -> EffectiveX86JitCodegenProfile {
+    if config.target != Target::X86_64 {
+        return EffectiveX86JitCodegenProfile {
+            target_features: X86TargetFeatures::generic_x86_64(),
+            fast_regalloc: false,
+        };
+    }
+    EffectiveX86JitCodegenProfile {
+        target_features: X86TargetFeatures::host(),
+        fast_regalloc: config.enable_jit_fast_regalloc && x86_jit_linearscan_regalloc_enabled(),
+    }
 }
 
 fn resolve_x86_jit_extern(
@@ -3177,11 +3328,12 @@ fn patch_x86_64_rel32_call(
     Ok(())
 }
 
-type CompileArtifactCacheContext = (
-    LocalFilesystemCompileArtifactCache,
-    CompileArtifactCacheKey,
-    CompileArtifactCacheBoundary,
-);
+struct CompileArtifactCacheContext {
+    cache: LocalFilesystemCompileArtifactCache,
+    key: CompileArtifactCacheKey,
+    boundary: CompileArtifactCacheBoundary,
+    reuse_permit: trust_cg_process_env::ArtifactReusePermit,
+}
 
 fn sha256_digest(bytes: &[u8]) -> String {
     format!("sha256:{}", sha256_hex(bytes))
@@ -3242,7 +3394,7 @@ fn compiler_codegen_options_sha256(
         None
     };
     let mut options = serde_json::json!({
-        "schema": "trust-cg.compile_artifact.codegen_options.v3",
+        "schema": "trust-cg.compile_artifact.codegen_options.v4",
         "target": config.target.name(),
         "target_triple": compiler_target_triple(target_spec),
         "target_vendor": target_spec.vendor.triple_component(),
@@ -3255,6 +3407,9 @@ fn compiler_codegen_options_sha256(
         "emit_debug": config.emit_debug,
         "parallel": config.parallel,
         "cegis_superopt_budget_sec": config.cegis_superopt_budget_sec,
+        "enable_fsym_trust_ir_preflight": config.enable_fsym_trust_ir_preflight,
+        "enable_jit_fast_regalloc": config.enable_jit_fast_regalloc,
+        "panic_unwind": config.panic_unwind,
         "profile_use_sha256": profile_use_sha256,
         "verify_feature": cfg!(feature = "verify"),
     });
@@ -3413,8 +3568,12 @@ fn lookup_compile_artifact(
     key: &CompileArtifactCacheKey,
     boundary: CompileArtifactCacheBoundary,
     proof_bundle_sha256: Option<&str>,
-) -> std::io::Result<CompileArtifactCacheLookup> {
-    match boundary {
+    reuse_permit: &trust_cg_process_env::ArtifactReusePermit,
+) -> std::io::Result<Option<CompileArtifactCacheLookup>> {
+    if !reuse_permit.is_valid() {
+        return Ok(None);
+    }
+    let lookup = match boundary {
         CompileArtifactCacheBoundary::Pipeline => match proof_bundle_sha256 {
             Some(digest) => {
                 cache.lookup_for_pipeline_with_expected_proof_bundle_sha256(key, digest)
@@ -3425,7 +3584,8 @@ fn lookup_compile_artifact(
             Some(digest) => cache.lookup_for_service_with_expected_proof_bundle_sha256(key, digest),
             None => cache.lookup_for_service(key),
         },
-    }
+    }?;
+    Ok(reuse_permit.is_valid().then_some(lookup))
 }
 
 fn store_compile_artifact(
@@ -3435,8 +3595,12 @@ fn store_compile_artifact(
     artifact_bytes: &[u8],
     producer: &str,
     proof_bundle_sha256: Option<&str>,
-) -> std::io::Result<CompileArtifactCacheTelemetry> {
-    match boundary {
+    reuse_permit: &trust_cg_process_env::ArtifactReusePermit,
+) -> std::io::Result<Option<CompileArtifactCacheTelemetry>> {
+    if !reuse_permit.is_valid() {
+        return Ok(None);
+    }
+    let telemetry = match boundary {
         CompileArtifactCacheBoundary::Pipeline => match proof_bundle_sha256 {
             Some(digest) => cache.store_from_pipeline_with_proof_bundle_sha256(
                 key,
@@ -3455,7 +3619,8 @@ fn store_compile_artifact(
             ),
             None => cache.store_from_service(key, artifact_bytes, producer),
         },
-    }
+    }?;
+    Ok(Some(telemetry))
 }
 
 fn proof_status_label(cert: &ProofCertificate) -> &'static str {
@@ -3540,6 +3705,9 @@ fn rebase_riscv_call_fixup(
 pub struct Compiler {
     config: CompilerConfig,
     target_spec: TargetSpec,
+    jit_validation_resolution: OnceLock<Result<JitValidationResolution, Target>>,
+    x86_jit_codegen_profile: OnceLock<EffectiveX86JitCodegenProfile>,
+    aarch64_jit_isa_profile: OnceLock<AArch64IsaProfile>,
     profile_use: Option<trust_cg_opt::pgo::ProfData>,
     /// AOT PGO profile-generate sink. `Some` switches [`Compiler::compile`]
     /// into generate mode: per-block counter increments are injected during
@@ -3923,12 +4091,9 @@ fn sweep_prewarm_width(item_count: usize) -> Option<usize> {
     if item_count == 0 {
         return None;
     }
-    let available = std::thread::available_parallelism().map_or(1, usize::from);
-    let cap = std::env::var("TRUST_CG_MAX_PARALLELISM")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|v| *v > 0)
-        .map_or(available, |explicit| explicit.min(available).max(1));
+    let cap =
+        crate::resource_limits::artifact_neutral_parallelism_limit(std::num::NonZeroUsize::MAX)
+            .get();
     // NOT `cap.min(item_count)`: one obligation is no longer one task. Its
     // 100k-sample sweep splits into chunks across whatever pool it runs on
     // (`lowering_proof::fan_out_chunks`), so even a single-kind round fills
@@ -4336,6 +4501,9 @@ impl Compiler {
         Self {
             config,
             target_spec,
+            jit_validation_resolution: OnceLock::new(),
+            x86_jit_codegen_profile: OnceLock::new(),
+            aarch64_jit_isa_profile: OnceLock::new(),
             profile_use: None,
             profile_generate_sink: None,
             compile_artifact_cache: None,
@@ -4359,6 +4527,9 @@ impl Compiler {
         Self {
             config,
             target_spec,
+            jit_validation_resolution: OnceLock::new(),
+            x86_jit_codegen_profile: OnceLock::new(),
+            aarch64_jit_isa_profile: OnceLock::new(),
             profile_use: None,
             profile_generate_sink: None,
             compile_artifact_cache: None,
@@ -4503,12 +4674,109 @@ impl Compiler {
         self.target_spec
     }
 
+    /// Host-dependent x86 JIT policy captured once on first demand.
+    /// Compile-service identities bind this exact snapshot, and object-only
+    /// compilers avoid feature probing and legacy environment reads entirely.
+    pub(crate) fn effective_x86_jit_codegen_profile(&self) -> EffectiveX86JitCodegenProfile {
+        *self
+            .x86_jit_codegen_profile
+            .get_or_init(|| effective_x86_jit_codegen_profile(&self.config))
+    }
+
+    /// Host-dependent AArch64 ISA policy captured once on first JIT demand.
+    ///
+    /// Execution and reusable-artifact identity consumers must use this exact
+    /// snapshot. Object-only compilers stay on the generic baseline and do not
+    /// probe the host.
+    pub(crate) fn effective_aarch64_jit_isa_profile(&self) -> AArch64IsaProfile {
+        *self.aarch64_jit_isa_profile.get_or_init(|| {
+            if self.config.target == Target::Aarch64 {
+                AArch64IsaProfile::for_host_jit()
+            } else {
+                AArch64IsaProfile::BASELINE
+            }
+        })
+    }
+
+    /// Validation authority captured once on first demand.
+    ///
+    /// The public `CompilerConfig` resolver remains available for callers that
+    /// intentionally take a fresh ambient snapshot. A `Compiler` itself uses
+    /// one immutable resolution for identity, validation, and execution.
+    pub(crate) fn resolved_jit_validation_mode(&self) -> Result<JitValidationMode, CompileError> {
+        let mode = self.captured_jit_validation_mode()?;
+        let captured = self
+            .jit_validation_resolution
+            .get_or_init(|| self.config.jit_validation_resolution());
+        let resolution = (*captured).expect("captured validation mode already ruled out refusal");
+        if let Some(via_env) = resolution.warning_via_env {
+            warn_jit_unchecked_engaged(self.config.target, via_env);
+        }
+        Ok(mode)
+    }
+
+    /// Side-effect-free validation authority captured by this compiler.
+    /// Identity and provenance code use this accessor; only an execution
+    /// attempt emits the loud Unchecked warning.
+    pub(crate) fn captured_jit_validation_mode(&self) -> Result<JitValidationMode, CompileError> {
+        let captured = self
+            .jit_validation_resolution
+            .get_or_init(|| self.config.jit_validation_resolution());
+        (*captured)
+            .map(|resolution| resolution.mode)
+            .map_err(|target| CompileError::JitUncertifiedBytesRequireOptIn { target })
+    }
+
     fn compile_artifact_cache_context(
         &self,
         source_module: &trust_ir::Module,
         lowered_module: &trust_ir::Module,
     ) -> Result<Option<CompileArtifactCacheContext>, CompileError> {
         let Some(cache_config) = &self.compile_artifact_cache else {
+            return Ok(None);
+        };
+
+        // The RISC-V compile path does not yet consume or publish an object
+        // cache context. Do not encode TMBC, hash modules, or serialize policy
+        // for a context that dispatch will immediately discard. Receipt-backed
+        // RISC-V replay must wire the consumer before removing this bypass.
+        if self.config.target == Target::Riscv64 {
+            return Ok(None);
+        }
+
+        // Profile-generate compilation has an observable side effect beyond
+        // object bytes: it must populate the caller-owned CounterMap sink. A
+        // native-object hit cannot replay that side effect today, so both
+        // lookup and publication remain ineligible in generate mode.
+        if self.profile_generate_sink.is_some() {
+            return Ok(None);
+        }
+
+        // Proof policy does not weaken compiler identity. Package-version and
+        // build-host defaults can collide across same-version TrustCG source
+        // revisions, so every persistent replay requires source-lock and
+        // pinned-toolchain identities.
+        if !cache_config
+            .dependency_identity
+            .is_artifact_reuse_eligible()
+        {
+            return Ok(None);
+        }
+
+        // A cache admission policy is not permission to expand compilation
+        // work. Proof-bearing tiers are eligible only when the caller already
+        // requested proof generation explicitly through CompilerConfig.
+        if cache_config.proof_policy.requires_proof_bundle_digest() && !self.config.emit_proofs {
+            return Ok(None);
+        }
+
+        // Legacy TCG_*/TRUST_CG_* switches are not represented by
+        // `CompilerConfig`, yet many of them change lowering, optimization,
+        // regalloc, proof policy, or layout. Reusing an object keyed only by
+        // the explicit config in that state can return bytes produced under a
+        // different compiler policy. Unknown controls therefore disable reuse
+        // automatically until they migrate into an explicit, keyed policy.
+        let Some(reuse_permit) = trust_cg_process_env::artifact_reuse_permit() else {
             return Ok(None);
         };
 
@@ -4536,15 +4804,16 @@ impl Compiler {
         )
         .with_profile_use_sha256(profile_use_sha256);
 
-        Ok(Some((cache_config.backend(), key, cache_config.boundary)))
+        Ok(Some(CompileArtifactCacheContext {
+            cache: cache_config.backend(),
+            key,
+            boundary: cache_config.boundary,
+            reuse_permit,
+        }))
     }
 
     fn requires_verified_proof_promotion(&self) -> bool {
         self.config.emit_proofs
-            || self
-                .compile_artifact_cache
-                .as_ref()
-                .is_some_and(|cache| cache.proof_policy != CompileArtifactProofPolicy::Unchecked)
     }
 
     fn ensure_proofs_promotable(
@@ -4584,11 +4853,11 @@ impl Compiler {
 
     /// JIT-5 unconditional fail-closed promotion gate for a verifying JIT mode.
     ///
-    /// Unlike [`Self::ensure_proofs_promotable`] (which is a no-op unless the
-    /// artifact-cache proof policy demands promotion), this always rejects the
-    /// compile when the certificate set is empty or contains any unverified
-    /// entry — so `CachedVerified`/`AlwaysVerify` publish only cert-covered
-    /// bytes even when no compile-artifact cache is attached.
+    /// Unlike [`Self::ensure_proofs_promotable`] (which follows the explicit
+    /// object compile proof request), this always rejects the compile when the
+    /// certificate set is empty or contains any unverified entry — so
+    /// `CachedVerified`/`AlwaysVerify` publish only cert-covered bytes even
+    /// when no compile-artifact cache is attached.
     // Reached only from the verifying JIT cert path (feature = "verify").
     #[cfg_attr(not(feature = "verify"), allow(dead_code))]
     fn gate_jit_proofs_promotable(&self, proofs: &[ProofCertificate]) -> Result<(), CompileError> {
@@ -4629,12 +4898,11 @@ impl Compiler {
         per_func_emitted_code: &[Vec<u8>],
     ) -> Result<(Option<Vec<ProofCertificate>>, Vec<JitFunctionValidation>), CompileError> {
         let must_verify = validation_mode.requires_jit_verification();
-        // Preserve the legacy artifact-cache-driven promotion path (a compile
-        // artifact cache with a non-Unchecked proof policy demands proofs even
-        // when the JIT mode itself does not).
-        let legacy_promote = self.requires_verified_proof_promotion();
+        // Preserve an explicit CompilerConfig proof request even when the JIT
+        // validation mode itself does not require verification.
+        let explicit_proof_request = self.requires_verified_proof_promotion();
 
-        if !must_verify && !legacy_promote {
+        if !must_verify && !explicit_proof_request {
             // Unchecked (dev-only) or a non-verifying legacy path: no certs.
             return Ok((None, Vec::new()));
         }
@@ -4643,7 +4911,7 @@ impl Compiler {
         {
             // Verifying modes are unreachable without the `verify` feature —
             // `JitValidationMode::ensure_supported` fails closed in
-            // `to_jit_config` — and legacy promotion cannot produce proofs here.
+            // `to_jit_config` — and explicit promotion cannot produce proofs here.
             let _ = (isel_funcs, lir_functions, per_func_emitted_code);
             Err(CompileError::ProofsUnsupportedForTarget {
                 target: self.config.target,
@@ -4699,8 +4967,8 @@ impl Compiler {
                         (certs, verified, false)
                     }
                 } else {
-                    // AlwaysVerify / legacy artifact-cache promotion: full
-                    // verify, never cached.
+                    // AlwaysVerify / explicit CompilerConfig proof request:
+                    // full verify, never cached.
                     let certs = generate_x86_64_proof_certificates(func, Some(lir_func));
                     let verified = certs.iter().all(|c| c.verified);
                     (certs, verified, false)
@@ -4716,10 +4984,10 @@ impl Compiler {
             }
 
             let proofs = Some(all_certs);
-            // Fail-closed promotion gate. `ensure_proofs_promotable` covers the
-            // legacy artifact-cache policy; `gate_jit_proofs_promotable` is the
-            // unconditional verifying-mode gate (the former is a no-op when no
-            // artifact cache is attached).
+            // Fail-closed promotion gate. `ensure_proofs_promotable` covers an
+            // explicit CompilerConfig proof request;
+            // `gate_jit_proofs_promotable` is the unconditional verifying-mode
+            // gate.
             self.ensure_proofs_promotable(proofs.as_deref())?;
             if must_verify {
                 self.gate_jit_proofs_promotable(proofs.as_deref().unwrap_or(&[]))?;
@@ -5165,7 +5433,7 @@ impl Compiler {
         }
 
         // Build the internal pipeline.
-        let pipeline = self.build_pipeline();
+        let pipeline = self.build_pipeline(AArch64IsaProfile::for_aot_target(self.target_spec));
 
         // Phase 2+: Prepare each function through ISel, optimization,
         // regalloc, frame lowering, and branch resolution. All functions
@@ -5618,17 +5886,24 @@ impl Compiler {
         // sequential bottleneck of encoding functions one-by-one.
         let module_start = Instant::now();
         let mut compile_artifact_cache_telemetry = Vec::new();
-        let cached_object = if let Some((cache, key, boundary)) = &cache_context {
-            match lookup_compile_artifact(cache, key, *boundary, proof_bundle_sha256.as_deref())? {
-                CompileArtifactCacheLookup::Hit { entry, telemetry } => {
+        let cached_object = if let Some(context) = &cache_context {
+            match lookup_compile_artifact(
+                &context.cache,
+                &context.key,
+                context.boundary,
+                proof_bundle_sha256.as_deref(),
+                &context.reuse_permit,
+            )? {
+                Some(CompileArtifactCacheLookup::Hit { entry, telemetry }) => {
                     compile_artifact_cache_telemetry.push(telemetry);
                     Some(entry.artifact_bytes)
                 }
-                CompileArtifactCacheLookup::Miss { telemetry }
-                | CompileArtifactCacheLookup::Rejected { telemetry } => {
+                Some(CompileArtifactCacheLookup::Miss { telemetry })
+                | Some(CompileArtifactCacheLookup::Rejected { telemetry }) => {
                     compile_artifact_cache_telemetry.push(telemetry);
                     None
                 }
+                None => None,
             }
         } else {
             None
@@ -5676,15 +5951,18 @@ impl Compiler {
                     &module_frame_layouts,
                 )?
             };
-            if let Some((cache, key, boundary)) = &cache_context {
-                compile_artifact_cache_telemetry.push(store_compile_artifact(
-                    cache,
-                    key,
-                    *boundary,
+            if let Some(context) = &cache_context
+                && let Some(telemetry) = store_compile_artifact(
+                    &context.cache,
+                    &context.key,
+                    context.boundary,
                     &bytes,
                     "trust-cg-codegen::Compiler::compile",
                     proof_bundle_sha256.as_deref(),
-                )?);
+                    &context.reuse_permit,
+                )?
+            {
+                compile_artifact_cache_telemetry.push(telemetry);
             }
             bytes
         };
@@ -5961,7 +6239,11 @@ impl Compiler {
         }
 
         let x86_opt_level = x86_opt_level_from_codegen(self.config.opt_level);
-        let mut optimized_isel_funcs = isel_funcs.clone();
+        // Raw dataflow validation above is the final consumer of the
+        // pre-optimization graph. Transfer ownership into optimization rather
+        // than retaining and deep-cloning an otherwise-dead copy of every
+        // instruction, operand, block, and side table.
+        let mut optimized_isel_funcs = isel_funcs;
         let opt_start = Instant::now();
         let optimization_passes_run: usize = {
             let pipeline = X86Pipeline::new(X86PipelineConfig {
@@ -6007,6 +6289,19 @@ impl Compiler {
             .map(count_x86_real_instructions)
             .sum();
 
+        // One authoritative native-output pipeline owns the module assembly.
+        // Its encoded result is shared by metrics, the optional relocation
+        // proof inventory, and final object emission; none of those consumers
+        // may independently re-run regalloc, frame lowering, or encoding.
+        let object_pipeline = X86Pipeline::new(X86PipelineConfig {
+            opt_level: x86_opt_level,
+            output_format,
+            emit_frame: true,
+            call_abi,
+            panic_unwind: self.config.panic_unwind,
+            ..X86PipelineConfig::default()
+        });
+
         #[cfg(feature = "verify")]
         let proof_certs_start = Instant::now();
         // CT-8 (encode reuse): when the proof-cert lane runs, the module is
@@ -6023,20 +6318,12 @@ impl Compiler {
             Duration,
         ) = if self.config.emit_proofs || self.requires_verified_proof_promotion() {
             let mut all_certs: Vec<ProofCertificate> = Vec::new();
-            let proof_lane_pipeline = X86Pipeline::new(X86PipelineConfig {
-                opt_level: x86_opt_level,
-                output_format,
-                emit_frame: true,
-                call_abi,
-                panic_unwind: self.config.panic_unwind,
-                ..X86PipelineConfig::default()
-            });
             let assemble_start = Instant::now();
-            let assembled = proof_lane_pipeline
+            let assembled = object_pipeline
                 .assemble_module_after_x86_passes(&optimized_isel_funcs, use_parallel)
                 .map_err(|e| CompileError::Pipeline(x86_pipeline_error_to_pipeline_error(e)))?;
             let assemble_duration = assemble_start.elapsed();
-            let relocation_report = proof_lane_pipeline
+            let relocation_report = object_pipeline
                 .relocation_inventory_report_for_assembled(
                     &assembled,
                     &object_globals,
@@ -6044,10 +6331,10 @@ impl Compiler {
                 )
                 .map_err(|e| CompileError::Pipeline(x86_pipeline_error_to_pipeline_error(e)))?;
             append_object_relocation_inventory_certificate(&mut all_certs, &relocation_report);
-            // TV-2: `optimized_isel_funcs` clones `isel_funcs`, which is
-            // built 1:1 in `lir_functions` order, so the zip pairs each ISel
-            // function with the LIR function its ISel consumed; the verifier
-            // additionally name-guards the pairing.
+            // TV-2: `optimized_isel_funcs` preserves the 1:1 construction
+            // order of `lir_functions`, so the zip pairs each ISel function
+            // with the LIR function it consumed; the verifier additionally
+            // name-guards the pairing.
             //
             // CT-5: per-function certificate generation is the other dominant
             // compile-time cost (the "cert lane"). It runs the shared, read-only
@@ -6132,120 +6419,51 @@ impl Compiler {
             });
         }
         #[cfg(not(feature = "verify"))]
-        let proofs: Option<Vec<ProofCertificate>> = None;
+        let (proofs, assembled_for_emit, proof_lane_assemble_duration): (
+            Option<Vec<ProofCertificate>>,
+            Option<crate::x86_64::pipeline::X86AssembledModule>,
+            Duration,
+        ) = (None, None, Duration::ZERO);
         self.ensure_object_proofs_promotable(proofs.as_deref())?;
         let proof_bundle_sha256 = proof_bundle_sha256(proofs.as_deref());
 
-        // Raw code size: encode each function with RawBytes output and sum.
-        // Compile_module with RawBytes returns the concatenated per-function
-        // code (with inline const pools) — this is the raw code size,
-        // excluding any Mach-O / ELF object wrapper overhead.
-        //
-        // EH modules (`panic=unwind`): RawBytes output fail-closes on any
-        // function carrying exception-handling structure (raw bytes cannot
-        // carry the LSDA/personality/FDE sidecar — executing them would strand
-        // landing pads; the refusal is correct and stays). The SIZE metric is
-        // instead read off the REAL module assembly's concatenated code bytes
-        // — the exact `__text` payload of the object emitted below (only
-        // Mach-O carries x86 EH, and Mach-O keeps const pools inline, so this
-        // measures precisely what the RawBytes probe would have). Under the
-        // proof-cert lane the CT-8 shared assembly is reused (zero extra
-        // encode); otherwise the module is assembled once with the real
-        // output format.
-        let module_carries_eh = optimized_isel_funcs.iter().any(|f| !f.eh_info.is_empty());
-        let total_code_size = if module_carries_eh {
-            #[cfg(feature = "verify")]
-            let reused_size: Option<usize> = assembled_for_emit.as_ref().map(|a| a.code_size());
-            #[cfg(not(feature = "verify"))]
-            let reused_size: Option<usize> = None;
-            match reused_size {
-                Some(size) => size,
-                None => {
-                    let pipeline = X86Pipeline::new(X86PipelineConfig {
-                        opt_level: x86_opt_level,
-                        output_format,
-                        emit_frame: true,
-                        call_abi,
-                        ..X86PipelineConfig::default()
-                    });
-                    pipeline
-                        .module_code_size_after_x86_passes(&optimized_isel_funcs, use_parallel)
-                        .map_err(|e| {
-                            CompileError::Pipeline(x86_pipeline_error_to_pipeline_error(e))
-                        })?
-                }
-            }
-        } else {
-            // CT-11: reuse the proof lane's assembly here too. This branch used
-            // to re-run the ENTIRE backend — `compile_module_after_x86_passes`
-            // is a full per-function `run_full_regalloc` + frame + encode plus
-            // an object emit — and then keep only `.len()` for a metrics field.
-            // The EH branch above has always reused `assembled_for_emit`; this
-            // one simply never did, so a `-Cpanic=abort` crate (the common
-            // posture, and the whole benchmark suite) paid a second complete
-            // backend pass per CGU.
-            //
-            // The reused value is the RIGHT one, not an approximation:
-            // `assembled_for_emit` is built with the SAME `output_format` and
-            // is literally the assembly the object below is emitted from
-            // (`emit_assembled_module`), so `code_size()` is the emitted
-            // `__text` payload. That is what the RawBytes probe was
-            // reconstructing.
-            //
-            // Falls back to the probe when the proof lane is off (no assembly
-            // exists) or on non-`verify` builds. `TCG_NO_CODESIZE_REUSE=1`
-            // forces the old path so the change can be A/B'd inside ONE dylib.
-            #[cfg(feature = "verify")]
-            let reused_size: Option<usize> =
-                if crate::env_lock::var_os("TCG_NO_CODESIZE_REUSE").is_some() {
-                    None
-                } else {
-                    assembled_for_emit.as_ref().map(|a| a.code_size())
-                };
-            #[cfg(not(feature = "verify"))]
-            let reused_size: Option<usize> = None;
-            match reused_size {
-                Some(size) => size,
-                None => {
-                    let raw_bytes = {
-                        let pipeline = X86Pipeline::new(X86PipelineConfig {
-                            opt_level: x86_opt_level,
-                            output_format: X86OutputFormat::RawBytes,
-                            emit_frame: true,
-                            call_abi,
-                            ..X86PipelineConfig::default()
-                        });
-                        let result = if use_parallel {
-                            pipeline.compile_module_after_x86_passes_parallel(&optimized_isel_funcs)
-                        } else {
-                            pipeline.compile_module_after_x86_passes(&optimized_isel_funcs)
-                        };
-                        result.map_err(|e| {
-                            CompileError::Pipeline(x86_pipeline_error_to_pipeline_error(e))
-                        })?
-                    };
-                    raw_bytes.len()
-                }
-            }
-        };
-
-        // Final native object bytes via compile_module. This is the object
-        // returned to the caller; cross-function CALL fixups become
-        // X86_64_RELOC_BRANCH relocations on Mach-O and R_X86_64_PLT32
-        // relocations on ELF.
+        // If proofs did not need relocation inventory, assemble now. This is
+        // the ONLY proof-off backend traversal: the same native-format value
+        // supplies code-size metrics and is consumed by final object emission.
+        // EH sidecars, COFF `.rdata` pools, call/global fixups, and serial vs.
+        // parallel assembly therefore cannot drift between a metrics probe and
+        // the bytes returned to the caller.
         let encode_start = Instant::now();
+        let assembled_for_emit = match assembled_for_emit {
+            Some(assembled) => assembled,
+            None => object_pipeline
+                .assemble_module_after_x86_passes(&optimized_isel_funcs, use_parallel)
+                .map_err(|e| CompileError::Pipeline(x86_pipeline_error_to_pipeline_error(e)))?,
+        };
+        let total_code_size = assembled_for_emit.code_size();
+
+        // Final native object bytes from the authoritative assembly.
+        // Cross-function CALL fixups become X86_64_RELOC_BRANCH relocations on
+        // Mach-O, R_X86_64_PLT32 on ELF, and IMAGE_REL_AMD64_REL32 on COFF.
         let mut compile_artifact_cache_telemetry = Vec::new();
-        let cached_object = if let Some((cache, key, boundary)) = &cache_context {
-            match lookup_compile_artifact(cache, key, *boundary, proof_bundle_sha256.as_deref())? {
-                CompileArtifactCacheLookup::Hit { entry, telemetry } => {
+        let cached_object = if let Some(context) = &cache_context {
+            match lookup_compile_artifact(
+                &context.cache,
+                &context.key,
+                context.boundary,
+                proof_bundle_sha256.as_deref(),
+                &context.reuse_permit,
+            )? {
+                Some(CompileArtifactCacheLookup::Hit { entry, telemetry }) => {
                     compile_artifact_cache_telemetry.push(telemetry);
                     Some(entry.artifact_bytes)
                 }
-                CompileArtifactCacheLookup::Miss { telemetry }
-                | CompileArtifactCacheLookup::Rejected { telemetry } => {
+                Some(CompileArtifactCacheLookup::Miss { telemetry })
+                | Some(CompileArtifactCacheLookup::Rejected { telemetry }) => {
                     compile_artifact_cache_telemetry.push(telemetry);
                     None
                 }
+                None => None,
             }
         } else {
             None
@@ -6253,69 +6471,30 @@ impl Compiler {
         let obj_bytes = if let Some(bytes) = cached_object {
             bytes
         } else {
-            let bytes = {
-                let pipeline = X86Pipeline::new(X86PipelineConfig {
-                    opt_level: x86_opt_level,
-                    output_format,
-                    emit_frame: true,
-                    call_abi,
-                    panic_unwind: self.config.panic_unwind,
-                    ..X86PipelineConfig::default()
-                });
-                let full_encode = |pipeline: &X86Pipeline| {
-                    if use_parallel {
-                        pipeline.compile_module_after_x86_passes_with_globals_parallel(
-                            &optimized_isel_funcs,
-                            &object_globals,
-                        )
-                    } else {
-                        pipeline.compile_module_after_x86_passes_with_globals(
-                            &optimized_isel_funcs,
-                            &object_globals,
-                        )
-                    }
-                };
-                // CT-8: the proof lane already regalloc'd+encoded+assembled
-                // this exact module under an identically-configured pipeline
-                // — EMIT from that assembly (Phase 2 only) instead of
-                // re-running the full encode. Byte-identical by
-                // construction: emission is a deterministic pure function of
-                // (assembled module, globals, pipeline config), and
-                // `full_encode` is exactly assemble-then-emit of the same
-                // inputs (`X86Pipeline::compile_module_impl`). With the
-                // proof lane off (or non-verify builds) the full encode runs
-                // here unchanged.
-                #[cfg(feature = "verify")]
-                let result = match assembled_for_emit {
-                    Some(assembled) => pipeline.emit_assembled_module(assembled, &object_globals),
-                    None => full_encode(&pipeline),
-                };
-                #[cfg(not(feature = "verify"))]
-                let result = full_encode(&pipeline);
-                result
-                    .map_err(|e| CompileError::Pipeline(x86_pipeline_error_to_pipeline_error(e)))?
-            };
-            if let Some((cache, key, boundary)) = &cache_context {
-                compile_artifact_cache_telemetry.push(store_compile_artifact(
-                    cache,
-                    key,
-                    *boundary,
+            let bytes = object_pipeline
+                .emit_assembled_module(assembled_for_emit, &object_globals)
+                .map_err(|e| CompileError::Pipeline(x86_pipeline_error_to_pipeline_error(e)))?;
+            if let Some(context) = &cache_context
+                && let Some(telemetry) = store_compile_artifact(
+                    &context.cache,
+                    &context.key,
+                    context.boundary,
                     &bytes,
                     "trust-cg-codegen::Compiler::compile_x86_64",
                     proof_bundle_sha256.as_deref(),
-                )?);
+                    &context.reuse_permit,
+                )?
+            {
+                compile_artifact_cache_telemetry.push(telemetry);
             }
             bytes
         };
         if tracing {
-            // CT-8: fold the proof lane's shared module-encode time (the
-            // assembly the object emission above reused) into this phase so
-            // ALL module-encode work is reported here, none under
-            // `x86_proof_certs`.
-            #[cfg(feature = "verify")]
+            // Fold a proof lane's earlier shared assembly into this phase; a
+            // proof-off assembly is already inside `encode_start.elapsed()`.
+            // Thus every backend traversal is reported exactly once under the
+            // module phase and none is hidden in the metrics path.
             let encode_duration = encode_start.elapsed() + proof_lane_assemble_duration;
-            #[cfg(not(feature = "verify"))]
-            let encode_duration = encode_start.elapsed();
             trace_entries.push(TraceEntry {
                 phase: "x86_compile_module".to_string(),
                 duration: encode_duration,
@@ -6784,7 +6963,10 @@ impl Compiler {
         }
 
         let x86_opt_level = x86_opt_level_from_codegen(self.config.opt_level);
-        let mut optimized_isel_funcs = isel_funcs.clone();
+        // As in AOT, raw validation is complete and no later JIT phase reads
+        // the unoptimized graph. Move it into the mutating optimizer so peak
+        // memory does not include two complete ISel graphs.
+        let mut optimized_isel_funcs = isel_funcs;
         let opt_start = Instant::now();
         // JIT-8: give the x86 in-process JIT a latency-tuned allocation profile.
         // The production JIT (`CompilerConfig::for_host_jit` / `jit_fast`) sets
@@ -6799,12 +6981,14 @@ impl Compiler {
         // CachedVerified cert path still covers every emitted byte. AOT is
         // unaffected (it never sets `enable_jit_fast_regalloc`).
         // `TCG_NO_X86_JIT_LINEARSCAN` forces the previous Greedy profile.
-        let use_fast_jit_regalloc =
-            self.config.enable_jit_fast_regalloc && x86_jit_linearscan_regalloc_enabled();
+        let effective_codegen_profile = self.effective_x86_jit_codegen_profile();
+        let use_fast_jit_regalloc = effective_codegen_profile.fast_regalloc;
         let jit_base_config = if use_fast_jit_regalloc {
-            X86PipelineConfig::host_jit_fast()
+            X86PipelineConfig::host_jit_fast_with_features(
+                effective_codegen_profile.target_features,
+            )
         } else {
-            X86PipelineConfig::host_jit()
+            X86PipelineConfig::host_jit_with_features(effective_codegen_profile.target_features)
         };
         let selected_pipeline_target_features = jit_base_config.target_features;
         let pipeline = X86Pipeline::new(X86PipelineConfig {
@@ -6830,8 +7014,7 @@ impl Compiler {
                 output_format: X86OutputFormat::RawBytes,
                 emit_frame: true,
                 call_abi,
-                target_features: selected_pipeline_target_features,
-                ..X86PipelineConfig::host_jit()
+                ..X86PipelineConfig::host_jit_with_features(selected_pipeline_target_features)
             }))
         } else {
             None
@@ -7246,6 +7429,7 @@ impl Compiler {
                 spill_slot_count: 0,
                 branch_count: count_x86_branch_instructions(func),
                 x86_machine_code: encoded.machine_code_evidence,
+                aarch64_machine_code: None,
                 phase_timings,
             })
             .collect();
@@ -7282,6 +7466,7 @@ impl Compiler {
             proof_optimization_certificates: Vec::new(),
             per_function_metrics,
             host_jit_selected_codegen_profile: Some(selected_codegen_profile),
+            aarch64_machine_code: None,
             validation,
         })
     }
@@ -7306,7 +7491,7 @@ impl Compiler {
             });
         }
         let start = Instant::now();
-        let pipeline = self.build_pipeline();
+        let pipeline = self.build_pipeline(AArch64IsaProfile::for_aot_target(self.target_spec));
 
         let (obj_bytes, optimization_stats) = pipeline.compile_ir_function_with_stats(ir_func)?;
         #[cfg(not(feature = "verify"))]
@@ -7375,8 +7560,8 @@ impl Compiler {
     /// Compile a trust_ir module to executable memory for JIT execution.
     ///
     /// This API is for in-process execution. The configured target and, for
-    /// x86-64, the requested OS/ABI target spec must match the host process;
-    /// otherwise the compiler returns [`CompileError::JitTargetMismatch`] or
+    /// every wired architecture, the requested OS/ABI target spec must match
+    /// the host process; otherwise the compiler returns [`CompileError::JitTargetMismatch`] or
     /// [`CompileError::JitTargetSpecMismatch`] before lowering. Use
     /// [`Compiler::for_host`] or [`CompilerConfig::for_host_jit`] for host JIT
     /// callers.
@@ -7418,13 +7603,13 @@ impl Compiler {
         profile_hooks: crate::jit::ProfileHookMode,
     ) -> Result<JitCompilationResult, CompileError> {
         self.ensure_host_jit_target()?;
-        // JIT-5: resolve the validation mode ONCE (applies the
-        // TCG_JIT_UNCHECKED=1 env gate + fail-closed downgrade check), then
-        // thread it into both cert machineries. `to_jit_config` re-resolves for
-        // the aarch64 JitCertificate `verify` bit; the one-time env warning is
-        // idempotent so a double-resolve is harmless.
-        let validation_mode = self.config.resolve_jit_validation_mode()?;
-        let jit_config = self.config.to_jit_config(profile_hooks)?;
+        // JIT-5: use the validation mode captured when this Compiler was
+        // constructed (including the TCG_JIT_UNCHECKED gate), then thread that
+        // one immutable answer into both certificate machineries and identity.
+        let validation_mode = self.resolved_jit_validation_mode()?;
+        let jit_config = self
+            .config
+            .to_jit_config_with_validation_mode(profile_hooks, validation_mode)?;
 
         let total_start = Instant::now();
         let tracing = self.config.trace_level != CompilerTraceLevel::None;
@@ -7494,7 +7679,8 @@ impl Compiler {
         reject_aarch64_jit_eh(&lir_functions)?;
 
         // Build the internal pipeline.
-        let pipeline = self.build_pipeline();
+        let aarch64_jit_isa_profile = self.effective_aarch64_jit_isa_profile();
+        let pipeline = self.build_pipeline(aarch64_jit_isa_profile);
 
         // Phase 2+: Prepare each function through ISel, optimization,
         // regalloc, frame lowering, and branch resolution. The prepared
@@ -7618,6 +7804,17 @@ impl Compiler {
         let proof_optimization_certificates =
             collect_proof_optimization_certificates(&preparation_metrics);
         let fsym_trust_ir_metrics = summarize_fsym_trust_ir_metrics(&preparation_metrics);
+        // Fold the already-captured post-RA evidence before executable memory
+        // is published. This is intentionally not a second instruction-stream
+        // scan: preparation performed the mandatory final validation walk and
+        // retained its typed result in `PreparationMetrics`.
+        let aarch64_machine_code = aggregate_aarch64_jit_machine_code_evidence(
+            pipeline.aarch64_target_machine(),
+            prepared_funcs
+                .iter()
+                .zip(preparation_metrics.iter())
+                .map(|(func, metrics)| (func.name.as_str(), metrics.aarch64_machine_code)),
+        )?;
 
         #[cfg(feature = "verify")]
         let proofs = if self.config.emit_proofs || self.requires_verified_proof_promotion() {
@@ -7660,7 +7857,10 @@ impl Compiler {
         // Final phase: encode all prepared functions into executable memory,
         // resolve internal cross-function branches, and bind external symbols.
         let jit_start = Instant::now();
-        let jit = crate::jit::JitCompiler::new(jit_config);
+        let jit = crate::jit::JitCompiler::new_with_aarch64_isa_profile(
+            jit_config,
+            aarch64_jit_isa_profile,
+        );
         let (mut buffer, encoding_timings) = jit
             .compile_raw_with_encoding_metrics(&prepared_funcs, extern_symbols)
             .map_err(CompileError::Jit)?;
@@ -7670,8 +7870,8 @@ impl Compiler {
         // verifying mode (CachedVerified / AlwaysVerify) every published
         // function must carry a verified, bytes-bound certificate; otherwise an
         // uncertified byte would be published. `ensure_proofs_promotable` above
-        // only covers the compiler.rs ProofCertificate path (a no-op unless an
-        // artifact-cache proof policy demands promotion), so gate the buffer
+        // only covers the compiler.rs ProofCertificate path (a no-op unless
+        // object proofs were explicitly requested), so gate the buffer
         // certificates explicitly here.
         if validation_mode.requires_jit_verification() {
             let ranges: Vec<String> = buffer
@@ -7718,6 +7918,7 @@ impl Compiler {
                     spill_slot_count: prep_metrics.spill_slot_count,
                     branch_count: count_branch_instructions(func),
                     x86_machine_code: X86MachineCodeEvidence::default(),
+                    aarch64_machine_code: prep_metrics.aarch64_machine_code,
                     phase_timings,
                 }
             })
@@ -7811,12 +8012,13 @@ impl Compiler {
             proof_optimization_certificates,
             per_function_metrics,
             host_jit_selected_codegen_profile: None,
+            aarch64_machine_code: Some(aarch64_machine_code),
             validation,
         })
     }
 
     /// Build the internal [`Pipeline`] from the compiler configuration.
-    fn build_pipeline(&self) -> Pipeline {
+    fn build_pipeline(&self, aarch64_isa_profile: AArch64IsaProfile) -> Pipeline {
         let pipeline = Pipeline::new(PipelineConfig {
             opt_level: self.config.opt_level,
             emit_debug: self.config.emit_debug,
@@ -7832,7 +8034,8 @@ impl Compiler {
             skip_cse_gvn: false,
             disabled_passes_override: None,
             contains4_scanner_batch_rewrite_override: None,
-        });
+        })
+        .with_aarch64_isa_profile(aarch64_isa_profile);
 
         let pipeline =
             if self.production_certified_pass_chain && self.certified_pass_chain.is_none() {
@@ -7863,14 +8066,15 @@ impl Compiler {
             });
         }
 
-        if self.config.target == Target::X86_64 {
-            let host_spec = TargetSpec::host_for_architecture(host);
-            if self.target_spec != host_spec {
-                return Err(CompileError::JitTargetSpecMismatch {
-                    requested: self.target_spec,
-                    host: host_spec,
-                });
-            }
+        // Executable-memory compilation is an exact host ABI operation, not
+        // merely an architecture match. DarwinPCS/AAPCS64 and the x86 object
+        // ABIs differ in stack arguments, TLS, unwind, and symbol semantics.
+        let host_spec = TargetSpec::host_for_architecture(host);
+        if self.target_spec != host_spec {
+            return Err(CompileError::JitTargetSpecMismatch {
+                requested: self.target_spec,
+                host: host_spec,
+            });
         }
 
         match self.config.target {
@@ -7898,6 +8102,163 @@ mod tests {
     };
 
     use super::*;
+
+    fn test_aarch64_target_machine(
+        target: TargetSpec,
+        profile: AArch64IsaProfile,
+    ) -> AArch64TargetMachine {
+        AArch64TargetMachine::try_new(target, profile.into()).unwrap()
+    }
+
+    #[test]
+    fn aarch64_jit_machine_code_evidence_fold_unions_existing_requirements() {
+        use crate::target::AArch64IsaFeature;
+
+        let machine = test_aarch64_target_machine(
+            TargetSpec::parse("aarch64-apple-darwin").unwrap(),
+            AArch64IsaProfile::APPLE_ARM64,
+        );
+        let lse = AArch64MachineCodeEvidence::try_new(
+            &machine,
+            OutputTargetFeatures::try_from_output([AArch64IsaFeature::Lse]).unwrap(),
+        )
+        .unwrap();
+        let fp16 = AArch64MachineCodeEvidence::try_new(
+            &machine,
+            OutputTargetFeatures::try_from_output([AArch64IsaFeature::Fp16]).unwrap(),
+        )
+        .unwrap();
+
+        let aggregate = aggregate_aarch64_jit_machine_code_evidence(
+            &machine,
+            [("lse", Some(lse)), ("fp16", Some(fp16))],
+        )
+        .unwrap();
+        assert_eq!(aggregate.target(), *machine.identity());
+        assert_eq!(aggregate.admitted_features(), machine.admitted_features());
+        assert_eq!(
+            aggregate.required_features(),
+            OutputTargetFeatures::try_from_output([
+                AArch64IsaFeature::Lse,
+                AArch64IsaFeature::Fp16,
+            ])
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn aarch64_jit_machine_code_evidence_fold_rejects_missing_or_mismatched_evidence() {
+        let target = TargetSpec::parse("aarch64-apple-darwin").unwrap();
+        let machine = test_aarch64_target_machine(target, AArch64IsaProfile::APPLE_ARM64);
+        let baseline =
+            AArch64MachineCodeEvidence::try_new(&machine, OutputTargetFeatures::NONE).unwrap();
+
+        let missing = aggregate_aarch64_jit_machine_code_evidence(
+            &machine,
+            [("present", Some(baseline)), ("missing", None)],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            missing,
+            CompileError::Aarch64MachineCodeEvidenceMissing { function_name }
+                if function_name == "missing"
+        ));
+
+        let other_target = test_aarch64_target_machine(
+            TargetSpec::parse("aarch64-unknown-linux-gnu").unwrap(),
+            AArch64IsaProfile::APPLE_ARM64,
+        );
+        let other_target_evidence =
+            AArch64MachineCodeEvidence::try_new(&other_target, OutputTargetFeatures::NONE).unwrap();
+        let target_mismatch = aggregate_aarch64_jit_machine_code_evidence(
+            &machine,
+            [("wrong_target", Some(other_target_evidence))],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            target_mismatch,
+            CompileError::Aarch64MachineCodeEvidencePipelineMismatch {
+                function_name,
+                expected_target,
+                actual_target,
+                ..
+            } if function_name == "wrong_target"
+                && expected_target == target
+                && actual_target == *other_target.identity()
+        ));
+
+        let other_admission = test_aarch64_target_machine(target, AArch64IsaProfile::BASELINE);
+        let other_admission_evidence =
+            AArch64MachineCodeEvidence::try_new(&other_admission, OutputTargetFeatures::NONE)
+                .unwrap();
+        let admission_mismatch = aggregate_aarch64_jit_machine_code_evidence(
+            &machine,
+            [("wrong_admission", Some(other_admission_evidence))],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            admission_mismatch,
+            CompileError::Aarch64MachineCodeEvidencePipelineMismatch {
+                function_name,
+                expected_admitted,
+                actual_admitted,
+                ..
+            } if function_name == "wrong_admission"
+                && expected_admitted == AArch64IsaProfile::APPLE_ARM64
+                && actual_admitted == AArch64IsaProfile::BASELINE
+        ));
+    }
+
+    #[test]
+    fn compiler_captures_ambient_jit_policy_once() {
+        let validation = crate::env_lock::with_env_overrides(&[(JIT_UNCHECKED_ENV, "1")], || {
+            let compiler = Compiler::new(CompilerConfig::jit_fast(Target::X86_64));
+            assert_eq!(
+                compiler.captured_jit_validation_mode().unwrap(),
+                JitValidationMode::Unchecked
+            );
+            compiler
+        });
+        assert_eq!(
+            validation.captured_jit_validation_mode().unwrap(),
+            JitValidationMode::Unchecked,
+            "an existing Compiler must retain its captured validation policy"
+        );
+
+        crate::env_lock::with_env_overrides_removed(&["TCG_NO_X86_JIT_LINEARSCAN"], || {
+            let enabled = Compiler::new(CompilerConfig::jit_fast(Target::X86_64));
+            assert!(enabled.effective_x86_jit_codegen_profile().fast_regalloc);
+            crate::env_lock::with_env_overrides(&[("TCG_NO_X86_JIT_LINEARSCAN", "1")], || {
+                let disabled = Compiler::new(CompilerConfig::jit_fast(Target::X86_64));
+                assert!(!disabled.effective_x86_jit_codegen_profile().fast_regalloc);
+                assert!(
+                    enabled.effective_x86_jit_codegen_profile().fast_regalloc,
+                    "an existing Compiler must retain its captured policy"
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn compiler_defers_host_jit_snapshot_for_object_only_clients() {
+        let compiler = Compiler::new(CompilerConfig::default());
+        assert!(compiler.jit_validation_resolution.get().is_none());
+        assert!(compiler.x86_jit_codegen_profile.get().is_none());
+        assert!(compiler.aarch64_jit_isa_profile.get().is_none());
+    }
+
+    #[test]
+    fn compiler_captures_effective_aarch64_jit_isa_profile_once() {
+        let compiler = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64));
+        assert!(compiler.aarch64_jit_isa_profile.get().is_none());
+        let selected = compiler.effective_aarch64_jit_isa_profile();
+        assert_eq!(selected, AArch64IsaProfile::for_host_jit());
+        assert_eq!(
+            compiler.aarch64_jit_isa_profile.get().copied(),
+            Some(selected)
+        );
+        assert_eq!(compiler.effective_aarch64_jit_isa_profile(), selected);
+    }
 
     #[test]
     fn selected_codegen_evidence_accepts_uniform_actual_pipeline_features() {
@@ -9349,10 +9710,11 @@ mod tests {
         let cache_config = test_cache_config(&root, CompileArtifactProofPolicy::Unchecked);
         let compiler = Compiler::new_for_target_spec(config.clone(), target_spec)
             .with_compile_artifact_cache(cache_config.clone());
-        let (_, current_key, _) = compiler
+        let current_context = compiler
             .compile_artifact_cache_context(&module, &module)
             .unwrap()
             .expect("test compiler should build a cache context");
+        let current_key = &current_context.key;
 
         let stale_codegen_options_sha256 = pre_unwind_guard_codegen_options_sha256(
             &config,
@@ -9590,6 +9952,33 @@ mod tests {
             ),
             "expected JitTargetMismatch for {target:?}, got {err}"
         );
+    }
+
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[test]
+    fn test_host_jit_rejects_same_architecture_non_host_abi() {
+        let requested = match Target::host() {
+            Target::Aarch64 if cfg!(target_os = "macos") => {
+                TargetSpec::parse("aarch64-unknown-linux-gnu").unwrap()
+            }
+            Target::Aarch64 => TargetSpec::parse("aarch64-apple-darwin").unwrap(),
+            Target::X86_64 if cfg!(target_os = "macos") => {
+                TargetSpec::parse("x86_64-unknown-linux-gnu").unwrap()
+            }
+            Target::X86_64 => TargetSpec::parse("x86_64-apple-darwin").unwrap(),
+            Target::Riscv64 => unreachable!("test is limited to wired JIT hosts"),
+        };
+        let compiler = Compiler::new_for_target_spec(CompilerConfig::for_host_jit(), requested);
+        let err = compiler
+            .ensure_host_jit_target()
+            .expect_err("same-architecture cross-ABI JIT must fail closed");
+        assert!(matches!(
+            err,
+            CompileError::JitTargetSpecMismatch {
+                requested: actual,
+                host,
+            } if actual == requested && host == TargetSpec::host_for_architecture(Target::host())
+        ));
     }
 
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
@@ -9930,6 +10319,261 @@ mod tests {
     }
 
     #[test]
+    fn compile_artifact_cache_skips_unwired_riscv_context_work() {
+        let root = temp_cache_root("riscv-unwired");
+        let module = const_i64_module("compiler_cache_riscv", "answer", 42);
+        let target_spec = TargetSpec::parse("riscv64-unknown-unknown").unwrap();
+        let config = CompilerConfig {
+            target: Target::Riscv64,
+            opt_level: OptLevel::O0,
+            parallel: false,
+            ..CompilerConfig::default()
+        };
+        let compiler =
+            Compiler::new_for_target_spec(config, target_spec).with_compile_artifact_cache(
+                test_cache_config(&root, CompileArtifactProofPolicy::Unchecked),
+            );
+
+        assert!(
+            compiler
+                .compile_artifact_cache_context(&module, &module)
+                .expect("RISC-V cache bypass should not fail")
+                .is_none(),
+            "an unwired RISC-V cache must not pay context encoding and hashing"
+        );
+        assert!(
+            !root.exists(),
+            "building an unwired RISC-V cache context must not touch storage"
+        );
+    }
+
+    #[test]
+    fn compile_artifact_cache_refuses_unkeyed_ambient_compiler_controls() {
+        let root = temp_cache_root("ambient-control");
+        let module = const_i64_module("compiler_cache_ambient", "answer", 42);
+        let target_spec = TargetSpec::parse("aarch64-apple-darwin").unwrap();
+        let config = CompilerConfig {
+            opt_level: OptLevel::O0,
+            parallel: false,
+            ..CompilerConfig::default()
+        };
+        let compiler =
+            Compiler::new_for_target_spec(config, target_spec).with_compile_artifact_cache(
+                test_cache_config(&root, CompileArtifactProofPolicy::Unchecked),
+            );
+
+        trust_cg_process_env::with_env_overrides(&[("TCG_NO_SELECT_FOLD", "1")], || {
+            let safety = trust_cg_process_env::artifact_reuse_environment_safety();
+            assert!(
+                safety
+                    .unkeyed_controls()
+                    .iter()
+                    .any(|key| key == std::ffi::OsStr::new("TCG_NO_SELECT_FOLD")),
+                "{safety:?}"
+            );
+            assert!(
+                compiler
+                    .compile_artifact_cache_context(&module, &module)
+                    .expect("cache safety check should not fail")
+                    .is_none(),
+                "an unkeyed ambient lowering control must disable object reuse"
+            );
+        });
+    }
+
+    #[test]
+    fn compile_artifact_cache_identity_binds_explicit_behavior_controls() {
+        let target_spec = TargetSpec::parse("x86_64-apple-darwin").unwrap();
+        let base = CompilerConfig {
+            target: Target::X86_64,
+            parallel: false,
+            ..CompilerConfig::default()
+        };
+        let digest = |config: &CompilerConfig| {
+            compiler_codegen_options_sha256(
+                config,
+                target_spec,
+                COMPILE_ARTIFACT_PROFILE_USE_DISABLED_SHA256,
+            )
+            .expect("codegen identity should serialize")
+        };
+        let baseline = digest(&base);
+
+        let mut fast_regalloc = base.clone();
+        fast_regalloc.enable_jit_fast_regalloc = true;
+        assert_ne!(baseline, digest(&fast_regalloc));
+
+        let mut fsym_preflight = base.clone();
+        fsym_preflight.enable_fsym_trust_ir_preflight = true;
+        assert_ne!(baseline, digest(&fsym_preflight));
+
+        let mut panic_unwind = base;
+        panic_unwind.panic_unwind = true;
+        assert_ne!(baseline, digest(&panic_unwind));
+    }
+
+    #[test]
+    fn compile_artifact_cache_context_requires_source_lock_identity_when_unchecked() {
+        let root = temp_cache_root("unchecked-source-lock");
+        let module = const_i64_module("compiler_cache_source_lock", "answer", 42);
+        let target_spec = TargetSpec::parse("aarch64-apple-darwin").unwrap();
+        let config = CompilerConfig {
+            opt_level: OptLevel::O0,
+            parallel: false,
+            ..CompilerConfig::default()
+        };
+
+        trust_cg_process_env::with_env_overrides_removed(
+            trust_cg_process_env::ARTIFACT_REUSE_ENV_EXEMPT_KEYS,
+            || {
+                let default_cache = CompileArtifactCacheConfig::production_default(
+                    &root,
+                    CompileArtifactProofPolicy::Unchecked,
+                );
+                assert!(
+                    !default_cache
+                        .dependency_identity
+                        .is_artifact_reuse_eligible()
+                );
+                let default_compiler = Compiler::new_for_target_spec(config.clone(), target_spec)
+                    .with_compile_artifact_cache(default_cache);
+                assert!(
+                    default_compiler
+                        .compile_artifact_cache_context(&module, &module)
+                        .expect("cache eligibility check should succeed")
+                        .is_none(),
+                    "package-version/build-host defaults must not authorize replay"
+                );
+            },
+        );
+
+        let source_locked =
+            Compiler::new_for_target_spec(config, target_spec).with_compile_artifact_cache(
+                test_cache_config(&root, CompileArtifactProofPolicy::Unchecked),
+            );
+        assert!(
+            source_locked
+                .compile_artifact_cache_context(&module, &module)
+                .expect("cache context creation should succeed")
+                .is_some(),
+            "explicit source-lock and pinned-tool identities should authorize reuse"
+        );
+    }
+
+    #[test]
+    fn compile_artifact_cache_bypasses_profile_generate_side_effects() {
+        let root = temp_cache_root("profile-generate-ineligible");
+        let module = const_i64_module("compiler_cache_profile_generate", "answer", 42);
+        let sink = std::sync::Arc::new(std::sync::Mutex::new(trust_cg_opt::pgo::CounterMap::new()));
+        let compiler = Compiler::new_for_target_spec(
+            CompilerConfig {
+                opt_level: OptLevel::O0,
+                parallel: false,
+                ..CompilerConfig::default()
+            },
+            TargetSpec::parse("aarch64-apple-darwin").unwrap(),
+        )
+        .with_profile_generate(std::sync::Arc::clone(&sink))
+        .with_compile_artifact_cache(test_cache_config(
+            &root,
+            CompileArtifactProofPolicy::Unchecked,
+        ));
+
+        assert!(
+            compiler
+                .compile_artifact_cache_context(&module, &module)
+                .expect("cache eligibility check should succeed")
+                .is_none(),
+            "profile generation must bypass object reuse until CounterMap replay exists"
+        );
+        let result = compiler
+            .compile(&module)
+            .expect("profile-generate compile should succeed");
+        assert!(result.compile_artifact_cache_telemetry.is_empty());
+        assert!(
+            !sink
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty(),
+            "cold compilation must populate the caller's counter map"
+        );
+
+        if root.exists() {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn compile_artifact_cache_rejects_publication_after_transient_control() {
+        let root = temp_cache_root("transient-ambient-control");
+        let module = const_i64_module("compiler_cache_transient", "answer", 42);
+        let target_spec = TargetSpec::parse("aarch64-apple-darwin").unwrap();
+        let compiler = Compiler::new_for_target_spec(
+            CompilerConfig {
+                opt_level: OptLevel::O0,
+                parallel: false,
+                ..CompilerConfig::default()
+            },
+            target_spec,
+        )
+        .with_compile_artifact_cache(test_cache_config(
+            &root,
+            CompileArtifactProofPolicy::Unchecked,
+        ));
+        let context = compiler
+            .compile_artifact_cache_context(&module, &module)
+            .expect("cache context creation should succeed")
+            .expect("default environment should issue a cache permit");
+
+        let artifact_bytes =
+            trust_cg_process_env::with_env_overrides(&[("TCG_NO_SELECT_FOLD", "1")], || {
+                vec![0xca, 0xfe]
+            });
+        assert!(
+            trust_cg_process_env::artifact_reuse_environment_safety().is_reuse_safe(),
+            "the transient scope should have ended"
+        );
+        assert!(!context.reuse_permit.is_valid());
+        assert!(
+            lookup_compile_artifact(
+                &context.cache,
+                &context.key,
+                context.boundary,
+                None,
+                &context.reuse_permit,
+            )
+            .expect("permit rejection should not be an I/O error")
+            .is_none(),
+            "an invalidated transaction must bypass object lookup"
+        );
+        assert!(
+            store_compile_artifact(
+                &context.cache,
+                &context.key,
+                context.boundary,
+                &artifact_bytes,
+                "transient-policy-test",
+                None,
+                &context.reuse_permit,
+            )
+            .expect("permit rejection should not be an I/O error")
+            .is_none(),
+            "a transient-policy result must not be published"
+        );
+        assert!(matches!(
+            context
+                .cache
+                .lookup_for_pipeline(&context.key)
+                .expect("raw cache lookup should succeed"),
+            CompileArtifactCacheLookup::Miss { .. }
+        ));
+
+        if root.exists() {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
     fn compile_artifact_cache_profile_use_misses_after_no_profile_entry() {
         let root = temp_cache_root("profile-use-no-profile");
         let module = const_i64_module("compiler_cache_profile_use", "answer", 42);
@@ -10008,11 +10652,48 @@ mod tests {
     }
 
     #[test]
+    fn compile_artifact_cache_proof_policy_does_not_enable_proof_generation() {
+        let root = temp_cache_root("proof-policy-no-expansion");
+        let module = const_i64_module("compiler_cache_no_proof_expansion", "answer", 7);
+        let target_spec = TargetSpec::parse("aarch64-apple-darwin").unwrap();
+        let config = CompilerConfig {
+            opt_level: OptLevel::O0,
+            emit_proofs: false,
+            parallel: false,
+            ..CompilerConfig::default()
+        };
+
+        let baseline = Compiler::new_for_target_spec(config.clone(), target_spec)
+            .compile(&module)
+            .expect("ordinary compile should succeed");
+        let cache_attached = Compiler::new_for_target_spec(config, target_spec)
+            .with_compile_artifact_cache(test_cache_config(
+                &root,
+                CompileArtifactProofPolicy::Smoke,
+            ))
+            .compile(&module)
+            .expect("cache policy must not expand proof work or reject compilation");
+
+        assert_eq!(cache_attached.object_code, baseline.object_code);
+        assert!(baseline.proofs.is_none());
+        assert!(cache_attached.proofs.is_none());
+        assert!(
+            cache_attached.compile_artifact_cache_telemetry.is_empty(),
+            "proof-bearing cache policy must bypass when proofs were not explicitly requested"
+        );
+
+        if root.exists() {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
     fn compile_artifact_cache_proof_policy_change_misses_integrated_path() {
         let root = temp_cache_root("proof-policy");
         let module = const_i64_module("compiler_cache_policy", "answer", 7);
         let config = CompilerConfig {
             opt_level: OptLevel::O0,
+            emit_proofs: true,
             parallel: false,
             ..CompilerConfig::default()
         };
@@ -11334,6 +12015,96 @@ mod tests {
         assert!(!config.parallel);
     }
 
+    /// The proof-off x86 AOT path must perform the expensive target backend
+    /// exactly once per function. Before the assembled-module handoff was
+    /// generalized, code-size measurement encoded all F functions as raw bytes
+    /// and native object emission encoded the same F functions again (2F).
+    #[test]
+    fn test_x86_proof_off_aot_assembles_each_function_once() {
+        use trust_ir::Ty;
+        use trust_ir_build::ModuleBuilder;
+
+        const FUNCTION_COUNT: usize = 5;
+
+        let build_module = || {
+            let mut mb = ModuleBuilder::new("x86_proof_off_single_assembly");
+            for index in 0..FUNCTION_COUNT {
+                let ty = mb.add_func_type(vec![Ty::I64, Ty::I64], vec![Ty::I64]);
+                let mut fb = mb.function(format!("single_assembly_{index}"), ty);
+                let entry = fb.create_block();
+                let lhs = fb.add_block_param(entry, Ty::I64);
+                let rhs = fb.add_block_param(entry, Ty::I64);
+                fb.switch_to_block(entry);
+                let constant = fb.iconst(Ty::I64, index as i128 + 3);
+                let sum = fb.add(Ty::I64, lhs, rhs);
+                let product = fb.mul(Ty::I64, sum, constant);
+                fb.ret(vec![product]);
+                fb.build();
+            }
+            let mut module = mb.build();
+            module.globals.push(typed_global(
+                "SINGLE_ASSEMBLY_GLOBAL",
+                Ty::I64,
+                true,
+                Some(trust_ir::Constant::Int(17)),
+            ));
+            module
+        };
+
+        let compile_once = || {
+            Compiler::new(CompilerConfig {
+                target: Target::X86_64,
+                parallel: false,
+                emit_proofs: false,
+                ..CompilerConfig::default()
+            })
+            .compile(&build_module())
+            .expect("proof-off x86 module should compile")
+        };
+
+        crate::x86_64::pipeline::reset_test_x86_function_backend_invocations();
+        let first = compile_once();
+        assert_eq!(
+            crate::x86_64::pipeline::test_x86_function_backend_invocations(),
+            FUNCTION_COUNT,
+            "one proof-off AOT compile must run regalloc/frame/encode F times, not 2F"
+        );
+
+        crate::x86_64::pipeline::reset_test_x86_function_backend_invocations();
+        let second = compile_once();
+        assert_eq!(
+            crate::x86_64::pipeline::test_x86_function_backend_invocations(),
+            FUNCTION_COUNT,
+            "the single-assembly invariant must hold on repeated compilation"
+        );
+
+        assert_eq!(first.object_code, second.object_code);
+        assert_eq!(first.proofs, None);
+        assert_eq!(second.proofs, None);
+        assert_eq!(first.metrics.function_count, FUNCTION_COUNT);
+        assert_eq!(
+            first.metrics.code_size_bytes,
+            second.metrics.code_size_bytes
+        );
+        assert_eq!(
+            first.metrics.instruction_count,
+            second.metrics.instruction_count
+        );
+        assert_eq!(
+            first.metrics.optimization_passes_run,
+            second.metrics.optimization_passes_run
+        );
+        assert_eq!(
+            first.metrics.proof_optimizations,
+            second.metrics.proof_optimizations
+        );
+        assert_eq!(first.metrics.fsym_trust_ir, second.metrics.fsym_trust_ir);
+        assert_eq!(
+            first.proof_optimization_certificates,
+            second.proof_optimization_certificates
+        );
+    }
+
     #[test]
     fn test_parallel_multi_function_module_produces_same_output() {
         // Build a trust_ir module with 3 functions and compile it both serially
@@ -11471,7 +12242,13 @@ mod tests {
             .expect("x86 multi-function module should compile")
         };
 
+        crate::x86_64::pipeline::reset_test_x86_function_backend_invocations();
         let serial = compile_with(false);
+        assert_eq!(
+            crate::x86_64::pipeline::test_x86_function_backend_invocations(),
+            6,
+            "proof-on serial AOT must also run regalloc/frame/encode F times, not 2F"
+        );
         let parallel_a = compile_with(true);
         let parallel_b = compile_with(true);
 
@@ -11506,6 +12283,22 @@ mod tests {
         assert_eq!(
             serial.metrics.code_size_bytes,
             parallel_a.metrics.code_size_bytes
+        );
+        assert_eq!(
+            serial.metrics.optimization_passes_run,
+            parallel_a.metrics.optimization_passes_run
+        );
+        assert_eq!(
+            serial.metrics.proof_optimizations,
+            parallel_a.metrics.proof_optimizations
+        );
+        assert_eq!(
+            serial.metrics.fsym_trust_ir,
+            parallel_a.metrics.fsym_trust_ir
+        );
+        assert_eq!(
+            serial.proof_optimization_certificates,
+            parallel_a.proof_optimization_certificates
         );
     }
 
@@ -11733,6 +12526,26 @@ mod tests {
         assert_eq!(result.metrics.function_count, 1);
         assert!(result.metrics.instruction_count > 0);
         assert!(result.metrics.code_size_bytes > 0);
+        let module_evidence = result
+            .aarch64_machine_code
+            .expect("AArch64 JIT result must retain aggregate machine-code evidence");
+        assert_eq!(
+            module_evidence.target(),
+            TargetSpec::host_for_architecture(Target::Aarch64)
+        );
+        assert_eq!(
+            module_evidence.admitted_features(),
+            AArch64IsaProfile::for_host_jit().admitted_target_features()
+        );
+        assert_eq!(
+            module_evidence.required_features(),
+            OutputTargetFeatures::NONE
+        );
+        assert_eq!(result.per_function_metrics.len(), 1);
+        assert_eq!(
+            result.per_function_metrics[0].aarch64_machine_code,
+            Some(module_evidence)
+        );
         assert!(
             result.buffer.get_fn_ptr("add_fn").is_some(),
             "add_fn should be in the symbol map"
@@ -11796,6 +12609,27 @@ mod tests {
         assert!(result.buffer.get_fn_ptr("add_fn").is_some());
         assert!(result.buffer.get_fn_ptr("mul_fn").is_some());
         assert!(result.buffer.get_fn_ptr("sub_fn").is_some());
+
+        let module_evidence = result
+            .aarch64_machine_code
+            .expect("AArch64 JIT result must retain aggregate machine-code evidence");
+        let required = result
+            .per_function_metrics
+            .iter()
+            .map(|metrics| {
+                metrics
+                    .aarch64_machine_code
+                    .expect("each AArch64 JIT function must retain its evidence")
+                    .required_features()
+            })
+            .fold(OutputTargetFeatures::NONE, OutputTargetFeatures::union);
+        assert_eq!(module_evidence.required_features(), required);
+        assert!(
+            result
+                .per_function_metrics
+                .iter()
+                .all(|metrics| metrics.x86_machine_code == X86MachineCodeEvidence::default())
+        );
 
         // Verify symbols have distinct offsets (functions are laid out sequentially).
         let symbols: std::collections::HashMap<&str, u64> = result.buffer.symbols().collect();

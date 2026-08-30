@@ -341,6 +341,12 @@ pub struct OptimizationPipeline {
     /// `sincos` ABI differs, so the merge must stay inert. Set by the codegen
     /// pipeline from the concrete target triple.
     target_is_darwin: bool,
+    /// Whether the selected AArch64 execution target admits FEAT_DotProd.
+    ///
+    /// This is a backend capability, not a frontend-language property.  The
+    /// fail-closed default keeps every optimizer caller target-neutral: passes
+    /// may synthesize `UDOT` only after a target resolver explicitly opts in.
+    aarch64_dotprod: bool,
 }
 
 impl OptimizationPipeline {
@@ -358,6 +364,7 @@ impl OptimizationPipeline {
             disabled_passes_override: None,
             contains4_scanner_batch_rewrite_override: None,
             target_is_darwin: false,
+            aarch64_dotprod: false,
         }
     }
 
@@ -385,6 +392,16 @@ impl OptimizationPipeline {
     /// `false` (no merge), so callers that never set this stay bit-identical.
     pub fn with_target_is_darwin(mut self, darwin: bool) -> Self {
         self.target_is_darwin = darwin;
+        self
+    }
+
+    /// Admit AArch64 FEAT_DotProd instructions synthesized by optimization.
+    ///
+    /// Callers must derive this value from the resolved target/host ISA
+    /// profile. The default is `false`, so generic and cross-target pipelines
+    /// cannot accidentally manufacture optional instructions.
+    pub fn with_aarch64_dotprod(mut self, enabled: bool) -> Self {
+        self.aarch64_dotprod = enabled;
         self
     }
 
@@ -991,7 +1008,9 @@ impl OptimizationPipeline {
                 // accumulator, `a[i]` loads, lane-wise ops) and BAILS otherwise.
                 // Kill switch: `TRUST_CG_DISABLE_PASSES=neon_array`.
                 if !is_disabled("neon_array") {
-                    pm = pm.with_pass(Box::new(NeonArrayPass::new()));
+                    pm = pm.with_pass(Box::new(
+                        NeonArrayPass::new().with_aarch64_dotprod(self.aarch64_dotprod),
+                    ));
                 }
                 // SOUND NEON byte-widening reduction into a u64 accumulator
                 // (popcount-sum / byte-sum) — the case neon_array's i32-only
@@ -999,9 +1018,13 @@ impl OptimizationPipeline {
                 // v3_popcount). Composes already-proven CNT/UADDLP/ADD/UMOV +
                 // the const-materialization MOVI and the shared-debt paired-Q
                 // load, all now credited per-compile, so it promotes gate-clean.
-                // Default-ON; kill switch: `TRUST_CG_DISABLE_PASSES=neon_bytesum`.
+                // Present by default but inert unless the resolved target
+                // explicitly admits FEAT_DotProd; kill switch:
+                // `TRUST_CG_DISABLE_PASSES=neon_bytesum`.
                 if !is_disabled("neon_bytesum") {
-                    pm = pm.with_pass(Box::new(NeonBytesumPass::new()));
+                    pm = pm.with_pass(Box::new(
+                        NeonBytesumPass::new().with_aarch64_dotprod(self.aarch64_dotprod),
+                    ));
                 }
                 // SOUND NEON min/max & bitwise array-reduction vectorizer:
                 // extends neon-array to the non-add associative+commutative
@@ -1682,7 +1705,9 @@ impl OptimizationPipeline {
                 // accumulator, `a[i]` loads, lane-wise ops) and BAILS otherwise.
                 // Kill switch: `TRUST_CG_DISABLE_PASSES=neon_array`.
                 if !is_disabled("neon_array") {
-                    pm = pm.with_pass(Box::new(NeonArrayPass::new()));
+                    pm = pm.with_pass(Box::new(
+                        NeonArrayPass::new().with_aarch64_dotprod(self.aarch64_dotprod),
+                    ));
                 }
                 // SOUND NEON byte-widening reduction into a u64 accumulator
                 // (popcount-sum / byte-sum) — the case neon_array's i32-only
@@ -1690,9 +1715,13 @@ impl OptimizationPipeline {
                 // v3_popcount). Composes already-proven CNT/UADDLP/ADD/UMOV +
                 // the const-materialization MOVI and the shared-debt paired-Q
                 // load, all now credited per-compile, so it promotes gate-clean.
-                // Default-ON; kill switch: `TRUST_CG_DISABLE_PASSES=neon_bytesum`.
+                // Present by default but inert unless the resolved target
+                // explicitly admits FEAT_DotProd; kill switch:
+                // `TRUST_CG_DISABLE_PASSES=neon_bytesum`.
                 if !is_disabled("neon_bytesum") {
-                    pm = pm.with_pass(Box::new(NeonBytesumPass::new()));
+                    pm = pm.with_pass(Box::new(
+                        NeonBytesumPass::new().with_aarch64_dotprod(self.aarch64_dotprod),
+                    ));
                 }
                 // SOUND NEON min/max & bitwise array-reduction vectorizer:
                 // extends neon-array to the non-add associative+commutative
@@ -2150,6 +2179,22 @@ mod tests {
 
     fn preg(reg: trust_cg_ir::PReg) -> MachOperand {
         MachOperand::PReg(reg)
+    }
+
+    #[test]
+    fn aarch64_dotprod_capability_defaults_off_and_is_additive() {
+        assert!(!OptimizationPipeline::new(OptLevel::O2).aarch64_dotprod);
+        assert!(
+            OptimizationPipeline::new(OptLevel::O2)
+                .with_aarch64_dotprod(true)
+                .aarch64_dotprod
+        );
+        assert!(
+            !OptimizationPipeline::new(OptLevel::O2)
+                .with_aarch64_dotprod(true)
+                .with_aarch64_dotprod(false)
+                .aarch64_dotprod
+        );
     }
 
     /// Build a simple vectorizable add loop (i32, trip count 100).

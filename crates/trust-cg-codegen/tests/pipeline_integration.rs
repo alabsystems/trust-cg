@@ -747,18 +747,12 @@ fn test_full_pipeline_produces_valid_object() {
         ..Default::default()
     });
 
-    let result = pipeline.compile_ir_function(&mut func);
-    match result {
+    match pipeline.compile_ir_function(&mut func) {
         Ok(obj_bytes) => {
             assert!(is_valid_macho(&obj_bytes), "Should produce valid Mach-O");
             assert_eq!(macho_filetype(&obj_bytes), 1);
         }
-        Err(e) => {
-            // RegAlloc may fail for VReg-based functions because the
-            // regalloc adapter is simplified. This is expected and tracked
-            // as TODO for unification.
-            eprintln!("Pipeline failed (expected for VReg path): {}", e);
-        }
+        Err(e) => panic!("full pipeline (O0, VReg regalloc path) failed to compile add_full: {e}"),
     }
 }
 

@@ -113,6 +113,10 @@ fn all_reconstructable() -> Vec<X86Opcode> {
         X86Opcode::ShrRI,
         X86Opcode::SarRR,
         X86Opcode::SarRI,
+        // variable-count rotate (ROL r/m64, CL — rotate Stage 1: the proof
+        // lands BEFORE any emission; the Stage-2 variable-rotate peephole is
+        // admission-gated on exactly this reconstruction discharging Valid):
+        X86Opcode::RolRCl,
         X86Opcode::Movzx,
         X86Opcode::MovzxW,
         X86Opcode::MovsxB,
@@ -1268,6 +1272,226 @@ mod mem_rmw {
                 VerificationResult::Invalid { .. }
             ),
             "a plain store where an RMW was intended must REFUTE"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VARIABLE-COUNT ROTATE (RolRCl — ROL r/m64, CL) — SOUNDNESS PERIMETER
+// ---------------------------------------------------------------------------
+//
+// Rotate Stage 1 (0cb31507 template: NO allowlist, reconstruction credit
+// only). SOURCE = the bridge's `bitmanip_rotate` expansion — the exact idiom
+// the Stage-2 peephole deletes:
+//
+//     eff   = c & (w-1)
+//     compl = (0 - eff) & (w-1)
+//     S     = (x << eff) | (x >>u compl)
+//
+// MACHINE = the hardware-masked `encode_rol_rcl_masked`: `m = c & (w-1)`,
+// `M = (x >>u ((w - m) & (w-1))) | (x << m)` — OR halves in the OPPOSITE
+// order, complement via `(w-m)&(w-1)` (not the source's `(0-eff)&(w-1)`), so
+// the obligation is structurally distinct. TOTAL: no precondition, `m = 0`
+// gives `x` on both sides. These tests lock in BOTH directions:
+//   (a) the faithful form reconstructs Valid with Reconstructed provenance,
+//       binds the implicit-CL count as a declared input, and carries NO
+//       precondition; a width-8 twin is EXHAUSTIVELY swept by the evaluator;
+//   (b) every injected corruption REFUTES — ROR-for-ROL (swapped halves), a
+//       dropped wrap half, an UNMASKED machine count (c >= w diverges), a
+//       wrong hardware mask (& 31 at 64-bit), and SHL-for-ROL (the real
+//       shift encoder where the rotate was intended).
+// A false COVERED credit here is as bad as a shipped miscompile: the Stage-2
+// variable-rotate peephole's admission gate is this very reconstruction, so
+// if any refutation fails to fire the whole fail-closed argument is void.
+mod rotl_var {
+    use super::*;
+    use trust_cg_verify::x86_64_semantics::encode_rol_rcl_masked;
+
+    fn x(width: u32) -> SmtExpr {
+        SmtExpr::var("recon_src1", width)
+    }
+    fn c(width: u32) -> SmtExpr {
+        SmtExpr::var("recon_src2", width)
+    }
+
+    /// The faithful SOURCE side at `width`: the bridge idiom, bridge order,
+    /// built with the same public trust_ir encoders the reconstructor uses.
+    fn rotl_source(width: u32, ty: Type) -> SmtExpr {
+        let w_mask = SmtExpr::bv_const(u64::from(width - 1), width);
+        let eff =
+            encode_trust_ir_bitwise_binop(&Opcode::Band, ty.clone(), c(width), w_mask.clone());
+        let neg = encode_trust_ir_binop(
+            &Opcode::Isub,
+            ty.clone(),
+            SmtExpr::bv_const(0, width),
+            eff.clone(),
+        );
+        let compl = encode_trust_ir_bitwise_binop(&Opcode::Band, ty.clone(), neg, w_mask);
+        let lo = encode_trust_ir_shift(&Opcode::Ishl, ty.clone(), x(width), eff);
+        let hi = encode_trust_ir_shift(&Opcode::Ushr, ty.clone(), x(width), compl);
+        encode_trust_ir_bitwise_binop(&Opcode::Bor, ty, lo, hi)
+    }
+
+    fn rotl_ob(name: &str, width: u32, machine_expr: SmtExpr) -> ProofObligation {
+        ProofObligation {
+            name: name.to_string(),
+            trust_ir_expr: rotl_source(width, if width == 8 { Type::I8 } else { Type::I64 }),
+            aarch64_expr: machine_expr,
+            inputs: vec![
+                ("recon_src1".to_string(), width),
+                ("recon_src2".to_string(), width),
+            ],
+            preconditions: vec![],
+            fp_inputs: vec![],
+            category: None,
+            machine_side_provenance: MachineSideProvenance::Reconstructed {
+                from_opcode: "RolRCl".to_string(),
+                arity: 2,
+            },
+        }
+    }
+
+    // -- (a) POSITIVE --------------------------------------------------------
+
+    #[test]
+    fn faithful_rotl_var_reconstructs_valid_total_and_binds_cl() {
+        // The RR-shift shape: [dst, src1], count implicit in CL.
+        let inst = X86ISelInst::new(X86Opcode::RolRCl, vec![r64(0), r64(1)]);
+        let ob = reconstruct_x86_alu_obligation(&inst).expect("RolRCl must reconstruct");
+        assert!(ob.is_reconstructed(), "RolRCl must be Reconstructed");
+        assert!(
+            ob.inputs.iter().any(|(n, _)| n == "recon_src2"),
+            "the implicit CL count must be bound as a declared SMT input"
+        );
+        // TOTAL — strictly stronger than the shift lane: the count<width
+        // precondition must NOT be present (both sides mask mod width).
+        assert!(
+            ob.preconditions.is_empty(),
+            "the rotate obligation must be precondition-free (total)"
+        );
+        assert!(
+            matches!(verify_by_evaluation(&ob), VerificationResult::Valid),
+            "the faithful variable rotate must be Valid"
+        );
+    }
+
+    #[test]
+    fn rotl_var_width8_twin_is_exhaustively_valid() {
+        // Width-8 twin of the same obligation (the shift lane's i8 pattern):
+        // the evaluator sweeps 8-bit inputs EXHAUSTIVELY, so this pins the
+        // mask/complement algebra at every (x, c) pair including c = 0,
+        // c = width, and every wrap-around count.
+        let ob = rotl_ob(
+            "RECONSTRUCTED x86_64 RotlVar_8 width-8 exhaustive twin",
+            8,
+            encode_rol_rcl_masked(S, x(8), c(8)),
+        );
+        assert!(
+            matches!(verify_by_evaluation(&ob), VerificationResult::Valid),
+            "the width-8 rotate obligation must be exhaustively Valid"
+        );
+    }
+
+    // -- (b) REFUTATION controls (0cb31507 template) -------------------------
+
+    #[test]
+    fn ror_for_rol_refutes() {
+        // The machine halves SWAPPED (rotate-RIGHT by m where rotate-left was
+        // intended): rotl(x, m) != rotr(x, m) for a generic m ⇒ REFUTE.
+        let w_mask = SmtExpr::bv_const(63, 64);
+        let m = c(64).bvand(w_mask.clone());
+        let compl = SmtExpr::bv_const(64, 64).bvsub(m.clone()).bvand(w_mask);
+        let buggy = rotl_ob(
+            "RolRCl INJECTED as ROR (swapped halves)",
+            64,
+            x(64).bvshl(compl).bvor(x(64).bvlshr(m)), // WRONG: rotate right
+        );
+        assert!(
+            matches!(
+                verify_by_evaluation(&buggy),
+                VerificationResult::Invalid { .. }
+            ),
+            "ROR-for-ROL must REFUTE"
+        );
+    }
+
+    #[test]
+    fn dropped_wrap_half_refutes() {
+        // The machine side loses the wrap (>>u) half entirely: a rotate that
+        // discards the wrapped-around bits is a shift, not a rotate ⇒ REFUTE.
+        let m = c(64).bvand(SmtExpr::bv_const(63, 64));
+        let buggy = rotl_ob(
+            "RolRCl INJECTED dropped wrap half",
+            64,
+            x(64).bvshl(m), // WRONG: no wrap half
+        );
+        assert!(
+            matches!(
+                verify_by_evaluation(&buggy),
+                VerificationResult::Invalid { .. }
+            ),
+            "a rotate that drops the wrap half must REFUTE"
+        );
+    }
+
+    #[test]
+    fn unmasked_machine_count_refutes() {
+        // The machine side rotates by the RAW count (no & 63): for c >= 64
+        // both raw shifts overflow to zero while the source rotates by
+        // c & 63 ⇒ REFUTE (e.g. c = 65: source = rotl(x,1), machine = 0).
+        let buggy = rotl_ob(
+            "RolRCl INJECTED unmasked machine count",
+            64,
+            x(64)
+                .bvlshr(SmtExpr::bv_const(64, 64).bvsub(c(64)))
+                .bvor(x(64).bvshl(c(64))), // WRONG: raw c, no hardware mask
+        );
+        assert!(
+            matches!(
+                verify_by_evaluation(&buggy),
+                VerificationResult::Invalid { .. }
+            ),
+            "an unmasked machine rotate count must REFUTE"
+        );
+    }
+
+    #[test]
+    fn wrong_mask_31_refutes() {
+        // The machine side masks the count with the 32-BIT mask (& 31) at
+        // 64-bit width: c = 32 rotates by 32 on the source side but by 0 on
+        // the machine side ⇒ REFUTE (the exact wrong-width-mask bug class).
+        let w_mask = SmtExpr::bv_const(63, 64);
+        let m31 = c(64).bvand(SmtExpr::bv_const(31, 64)); // WRONG mask
+        let compl = SmtExpr::bv_const(64, 64).bvsub(m31.clone()).bvand(w_mask);
+        let buggy = rotl_ob(
+            "RolRCl INJECTED 32-bit hardware mask at 64-bit width",
+            64,
+            x(64).bvlshr(compl).bvor(x(64).bvshl(m31)),
+        );
+        assert!(
+            matches!(
+                verify_by_evaluation(&buggy),
+                VerificationResult::Invalid { .. }
+            ),
+            "a 64-bit rotate masked & 31 must REFUTE"
+        );
+    }
+
+    #[test]
+    fn shl_for_rol_refutes() {
+        // The REAL masked shift encoder where the rotate was intended (the
+        // wrong-opcode emission): SHL discards what ROL wraps ⇒ REFUTE.
+        let buggy = rotl_ob(
+            "RolRCl INJECTED as ShlRR (real shift encoder)",
+            64,
+            encode_shl_rr_masked(S, x(64), c(64)), // WRONG opcode
+        );
+        assert!(
+            matches!(
+                verify_by_evaluation(&buggy),
+                VerificationResult::Invalid { .. }
+            ),
+            "SHL-for-ROL must REFUTE"
         );
     }
 }

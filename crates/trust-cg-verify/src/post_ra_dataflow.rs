@@ -550,6 +550,15 @@ fn is_post_ra_shift_rr(opcode: X86Opcode) -> bool {
     matches!(opcode, ShlRR | ShrRR | SarRR)
 }
 
+/// Verify-owned mirror of codegen's `is_x86_rotate_rcl`. Kept SEPARATE from
+/// [`is_post_ra_shift_rr`] exactly as codegen keeps its predicates separate:
+/// the CL rotate shares the tied `[dst, src]` SHAPE with the CL shifts but not
+/// their flag mask (ROL touches only CF/OF), so a future flag-sensitive user
+/// of the shift predicate must not silently absorb the rotate.
+fn is_post_ra_rotate_rcl(opcode: X86Opcode) -> bool {
+    matches!(opcode, X86Opcode::RolRCl)
+}
+
 fn is_post_ra_explicit_source_unary(opcode: X86Opcode) -> bool {
     matches!(opcode, X86Opcode::Neg | X86Opcode::Not)
 }
@@ -571,7 +580,9 @@ pub fn post_ra_tied_lhs_index(inst: &X86ISelInst) -> Option<usize> {
     }
 
     if inst.operands.len() == 2
-        && (is_post_ra_shift_rr(inst.opcode) || is_post_ra_explicit_source_unary(inst.opcode))
+        && (is_post_ra_shift_rr(inst.opcode)
+            || is_post_ra_rotate_rcl(inst.opcode)
+            || is_post_ra_explicit_source_unary(inst.opcode))
     {
         return Some(1);
     }
@@ -1385,6 +1396,31 @@ pub(crate) fn classify_x86_post_ra_inst(
                 return Err(malformed(
                     inst,
                     "shift-by-CL opcode must be the tied 2-operand or in-place 1-operand form",
+                ));
+            }
+        }
+
+        // --- Rotate-by-CL (implicit RCX-root read). NOT the ShlRR flag
+        // model: ROL touches ONLY CF and OF — SF/ZF/AF/PF are UNAFFECTED
+        // (see the classify_immediate_rotate_flags note; reusing the shift
+        // mask here would be a WRONG-VALUE model for AF). And because CL may
+        // be ZERO every flag may be preserved, so NOTHING is definite:
+        // may-undef restricted to CF|OF, empty def mask. (CF is strictly
+        // conservative — architecturally a nonzero count writes CF with a
+        // DEFINED value — but without value reasoning about CL the
+        // fail-closed direction is to treat prior CF definedness as
+        // killable.) ---
+        RolRCl => {
+            acc.flags_may_undef_mask = FLAG_CF | FLAG_OF;
+            acc.read_preg(x86_64_regs::RCX);
+            if post_ra_tied_lhs_index(inst) == Some(1) {
+                classify_tied_site(inst, alloc, &mut acc)?;
+            } else if n == 1 {
+                acc.read_def_reg(&inst.operands[0], alloc);
+            } else {
+                return Err(malformed(
+                    inst,
+                    "rotate-by-CL opcode must be the tied 2-operand or in-place 1-operand form",
                 ));
             }
         }
@@ -3020,6 +3056,15 @@ mod tests {
                 ],
                 amap(&[(0, RegClass::Gpr64, RAX), (1, RegClass::Gpr64, RBX)]),
             ),
+            // 2-op RolRCl [dst, ghost] (with a CL setup so RCX is defined):
+            // the rotate's tied ghost is checked exactly like the CL shifts'.
+            (
+                vec![
+                    inst(X86Opcode::MovRI, vec![p(RCX), imm(3)]),
+                    inst(X86Opcode::RolRCl, vec![g64(0), g64(1)]),
+                ],
+                amap(&[(0, RegClass::Gpr64, RAX), (1, RegClass::Gpr64, RBX)]),
+            ),
             // 2-op Neg [dst, ghost].
             (
                 vec![inst(X86Opcode::Neg, vec![g64(0), g64(1)])],
@@ -4185,6 +4230,9 @@ mod tests {
                 0,
             ),
             (X86Opcode::ShlRR, vec![p(RBX)], 0, 0, FLAG_AF | FLAG_OF),
+            // Variable rotate: NOT the ShlRR mask — ROL touches only CF/OF
+            // (never AF), and with CL possibly zero nothing is definite.
+            (X86Opcode::RolRCl, vec![p(RBX)], 0, 0, FLAG_CF | FLAG_OF),
         ];
         for (opcode, operands, defined, undefined, may_undefined) in cases {
             let access = classify_x86_post_ra_inst(
@@ -4401,6 +4449,41 @@ mod tests {
                 PostRaDataflowViolationKind::ReadOfClobberedFlags,
                 "ZF",
             ),
+            // Variable rotate: never DEFINES ZF (CL may be zero, and even a
+            // nonzero-count ROL leaves ZF untouched), so an undefined prior
+            // ZF stays undefined through it.
+            (
+                "variable_rotate_never_defines_zf",
+                vec![inst(X86Opcode::RolRCl, vec![p(RBX)]), jcc(X86CondCode::E)],
+                PostRaDataflowViolationKind::ReadOfUndefinedFlags,
+                "ZF",
+            ),
+            // Variable rotate: may UNDEFINE a previously-defined OF (an
+            // effective count > 1 leaves OF architecturally undefined).
+            (
+                "variable_rotate_may_undefine_prior_of",
+                vec![
+                    inst(X86Opcode::CmpRR, vec![p(RAX), p(RBX)]),
+                    inst(X86Opcode::RolRCl, vec![p(RBX)]),
+                    jcc(X86CondCode::O),
+                ],
+                PostRaDataflowViolationKind::ReadOfUndefinedFlags,
+                "OF",
+            ),
+            // Variable rotate: CF is deliberately CONSERVATIVE (may-undef) —
+            // without value reasoning about CL a prior CF read across the
+            // rotate must fail closed, unlike the CL shifts whose model
+            // passes CF definedness through.
+            (
+                "variable_rotate_kills_prior_cf_conservatively",
+                vec![
+                    inst(X86Opcode::CmpRR, vec![p(RAX), p(RBX)]),
+                    inst(X86Opcode::RolRCl, vec![p(RBX)]),
+                    jcc(X86CondCode::B),
+                ],
+                PostRaDataflowViolationKind::ReadOfUndefinedFlags,
+                "CF",
+            ),
         ] {
             let func = x86_func(name, insts);
             assert_flag_violation(&func, kind, flag_name);
@@ -4427,6 +4510,16 @@ mod tests {
                 vec![
                     inst(X86Opcode::CmpRR, vec![p(RAX), p(RBX)]),
                     inst(X86Opcode::ShlRR, vec![p(RBX)]),
+                    jcc(X86CondCode::E),
+                ],
+            ),
+            // Variable rotate PRESERVES ZF (it is not in the rotate's touched
+            // set at any count), so a prior CMP's ZF stays readable across it.
+            (
+                "cmp_variable_rotate_keeps_zf_valid",
+                vec![
+                    inst(X86Opcode::CmpRR, vec![p(RAX), p(RBX)]),
+                    inst(X86Opcode::RolRCl, vec![p(RBX)]),
                     jcc(X86CondCode::E),
                 ],
             ),
@@ -5162,6 +5255,16 @@ mod tests {
         );
         assert_eq!(
             post_ra_tied_lhs_index(&inst(X86Opcode::ShlRR, vec![g64(0)])),
+            None
+        );
+        // Rotate-by-CL: same tied shape as the CL shifts (separate predicate,
+        // same schema).
+        assert_eq!(
+            post_ra_tied_lhs_index(&inst(X86Opcode::RolRCl, vec![g64(0), g64(1)])),
+            some1
+        );
+        assert_eq!(
+            post_ra_tied_lhs_index(&inst(X86Opcode::RolRCl, vec![g64(0)])),
             None
         );
         // Explicit-source unary: tied at 2 operands, in-place at 1.

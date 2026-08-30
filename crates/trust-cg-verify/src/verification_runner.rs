@@ -1356,6 +1356,10 @@ mod tests {
     #[test]
     fn test_run_with_ay_arithmetic_subset() {
         if !crate::ay_bridge::z3_available() {
+            crate::formal_gap::skip_test(
+                "test_run_with_ay_arithmetic_subset",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -1399,6 +1403,10 @@ mod tests {
     #[test]
     fn test_run_with_mode_ay_cli() {
         if !crate::ay_bridge::z3_available() {
+            crate::formal_gap::skip_test(
+                "test_run_with_mode_ay_cli",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -1414,6 +1422,10 @@ mod tests {
     #[test]
     fn test_run_with_mode_mock_then_ay() {
         if !crate::ay_bridge::z3_available() {
+            crate::formal_gap::skip_test(
+                "test_run_with_mode_mock_then_ay",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 

@@ -83,11 +83,6 @@ const DYLD_PATH: &str = "/usr/lib/dyld";
 /// macOS 14.0.0 encoded as (major << 16) | (minor << 8) | patch.
 const MACOS_14_0_0: u32 = 0x000E_0000;
 
-/// Section type for lazy symbol pointers (__la_symbol_ptr).
-/// Used for lazy-binding stubs (future: dyld_stub_binder integration).
-#[allow(dead_code)]
-const S_LAZY_SYMBOL_POINTERS: u32 = 0x7;
-
 /// Section type for non-lazy symbol pointers (__got / __nl_symbol_ptr).
 const S_NON_LAZY_SYMBOL_POINTERS: u32 = 0x6;
 

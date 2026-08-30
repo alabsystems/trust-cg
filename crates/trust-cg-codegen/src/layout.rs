@@ -104,6 +104,19 @@ pub fn compute_block_layout(func: &mut MachFunction) {
 ///
 /// Prefers the fall-through path: for a conditional branch block, the
 /// successor that would be the implicit fall-through if placed next.
+///
+/// COLD-TRAP DEMOTION (`TCG_BP_NO_TRAPSINK=1` restores the old behavior): a
+/// successor that is a no-successor trap continuation (a panic/abort arm whose
+/// last real instruction is an unconditional trap — see
+/// [`is_cold_trap_block`]) is never *preferred*, only taken when nothing else
+/// is available. The measured pathology (p3_gcd `main`): the gcd loop's
+/// divide-by-zero guard block ends `cbnz x, body ; b panic`, whose
+/// fall-through preference is the PANIC arm — the greedy chain dives into the
+/// dead `bl abort` block, the loop BODY is stranded for `find_next_chain_head`
+/// to append at the far end, and every iteration pays a forward-taken `cbnz`
+/// plus the backward-taken backedge (2 taken branches instead of 1). Pure
+/// ordering: every caller runs over explicit `Block`-operand edges, so the
+/// choice changes which seam falls through, never where an edge goes.
 fn pick_best_successor(func: &MachFunction, block: BlockId, placed: &[bool]) -> Option<BlockId> {
     let blk = func.block(block);
     if blk.succs.is_empty() {
@@ -113,42 +126,99 @@ fn pick_best_successor(func: &MachFunction, block: BlockId, placed: &[bool]) -> 
     // Determine fall-through preference from the terminator pattern.
     let ft = get_fallthrough_successor(func, block);
 
-    // Prefer the fall-through successor if it's unplaced.
+    // Prefer the fall-through successor if it's unplaced (and not a cold trap
+    // continuation).
+    if let Some(ft_block) = ft
+        && !placed[ft_block.0 as usize]
+        && !is_cold_trap_block(func, ft_block)
+    {
+        return Some(ft_block);
+    }
+
+    // Otherwise pick the first unplaced non-trap successor.
+    if let Some(&succ) = blk
+        .succs
+        .iter()
+        .find(|&&succ| !placed[succ.0 as usize] && !is_cold_trap_block(func, succ))
+    {
+        return Some(succ);
+    }
+
+    // Only trap continuations remain: keep the original preference order.
     if let Some(ft_block) = ft
         && !placed[ft_block.0 as usize]
     {
         return Some(ft_block);
     }
-
-    // Otherwise pick the first unplaced successor.
     blk.succs
         .iter()
         .find(|&&succ| !placed[succ.0 as usize])
         .copied()
 }
 
+/// True for a block that can only be a statically cold panic/abort
+/// continuation: it has no successors and its last real instruction is an
+/// unconditional trap (`TrapOverflow` — the post-noreturn-call trap, encoded as
+/// `brk` — or a literal `Brk`). Falling through into such a block wastes the
+/// fall-through seam on bytes that never execute; layout prefers to sink it.
+/// Kill switch: `TCG_BP_NO_TRAPSINK=1`.
+fn is_cold_trap_block(func: &MachFunction, block: BlockId) -> bool {
+    if !bp_trapsink_enabled() {
+        return false;
+    }
+    if !func.block(block).succs.is_empty() {
+        return false;
+    }
+    last_real_inst(func, block).is_some_and(|id| {
+        matches!(
+            func.inst(id).opcode,
+            AArch64Opcode::TrapOverflow | AArch64Opcode::Brk
+        )
+    })
+}
+
+/// Cold-trap demotion in the greedy chain (default ON). Kill switch:
+/// `TCG_BP_NO_TRAPSINK=1`. Cached: it is consulted once per successor
+/// candidate inside the greedy chainer, not once per function.
+fn bp_trapsink_enabled() -> bool {
+    static F: OnceLock<bool> = OnceLock::new();
+    *F.get_or_init(|| !matches!(std::env::var("TCG_BP_NO_TRAPSINK").as_deref(), Ok("1")))
+}
+
 /// Find the next chain head: an unplaced block that has at least one placed
 /// predecessor. If no such block exists, return any unplaced block.
+///
+/// Cold trap continuations ([`is_cold_trap_block`]) are demoted here too:
+/// choosing one as a chain head would drop its dead `bl abort` bytes into the
+/// middle of the layout (in p3_gcd it interleaved the panic arm between a
+/// loop's exit continuation and the loop body). They are still placed, just
+/// after every non-trap candidate with a placed predecessor is exhausted.
 fn find_next_chain_head(func: &MachFunction, placed: &[bool]) -> Option<BlockId> {
     let mut any_unplaced = None;
+    let mut trap_with_placed_pred = None;
 
     for i in 0..func.blocks.len() {
         if placed[i] {
             continue;
         }
+        let candidate = BlockId(i as u32);
         if any_unplaced.is_none() {
-            any_unplaced = Some(BlockId(i as u32));
+            any_unplaced = Some(candidate);
         }
         // Prefer blocks reachable from placed blocks.
         let blk = &func.blocks[i];
-        for &pred in &blk.preds {
-            if placed[pred.0 as usize] {
-                return Some(BlockId(i as u32));
+        let has_placed_pred = blk.preds.iter().any(|&pred| placed[pred.0 as usize]);
+        if has_placed_pred {
+            if !is_cold_trap_block(func, candidate) {
+                return Some(candidate);
+            }
+            if trap_with_placed_pred.is_none() {
+                trap_with_placed_pred = Some(candidate);
             }
         }
     }
 
-    any_unplaced
+    trap_with_placed_pred.or(any_unplaced)
 }
 
 // ---------------------------------------------------------------------------
@@ -671,6 +741,356 @@ fn bp_min_conds() -> usize {
             .and_then(|s| s.parse().ok())
             .unwrap_or(4)
     })
+}
+
+/// True when every pseudo instruction in `block` is inert at this phase: no
+/// side effects, no memory write, and not a value-carrying pseudo (`Phi`,
+/// `Copy`, `StackAlloc`). The layout pass runs after copy lowering and frame
+/// lowering, so these should already be gone; the check is the fail-closed
+/// guard for the two transforms below that let control BYPASS a block's
+/// pseudos ([`thread_decided_cb_pairs`] skips `Y`, the rotated latch of
+/// [`rotate_single_test_header_loops`] skips `H`).
+fn block_pseudos_are_inert(func: &MachFunction, block: BlockId) -> bool {
+    func.block(block).insts.iter().all(|&id| {
+        let inst = func.inst(id);
+        !inst.is_pseudo()
+            || (!inst.has_side_effects()
+                && !inst.writes_memory()
+                && !matches!(
+                    inst.opcode,
+                    AArch64Opcode::Phi | AArch64Opcode::Copy | AArch64Opcode::StackAlloc
+                ))
+    })
+}
+
+/// Thread away compare-and-branch pairs whose outcome is decided by the
+/// dominating test of the SAME register (kill switch: `TCG_BP_NO_DOMTHREAD=1`).
+///
+/// Shape (p3_gcd's inlined `a % b` guard inside the `while b != 0` loop):
+///
+/// ```text
+///   X: ... ; Cbz  r, T  ; B Y        (loop test: r == 0 → exit)
+///   Y: Cbnz r, D ; B P               (X's ONLY successor on the not-taken arm;
+///                                     the `%` divide-by-zero guard on the SAME r)
+/// ```
+///
+/// On the X→Y edge X's conditional was NOT taken, which fixes the sign of `r`:
+/// `Cbz` not taken ⇒ `r != 0`; `Cbnz` not taken ⇒ `r == 0`. `Y` holds NOTHING
+/// but a compare-and-branch on the exact same register operand (same physical
+/// register AND width — operand equality), with no instruction in between that
+/// could redefine it (`X`'s trailing `B` writes nothing, `Y`'s test is its
+/// first real instruction and its pseudos are inert). So `Y`'s branch outcome
+/// is a constant on this edge and `Y` is equivalent to an unconditional `B` to
+/// the decided target: retarget `X`'s trailing `B Y` there. `Y` had `X` as its
+/// only predecessor, so it becomes unreachable and is detached from
+/// `block_order` (dead `bl panic` bytes leave the layout; the arena slot stays,
+/// emptied, exactly like `branch_forward`'s retired trampolines). Per-iteration
+/// effect on p3's gcd loop: the always-taken forward `cbnz` disappears and the
+/// loop body becomes reachable by fall-through.
+///
+/// Runs right after fall-through materialization (every edge an explicit
+/// `Block` operand, succ/pred rebuilt) and before dominator/loop analysis, so
+/// the analyses and the reorder see the simplified CFG. Fail-closed on any
+/// deviation from the exact shape.
+fn thread_decided_cb_pairs(func: &mut MachFunction) -> bool {
+    if !bp_domthread_enabled() {
+        return false;
+    }
+    let entry = func.entry;
+    let mut changed = false;
+    let mut threaded_away: Vec<BlockId> = Vec::new();
+    // Fixpoint: a retarget can expose another decided pair. Bounded by the
+    // block count (each round must retarget at least one trailing `B`).
+    for _ in 0..func.blocks.len() {
+        let mut round_changed = false;
+        let order = func.block_order.clone();
+        for &x in &order {
+            let Some(xcp) = classify_cond_pair(func, x) else {
+                continue;
+            };
+            let x_op = func.inst(xcp.cond_id).opcode;
+            if !matches!(x_op, AArch64Opcode::Cbz | AArch64Opcode::Cbnz) {
+                continue;
+            }
+            let y = xcp.ft_target;
+            if y == x || y == xcp.cc_target || y == entry {
+                continue;
+            }
+            // Y must be entered ONLY through X's not-taken arm.
+            let mut preds: Vec<BlockId> = func.block(y).preds.clone();
+            preds.sort_by_key(|b| b.0);
+            preds.dedup();
+            if preds.as_slice() != [x] {
+                continue;
+            }
+            // Y must hold NOTHING but the decided compare-and-branch pair.
+            let y_reals = func
+                .block(y)
+                .insts
+                .iter()
+                .filter(|&&id| !func.inst(id).is_pseudo())
+                .count();
+            if y_reals != 2 || !block_pseudos_are_inert(func, y) {
+                continue;
+            }
+            let Some(ycp) = classify_cond_pair(func, y) else {
+                continue;
+            };
+            let y_op = func.inst(ycp.cond_id).opcode;
+            if !matches!(y_op, AArch64Opcode::Cbz | AArch64Opcode::Cbnz) {
+                continue;
+            }
+            // Same register operand — exact operand equality is width-aware
+            // (a W-reg and its X-reg alias are distinct operands). Compare
+            // every non-`Block` operand so the check does not depend on
+            // operand position.
+            if non_block_operands(func.inst(xcp.cond_id))
+                != non_block_operands(func.inst(ycp.cond_id))
+            {
+                continue;
+            }
+            // Not-taken X arm: Cbz ⇒ r != 0, Cbnz ⇒ r == 0. Y's branch is
+            // taken iff its polarity matches that fact.
+            let dest = if x_op == y_op {
+                ycp.ft_target // same polarity ⇒ Y's conditional NOT taken
+            } else {
+                ycp.cc_target // opposite polarity ⇒ Y's conditional taken
+            };
+            if dest == y {
+                continue;
+            }
+            let b_inst = func.inst_mut(xcp.b_id);
+            for op in &mut b_inst.operands {
+                if let MachOperand::Block(t) = op {
+                    *t = dest;
+                }
+            }
+            threaded_away.push(y);
+            round_changed = true;
+            changed = true;
+        }
+        if !round_changed {
+            break;
+        }
+        rebuild_succs_from_block_operands(func);
+    }
+    if changed {
+        // Detach the threaded-away blocks that are now unreachable so their
+        // dead panic bytes leave the executable layout. Each retired block is
+        // dropped from `block_order` AND emptied of its instructions (the
+        // `branch_forward` arena-shell contract: BlockId is never renumbered).
+        let dead: Vec<BlockId> = threaded_away
+            .iter()
+            .copied()
+            .filter(|&b| b != entry && func.block(b).preds.is_empty())
+            .collect();
+        for &b in &dead {
+            func.block_mut(b).insts.clear();
+        }
+        func.block_order.retain(|&b| !dead.contains(&b));
+        // Re-derive succ/pred edges over the reduced executable domain so no
+        // stale edge from a detached block survives into loop analysis (a
+        // stale pred made `scattered_loop_headers` see a body block missing
+        // from the order and misclassify the loop as a repair target).
+        rebuild_succs_from_block_operands(func);
+    }
+    changed
+}
+
+/// Every operand of `inst` that is not a `Block` target, in order.
+fn non_block_operands(inst: &MachInst) -> Vec<&MachOperand> {
+    inst.operands
+        .iter()
+        .filter(|op| !matches!(op, MachOperand::Block(_)))
+        .collect()
+}
+
+/// Dominated same-register compare-and-branch threading (default ON). Kill
+/// switch: `TCG_BP_NO_DOMTHREAD=1`. Read fresh (once per function) so A/B
+/// harnesses see a consistent per-process value.
+fn bp_domthread_enabled() -> bool {
+    !matches!(std::env::var("TCG_BP_NO_DOMTHREAD").as_deref(), Ok("1"))
+}
+
+/// Rotate a two-block loop whose header is a SINGLE compare-and-branch
+/// (`Cbz`/`Cbnz r, EXIT`) into do-while form (kill switch:
+/// `TCG_BP_NO_CBZ_ROTATE=1`).
+///
+/// Shape, over the FINAL layout (three consecutive blocks, exactly like
+/// [`rotate_top_tested_loops`]):
+///
+/// ```text
+///   order[i]   H:  Cbz r, EXIT        (H's ONLY real instruction; falls to Bd)
+///   order[i+1] Bd: <body...> ; B H    (unconditional back-edge)
+///   order[i+2] EXIT
+/// ```
+///
+/// becomes
+///
+/// ```text
+///   order[i]   H:  Cbz r, EXIT        (one-time zero-trip guard)
+///   order[i+1] Bd: <body...> ; Cbnz r, Bd    (falls through to EXIT)
+///   order[i+2] EXIT
+/// ```
+///
+/// Per continue-iteration this replaces a not-taken `Cbz` at the top plus a
+/// taken backward `B` at the bottom with ONE taken backward `Cbnz` (p3_gcd's
+/// inner loop: 7 fetched instructions / 1 taken branch → 5 / 1, the clang
+/// shape). Unlike [`rotate_top_tested_loops`] (default-off: its cloned `cmp`
+/// joins the induction-variable critical path) this clones NO compare — the
+/// test is a single register-zero check that consumes the same register `H`
+/// would read, so the rotated form strictly removes two fetched instructions
+/// per iteration.
+///
+/// Soundness: the inverted test executes at the exact instruction position of
+/// the `B H` it replaces, so it reads `r` in the identical state `H`'s test
+/// would have seen after the back-edge (`H` holds nothing but that one test
+/// plus inert pseudos, and no instruction sits between the old `B H` and `H`'s
+/// test). `Cbnz` is the exact complement of `Cbz`: the rotated latch re-enters
+/// `Bd` exactly when `H` would have fallen through into it, and falls through
+/// to `EXIT` (`order[i+2]`, verified to be the conditional's target) exactly
+/// when `H` would have branched there. `H` itself is untouched, so the
+/// loop-entry path and any other predecessor of `H` behave identically. No
+/// flags are involved. `Bd`'s succ/pred edges are re-derived locally so the
+/// stored CFG matches the new terminator. Fail-closed on any deviation from
+/// the exact shape.
+fn rotate_single_test_header_loops(func: &mut MachFunction) -> bool {
+    if !bp_cbz_rotate_enabled() {
+        return false;
+    }
+    struct Plan {
+        header: BlockId,
+        body: BlockId,
+        exit: BlockId,
+        back_edge_id: InstId,
+        inverted: MachInst,
+    }
+    let order = func.block_order.clone();
+    let mut plans: Vec<Plan> = Vec::new();
+    for i in 0..order.len() {
+        let header = order[i];
+        let (Some(&body), Some(&exit)) = (order.get(i + 1), order.get(i + 2)) else {
+            continue;
+        };
+        if body == header || exit == header || exit == body {
+            continue;
+        }
+        // H must be EXACTLY one real instruction: Cbz|Cbnz r, EXIT, and its
+        // pseudos (bypassed by the rotated latch) must be inert.
+        let header_reals: Vec<InstId> = func
+            .block(header)
+            .insts
+            .iter()
+            .copied()
+            .filter(|&id| !func.inst(id).is_pseudo())
+            .collect();
+        let [cond_id] = header_reals.as_slice() else {
+            continue;
+        };
+        if !block_pseudos_are_inert(func, header) {
+            continue;
+        }
+        let cond = func.inst(*cond_id);
+        if !matches!(cond.opcode, AArch64Opcode::Cbz | AArch64Opcode::Cbnz) {
+            continue;
+        }
+        if single_block_operand(cond) != Some(exit) {
+            continue;
+        }
+        // Bd's last real instruction must be the unconditional back-edge `B H`.
+        let Some(back_edge_id) = last_real_inst(func, body) else {
+            continue;
+        };
+        let back = func.inst(back_edge_id);
+        if back.opcode != AArch64Opcode::B || single_block_operand(back) != Some(header) {
+            continue;
+        }
+        // Fail-closed: the back-edge must be Bd's ONLY reference to H. A body
+        // whose conditional also targets H (`cbz x2, H ; B H` — reachable
+        // post-RA when branch forwarding retargets a conditional and its
+        // trailing `B` independently) would keep the Bd -> H edge after the
+        // rewrite, and the rotated latch would no longer be the sole way back
+        // into the loop. Refuse the whole plan rather than rotate it.
+        if func
+            .block(body)
+            .insts
+            .iter()
+            .filter(|&&id| id != back_edge_id)
+            .any(|&id| {
+                func.inst(id)
+                    .operands
+                    .iter()
+                    .any(|op| matches!(op, MachOperand::Block(t) if *t == header))
+            })
+        {
+            continue;
+        }
+        let swapped = if cond.opcode == AArch64Opcode::Cbz {
+            AArch64Opcode::Cbnz
+        } else {
+            AArch64Opcode::Cbz
+        };
+        let ops = cond
+            .operands
+            .iter()
+            .map(|op| match op {
+                MachOperand::Block(_) => MachOperand::Block(body),
+                other => other.clone(),
+            })
+            .collect();
+        plans.push(Plan {
+            header,
+            body,
+            exit,
+            back_edge_id,
+            inverted: MachInst::new(swapped, ops),
+        });
+    }
+    if plans.is_empty() {
+        return false;
+    }
+    for plan in plans {
+        func.block_mut(plan.body)
+            .insts
+            .retain(|&id| id != plan.back_edge_id);
+        let inv_id = func.push_inst(plan.inverted);
+        func.append_inst(plan.body, inv_id);
+        // Local CFG fixup for the latch: its successor set is now every
+        // remaining `Block` operand plus the fall-through into EXIT.
+        let mut new_succs: Vec<BlockId> = Vec::new();
+        for &id in &func.block(plan.body).insts {
+            for op in &func.inst(id).operands {
+                if let MachOperand::Block(t) = op
+                    && !new_succs.contains(t)
+                {
+                    new_succs.push(*t);
+                }
+            }
+        }
+        if !new_succs.contains(&plan.exit) {
+            new_succs.push(plan.exit);
+        }
+        let old_succs = std::mem::take(&mut func.block_mut(plan.body).succs);
+        for &t in &old_succs {
+            if !new_succs.contains(&t) {
+                func.block_mut(t).preds.retain(|&p| p != plan.body);
+            }
+        }
+        for &t in &new_succs {
+            if !func.block(t).preds.contains(&plan.body) {
+                func.block_mut(t).preds.push(plan.body);
+            }
+        }
+        debug_assert!(!func.block(plan.header).preds.contains(&plan.body));
+        func.block_mut(plan.body).succs = new_succs;
+    }
+    true
+}
+
+/// Single-test-header (Cbz/Cbnz) do-while rotation (default ON). Kill switch:
+/// `TCG_BP_NO_CBZ_ROTATE=1`. Read fresh (once per function).
+fn bp_cbz_rotate_enabled() -> bool {
+    !matches!(std::env::var("TCG_BP_NO_CBZ_ROTATE").as_deref(), Ok("1"))
 }
 
 /// A block ending in the conditional-pair terminator `... ; COND cc T ; B F`
@@ -2109,6 +2529,11 @@ pub fn aarch64_layout_fallthrough_and_elide(func: &mut MachFunction, rotate: boo
     // dominator/loop analysis and the placement heuristic see the full CFG.
     rebuild_succs_from_block_operands(func);
 
+    // Step 2.5: thread away compare-and-branch pairs decided by a dominating
+    // test of the same register (p3_gcd's in-loop divide-by-zero guard). Runs
+    // before dominator/loop analysis so the reorder sees the simplified CFG.
+    let threaded = thread_decided_cb_pairs(func);
+
     // Step 3: loop analysis over the clean explicit CFG. Dominators and natural
     // loops are layout-independent (derived from `entry` + succ/pred edges), so
     // the membership/nesting facts stay valid across the reorder that follows.
@@ -2288,16 +2713,23 @@ pub fn aarch64_layout_fallthrough_and_elide(func: &mut MachFunction, rotate: boo
     // Step 4: elide each trailing `B target` whose target is now layout-next.
     let elided = elide_trailing_b_to_layout_next(func);
 
+    // Step 4.5: rotate two-block loops whose header is a single Cbz/Cbnz into
+    // do-while form (no compare cloned — see the function doc; this is NOT the
+    // default-off `rotate` experiment below).
+    let cbz_rotated = rotate_single_test_header_loops(func);
+
     // Step 5 (optional): bottom-test rotation.
     let rotated = rotate && rotate_top_tested_loops(func);
 
     reordered
+        || threaded
         || pulled
         || latch_rotated
         || copylatch_pulled
         || !armrot.is_empty()
         || next_oriented
         || elided
+        || cbz_rotated
         || rotated
 }
 
@@ -2363,7 +2795,10 @@ fn bp_small_orient_enabled() -> bool {
 /// verbatim (the pre-feature bytes). Read fresh (not cached) so PGO-mode env
 /// screening and A/B harnesses see a consistent, per-process value.
 fn bp_next_orient_enabled() -> bool {
-    !matches!(std::env::var("TCG_BP_NO_NEXT_ORIENT").as_deref(), Ok("1"))
+    !matches!(
+        trust_cg_process_env::var("TCG_BP_NO_NEXT_ORIENT").as_deref(),
+        Ok("1")
+    )
 }
 /// Static cold-guard sinking (default ON). Kill switch: `TCG_BP_NO_COLDSINK=1`
 /// restores the greedy fall-through chain for guard-bearing functions (byte
@@ -4412,13 +4847,9 @@ mod tests {
     /// taken branch fewer, with the successor SET unchanged — AND the
     /// `TCG_BP_NO_NEXT_ORIENT=1` kill switch leaves it verbatim.
     ///
-    /// Both directions live in ONE test on purpose: `bp_next_orient_enabled`
-    /// reads the process environment fresh (so a PGO/A-B harness sees a
-    /// consistent per-process value), and `cargo test` runs tests in parallel,
-    /// so a separate env-mutating test would race this one. Nothing else in the
-    /// suite asserts that this step FIRES, and a transient disable only
-    /// restores pre-feature behavior, which every other test is written
-    /// against.
+    /// Both directions live in one test. The kill switch uses the shared
+    /// thread-local environment layer, so parallel tests cannot observe the
+    /// temporary value.
     #[test]
     fn next_orient_collapses_branch_over_branch_and_honours_its_kill_switch() {
         let (mut func, [entry, next, far]) = make_branch_over_branch();
@@ -4445,8 +4876,9 @@ mod tests {
         assert_eq!(func.block_order, vec![entry, next, far]);
 
         // Kill switch: same fixture, pair kept verbatim.
-        // SAFETY(test): restored before the assertions below.
-        unsafe { std::env::set_var("TCG_BP_NO_NEXT_ORIENT", "1") };
+        let env_scope = trust_cg_process_env::override_scope();
+        let kill_switch =
+            trust_cg_process_env::ScopedEnvVar::set(&env_scope, "TCG_BP_NO_NEXT_ORIENT", "1");
         let (mut off, [off_entry, ..]) = make_branch_over_branch();
         let off_loops = no_loops(&off);
         let changed = orient_next_is_cc_target(&mut off, &off_loops);
@@ -4456,7 +4888,7 @@ mod tests {
             .iter()
             .map(|&i| off.inst(i).opcode)
             .collect();
-        unsafe { std::env::remove_var("TCG_BP_NO_NEXT_ORIENT") };
+        drop(kill_switch);
         assert!(!changed);
         assert_eq!(
             off_ops,
@@ -5640,5 +6072,402 @@ mod tests {
             let mut func = two_armed_descent_loop();
             assert!(!run_armrot(&mut func).is_empty());
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // p3_gcd inner-loop levers: cold-trap demotion, dominated same-register
+    // compare-and-branch threading, single-test-header do-while rotation.
+    // These assume the default (kill switches unset).
+    // -----------------------------------------------------------------------
+
+    fn xreg(i: u16) -> MachOperand {
+        use trust_cg_ir::PReg;
+        MachOperand::PReg(PReg::new(i))
+    }
+
+    fn cb(op: AArch64Opcode, reg: MachOperand, target: BlockId) -> MachInst {
+        MachInst::new(op, vec![reg, MachOperand::Block(target)])
+    }
+
+    /// Every block's (opcode, operands) list plus the order: a byte-identity
+    /// snapshot for the fail-closed assertions.
+    fn snapshot(
+        func: &MachFunction,
+    ) -> (Vec<BlockId>, Vec<Vec<(AArch64Opcode, Vec<MachOperand>)>>) {
+        let insts = func
+            .blocks
+            .iter()
+            .map(|blk| {
+                blk.insts
+                    .iter()
+                    .map(|&id| (func.inst(id).opcode, func.inst(id).operands.clone()))
+                    .collect()
+            })
+            .collect();
+        (func.block_order.clone(), insts)
+    }
+
+    /// `bb0: Cbnz x1, bb2 ; B bb1` with `bb1` a no-successor trap arm. The
+    /// greedy chain's fall-through preference is the trap arm; demotion puts
+    /// the live arm next instead and sinks the trap. A `Ret`-terminated arm
+    /// in the same slot is NOT demoted (fail-closed: only unconditional traps).
+    #[test]
+    fn trapsink_greedy_chain_never_prefers_a_trap_fallthrough() {
+        for (arm, expect) in [
+            (AArch64Opcode::Brk, [BlockId(0), BlockId(2), BlockId(1)]),
+            (
+                AArch64Opcode::TrapOverflow,
+                [BlockId(0), BlockId(2), BlockId(1)],
+            ),
+            (AArch64Opcode::Ret, [BlockId(0), BlockId(1), BlockId(2)]),
+        ] {
+            let mut func = make_func("trapsink_ft", 3);
+            let (bb0, bb1, bb2) = (BlockId(0), BlockId(1), BlockId(2));
+            add_inst(&mut func, bb0, cb(AArch64Opcode::Cbnz, xreg(1), bb2));
+            add_inst(&mut func, bb0, b(bb1));
+            func.add_edge(bb0, bb2);
+            func.add_edge(bb0, bb1);
+            add_inst(&mut func, bb1, MachInst::new(arm, vec![]));
+            add_inst(&mut func, bb2, MachInst::new(AArch64Opcode::Ret, vec![]));
+            compute_block_layout(&mut func);
+            assert_eq!(func.block_order, expect.to_vec(), "arm = {arm:?}");
+        }
+    }
+
+    /// When a chain ends, `find_next_chain_head` scans for an unplaced block
+    /// with a placed predecessor: a trap arm that qualifies first must yield
+    /// to a later non-trap candidate and be placed last.
+    #[test]
+    fn trapsink_chain_head_defers_trap_to_non_trap_candidates() {
+        let mut func = make_func("trapsink_head", 5);
+        let ids: Vec<BlockId> = (0..5).map(|i| BlockId(i)).collect();
+        let (bb0, bb1, bb2, bb3, bb4) = (ids[0], ids[1], ids[2], ids[3], ids[4]);
+        add_inst(&mut func, bb0, cb(AArch64Opcode::Cbz, xreg(1), bb1));
+        add_inst(&mut func, bb0, b(bb2));
+        func.add_edge(bb0, bb1);
+        func.add_edge(bb0, bb2);
+        add_inst(
+            &mut func,
+            bb1,
+            MachInst::new(AArch64Opcode::TrapOverflow, vec![]),
+        );
+        add_inst(&mut func, bb2, cb(AArch64Opcode::Cbz, xreg(2), bb3));
+        add_inst(&mut func, bb2, b(bb4));
+        func.add_edge(bb2, bb3);
+        func.add_edge(bb2, bb4);
+        add_inst(&mut func, bb3, MachInst::new(AArch64Opcode::Ret, vec![]));
+        add_inst(&mut func, bb4, MachInst::new(AArch64Opcode::Ret, vec![]));
+        compute_block_layout(&mut func);
+        assert_eq!(func.block_order, vec![bb0, bb2, bb4, bb3, bb1]);
+    }
+
+    /// `bb0 X: x_op x1, T ; B Y` / `bb2 Y: y_op x1, D ; B P` with T/D/P
+    /// leaves; every edge explicit (post-materialization shape).
+    fn make_decided_pair(
+        x_op: AArch64Opcode,
+        y_op: AArch64Opcode,
+        y_reg: MachOperand,
+    ) -> (MachFunction, [BlockId; 5]) {
+        let mut func = make_func("decided_pair", 5);
+        let (x, t, y, d, p) = (BlockId(0), BlockId(1), BlockId(2), BlockId(3), BlockId(4));
+        add_inst(&mut func, x, cb(x_op, xreg(1), t));
+        add_inst(&mut func, x, b(y));
+        add_inst(&mut func, t, MachInst::new(AArch64Opcode::Ret, vec![]));
+        add_inst(&mut func, y, cb(y_op, y_reg, d));
+        add_inst(&mut func, y, b(p));
+        add_inst(&mut func, d, MachInst::new(AArch64Opcode::Ret, vec![]));
+        add_inst(&mut func, p, MachInst::new(AArch64Opcode::Brk, vec![]));
+        func.block_order = vec![x, t, y, d, p];
+        rebuild_succs_from_block_operands(&mut func);
+        (func, [x, t, y, d, p])
+    }
+
+    /// All four polarity combinations: same polarity decides Y's conditional
+    /// NOT taken (X's `B` retargets to P), opposite polarity decides it taken
+    /// (retargets to D). Y is detached from the order and emptied.
+    #[test]
+    fn domthread_threads_decided_pair_in_every_polarity() {
+        use AArch64Opcode::{Cbnz, Cbz};
+        for (x_op, y_op, want_d) in [
+            (Cbz, Cbz, false),
+            (Cbz, Cbnz, true),
+            (Cbnz, Cbnz, false),
+            (Cbnz, Cbz, true),
+        ] {
+            let (mut func, [x, t, y, d, p]) = make_decided_pair(x_op, y_op, xreg(1));
+            assert!(
+                thread_decided_cb_pairs(&mut func),
+                "{x_op:?}/{y_op:?} must thread"
+            );
+            let dest = if want_d { d } else { p };
+            let last = *func.block(x).insts.last().unwrap();
+            assert_eq!(func.inst(last).opcode, AArch64Opcode::B);
+            assert_eq!(
+                single_block_operand(func.inst(last)),
+                Some(dest),
+                "{x_op:?}/{y_op:?}: X's trailing B must retarget to the decided block"
+            );
+            // X's own conditional is untouched.
+            let cond = func.block(x).insts[0];
+            assert_eq!(func.inst(cond).opcode, x_op);
+            assert_eq!(single_block_operand(func.inst(cond)), Some(t));
+            assert_eq!(func.block_order, vec![x, t, d, p]);
+            assert!(func.block(y).insts.is_empty(), "Y must be emptied");
+            assert!(func.block(y).preds.is_empty());
+            assert!(func.block(y).succs.is_empty());
+            assert!(func.block(dest).preds.contains(&x));
+            let mut xs = func.block(x).succs.clone();
+            xs.sort_by_key(|b| b.0);
+            let mut want = vec![t, dest];
+            want.sort_by_key(|b| b.0);
+            assert_eq!(xs, want);
+        }
+    }
+
+    /// Fail-closed: every deviation from the exact decided shape leaves the
+    /// function byte-identical.
+    #[test]
+    fn domthread_refuses_undecided_shapes() {
+        use AArch64Opcode::{Cbnz, Cbz};
+        // (a) Y tests a DIFFERENT register.
+        let (mut func, _) = make_decided_pair(Cbz, Cbnz, xreg(2));
+        let before = snapshot(&func);
+        assert!(!thread_decided_cb_pairs(&mut func));
+        assert_eq!(snapshot(&func), before, "different register");
+
+        // (b) Y has a second predecessor (T jumps into Y instead of returning).
+        let (mut func, [_, t, y, ..]) = make_decided_pair(Cbz, Cbnz, xreg(1));
+        func.block_mut(t).insts.clear();
+        add_inst(&mut func, t, b(y));
+        rebuild_succs_from_block_operands(&mut func);
+        let before = snapshot(&func);
+        assert!(!thread_decided_cb_pairs(&mut func));
+        assert_eq!(snapshot(&func), before, "second predecessor");
+
+        // (c) Y carries a real instruction besides the pair.
+        let (mut func, [_, _, y, ..]) = make_decided_pair(Cbz, Cbnz, xreg(1));
+        let extra = func.push_inst(MachInst::new(
+            AArch64Opcode::AddRI,
+            vec![xreg(3), xreg(3), MachOperand::Imm(1)],
+        ));
+        func.block_mut(y).insts.insert(0, extra);
+        let before = snapshot(&func);
+        assert!(!thread_decided_cb_pairs(&mut func));
+        assert_eq!(snapshot(&func), before, "extra real instruction");
+
+        // (d) Y carries a value-carrying pseudo (a Copy) — not inert.
+        let (mut func, [_, _, y, ..]) = make_decided_pair(Cbz, Cbnz, xreg(1));
+        let copy = func.push_inst(MachInst::new(AArch64Opcode::Copy, vec![xreg(1), xreg(4)]));
+        assert!(func.inst(copy).is_pseudo());
+        func.block_mut(y).insts.insert(0, copy);
+        let before = snapshot(&func);
+        assert!(!thread_decided_cb_pairs(&mut func));
+        assert_eq!(snapshot(&func), before, "non-inert pseudo");
+
+        // (e) X's conditional is a flag branch, not a compare-and-branch.
+        let (mut func, [x, t, ..]) = make_decided_pair(Cbz, Cbnz, xreg(1));
+        let cond = func.block(x).insts[0];
+        *func.inst_mut(cond) = bcond(AArch64CC::EQ, t);
+        let before = snapshot(&func);
+        assert!(!thread_decided_cb_pairs(&mut func));
+        assert_eq!(snapshot(&func), before, "BCond dominator");
+    }
+
+    /// `bb0 -> bb1 H: cb x1, EXIT` (single real) / `bb2 Bd: add ; B H` /
+    /// `bb3 EXIT: Ret`, in that order with the header's fall-through already
+    /// implicit (post-elision shape).
+    fn make_single_test_loop(header_op: AArch64Opcode) -> (MachFunction, [BlockId; 4]) {
+        let mut func = make_func("single_test_loop", 4);
+        let (pre, h, bd, exit) = (BlockId(0), BlockId(1), BlockId(2), BlockId(3));
+        add_inst(&mut func, h, cb(header_op, xreg(1), exit));
+        add_inst(
+            &mut func,
+            bd,
+            MachInst::new(
+                AArch64Opcode::AddRI,
+                vec![xreg(2), xreg(2), MachOperand::Imm(1)],
+            ),
+        );
+        add_inst(&mut func, bd, b(h));
+        add_inst(&mut func, exit, MachInst::new(AArch64Opcode::Ret, vec![]));
+        func.add_edge(pre, h);
+        func.add_edge(h, exit);
+        func.add_edge(h, bd);
+        func.add_edge(bd, h);
+        func.block_order = vec![pre, h, bd, exit];
+        (func, [pre, h, bd, exit])
+    }
+
+    #[test]
+    fn cbz_rotate_turns_single_test_header_loop_into_do_while() {
+        use AArch64Opcode::{Cbnz, Cbz};
+        for (header_op, latch_op) in [(Cbz, Cbnz), (Cbnz, Cbz)] {
+            let (mut func, [pre, h, bd, exit]) = make_single_test_loop(header_op);
+            assert!(rotate_single_test_header_loops(&mut func));
+            // Header untouched: the one-time zero-trip guard.
+            let h_ops: Vec<_> = func
+                .block(h)
+                .insts
+                .iter()
+                .map(|&i| func.inst(i).opcode)
+                .collect();
+            assert_eq!(h_ops, vec![header_op]);
+            assert_eq!(
+                single_block_operand(func.inst(func.block(h).insts[0])),
+                Some(exit)
+            );
+            // Latch: body, then the inverted test back to the body.
+            let bd_ops: Vec<_> = func
+                .block(bd)
+                .insts
+                .iter()
+                .map(|&i| func.inst(i).opcode)
+                .collect();
+            assert_eq!(bd_ops, vec![AArch64Opcode::AddRI, latch_op]);
+            let latch = func.inst(*func.block(bd).insts.last().unwrap());
+            assert_eq!(latch.operands, vec![xreg(1), MachOperand::Block(bd)]);
+            assert_eq!(func.block_order, vec![pre, h, bd, exit]);
+            // Stored CFG matches the new terminator.
+            let mut bd_succs = func.block(bd).succs.clone();
+            bd_succs.sort_by_key(|b| b.0);
+            assert_eq!(bd_succs, vec![bd, exit]);
+            assert_eq!(func.block(h).preds, vec![pre]);
+            assert!(func.block(bd).preds.contains(&bd));
+            assert!(func.block(exit).preds.contains(&bd));
+        }
+    }
+
+    /// Fail-closed: any deviation from `H: single cb ; Bd: ... B H ; EXIT`
+    /// leaves the function byte-identical.
+    #[test]
+    fn cbz_rotate_refuses_non_matching_shapes() {
+        use AArch64Opcode::Cbz;
+        // (a) Header holds a compare + flag branch (rotate_top_tested_loops'
+        //     opt-in domain, not this one).
+        let (mut func, [_, h, _, exit]) = make_single_test_loop(Cbz);
+        func.block_mut(h).insts.clear();
+        add_inst(
+            &mut func,
+            h,
+            MachInst::new(AArch64Opcode::CmpRI, vec![xreg(1), MachOperand::Imm(0)]),
+        );
+        add_inst(&mut func, h, bcond(AArch64CC::EQ, exit));
+        let before = snapshot(&func);
+        assert!(!rotate_single_test_header_loops(&mut func));
+        assert_eq!(snapshot(&func), before, "two-instruction header");
+
+        // (b) The header's target is not the block laid out after the body.
+        let (mut func, [pre, h, bd, exit]) = make_single_test_loop(Cbz);
+        let far = func.create_block();
+        add_inst(&mut func, far, MachInst::new(AArch64Opcode::Ret, vec![]));
+        func.block_order = vec![pre, h, bd, far, exit];
+        let before = snapshot(&func);
+        assert!(!rotate_single_test_header_loops(&mut func));
+        assert_eq!(snapshot(&func), before, "exit not layout-next after body");
+
+        // (c) The back-edge is conditional, not an unconditional `B H`.
+        let (mut func, [_, h, bd, _]) = make_single_test_loop(Cbz);
+        let back = *func.block(bd).insts.last().unwrap();
+        *func.inst_mut(back) = cb(AArch64Opcode::Cbnz, xreg(2), h);
+        let before = snapshot(&func);
+        assert!(!rotate_single_test_header_loops(&mut func));
+        assert_eq!(snapshot(&func), before, "conditional back-edge");
+
+        // (d) The header carries a value-carrying pseudo the latch would skip.
+        let (mut func, [_, h, ..]) = make_single_test_loop(Cbz);
+        let copy = func.push_inst(MachInst::new(AArch64Opcode::Copy, vec![xreg(1), xreg(4)]));
+        func.block_mut(h).insts.insert(0, copy);
+        let before = snapshot(&func);
+        assert!(!rotate_single_test_header_loops(&mut func));
+        assert_eq!(snapshot(&func), before, "non-inert header pseudo");
+
+        // (e) The body's conditional ALSO targets H (`cbz x2, H ; B H`): the
+        //     back-edge is not Bd's only reference to the header. The plan
+        //     match only inspects the last real instruction, so without the
+        //     explicit refusal the rewrite would leave Bd -> H in the CFG and
+        //     trip the post-rewrite `debug_assert!` on H's preds.
+        let (mut func, [_, h, bd, _]) = make_single_test_loop(Cbz);
+        let body_first = func.block(bd).insts[0];
+        *func.inst_mut(body_first) = cb(Cbz, xreg(2), h);
+        let before = snapshot(&func);
+        assert!(!rotate_single_test_header_loops(&mut func));
+        assert_eq!(
+            snapshot(&func),
+            before,
+            "conditional in body also targets H"
+        );
+        assert!(func.block(h).preds.contains(&bd), "Bd -> H edge kept");
+    }
+
+    /// The p3_gcd `while b != 0 { a % b }` shape end to end through the
+    /// production pass: loop test, in-loop divide-by-zero guard on the same
+    /// register, body, exit, panic arm. Expected: the guard is threaded away
+    /// (its block detached), the body falls through from the header, the
+    /// latch is the single taken `cbnz`, and the panic arm sinks to the end.
+    #[test]
+    fn p3_gcd_guard_loop_lands_on_the_clang_shape() {
+        let mut func = make_func("p3_gcd", 6);
+        let (entry, h, guard, body, exit, panic) = (
+            BlockId(0),
+            BlockId(1),
+            BlockId(2),
+            BlockId(3),
+            BlockId(4),
+            BlockId(5),
+        );
+        add_inst(&mut func, entry, b(h));
+        add_inst(&mut func, h, cb(AArch64Opcode::Cbz, xreg(1), exit));
+        add_inst(&mut func, h, b(guard));
+        add_inst(&mut func, guard, cb(AArch64Opcode::Cbnz, xreg(1), body));
+        add_inst(&mut func, guard, b(panic));
+        add_inst(
+            &mut func,
+            body,
+            MachInst::new(
+                AArch64Opcode::AddRI,
+                vec![xreg(2), xreg(2), MachOperand::Imm(1)],
+            ),
+        );
+        add_inst(&mut func, body, b(h));
+        add_inst(&mut func, exit, MachInst::new(AArch64Opcode::Ret, vec![]));
+        add_inst(&mut func, panic, MachInst::new(AArch64Opcode::Brk, vec![]));
+        for (from, to) in [
+            (entry, h),
+            (h, exit),
+            (h, guard),
+            (guard, body),
+            (guard, panic),
+            (body, h),
+        ] {
+            func.add_edge(from, to);
+        }
+        func.block_order = vec![entry, h, guard, body, exit, panic];
+
+        assert!(aarch64_layout_fallthrough_and_elide(&mut func, false));
+
+        assert_eq!(func.block_order, vec![entry, h, body, exit, panic]);
+        assert!(func.block(guard).insts.is_empty(), "guard threaded away");
+        let ops = |blk: BlockId| -> Vec<AArch64Opcode> {
+            func.block(blk)
+                .insts
+                .iter()
+                .map(|&i| func.inst(i).opcode)
+                .collect()
+        };
+        assert_eq!(ops(entry), vec![], "entry's `b H` elided");
+        assert_eq!(
+            ops(h),
+            vec![AArch64Opcode::Cbz],
+            "header: one zero-trip guard"
+        );
+        assert_eq!(
+            single_block_operand(func.inst(func.block(h).insts[0])),
+            Some(exit)
+        );
+        assert_eq!(ops(body), vec![AArch64Opcode::AddRI, AArch64Opcode::Cbnz]);
+        let latch = func.inst(*func.block(body).insts.last().unwrap());
+        assert_eq!(latch.operands, vec![xreg(1), MachOperand::Block(body)]);
+        assert_eq!(ops(exit), vec![AArch64Opcode::Ret]);
+        assert_eq!(ops(panic), vec![AArch64Opcode::Brk]);
     }
 }

@@ -389,8 +389,22 @@ validate_policy() {
     RUN_EXACT_TESTS=1
 }
 
+# `AY_SOLVER_PATH` is the canonical override and the ONLY name the backend
+# reads (crates/trust-cg-verify/src/ay_bridge.rs, select_solver_binary: an
+# explicit AY_SOLVER_PATH wins over the toolchain layout and PATH lookup).
+# `TCG_SOLVER_PATH` is accepted as a legacy alias for existing operator
+# invocations and exported to the canonical name, so the tests see exactly the
+# solver this gate saw — a gate that believes a solver exists while the tests
+# resolve nothing is the failure mode this mapping closes.
+if [ -z "${AY_SOLVER_PATH:-}" ] && [ -n "${TCG_SOLVER_PATH:-}" ]; then
+    export AY_SOLVER_PATH="${TCG_SOLVER_PATH}"
+fi
 tcg_solver_present() {
-    [ -n "${TCG_SOLVER_PATH:-}" ] && [ -x "${TCG_SOLVER_PATH}" ] && return 0
+    if [ -n "${AY_SOLVER_PATH:-}" ]; then
+        # The backend accepts either a file path or a bare binary name on PATH.
+        [ -x "${AY_SOLVER_PATH}" ] && return 0
+        command -v "${AY_SOLVER_PATH}" >/dev/null 2>&1 && return 0
+    fi
     command -v ay >/dev/null 2>&1 && return 0
     for root in "$HOME/trust" "$HOME"; do
         [ -x "$root/build/aarch64-apple-darwin/stage2/bin/ay" ] && return 0
@@ -418,7 +432,8 @@ run_complement() {
     if ! tcg_solver_present; then
         echo "run_public_release_codegen_tests: NO AY SOLVER FOUND -- skipping the" >&2
         echo "  CEGIS superopt and AY regalloc differential tests. This release is" >&2
-        echo "  verified MODULO those lanes. Set TCG_SOLVER_PATH or put \`ay\` on PATH." >&2
+        echo "  verified MODULO those lanes. Set AY_SOLVER_PATH (TCG_SOLVER_PATH is an" >&2
+        echo "  accepted alias) or put \`ay\` on PATH." >&2
         for test_name in \
             test_cegis_cache_hit_on_repeat \
             test_cegis_codegen_layer_a_mul_zero_i32_matches_hand_movz \

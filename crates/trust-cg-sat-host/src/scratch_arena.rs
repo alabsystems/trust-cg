@@ -105,17 +105,9 @@ pub struct ScratchArena {
     reserve_words: usize,
     /// Bump cursor (in `c_int` units, relative to
     /// `scratch_base_offset`). Reset to 0 by [`Self::reset`].
-    #[allow(dead_code)]
     cursor: usize,
-    /// Cached `S->mem_max` (read once at bind time). Used by the
-    /// near-overflow guard to test
-    /// `s.mem_used + SCRATCH_NEAR_OVERFLOW_MARGIN < scratch_base_offset`
-    /// without re-reading the solver.
-    #[allow(dead_code)]
-    db_mem_max: usize,
     /// True once `bind_to_solver` has succeeded. Methods that require
     /// binding will assert this in debug builds.
-    #[allow(dead_code)]
     bound: bool,
 }
 
@@ -139,7 +131,6 @@ impl ScratchArena {
             scratch_base_offset: 0,
             reserve_words,
             cursor: 0,
-            db_mem_max: 0,
             bound: false,
         }
     }
@@ -212,7 +203,6 @@ impl ScratchArena {
 
         self.db_base = db_base;
         self.scratch_base_offset = scratch_base_offset;
-        self.db_mem_max = mem_max;
         self.cursor = 0;
         self.bound = true;
         Ok(())

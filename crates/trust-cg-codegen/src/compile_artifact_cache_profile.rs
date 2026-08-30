@@ -7,7 +7,11 @@
 //!
 //! This module does not install or trust cached native code by itself. It
 //! defines the canonical identity that a later filesystem cache backend must
-//! bind before replaying compile artifacts into Trust self-build lanes.
+//! bind before replaying compile artifacts into Trust self-build lanes. The
+//! production compiler additionally refuses lookup/publication whenever
+//! [`trust_cg_process_env::artifact_reuse_permit`] cannot issue or validate a
+//! transaction because an ambient compiler control is not represented by an
+//! explicit cache identity.
 
 use std::{
     env, fs,
@@ -33,13 +37,13 @@ pub const COMPILE_ARTIFACT_PROFILE_USE_DISABLED_SHA256: &str =
 ///
 /// Proof-authoritative partitions require an explicit source-lock identity instead.
 pub const COMPILE_ARTIFACT_DEFAULT_TRUST_IR_IDENTITY: &str =
-    "trust_ir:036e1ea8a3994b0eeb826c88e6116cf076560aea";
+    "trust_ir:cf5a6eaecea7d7a36f0d89c63e36882b787b770d";
 
 /// AY revision identity used by unchecked production cache partitions.
 ///
 /// Proof-authoritative partitions require an explicit source-lock identity instead.
 pub const COMPILE_ARTIFACT_DEFAULT_AY_IDENTITY: &str =
-    "ay:419bc211ca4b95c04e0c63896389a2d1ad54dc32";
+    "ay:5d586a5c2035e94c3f6ad00028e21ae5529cd2f3";
 
 /// Maximum manifest size accepted when replaying a local compile artifact cache entry.
 pub const COMPILE_ARTIFACT_CACHE_MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
@@ -534,6 +538,17 @@ impl CompileArtifactDependencyIdentity {
             && source_lock_identity(&self.ay_identity)
             && pinned_tool_identity(&self.rustc_identity)
             && pinned_tool_identity(&self.cargo_identity)
+    }
+
+    /// Return true when persistent artifact reuse is bound to source-lock and
+    /// pinned-toolchain identities rather than package-version/build-host
+    /// placeholders.
+    ///
+    /// The unchecked proof policy relaxes proof-bundle requirements, not
+    /// compiler/dependency identity. Production compiler cache contexts use
+    /// this stricter predicate for every replay policy.
+    pub fn is_artifact_reuse_eligible(&self) -> bool {
+        self.has_source_lock_identity()
     }
 
     /// Build a production default identity, overridable by Trust self-build
@@ -1557,14 +1572,14 @@ fn missing_required_text(value: &str) -> bool {
 }
 
 fn env_or_default(key: &str, default: impl Into<String>) -> String {
-    env::var(key)
+    trust_cg_process_env::var(key)
         .ok()
         .filter(|value| !missing_required_text(value))
         .unwrap_or_else(|| default.into())
 }
 
 fn env_or_missing(key: &str) -> String {
-    env::var(key)
+    trust_cg_process_env::var(key)
         .ok()
         .filter(|value| !missing_required_text(value))
         .unwrap_or_else(|| format!("TODO:required-source-lock:{key}"))
@@ -1630,6 +1645,44 @@ mod tests {
         assert_eq!(
             ay_rows, 2,
             "unchecked AY cache identity must match both regalloc manifest pins"
+        );
+    }
+
+    #[test]
+    fn dependency_identity_honors_safe_thread_local_environment_overrides() {
+        trust_cg_process_env::with_env_overrides(
+            &[
+                (
+                    "TRUST_CG_COMPILE_ARTIFACT_TRUST_CG_IDENTITY",
+                    "source-lock-sha256:cg-test",
+                ),
+                (
+                    "TRUST_CG_COMPILE_ARTIFACT_TRUST_IR_IDENTITY",
+                    "source-lock-sha256:ir-test",
+                ),
+                (
+                    "TRUST_CG_COMPILE_ARTIFACT_AY_IDENTITY",
+                    "source-lock-sha256:ay-test",
+                ),
+                (
+                    "TRUST_CG_COMPILE_ARTIFACT_RUSTC_IDENTITY",
+                    "rustc:sha256:rustc-test",
+                ),
+                (
+                    "TRUST_CG_COMPILE_ARTIFACT_CARGO_IDENTITY",
+                    "cargo:sha256:cargo-test",
+                ),
+                ("TRUST_CG_COMPILE_ARTIFACT_DEPENDENCY_MODE", "upstream"),
+            ],
+            || {
+                let identity = CompileArtifactDependencyIdentity::from_env_or_defaults();
+                assert_eq!(identity.trust_cg_identity, "source-lock-sha256:cg-test");
+                assert_eq!(identity.trust_ir_identity, "source-lock-sha256:ir-test");
+                assert_eq!(identity.ay_identity, "source-lock-sha256:ay-test");
+                assert_eq!(identity.rustc_identity, "rustc:sha256:rustc-test");
+                assert_eq!(identity.cargo_identity, "cargo:sha256:cargo-test");
+                assert_eq!(identity.dependency_mode, "upstream");
+            },
         );
     }
 

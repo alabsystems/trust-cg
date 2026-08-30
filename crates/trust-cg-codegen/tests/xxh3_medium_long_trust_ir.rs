@@ -12,6 +12,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "common/skip.rs"]
+mod skip;
+
 use trust_cg_codegen::compiler::{Compiler, CompilerConfig};
 use trust_cg_codegen::pipeline::OptLevel;
 use trust_ir::{BinOp, Inst, Ty, ValueId};
@@ -111,18 +114,6 @@ int main(void) {
     return 0;
 }
 "#;
-
-fn is_aarch64() -> bool {
-    cfg!(target_arch = "aarch64")
-}
-
-fn has_cc() -> bool {
-    Command::new("cc")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
 
 fn make_test_dir(test_name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("trust_cg_xxh3_medium_long_{test_name}"));
@@ -488,7 +479,7 @@ fn test_xxh3_medium_long_compiles_o0_o2() {
 
 #[test]
 fn test_xxh3_medium_long_e2e_o0_o2() {
-    if !is_aarch64() || !has_cc() {
+    if !skip::aarch64_linkrun_or_skip("test_xxh3_medium_long_e2e_o0_o2") {
         return;
     }
 

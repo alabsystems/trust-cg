@@ -107,7 +107,8 @@
 //!
 //! ## Fail-closed guards (BAIL preconditions)
 //!
-//! Innermost loop only; a single `Gpr64` accumulator read ONLY along its
+//! An explicitly admitted AArch64 FEAT_DotProd target; innermost loop only; a
+//! single `Gpr64` accumulator read ONLY along its
 //! reduction path (an `AddRR` reduction, or the count-if diamond's `+1`/`+0`
 //! arms); a single `+1` `Gpr64` induction; a compile-time-constant bound `N`
 //! with `width(kind) <= N` and `8*N < 2^31` (popcount) / `< 2^31` (count-if) used by
@@ -119,8 +120,10 @@
 //! multi-valued bound, or `acc` read off the reduction path all BAIL — anything
 //! unrecognized leaves the loop entirely scalar.
 //!
-//! Default-ON; disable with `TRUST_CG_DISABLE_PASSES=neon_bytesum`. Every opcode
-//! it emits is credited by the per-compile proof gate — CNT/CMEQ/AND/UDOT/ADD/
+//! Included in O2/O3, but inert until the resolved target profile explicitly
+//! admits FEAT_DotProd; disable with
+//! `TRUST_CG_DISABLE_PASSES=neon_bytesum`. Every opcode it emits is credited by
+//! the per-compile proof gate — CNT/CMEQ/AND/UDOT/ADD/
 //! UMOV via their faithful lowering proofs, the paired-Q load via the shared
 //! Ldr*/Str* memory debt, and the `MOVI #0`/`MOVI #1` byte-mask via
 //! constant-materialization covered-elsewhere (`function_verifier`) — so a
@@ -216,11 +219,26 @@ const MASK32: i64 = 0xFFFF_FFFF; // the `as u32` mask preceding the SWAR
 #[derive(Default)]
 pub struct NeonBytesumPass {
     fired: usize,
+    /// Explicit target capability. Every current lowering shape uses `UDOT`,
+    /// so false makes the pass entirely inert rather than emitting an optional
+    /// instruction for an unresolved target.
+    aarch64_dotprod: bool,
 }
 
 impl NeonBytesumPass {
     pub fn new() -> Self {
-        Self { fired: 0 }
+        Self {
+            fired: 0,
+            aarch64_dotprod: false,
+        }
+    }
+    /// Admit FEAT_DotProd instructions for a resolved AArch64 target.
+    ///
+    /// The fail-closed default is disabled; callers must explicitly thread the
+    /// backend capability into this frontend-neutral optimization pass.
+    pub fn with_aarch64_dotprod(mut self, enabled: bool) -> Self {
+        self.aarch64_dotprod = enabled;
+        self
     }
     /// Loops vectorized in the last `run`.
     pub fn fired(&self) -> usize {
@@ -234,12 +252,20 @@ impl MachinePass for NeonBytesumPass {
     }
 
     fn run(&mut self, func: &mut MachFunction) -> bool {
+        if !self.aarch64_dotprod {
+            self.fired = 0;
+            return false;
+        }
         let dom = DomTree::compute(func);
         let loops = LoopAnalysis::compute(func, &dom);
         self.run_core(func, &dom, &loops)
     }
 
     fn run_with_analyses(&mut self, func: &mut MachFunction, analyses: &mut AnalysisCache) -> bool {
+        if !self.aarch64_dotprod {
+            self.fired = 0;
+            return false;
+        }
         let loops = analyses.loop_analysis(func).clone();
         let changed = {
             let dom = analyses.domtree(func);
@@ -276,7 +302,7 @@ impl NeonBytesumPass {
         }
         let mut changed = false;
         for rec in plans {
-            if apply(func, &rec) {
+            if apply(func, &rec, self.aarch64_dotprod) {
                 self.fired += 1;
                 changed = true;
             }
@@ -2895,7 +2921,13 @@ fn emit_hexnibble_block(
     }
 }
 
-fn apply(func: &mut MachFunction, rec: &Recognized) -> bool {
+fn apply(func: &mut MachFunction, rec: &Recognized, aarch64_dotprod: bool) -> bool {
+    // All currently recognized shapes lower through `NeonUdotV`. Keep the
+    // capability check at the mutation boundary as a second fail-closed guard
+    // in addition to the pass entry checks above.
+    if !aarch64_dotprod {
+        return false;
+    }
     // Per-kind unroll: ByteSum = 8 accumulators / 128B per iteration;
     // Popcount / PredCountEqZero = 4 / 64B (see `unroll`).
     let unroll = unroll(rec.kind);

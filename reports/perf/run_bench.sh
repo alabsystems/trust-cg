@@ -22,9 +22,12 @@
 #   checksum (& 0xff) — we assert the bridge binary yields the SAME code as LLVM.
 #   A mismatch is a CORRECTNESS bug, NOT a perf result.
 #
-# Output: a CSV (results.csv) consumed by the report generator. Benchmarks the
-# bridge fails to compile (fail-closed coverage gaps) are recorded with a FAIL
-# marker and excluded from perf stats.
+# Output: a CSV consumed by the report generator (gen_report.py). Default
+#   path: results/results.csv next to this script (gitignored raw output;
+#   the tracked results.csv is a reviewed snapshot copied out by hand).
+#   Override with $OUT_CSV.
+# Benchmarks the bridge fails to compile (fail-closed coverage gaps) are
+# recorded with a FAIL marker and excluded from perf stats.
 #
 # Author: Andrew Yates · Copyright 2026 Andrew Yates · License: Apache-2.0
 set -u
@@ -49,7 +52,8 @@ BRIDGE_COMPILE_REPS=1   # bridge compile timing. The proof-gated compile is
                         # tighter compile-time estimate if you have the time.
 EXEC_REPS=5             # best-of-N exec timing
 
-OUT_CSV="${OUT_CSV:-$HERE/results.csv}"
+OUT_CSV="${OUT_CSV:-$HERE/results/results.csv}"
+mkdir -p "$(dirname "$OUT_CSV")"
 SCRATCH="$(mktemp -d)"
 trap 'rm -rf "$SCRATCH"' EXIT
 

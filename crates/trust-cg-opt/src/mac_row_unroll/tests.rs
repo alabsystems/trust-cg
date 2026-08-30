@@ -435,6 +435,39 @@ fn idempotent_second_run_is_noop() {
     );
 }
 
+#[test]
+fn no_madd_prefilter_skips_cached_cfg_analyses() {
+    // A valid multi-block CFG without a Madd cannot contain this pass's row-MAC
+    // shape. The cache counters make the avoided analyses directly observable.
+    let mut func = MachFunction::new("no_madd".to_string(), Signature::new(vec![], vec![]));
+    let exit = func.create_block();
+    let branch = func.push_inst(MachInst::new(AArch64Opcode::B, vec![bl(exit)]));
+    func.append_inst(func.entry, branch);
+    let ret = func.push_inst(MachInst::new(AArch64Opcode::Ret, vec![]));
+    func.append_inst(exit, ret);
+    func.add_edge(func.entry, exit);
+    assert!(!has_live_madd(&func));
+
+    let mut direct_pass = MacRowUnroll::new();
+    assert!(!<MacRowUnroll as MachinePass>::run(
+        &mut direct_pass,
+        &mut func,
+    ));
+    assert_eq!(direct_pass.fired(), 0);
+
+    let mut pass = MacRowUnroll::new();
+    let mut analyses = AnalysisCache::new();
+    assert!(!<MacRowUnroll as MachinePass>::run_with_analyses(
+        &mut pass,
+        &mut func,
+        &mut analyses,
+    ));
+    assert_eq!(pass.fired(), 0);
+    let stats = analyses.stats();
+    assert_eq!(stats.domtree_computations, 0);
+    assert_eq!(stats.loop_analysis_computations, 0);
+}
+
 // ---------------------------------------------------------------------------
 // FAIL-SAFE NEGATIVE CONTROLS
 // ---------------------------------------------------------------------------

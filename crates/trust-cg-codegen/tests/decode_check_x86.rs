@@ -171,9 +171,21 @@ fn decode_check_corpus_replay() {
             }
         }
     }
-    for &op in &[X86Opcode::ShlRR, X86Opcode::ShrRR, X86Opcode::SarRR] {
+    // Variable-count rotate rides the same D3-group CL form as the shifts.
+    for &op in &[
+        X86Opcode::ShlRR,
+        X86Opcode::ShrRR,
+        X86Opcode::SarRR,
+        X86Opcode::RolRCl,
+    ] {
         for &d in GPR64 {
             check(op, &X86InstOperands::r(d));
+        }
+    }
+    // Immediate rotate corpus rows (C1 /0 ib), mirroring the shift-imm rows.
+    for &d in GPR64 {
+        for &sh in &[0i64, 1, 7, 31, 63] {
+            check(X86Opcode::RolRI, &X86InstOperands::ri(d, sh));
         }
     }
 

@@ -43,7 +43,7 @@ configured authority policy.
 A separate `wasm32` lane takes one trust-ir module straight to closed-module
 `.wasm` bytes, bypassing the register-machine optimizer and allocator.
 
-> **Status — 0.x research preview (0.4.0).** trust-cg compiles a useful, tested
+> **Status — 0.x research preview (0.5.0).** trust-cg compiles a useful, tested
 > subset of trust-ir, but it is not a production compiler, a full Rust backend,
 > or a complete formal verification of every emitted binary. ABI, aggregate,
 > relocation, unwind, SIMD, atomic, and proof coverage are still incomplete.
@@ -195,7 +195,7 @@ presented as stronger evidence than it is.
 
 The opcode evidence inventory pins accepted/deferred classifications for
 every inventoried backend: AArch64 156/248 accepted (92 explicit RED rows),
-x86-64 167/196 (29 RED), RISC-V 14/17 (3 RED), and WebAssembly 111/113
+x86-64 168/197 (29 RED), RISC-V 14/17 (3 RED), and WebAssembly 111/113
 (2 RED: `f32.const` and `f64.const`, whose raw IEEE-754 immediates the
 signed-LEB decoder does not reach). These ratios measure accepted obligation
 coverage over emitted value/effect inventories, not compiler correctness or

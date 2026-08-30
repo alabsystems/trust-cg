@@ -1020,6 +1020,10 @@ mod tests {
     #[test]
     fn cegis_proves_switch_jump_table_address_i64() {
         if !crate::ay_bridge::z3_available() {
+            crate::formal_gap::skip_test(
+                "cegis_proves_switch_jump_table_address_i64",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 

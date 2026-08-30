@@ -1043,6 +1043,34 @@ pub enum X86Opcode {
     /// Appended after XorMRSib to preserve older implicit opcode
     /// discriminants.
     AddMRSib,
+    /// ROL r/m{32,64}, CL (`REX.W? D3 /0`) — rotate left by the count held in
+    /// the implicit CL register.
+    ///
+    /// `dst = (dst << m) | (dst >>u ((w - m) & (w-1)))` with `m = CL & (w-1)`:
+    /// the hardware masks the count mod the operand width (`& 63` at 64-bit,
+    /// `& 31` at 32-bit), so a zero EFFECTIVE count is the identity. The
+    /// variable-count sibling of `RolRI` (`C1 /0 ib`), standing to it exactly
+    /// as `ShlRR` (`D3 /4`) stands to `ShlRI`: two-address `[dst, src]` form
+    /// with the count implicit in CL (fixed-RCX regalloc constraint), NOT an
+    /// operand.
+    ///
+    /// ⚑ FLAGS DIFFER FROM THE OTHER SHIFTS — and from `RolRI`'s constant-count
+    /// model. ROL writes only CF (count != 0; last bit rotated out) and OF
+    /// (defined ONLY for an effective 1-bit rotate, architecturally undefined
+    /// for larger counts) and leaves SF/ZF/AF/PF UNAFFECTED — it is NOT the
+    /// SHL/SHR mask. Moreover CL may be ZERO at runtime, in which case EVERY
+    /// flag is preserved, so nothing is definitely written. Anything reasoning
+    /// about flag deadness must model that separately or it will conclude a
+    /// live flag is dead (the same trap pinned on `RolRI` above).
+    ///
+    /// Producer: the Stage-2 variable-rotate peephole (collapsing the bridge's
+    /// `bitmanip_rotate` shl/shr/or expansion with `& 63`-masked counts).
+    /// Nothing emits this opcode in Stage 1; it exists so the reconstruction
+    /// proof and all plumbing land first.
+    ///
+    /// Appended after AddMRSib to preserve older implicit opcode
+    /// discriminants.
+    RolRCl,
 }
 
 impl X86Opcode {
@@ -1103,6 +1131,15 @@ impl X86Opcode {
             XorMR | AddMR | XorMRSib | AddMRSib => InstFlags::READS_MEMORY
                 .union(InstFlags::WRITES_MEMORY)
                 .union(InstFlags::HAS_SIDE_EFFECTS),
+
+            // Variable-count rotate (ROL r/m64, CL): a pure register
+            // value-producer like the CL shifts — no memory, no side effects
+            // (the CF/OF flag contract is owned by the effects + TV-5 flag
+            // models, not InstFlags). Explicit rather than left to the
+            // `_ => EMPTY` wildcard so the choice is visibly deliberate for an
+            // appended opcode (the 8150da8f discipline); pinned by the
+            // pure_arithmetic_has_empty_flags unit test.
+            RolRCl => InstFlags::EMPTY,
 
             // Compare/test (set RFLAGS = side effect)
             CmpRR | CmpRI | CmpRI8 | TestRR | TestRI | Ucomisd | Ucomiss | BtRI => {
@@ -1687,6 +1724,7 @@ mod tests {
             X86Opcode::ShrRI,
             X86Opcode::SarRR,
             X86Opcode::SarRI,
+            X86Opcode::RolRCl,
             X86Opcode::MovRR,
             X86Opcode::MovRR32,
             X86Opcode::MovRI,

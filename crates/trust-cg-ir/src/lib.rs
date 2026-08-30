@@ -85,6 +85,7 @@ pub mod regs;
 pub mod riscv_ops;
 pub mod riscv_regs;
 pub mod target_info;
+pub mod target_machine;
 pub mod tls;
 pub mod trace;
 pub mod type_hierarchy;
@@ -123,6 +124,10 @@ pub use regs::{CondCode, PReg, RegClass, SpecialReg, VReg};
 pub use riscv_ops::RiscVOpcode;
 pub use riscv_regs::{RiscVPReg, RiscVRegClass};
 pub use target_info::{AArch64Target, OpcodeCategory, TargetInfo, X86_64Target};
+pub use target_machine::{
+    AdmittedTargetFeatures, CallingConvention, OutputTargetFeatures, Target, TargetFeature,
+    TargetFeatureSet, TargetFeatureSetError, TargetIdentity, TargetMachine, TargetMachineError,
+};
 pub use tls::TlsModel;
 pub use trace::{CompilationEvent, CompilationTrace, EventKind, Justification, RuleId, TraceLevel};
 pub use types::{BlockId, FrameIdx, InstId, StackSlotId, VRegId};

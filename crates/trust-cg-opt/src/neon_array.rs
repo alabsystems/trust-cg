@@ -230,9 +230,9 @@ const CTPOP_NEON_ENABLED: bool = true;
 /// unproven codegen. Nested `ctpop` uses (e.g. `2*ctpop(x)`) always take the
 /// UADDLP chain: UDOT is an accumulate and only sound at the term root.
 ///
-/// FEAT_DotProd is assumed present (every Apple M-series has it) — the same
-/// Apple-M target assumption as the LSE atomics; there is no per-feature
-/// machinery in the backend to gate on.
+/// This proof gate is necessary but not sufficient: the pass also requires an
+/// explicit FEAT_DotProd capability from the resolved backend target profile.
+/// Generic/cross-target callers default to the proven UADDLP fallback.
 const CTPOP_UDOT_ENABLED: bool = true;
 /// AArch64 condition code for signed less-than (`LT`).
 const CC_LT: i64 = 11;
@@ -270,11 +270,25 @@ const UNROLL_DOT: usize = 8;
 pub struct NeonArrayPass {
     /// Number of loops vectorized in the last run (diagnostics/tests).
     fired: usize,
+    /// Explicit target capability. False is the fail-closed default.
+    aarch64_dotprod: bool,
 }
 
 impl NeonArrayPass {
     pub fn new() -> Self {
-        Self { fired: 0 }
+        Self {
+            fired: 0,
+            aarch64_dotprod: false,
+        }
+    }
+
+    /// Admit FEAT_DotProd instructions for a resolved AArch64 target.
+    ///
+    /// This is intentionally additive and defaults off so direct pass users
+    /// cannot synthesize `UDOT` without declaring the target capability.
+    pub fn with_aarch64_dotprod(mut self, enabled: bool) -> Self {
+        self.aarch64_dotprod = enabled;
+        self
     }
 
     /// Loops vectorized in the last `run`.
@@ -413,7 +427,7 @@ impl NeonArrayPass {
         let mut changed = false;
         for rec in plans {
             let applied = if rec.widen.is_some() {
-                apply_widen(func, &rec)
+                apply_widen(func, &rec, self.aarch64_dotprod)
             } else if rec.dot.is_some() {
                 apply_dot_widen(func, &rec)
             } else if rec.abs.is_some() {
@@ -421,7 +435,7 @@ impl NeonArrayPass {
             } else if rec.is_i64 {
                 apply_i64(func, &rec)
             } else {
-                apply(func, &rec)
+                apply(func, &rec, self.aarch64_dotprod)
             };
             if applied {
                 self.fired += 1;
@@ -2970,7 +2984,7 @@ fn bound_reg(func: &mut MachFunction, rec: &Recognized, pre: InstId) -> VReg {
     }
 }
 
-fn apply(func: &mut MachFunction, rec: &Recognized) -> bool {
+fn apply(func: &mut MachFunction, rec: &Recognized, aarch64_dotprod: bool) -> bool {
     // IDEMPOTENCE: never vectorize the remainder loop of a loop this pass
     // already vectorized (see `crate::vector_remainder`).
     if crate::vector_remainder::preheader_folds_neon_lane_into(func, rec.preheader, rec.acc) {
@@ -3126,7 +3140,10 @@ fn apply(func: &mut MachFunction, rec: &Recognized) -> bool {
     let udot_inner = match rec.term {
         // UDOT accumulates into a SUM; only valid for the Add reduction.
         Term::Value(v)
-            if rec.reduce_op == ReduceOp::Add && CTPOP_NEON_ENABLED && CTPOP_UDOT_ENABLED =>
+            if rec.reduce_op == ReduceOp::Add
+                && CTPOP_NEON_ENABLED
+                && CTPOP_UDOT_ENABLED
+                && aarch64_dotprod =>
         {
             detect_ctpop_swar_i32(func, &rec.def, v)
         }
@@ -4290,7 +4307,7 @@ fn apply_abs_widen(func: &mut MachFunction, rec: &Recognized) -> bool {
 /// * pop (u8 only): `CNT.16B` then the proven `UDOT(acc, cnt, ones.16B)`
 ///   accumulate (2 ops, clang's shape); when `CTPOP_UDOT_ENABLED` is off,
 ///   fail-closed to the proven `CNT` + `UADDLP`x2 + `ADD.4S` chain.
-fn apply_widen(func: &mut MachFunction, rec: &Recognized) -> bool {
+fn apply_widen(func: &mut MachFunction, rec: &Recognized, aarch64_dotprod: bool) -> bool {
     // IDEMPOTENCE: never vectorize the remainder loop of a loop this pass
     // already vectorized (see `crate::vector_remainder`).
     if crate::vector_remainder::preheader_folds_neon_lane_into(func, rec.preheader, rec.acc) {
@@ -4330,11 +4347,12 @@ fn apply_widen(func: &mut MachFunction, rec: &Recognized) -> bool {
         })
         .collect();
     // The all-ones byte vector for the UDOT accumulate (pop kernels only).
-    let vones = (plan.pop && CTPOP_NEON_ENABLED && CTPOP_UDOT_ENABLED).then(|| {
-        let ones = alloc(func, RegClass::Fpr128);
-        emit_before(func, pre, AArch64Opcode::NeonMovi, vec![vreg(ones), imm(1)]);
-        ones
-    });
+    let vones =
+        (plan.pop && CTPOP_NEON_ENABLED && CTPOP_UDOT_ENABLED && aarch64_dotprod).then(|| {
+            let ones = alloc(func, RegClass::Fpr128);
+            emit_before(func, pre, AArch64Opcode::NeonMovi, vec![vreg(ones), imm(1)]);
+            ones
+        });
 
     // --- Preheader: sign-extend the loop bound once; `main_bound =
     // sxtw(bound) - (width-1)` (exact in i64 — sxtw(bound) is in i32 range so
@@ -5457,6 +5475,13 @@ mod tests {
             .count()
     }
 
+    /// Existing vector-shape tests model an AArch64 target with FEAT_DotProd.
+    /// Keep that target assumption explicit while production constructors stay
+    /// fail-closed.
+    fn dotprod_pass() -> NeonArrayPass {
+        NeonArrayPass::new().with_aarch64_dotprod(true)
+    }
+
     /// Build the rotated array-reduction loop `for i in 0..n: acc += a[i]` in the
     /// exact shape `loop-latch-layout` emits (guard / header / latch), plus a
     /// second array `b` and a `mul` when `dot` is set (dot product).
@@ -5539,7 +5564,7 @@ mod tests {
     #[test]
     fn vectorizes_array_sum() {
         let mut func = build_array_loop(false, ELEM_BYTES);
-        let mut pass = NeonArrayPass::new();
+        let mut pass = dotprod_pass();
         assert!(pass.run(&mut func), "should fire on `acc += a[i]`");
         assert_eq!(pass.fired(), 1);
         // 4 accumulators × 1 array = 2 LDP Q-pair loads; 4 accumulate + reduce adds.
@@ -5637,7 +5662,7 @@ mod tests {
         // `acc += (i*3+7) ^ a[i]` — affine iota term ⇒ fires with the iota
         // machinery (DUP iv splat + MOVI/INS iota + per-lane MUL/ADD/EOR).
         let mut func = build_iv_term_loop(false);
-        let mut pass = NeonArrayPass::new();
+        let mut pass = dotprod_pass();
         assert!(
             pass.run(&mut func),
             "affine iv term add reduction should vectorize"
@@ -5675,7 +5700,7 @@ mod tests {
     fn bails_on_add_iv_square_nonaffine() {
         // `acc += (i*i) ^ a[i]` — quadratic (NON-AFFINE) ⇒ must BAIL, no NEON.
         let mut func = build_iv_term_loop(true);
-        let mut pass = NeonArrayPass::new();
+        let mut pass = dotprod_pass();
         assert!(!pass.run(&mut func), "non-affine iv*iv term must BAIL");
         assert_eq!(count(&func, AArch64Opcode::NeonDupGen), 0, "no iota");
         assert_eq!(
@@ -5774,7 +5799,7 @@ mod tests {
     #[test]
     fn vectorizes_popcount_via_cnt_udot() {
         let mut func = build_popcount_loop(false);
-        let mut pass = NeonArrayPass::new();
+        let mut pass = dotprod_pass();
         assert!(
             pass.run(&mut func),
             "should fire on `acc += popcount(a[i])`"
@@ -5820,13 +5845,29 @@ mod tests {
     }
 
     #[test]
+    fn popcount_defaults_to_non_dotprod_fallback() {
+        let mut func = build_popcount_loop(false);
+        let mut pass = NeonArrayPass::new();
+        assert!(
+            pass.run(&mut func),
+            "baseline AArch64 should retain the proven popcount vectorization"
+        );
+        assert_eq!(count(&func, AArch64Opcode::NeonUdotV), 0);
+        assert_eq!(
+            count(&func, AArch64Opcode::NeonUaddlpV),
+            2 * UNROLL,
+            "each CNT result must use the baseline UADDLP widening chain"
+        );
+    }
+
+    #[test]
     fn nested_popcount_term_keeps_uaddlp_chain() {
         // `acc += popcount(a[i]) + a[i]`: the ctpop is NESTED inside the term, so
         // the accumulating UDOT is NOT sound there (it can only add into the
         // accumulator root). The generic lowering must keep the PROVEN
         // CNT + 2x UADDLP value-producing chain and a NeonAddV accumulate.
         let mut func = build_popcount_loop(true);
-        let mut pass = NeonArrayPass::new();
+        let mut pass = dotprod_pass();
         assert!(
             pass.run(&mut func),
             "should fire on `acc += popcount(a[i]) + a[i]`"
@@ -5849,7 +5890,7 @@ mod tests {
     #[test]
     fn vectorizes_dot_product() {
         let mut func = build_array_loop(true, ELEM_BYTES);
-        let mut pass = NeonArrayPass::new();
+        let mut pass = dotprod_pass();
         assert!(pass.run(&mut func), "should fire on `acc += a[i]*b[i]`");
         assert_eq!(pass.fired(), 1);
         // 4 accumulators × 2 arrays = 4 LDP Q-pair loads; 4 MUL.4S (one per accumulator).
@@ -5865,7 +5906,7 @@ mod tests {
     fn vectorizes_i64_array_sum() {
         // 64-bit `for i in 0..n: acc += a[i]` now vectorizes on the `.2D` path.
         let mut func = build_i64_array_loop(false, AArch64Opcode::AddRR);
-        let mut pass = NeonArrayPass::new();
+        let mut pass = dotprod_pass();
         assert!(pass.run(&mut func), "i64 `acc += a[i]` should fire (.2D)");
         assert_eq!(pass.fired(), 1);
         // 4 accumulators × 1 array = 2 LDP Q-pair loads; 4 accumulate + 3 combine
@@ -5906,7 +5947,7 @@ mod tests {
         // NEON EOR accumulators + EOR horizontal fold (identity 0, same zeroed
         // init as the sum). Proves the ReduceOp::Xor path fires (not dead code).
         let mut func = build_i64_array_loop(false, AArch64Opcode::EorRR);
-        let mut pass = NeonArrayPass::new();
+        let mut pass = dotprod_pass();
         assert!(
             pass.run(&mut func),
             "i64 `acc ^= a[i]` should fire (.2D EOR)"
@@ -5938,7 +5979,7 @@ mod tests {
         // widening MAC. Only the i32->i64 WIDENING dot (loads are i32 + Sxtw/Uxtw)
         // is vectorizable via SMLAL/UMLAL — see the widening-dot tests below.
         let mut func = build_i64_array_loop(true, AArch64Opcode::AddRR);
-        let mut pass = NeonArrayPass::new();
+        let mut pass = dotprod_pass();
         assert!(
             !pass.run(&mut func),
             "non-widening i64 dot product must BAIL (no .2D mul)"
@@ -5962,7 +6003,7 @@ mod tests {
         // i64 `acc += (a_i32[i] as i64) * (b_i32[i] as i64)` (Sxtw factors) now
         // vectorizes on the `.2D` path via the widening MAC SMLAL.2D + SMLAL2.2D.
         let mut func = build_widening_dot_loop(AArch64Opcode::Sxtw, AArch64Opcode::Sxtw);
-        let mut pass = NeonArrayPass::new();
+        let mut pass = dotprod_pass();
         assert!(
             pass.run(&mut func),
             "signed widening dot should fire (SMLAL/SMLAL2)"
@@ -6023,7 +6064,7 @@ mod tests {
         // Unsigned `acc(u64) += (a_u32[i] as u64) * (b_u32[i] as u64)` (Uxtw
         // factors) vectorizes via UMLAL.2D + UMLAL2.2D.
         let mut func = build_widening_dot_loop(AArch64Opcode::Uxtw, AArch64Opcode::Uxtw);
-        let mut pass = NeonArrayPass::new();
+        let mut pass = dotprod_pass();
         assert!(
             pass.run(&mut func),
             "unsigned widening dot should fire (UMLAL/UMLAL2)"
@@ -6056,7 +6097,7 @@ mod tests {
         // One factor sign-extended, the other zero-extended — there is NO single
         // widening MAC for a mixed-sign product; the recognizer MUST BAIL.
         let mut func = build_widening_dot_loop(AArch64Opcode::Sxtw, AArch64Opcode::Uxtw);
-        let mut pass = NeonArrayPass::new();
+        let mut pass = dotprod_pass();
         assert!(!pass.run(&mut func), "mixed-sign widening dot must BAIL");
         assert_eq!(count(&func, AArch64Opcode::NeonSmlalV), 0, "no SMLAL");
         assert_eq!(count(&func, AArch64Opcode::NeonUmlalV), 0, "no UMLAL");
@@ -6267,7 +6308,7 @@ mod tests {
         // must be recognized and vectorized just like the native shape.
         for op in [AArch64Opcode::AddRR, AArch64Opcode::EorRR] {
             let mut func = build_i64_rotated_loop(op);
-            let mut pass = NeonArrayPass::new();
+            let mut pass = dotprod_pass();
             assert!(
                 pass.run(&mut func),
                 "rotated i64 reduction ({op:?}) should fire"
@@ -6324,7 +6365,7 @@ mod tests {
         func.add_edge(latch, header);
         func.add_edge(latch, exit);
         func.next_vreg = 128;
-        let mut pass = NeonArrayPass::new();
+        let mut pass = dotprod_pass();
         assert!(
             !pass.run(&mut func),
             "register reduction must BAIL (no loads)"
@@ -6422,7 +6463,7 @@ mod tests {
     #[test]
     fn widen_sum_u8_fires_with_uaddlp_chain() {
         let mut func = build_widen_loop(AArch64Opcode::Uxtb, false);
-        let mut pass = NeonArrayPass::new();
+        let mut pass = dotprod_pass();
         assert!(pass.run(&mut func), "zext-i8 sum must vectorize (widening)");
         assert_eq!(pass.fired(), 1);
         // 4 Q registers per iteration = 2 LDP pair loads; per Q: 2 UADDLPs.
@@ -6438,7 +6479,7 @@ mod tests {
     #[test]
     fn widen_sum_i8_fires_with_saddlp_chain() {
         let mut func = build_widen_loop(AArch64Opcode::Sxtb, false);
-        let mut pass = NeonArrayPass::new();
+        let mut pass = dotprod_pass();
         assert!(pass.run(&mut func), "sext-i8 sum must vectorize (widening)");
         assert_eq!(count(&func, AArch64Opcode::NeonSaddlpV), 8, "2 per Q x 4");
         assert_eq!(
@@ -6451,7 +6492,7 @@ mod tests {
     #[test]
     fn widen_sum_u16_fires_single_uaddlp() {
         let mut func = build_widen_loop(AArch64Opcode::Uxth, false);
-        let mut pass = NeonArrayPass::new();
+        let mut pass = dotprod_pass();
         assert!(
             pass.run(&mut func),
             "zext-i16 sum must vectorize (widening)"
@@ -6462,7 +6503,7 @@ mod tests {
     #[test]
     fn widen_sum_i16_fires_single_saddlp() {
         let mut func = build_widen_loop(AArch64Opcode::Sxth, false);
-        let mut pass = NeonArrayPass::new();
+        let mut pass = dotprod_pass();
         assert!(
             pass.run(&mut func),
             "sext-i16 sum must vectorize (widening)"
@@ -6473,7 +6514,7 @@ mod tests {
     #[test]
     fn widen_pop_u8_fires_with_cnt_udot() {
         let mut func = build_widen_loop(AArch64Opcode::Uxtb, true);
-        let mut pass = NeonArrayPass::new();
+        let mut pass = dotprod_pass();
         assert!(
             pass.run(&mut func),
             "byte popcount must vectorize (widening)"
@@ -6487,7 +6528,7 @@ mod tests {
         // `ctpop(sext8(a[i]))` is NOT byte-local — the sign extension can add up
         // to 24 set bits — so CNT.16B would MISCOMPILE. Must BAIL (fail-closed).
         let mut func = build_widen_loop(AArch64Opcode::Sxtb, true);
-        let mut pass = NeonArrayPass::new();
+        let mut pass = dotprod_pass();
         assert!(!pass.run(&mut func), "sext-byte popcount must BAIL");
         assert_eq!(count(&func, AArch64Opcode::NeonCntV), 0);
         assert_eq!(count(&func, AArch64Opcode::NeonLdpQPost), 0);
@@ -6525,7 +6566,7 @@ mod tests {
         func.block_mut(hblk).insts.insert(pos, three);
         func.block_mut(hblk).insts.insert(pos + 1, mul);
         func.inst_mut(add_id).operands[2] = v(51);
-        let mut pass = NeonArrayPass::new();
+        let mut pass = dotprod_pass();
         assert!(
             !pass.run(&mut func),
             "ext-load with extra arithmetic must BAIL"
@@ -6638,7 +6679,7 @@ mod tests {
         // (500001 = 41249 | 7<<16) + multi-def step vreg. Must fire on the
         // mixed .4S path with the iota machinery.
         let mut func = build_inlined_puzzle_loop(41249, 7, false);
-        let mut pass = NeonArrayPass::new();
+        let mut pass = dotprod_pass();
         assert!(
             pass.run(&mut func),
             "inlined rotated xor-iota reduction with in-loop constant bound should fire"
@@ -6670,7 +6711,7 @@ mod tests {
         // inner header around the outer back edge, so the reaching-def fold
         // sees TWO defs and recognition must BAIL (no NEON).
         let mut func = build_inlined_puzzle_loop(41249, 7, true);
-        let mut pass = NeonArrayPass::new();
+        let mut pass = dotprod_pass();
         assert!(!pass.run(&mut func), "two reaching step defs must BAIL");
         assert_eq!(count(&func, AArch64Opcode::NeonLdpQPost), 0);
         assert_eq!(count(&func, AArch64Opcode::NeonEorV), 0);
@@ -6681,7 +6722,7 @@ mod tests {
         // Reconstructed bound 0 is outside the accepted [1, i32::MAX] window
         // (the rotated do-while's >=1-trip contract) and must BAIL.
         let mut func = build_inlined_puzzle_loop(0, 0, false);
-        let mut pass = NeonArrayPass::new();
+        let mut pass = dotprod_pass();
         assert!(!pass.run(&mut func), "constant bound 0 must BAIL");
         assert_eq!(count(&func, AArch64Opcode::NeonLdpQPost), 0);
     }
@@ -6697,7 +6738,7 @@ mod tests {
         let guard = BlockId(1);
         let exit = BlockId(4);
         func.add_edge(exit, guard);
-        let mut pass = NeonArrayPass::new();
+        let mut pass = dotprod_pass();
         assert!(
             !pass.run(&mut func),
             "native shape with multi-pred guard must BAIL"
@@ -6805,7 +6846,7 @@ mod tests {
         // the interior a[i] bounds check ELIDED (g_a is a pass-through). The
         // constant-bound forward chain must be recognized and vectorized as a dot.
         let mut func = build_chain_dot_loop(0);
-        let mut pass = NeonArrayPass::new();
+        let mut pass = dotprod_pass();
         assert!(
             pass.run(&mut func),
             "constant-bound chain dot should vectorize"
@@ -6837,7 +6878,7 @@ mod tests {
         // Same as above but the a[i] bounds check SURVIVED as a diamond checking
         // the SAME const 2048 (single-N holds): still fires.
         let mut func = build_chain_dot_loop(1);
-        let mut pass = NeonArrayPass::new();
+        let mut pass = dotprod_pass();
         assert!(
             pass.run(&mut func),
             "single-N interior diamond should still vectorize"
@@ -6856,7 +6897,7 @@ mod tests {
         // (1024) than the loop-continue (2048) proves nothing about the vector
         // range for that array — must BAIL (fail-closed).
         let mut func = build_chain_dot_loop(2);
-        let mut pass = NeonArrayPass::new();
+        let mut pass = dotprod_pass();
         assert!(!pass.run(&mut func), "mismatched interior bound must BAIL");
         assert_eq!(pass.fired(), 0);
         assert_eq!(count(&func, AArch64Opcode::NeonMulV), 0);
@@ -6867,7 +6908,7 @@ mod tests {
         // A guard that does not test (a copy of) the induction proves nothing
         // about the vectorized range — must BAIL.
         let mut func = build_chain_dot_loop(3);
-        let mut pass = NeonArrayPass::new();
+        let mut pass = dotprod_pass();
         assert!(!pass.run(&mut func), "non-iv guard index must BAIL");
         assert_eq!(pass.fired(), 0);
         assert_eq!(count(&func, AArch64Opcode::NeonMulV), 0);
@@ -6885,7 +6926,7 @@ mod tests {
             vec![v(71), v64(69), i(0)],
         ));
         func.block_mut(latch).insts.insert(0, st);
-        let mut pass = NeonArrayPass::new();
+        let mut pass = dotprod_pass();
         assert!(!pass.run(&mut func), "store in chain body must BAIL");
         assert_eq!(pass.fired(), 0);
     }
@@ -7013,7 +7054,7 @@ mod tests {
         // UADALP accumulate into `.2D` accumulators + the 2-lane drain
         // (3 SIMD ops per Q, under LLVM's uaddw/uaddw2 pair).
         let mut func = build_chain_abs_loop(0);
-        let mut pass = NeonArrayPass::new();
+        let mut pass = dotprod_pass();
         assert!(pass.run(&mut func), "chain abs-sum with addend should fire");
         assert_eq!(pass.fired(), 1);
         assert_eq!(
@@ -7084,7 +7125,7 @@ mod tests {
         // DUP at all (no ones splat, no invariant), no per-Q ADD.4S beyond the
         // .2D combine.
         let mut func = build_chain_abs_loop(1);
-        let mut pass = NeonArrayPass::new();
+        let mut pass = dotprod_pass();
         assert!(pass.run(&mut func), "plain chain abs-sum should fire");
         assert_eq!(pass.fired(), 1);
         assert_eq!(count(&func, AArch64Opcode::NeonAbsV), UNROLL);
@@ -7109,7 +7150,7 @@ mod tests {
         // function from the UADALP zext lowering on abs >= 2^31 (the i32::MIN
         // lane). MUST bail — this is the signed/unsigned miscompile axis.
         let mut func = build_chain_abs_loop(2);
-        let mut pass = NeonArrayPass::new();
+        let mut pass = dotprod_pass();
         assert!(!pass.run(&mut func), "Sxtw(abs) must BAIL (zext-only)");
         assert_eq!(pass.fired(), 0);
         assert_eq!(count(&func, AArch64Opcode::NeonAbsV), 0);
@@ -7119,7 +7160,7 @@ mod tests {
     fn chain_abs_bails_on_non_negation_arm() {
         // Neg arm computing `1 - x` is not `abs` — must BAIL.
         let mut func = build_chain_abs_loop(3);
-        let mut pass = NeonArrayPass::new();
+        let mut pass = dotprod_pass();
         assert!(!pass.run(&mut func), "non-negation arm must BAIL");
         assert_eq!(pass.fired(), 0);
         assert_eq!(count(&func, AArch64Opcode::NeonAbsV), 0);
@@ -7130,7 +7171,7 @@ mod tests {
         // Any instruction beyond the exact `MovR phi, x; B` in the identity arm
         // deviates from the proven diamond — must BAIL.
         let mut func = build_chain_abs_loop(4);
-        let mut pass = NeonArrayPass::new();
+        let mut pass = dotprod_pass();
         assert!(!pass.run(&mut func), "extra arm instruction must BAIL");
         assert_eq!(pass.fired(), 0);
         assert_eq!(count(&func, AArch64Opcode::NeonAbsV), 0);
@@ -7141,7 +7182,7 @@ mod tests {
         // A third in-loop write of the phi could change the joined value on
         // some path — must BAIL.
         let mut func = build_chain_abs_loop(5);
-        let mut pass = NeonArrayPass::new();
+        let mut pass = dotprod_pass();
         assert!(!pass.run(&mut func), "third phi writer must BAIL");
         assert_eq!(pass.fired(), 0);
         assert_eq!(count(&func, AArch64Opcode::NeonAbsV), 0);
@@ -7151,7 +7192,7 @@ mod tests {
     fn chain_abs_bails_on_wrong_condition() {
         // `EQ` is not a sign test: the diamond is not an abs — must BAIL.
         let mut func = build_chain_abs_loop(6);
-        let mut pass = NeonArrayPass::new();
+        let mut pass = dotprod_pass();
         assert!(!pass.run(&mut func), "non-sign-test condition must BAIL");
         assert_eq!(pass.fired(), 0);
         assert_eq!(count(&func, AArch64Opcode::NeonAbsV), 0);
@@ -7162,7 +7203,7 @@ mod tests {
         // The addend is (re)defined inside the loop — not invariant, the DUP
         // would freeze one value — must BAIL.
         let mut func = build_chain_abs_loop(7);
-        let mut pass = NeonArrayPass::new();
+        let mut pass = dotprod_pass();
         assert!(!pass.run(&mut func), "in-loop addend must BAIL");
         assert_eq!(pass.fired(), 0);
         assert_eq!(count(&func, AArch64Opcode::NeonAbsV), 0);
@@ -7175,7 +7216,7 @@ mod tests {
         // admissible term is the diamond's — must BAIL entirely (fail-closed;
         // no other track may fire on this loop either).
         let mut func = build_chain_abs_loop(8);
-        let mut pass = NeonArrayPass::new();
+        let mut pass = dotprod_pass();
         assert!(!pass.run(&mut func), "term bypassing the diamond must BAIL");
         assert_eq!(pass.fired(), 0);
         assert_eq!(count(&func, AArch64Opcode::NeonAbsV), 0);
@@ -7271,14 +7312,14 @@ mod tests {
     #[test]
     fn adv_merged_bound_no_carrier_fires() {
         let mut func = build_merged_bound_carrier_loop(2);
-        let mut pass = NeonArrayPass::new();
+        let mut pass = dotprod_pass();
         assert!(pass.run(&mut func), "merged-bound chain (no carrier) fires");
     }
 
     #[test]
     fn adv_carrier_same_n_fires() {
         let mut func = build_merged_bound_carrier_loop(1);
-        let mut pass = NeonArrayPass::new();
+        let mut pass = dotprod_pass();
         assert!(pass.run(&mut func), "carrier over N itself fires");
     }
 
@@ -7290,7 +7331,7 @@ mod tests {
         // vector guard N>=8 -> vector loop consumes k=0..8 with NO carrier ->
         // scalar header entered at k=8 -> exits immediately -> returns normally.
         let mut func = build_merged_bound_carrier_loop(0);
-        let mut pass = NeonArrayPass::new();
+        let mut pass = dotprod_pass();
         assert!(
             !pass.run(&mut func),
             "a carrier whose length register is NOT the loop bound must BAIL \
@@ -7341,7 +7382,7 @@ mod tests {
         func.add_edge(gblk, latch);
         func.add_edge(latch, header);
         func.next_vreg = 512;
-        let mut pass = NeonArrayPass::new();
+        let mut pass = dotprod_pass();
         assert!(!pass.run(&mut func), "LdrRO in the body must fail closed");
     }
 
@@ -7352,11 +7393,11 @@ mod tests {
     #[test]
     fn second_run_is_a_no_op() {
         let mut func = build_array_loop(false, ELEM_BYTES);
-        assert!(NeonArrayPass::new().run(&mut func), "first run must fire");
+        assert!(dotprod_pass().run(&mut func), "first run must fire");
         let (insts, blocks) = (func.insts.len(), func.blocks.len());
         for again in 2..=4 {
             assert!(
-                !NeonArrayPass::new().run(&mut func),
+                !dotprod_pass().run(&mut func),
                 "run {again}: re-fired on its own output"
             );
             assert_eq!(func.insts.len(), insts, "run {again} added instructions");
@@ -7394,13 +7435,13 @@ mod tests {
         for (label, build) in cases {
             let mut func = build();
             assert!(
-                NeonArrayPass::new().run(&mut func),
+                dotprod_pass().run(&mut func),
                 "{label}: first run must fire"
             );
             let (insts, blocks) = (func.insts.len(), func.blocks.len());
             for again in 2..=4 {
                 assert!(
-                    !NeonArrayPass::new().run(&mut func),
+                    !dotprod_pass().run(&mut func),
                     "{label}: run {again} re-fired on its own output"
                 );
                 assert_eq!(

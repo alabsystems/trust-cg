@@ -22,7 +22,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::sync::{
-    Arc,
+    Arc, OnceLock,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant, SystemTime};
@@ -30,11 +30,12 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::{
     compile_artifact_cache_profile::{
         CompileArtifactCacheBoundary, CompileArtifactCacheConfig, CompileArtifactCacheTelemetry,
-        CompileArtifactProofPolicy,
+        CompileArtifactDependencyIdentity, CompileArtifactProofPolicy,
     },
+    compile_policy::{CompilePolicy, CompilePolicyPartition},
     compiler::{
         CompilationMetrics, CompilationResult, CompileError, Compiler, CompilerConfig,
-        CompilerTrace, CompilerTraceLevel, FunctionQualityMetrics, JitCompilationResult,
+        CompilerTrace, FunctionQualityMetrics, JitCompilationResult, JitValidationMode,
         ProofCertificate,
     },
     jit::{
@@ -78,7 +79,7 @@ use crate::{
         evidence_environment_for, refuse_required_strength, route_evidence,
         route_evidence_for_manifest,
     },
-    target::{Target, TargetSpec},
+    target::{AArch64IsaFeature, AArch64IsaProfile, Target, TargetSpec},
 };
 use trust_cg_opt::cache::StableHasher;
 
@@ -472,7 +473,66 @@ impl CompileRequest {
     }
 }
 
-/// Stable artifact identity placeholder.
+/// Authoritative compile request plus the exact target OS/ABI selected by the
+/// caller.
+///
+/// Keeping target authority outside [`CompileRequest`] preserves the existing
+/// request API while allowing one immutable plan to cross synchronous or
+/// asynchronous worker boundaries. [`CompileService::compile_plan`] constructs
+/// one [`Compiler`] from this target and reuses it for artifact identity,
+/// manifest validation, lowering, publication, and installed-payload binding.
+#[derive(Debug, Clone)]
+pub struct CompilePlan {
+    request: CompileRequest,
+    target_spec: TargetSpec,
+}
+
+impl CompilePlan {
+    /// Create a compile plan with explicit target authority.
+    pub fn new(request: CompileRequest, target_spec: TargetSpec) -> Self {
+        Self {
+            request,
+            target_spec: target_spec.with_default_os_abi(),
+        }
+    }
+
+    /// Wrap a legacy request with its historical profile-derived target.
+    pub fn for_request(request: CompileRequest) -> Self {
+        let target = expanded_profile_for_request(&request).compiler.target;
+        Self::new(request, TargetSpec::default_for_architecture(target))
+    }
+
+    /// Borrow the scheduling, profile, proof, and install policy.
+    pub fn request(&self) -> &CompileRequest {
+        &self.request
+    }
+
+    /// Return the exact target architecture, operating system, and ABI.
+    pub fn target_spec(&self) -> TargetSpec {
+        self.target_spec
+    }
+
+    /// Consume the immutable plan into its request and target authority.
+    pub fn into_parts(self) -> (CompileRequest, TargetSpec) {
+        (self.request, self.target_spec)
+    }
+}
+
+impl From<CompileRequest> for CompilePlan {
+    fn from(request: CompileRequest) -> Self {
+        Self::for_request(request)
+    }
+}
+
+/// Stable compile-plan identity for an artifact request.
+///
+/// This identifies canonical source, target, resolved backend profile, and
+/// output/evidence policy. It is not a native-image content digest: process-
+/// local extern addresses and untyped ambient compiler experiments are not
+/// stable cross-process inputs. Cache reuse additionally requires an
+/// [`crate::ArtifactReusePermit`], while installed executable identity is
+/// authenticated by [`InstalledPayloadBinding::native_payload_sha256`] and
+/// [`InstalledPayloadBinding::published_image_sha256`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ArtifactIdentity(String);
 
@@ -522,7 +582,7 @@ impl RawExternBinding {
     }
 }
 
-/// Canonical input to the deterministic artifact identity hash.
+/// Canonical input to the deterministic compile-plan identity hash.
 #[derive(Debug, Clone)]
 pub struct ArtifactIdentityInput {
     /// Canonical lowered trust_ir/module bytes or prepared backend input bytes.
@@ -543,6 +603,8 @@ pub struct ArtifactIdentityInput {
     pub proof_policy: ProofPolicy,
     /// Install intent selected by the caller.
     pub install_intent: InstallIntent,
+    /// Compiler, dependency, and toolchain build identity.
+    pub dependency_identity: CompileArtifactDependencyIdentity,
 }
 
 impl ArtifactIdentityInput {
@@ -563,19 +625,70 @@ impl ArtifactIdentityInput {
             exported_symbols: exported_symbols.into_iter().map(Into::into).collect(),
             proof_policy: request.proof_policy.clone(),
             install_intent: request.install_intent,
+            dependency_identity: CompileArtifactDependencyIdentity::from_env_for_proof_policy(
+                compile_artifact_proof_policy_for_request(request),
+            ),
         }
     }
 
-    /// Compute the stable artifact identity digest.
+    /// Compute the stable compile-plan identity digest.
+    ///
+    /// This method captures host features, legacy x86 regalloc policy, and JIT
+    /// validation authority in a fresh [`Compiler`]. The compile service uses
+    /// the same `Compiler` instance for identity and execution. Direct callers
+    /// that reuse artifacts must also enforce [`crate::ArtifactReusePermit`]
+    /// and authenticate the final payload digest.
     pub fn identity(&self) -> ArtifactIdentity {
+        let compiler = Compiler::new(self.compiler.clone());
+        self.identity_with_compiler(&compiler)
+    }
+
+    fn identity_with_compiler(&self, compiler: &Compiler) -> ArtifactIdentity {
+        debug_assert_eq!(compiler.config().target, self.compiler.target);
         let mut hasher = StableHasher::new();
-        hash_str(&mut hasher, "trust-cg.compile_service.artifact_identity.v1");
+        // v5 consumes the shared canonical policy contract as an output and
+        // binds AArch64 artifacts to the exact ISA profile that authorizes
+        // their optional instructions. Keep the outer service domain version
+        // explicit so identities produced before that feature binding can
+        // never alias the strengthened contract or the former handwritten v2
+        // serializer.
+        hash_str(&mut hasher, "trust-cg.compile_service.artifact_identity.v5");
         hash_bytes(&mut hasher, &self.module_bytes);
+        // Keep the public request field independently bound even though a
+        // well-formed input matches CompilerConfig::target. CompilePolicy
+        // binds the latter plus the effective target OS/ABI.
         hash_target(&mut hasher, self.target);
         hash_profile_id(&mut hasher, self.profile);
-        hash_compiler_config(&mut hasher, &self.compiler);
-        hash_jit_config(&mut hasher, &self.jit);
+        // CompileService executes through Compiler for both object and
+        // executable-memory routes. Low-level JitConfig verification and
+        // dispatch knobs are not consumed by this route; only its effective
+        // profiling hook is threaded into executable compilation below.
+        // Hashing the compiler-only scope avoids false cache misses when an
+        // irrelevant low-level JIT control changes.
+        let policy = CompilePolicy::from_compiler(compiler.target_spec(), compiler.config())
+            .expect("Compiler target/config must form a bounded compile policy");
+        // ArtifactIdentity identifies emitted output and the install/proof
+        // evidence attached to it, not request scheduling or trace mechanics.
+        // Pair the two relevant disjoint projections. Full remains the right
+        // digest for request receipts, but would prevent safe reuse across
+        // deterministic serial/parallel and trace-level changes.
+        hash_bytes(
+            &mut hasher,
+            policy
+                .digest(CompilePolicyPartition::Artifact)
+                .as_bytes()
+                .as_slice(),
+        );
+        hash_bytes(
+            &mut hasher,
+            policy
+                .digest(CompilePolicyPartition::Evidence)
+                .as_bytes()
+                .as_slice(),
+        );
         hash_artifact_kind(&mut hasher, self.artifact_kind);
+        hash_effective_backend_profile(&mut hasher, compiler, &self.jit, self.artifact_kind);
+        hash_dependency_identity(&mut hasher, &self.dependency_identity);
         hash_usize(&mut hasher, self.exported_symbols.len());
         for symbol in &self.exported_symbols {
             hash_str(&mut hasher, symbol);
@@ -838,10 +951,10 @@ pub struct EntryPointMetadata {
 
 /// Stable schema for the non-circular installed executable payload binding.
 pub const INSTALLED_PAYLOAD_BINDING_SCHEMA: &str =
-    "trust-cg.compile_service.installed_payload_binding.v3";
+    "trust-cg.compile_service.installed_payload_binding.v4";
 
 /// Stable numeric version for [`InstalledPayloadBinding`].
-pub const INSTALLED_PAYLOAD_BINDING_SCHEMA_VERSION: u32 = 3;
+pub const INSTALLED_PAYLOAD_BINDING_SCHEMA_VERSION: u32 = 4;
 
 /// One exact function range in an installed executable payload binding.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1142,13 +1255,14 @@ impl ProofTvEvidenceReportV1 {
 
     fn new(
         request: &CompileRequest,
+        target_spec: TargetSpec,
         artifact: &CompiledArtifact,
         verdict: ProofTvVerdict,
         rejection_code: Option<ProofTvRejectionCode>,
         diagnostic_reason: Option<String>,
     ) -> Self {
         let (target_checksum, abi_checksum, layout_checksum, invalidation_checksum) =
-            report_binding_checksums(request, artifact);
+            report_binding_checksums(request, target_spec, artifact);
         let backend_proof_family = backend_proof_family_report_identity(artifact.metadata.target);
         let mut report = Self {
             schema: Self::SCHEMA,
@@ -1187,12 +1301,24 @@ impl ProofTvEvidenceReportV1 {
         report
     }
 
-    fn accepted(request: &CompileRequest, artifact: &CompiledArtifact) -> Self {
-        Self::new(request, artifact, ProofTvVerdict::Accepted, None, None)
+    fn accepted(
+        request: &CompileRequest,
+        target_spec: TargetSpec,
+        artifact: &CompiledArtifact,
+    ) -> Self {
+        Self::new(
+            request,
+            target_spec,
+            artifact,
+            ProofTvVerdict::Accepted,
+            None,
+            None,
+        )
     }
 
     fn rejected(
         request: &CompileRequest,
+        target_spec: TargetSpec,
         artifact: &CompiledArtifact,
         verdict: ProofTvVerdict,
         rejection_code: ProofTvRejectionCode,
@@ -1200,6 +1326,7 @@ impl ProofTvEvidenceReportV1 {
     ) -> Self {
         Self::new(
             request,
+            target_spec,
             artifact,
             verdict,
             Some(rejection_code),
@@ -3035,7 +3162,21 @@ impl CompileService {
     where
         F: FnOnce() -> Result<CompiledArtifact, CompileDiagnostic>,
     {
-        if let Some(response) = self.check_gate(&request, "before_compile") {
+        self.compile_plan_with(CompilePlan::for_request(request), |_| compile())
+    }
+
+    /// Run caller-supplied backend work under an explicit target plan.
+    ///
+    /// This is the target-aware counterpart to [`Self::compile_with`]. The
+    /// closure receives the same compiler instance used for manifest and
+    /// evidence policy checks, so caller-supplied lowering cannot require a
+    /// second independently configured compiler.
+    pub fn compile_plan_with<F>(&self, plan: CompilePlan, compile: F) -> CompileResponse
+    where
+        F: FnOnce(&Compiler) -> Result<CompiledArtifact, CompileDiagnostic>,
+    {
+        let (request, target_spec) = plan.into_parts();
+        if let Some(response) = self.check_gate(&request, target_spec, "before_compile") {
             return response;
         }
 
@@ -3043,7 +3184,9 @@ impl CompileService {
         // strength this host cannot reach. Emitting a weaker certificate under
         // a stronger label would be the exact dishonesty this gate exists to
         // prevent.
-        if let Some(response) = required_strength_rejection_response(&request) {
+        if let Some(response) =
+            required_strength_rejection_response(&request, target_spec.architecture)
+        {
             return response;
         }
 
@@ -3052,22 +3195,30 @@ impl CompileService {
         // runs before the caller closure, lowering, allocation, or manifest
         // attachment, so a mismatched manifest cannot acquire artifact state.
         let expanded = expanded_profile_for_request(&request);
-        let authority_compiler = Compiler::new(expanded.compiler);
+        let authority_compiler = self.compiler_for_plan(expanded.compiler, target_spec, &request);
         if let Some(diagnostic) =
             manifest_contract_preflight_diagnostic(&request, &authority_compiler, "before_compile")
         {
             return manifest_contract_rejection_response(&request, diagnostic);
         }
 
-        if let Some(response) = self.check_gate(&request, "before_lowering") {
+        if let Some(response) = self.check_gate(
+            &request,
+            authority_compiler.target_spec(),
+            "before_lowering",
+        ) {
             return response;
         }
 
-        if let Some(response) = self.check_gate(&request, "before_executable_allocation") {
+        if let Some(response) = self.check_gate(
+            &request,
+            authority_compiler.target_spec(),
+            "before_executable_allocation",
+        ) {
             return response;
         }
 
-        let mut artifact = match compile() {
+        let mut artifact = match compile(&authority_compiler) {
             Ok(artifact) => artifact,
             Err(diagnostic) => {
                 return CompileResponse {
@@ -3082,12 +3233,18 @@ impl CompileService {
             }
         };
 
-        if let Some(response) = self.check_gate(&request, "before_install") {
+        if let Some(response) =
+            self.check_gate(&request, authority_compiler.target_spec(), "before_install")
+        {
             return response;
         }
 
         attach_request_manifest(&request, &mut artifact);
-        apply_install_disposition(&request, &mut artifact);
+        apply_install_disposition_for_target(
+            &request,
+            authority_compiler.target_spec(),
+            &mut artifact,
+        );
         let disposition = artifact.install.disposition;
         let diagnostics = proof_tv_diagnostics(&artifact);
 
@@ -3104,7 +3261,12 @@ impl CompileService {
 
     /// Compile a trust_ir module into the artifact kind requested by `request`.
     pub fn compile(&self, request: CompileRequest, module: &trust_ir::Module) -> CompileResponse {
-        self.compile_with_extern_symbols(request, module, &HashMap::new())
+        self.compile_plan(CompilePlan::for_request(request), module)
+    }
+
+    /// Compile a trust_ir module under an explicit target plan.
+    pub fn compile_plan(&self, plan: CompilePlan, module: &trust_ir::Module) -> CompileResponse {
+        self.compile_plan_with_extern_symbols(plan, module, &HashMap::new())
     }
 
     /// Compile a trust_ir module with explicit external symbols for executable
@@ -3115,18 +3277,36 @@ impl CompileService {
         module: &trust_ir::Module,
         extern_symbols: &HashMap<String, *const u8>,
     ) -> CompileResponse {
-        if let Some(response) = self.check_gate(&request, "before_compile") {
+        self.compile_plan_with_extern_symbols(
+            CompilePlan::for_request(request),
+            module,
+            extern_symbols,
+        )
+    }
+
+    /// Compile a trust_ir module with explicit external symbols and target
+    /// authority.
+    pub fn compile_plan_with_extern_symbols(
+        &self,
+        plan: CompilePlan,
+        module: &trust_ir::Module,
+        extern_symbols: &HashMap<String, *const u8>,
+    ) -> CompileResponse {
+        let (request, target_spec) = plan.into_parts();
+        if let Some(response) = self.check_gate(&request, target_spec, "before_compile") {
             return response;
         }
 
         // See `compile_with`: strength refusal precedes all backend work.
-        if let Some(response) = required_strength_rejection_response(&request) {
+        if let Some(response) =
+            required_strength_rejection_response(&request, target_spec.architecture)
+        {
             return response;
         }
 
         let started = Instant::now();
         let expanded = expanded_profile_for_request(&request);
-        let compiler = self.compiler_for_request(expanded.compiler.clone(), &request);
+        let compiler = self.compiler_for_plan(expanded.compiler.clone(), target_spec, &request);
         if let Some(diagnostic) =
             manifest_contract_preflight_diagnostic(&request, &compiler, "before_lowering")
         {
@@ -3142,7 +3322,15 @@ impl CompileService {
         provenance.raw_extern_bindings = raw_extern_bindings_from_map(extern_symbols);
         let profile = request.profile.clone();
         let artifact_kind = request.artifact_kind;
-        let identity = match artifact_identity_for_module(&request, module) {
+        let identity = match artifact_identity_for_module(
+            &request,
+            module,
+            &compiler,
+            self.config
+                .compile_artifact_cache
+                .as_ref()
+                .map(|cache| &cache.dependency_identity),
+        ) {
             Ok(identity) => identity,
             Err(diagnostic) => {
                 return CompileResponse {
@@ -3157,13 +3345,19 @@ impl CompileService {
             }
         };
 
-        if let Some(response) = self.check_gate(&request, "before_lowering") {
+        if let Some(response) = self.check_gate(&request, compiler.target_spec(), "before_lowering")
+        {
             return response;
         }
 
-        if let Some(response) =
-            verifier_rejection_response(&request, module, &provenance, generation, &identity)
-        {
+        if let Some(response) = verifier_rejection_response(
+            &request,
+            module,
+            &compiler,
+            &provenance,
+            generation,
+            &identity,
+        ) {
             return response;
         }
 
@@ -3172,7 +3366,11 @@ impl CompileService {
                 &compiler, module, &request, profile, provenance, generation, started, identity,
             ),
             ArtifactKind::ExecutableMemory => {
-                if let Some(response) = self.check_gate(&request, "before_executable_allocation") {
+                if let Some(response) = self.check_gate(
+                    &request,
+                    compiler.target_spec(),
+                    "before_executable_allocation",
+                ) {
                     return response;
                 }
                 compile_executable_payload(
@@ -3204,12 +3402,13 @@ impl CompileService {
             }
         };
 
-        if let Some(response) = self.check_gate(&request, "before_install") {
+        if let Some(response) = self.check_gate(&request, compiler.target_spec(), "before_install")
+        {
             return response;
         }
 
         attach_request_manifest(&request, &mut artifact);
-        apply_install_disposition(&request, &mut artifact);
+        apply_install_disposition_for_target(&request, compiler.target_spec(), &mut artifact);
         let disposition = artifact.install.disposition;
         let diagnostics = proof_tv_diagnostics(&artifact);
         CompileResponse {
@@ -3223,12 +3422,13 @@ impl CompileService {
         }
     }
 
-    fn compiler_for_request(
+    fn compiler_for_plan(
         &self,
         compiler_config: CompilerConfig,
+        target_spec: TargetSpec,
         request: &CompileRequest,
     ) -> Compiler {
-        let compiler = Compiler::new(compiler_config);
+        let compiler = Compiler::new_for_target_spec(compiler_config, target_spec);
         match &self.config.compile_artifact_cache {
             Some(cache) => compiler.with_compile_artifact_cache(
                 cache
@@ -3239,7 +3439,12 @@ impl CompileService {
         }
     }
 
-    fn check_gate(&self, request: &CompileRequest, phase: &'static str) -> Option<CompileResponse> {
+    fn check_gate(
+        &self,
+        request: &CompileRequest,
+        target_spec: TargetSpec,
+        phase: &'static str,
+    ) -> Option<CompileResponse> {
         if request.cancellation.is_cancelled() {
             return Some(CompileResponse {
                 request_id: request.request_id.clone(),
@@ -3276,7 +3481,9 @@ impl CompileService {
             });
         }
 
-        if let Some(diagnostic) = proof_policy_preflight_diagnostic(request, phase) {
+        if let Some(diagnostic) =
+            proof_policy_preflight_diagnostic(request, target_spec.architecture, phase)
+        {
             return Some(CompileResponse {
                 request_id: request.request_id.clone(),
                 generation: request.generation,
@@ -3327,6 +3534,7 @@ impl VerifierRejectionKind {
 fn verifier_rejection_response(
     request: &CompileRequest,
     module: &trust_ir::Module,
+    compiler: &Compiler,
     provenance: &ArtifactProvenance,
     generation: CompileGeneration,
     identity: &ArtifactIdentity,
@@ -3337,6 +3545,7 @@ fn verifier_rejection_response(
         .with_phase("before_executable_allocation");
     let replay_report_metadata = verifier_rejection_replay_metadata(
         request,
+        compiler.target_spec(),
         provenance,
         generation,
         identity,
@@ -3344,6 +3553,7 @@ fn verifier_rejection_response(
         &diagnostic.message,
     );
     let mut metadata = ArtifactMetadata::from_profile(&request.profile, request.artifact_kind);
+    metadata.target = compiler.config().target;
     metadata.proof_policy_checksum = request.proof_policy.checksum();
     let mut artifact = CompiledArtifact::metadata_only_with(
         identity.clone(),
@@ -3478,6 +3688,7 @@ fn verifier_value_types(func: &trust_ir::Function) -> HashMap<u32, trust_ir::Ty>
 
 fn verifier_rejection_replay_metadata(
     request: &CompileRequest,
+    target_spec: TargetSpec,
     provenance: &ArtifactProvenance,
     generation: CompileGeneration,
     identity: &ArtifactIdentity,
@@ -3486,13 +3697,7 @@ fn verifier_rejection_replay_metadata(
 ) -> JitReplayReportMetadata {
     let mut report = JitReplayReportMetadata::new(0);
     report.artifact_id = Some(identity.as_str().to_owned());
-    report.target = Some(
-        expanded_profile_for_request(request)
-            .compiler
-            .target
-            .name()
-            .to_owned(),
-    );
+    report.target = Some(target_spec.triple());
     report
         .properties
         .insert("generation".to_owned(), generation.get().to_string());
@@ -3579,6 +3784,7 @@ fn compile_object_payload(
 
     let metadata = artifact_metadata_from_compilation(
         &profile,
+        compiler.config().target,
         ArtifactKind::Object,
         result.metrics.code_size_bytes,
         None,
@@ -3609,7 +3815,7 @@ fn compile_executable_payload(
     started: Instant,
     identity: ArtifactIdentity,
 ) -> Result<(CompiledArtifact, ArtifactPayload), CompileDiagnostic> {
-    let profile_hooks = profile.expand().jit.profile_hooks;
+    let profile_hooks = profile.expand().jit.effective_profile_hooks();
     let result = compiler
         .compile_module_to_jit_with_profile_hooks(module, extern_symbols, profile_hooks)
         .map_err(|error| {
@@ -3628,6 +3834,7 @@ fn compile_executable_payload(
 
     let metadata = artifact_metadata_from_compilation(
         &profile,
+        compiler.config().target,
         ArtifactKind::ExecutableMemory,
         result.metrics.code_size_bytes,
         Some(result.buffer.allocated_size()),
@@ -3658,11 +3865,13 @@ fn compile_executable_payload(
 
 fn artifact_metadata_from_compilation(
     profile: &CompileProfile,
+    target: Target,
     artifact_kind: ArtifactKind,
     code_size_bytes: usize,
     allocation_size_bytes: Option<usize>,
 ) -> ArtifactMetadata {
     let mut metadata = ArtifactMetadata::from_profile(profile, artifact_kind);
+    metadata.target = target;
     metadata.code_size_bytes = code_size_bytes;
     metadata.allocation_size_bytes = allocation_size_bytes;
     metadata
@@ -3775,11 +3984,12 @@ fn route_facts_for_request(request: &CompileRequest) -> RouteFacts {
 /// synthesized report says.
 fn proof_evidence_summary_for_artifact(
     request: &CompileRequest,
+    target: Target,
     artifact: &CompiledArtifact,
     report: &ProofTvEvidenceReportV1,
 ) -> ProofEvidenceSummary {
     let facts = route_facts_for_request(request);
-    let environment = evidence_environment_for(compile_target_for_request(request));
+    let environment = evidence_environment_for(target);
     let summary = match artifact.artifact_manifest.as_ref() {
         Some(manifest) => {
             route_evidence_for_manifest(ROUTE_EVIDENCE_VERIFIER, facts, &environment, manifest)
@@ -3797,11 +4007,6 @@ fn proof_evidence_summary_for_artifact(
     summary.with_verdict(verdict, Some(code))
 }
 
-/// Architecture the request's expanded profile compiles for.
-fn compile_target_for_request(request: &CompileRequest) -> Target {
-    expanded_profile_for_request(request).compiler.target
-}
-
 /// Refuse a request whose proof policy demands a discharge strength this host
 /// cannot reach.
 ///
@@ -3811,8 +4016,11 @@ fn compile_target_for_request(request: &CompileRequest) -> Target {
 /// caller that explicitly demands solver-backed certificates on a solver-less
 /// host gets a rejection instead of a statistically-discharged certificate
 /// wearing a stronger label.
-fn required_strength_rejection_response(request: &CompileRequest) -> Option<CompileResponse> {
-    let environment = evidence_environment_for(compile_target_for_request(request));
+fn required_strength_rejection_response(
+    request: &CompileRequest,
+    target: Target,
+) -> Option<CompileResponse> {
+    let environment = evidence_environment_for(target);
     let refusal: StrengthRefusal = refuse_required_strength(&request.proof_policy, &environment)?;
     Some(CompileResponse {
         request_id: request.request_id.clone(),
@@ -3828,7 +4036,18 @@ fn required_strength_rejection_response(request: &CompileRequest) -> Option<Comp
     })
 }
 
+#[cfg(test)]
 fn apply_install_disposition(request: &CompileRequest, artifact: &mut CompiledArtifact) {
+    let target =
+        TargetSpec::default_for_architecture(expanded_profile_for_request(request).compiler.target);
+    apply_install_disposition_for_target(request, target, artifact);
+}
+
+fn apply_install_disposition_for_target(
+    request: &CompileRequest,
+    target_spec: TargetSpec,
+    artifact: &mut CompiledArtifact,
+) {
     artifact.metadata.proof_policy_checksum = request.proof_policy.checksum();
     artifact.install.artifact = artifact.metadata.clone();
     artifact.install.proof_policy = request.proof_policy.clone();
@@ -3847,8 +4066,8 @@ fn apply_install_disposition(request: &CompileRequest, artifact: &mut CompiledAr
         &mut artifact.install.replay_report_metadata,
         artifact.install.proofs,
     );
-    let report = proof_tv_report_for_artifact(request, artifact);
-    ensure_proof_tv_replay_metadata(request, artifact, &report);
+    let report = proof_tv_report_for_artifact(request, target_spec, artifact);
+    ensure_proof_tv_replay_metadata(target_spec, artifact, &report);
     attach_proof_tv_report(&mut artifact.install.replay_report_metadata, &report);
     if !report.is_accepted() {
         artifact.install.disposition = ArtifactInstallDisposition::Rejected;
@@ -3858,7 +4077,7 @@ fn apply_install_disposition(request: &CompileRequest, artifact: &mut CompiledAr
     // this is the single place that guarantees the evidence field is present
     // (negative when nothing ran) on every artifact the service returns.
     artifact.install.proof_evidence_summary =
-        proof_evidence_summary_for_artifact(request, artifact, &report);
+        proof_evidence_summary_for_artifact(request, target_spec.architecture, artifact, &report);
     artifact.install.proof_evidence_report = Some(report);
 }
 
@@ -3996,12 +4215,14 @@ fn proof_rejection_failure_code(rejection_code: Option<ProofRejectionCode>) -> &
 
 fn proof_tv_report_for_artifact(
     request: &CompileRequest,
+    target_spec: TargetSpec,
     artifact: &CompiledArtifact,
 ) -> ProofTvEvidenceReportV1 {
     if let Some(outcome) = &request.proof_tv_evidence {
         if let Some(code) = outcome.rejection_code {
             return ProofTvEvidenceReportV1::rejected(
                 request,
+                target_spec,
                 artifact,
                 outcome.verdict,
                 code,
@@ -4009,10 +4230,11 @@ fn proof_tv_report_for_artifact(
             );
         }
         if outcome.verdict == ProofTvVerdict::Accepted {
-            return ProofTvEvidenceReportV1::accepted(request, artifact);
+            return ProofTvEvidenceReportV1::accepted(request, target_spec, artifact);
         }
         return ProofTvEvidenceReportV1::rejected(
             request,
+            target_spec,
             artifact,
             outcome.verdict,
             ProofTvRejectionCode::Unknown,
@@ -4021,9 +4243,9 @@ fn proof_tv_report_for_artifact(
     }
 
     match proof_tv_outcome_from_summary(artifact.install.proofs) {
-        None => ProofTvEvidenceReportV1::accepted(request, artifact),
+        None => ProofTvEvidenceReportV1::accepted(request, target_spec, artifact),
         Some((verdict, code)) => {
-            ProofTvEvidenceReportV1::rejected(request, artifact, verdict, code, None)
+            ProofTvEvidenceReportV1::rejected(request, target_spec, artifact, verdict, code, None)
         }
     }
 }
@@ -4076,7 +4298,7 @@ fn proof_tv_diagnostics(artifact: &CompiledArtifact) -> Vec<CompileDiagnostic> {
 }
 
 fn ensure_proof_tv_replay_metadata(
-    request: &CompileRequest,
+    target_spec: TargetSpec,
     artifact: &mut CompiledArtifact,
     report: &ProofTvEvidenceReportV1,
 ) {
@@ -4086,13 +4308,7 @@ fn ensure_proof_tv_replay_metadata(
 
     let mut replay = JitReplayReportMetadata::new(0);
     replay.artifact_id = Some(artifact.identity.as_str().to_owned());
-    replay.target = Some(
-        expanded_profile_for_request(request)
-            .compiler
-            .target
-            .name()
-            .to_owned(),
-    );
+    replay.target = Some(target_spec.triple());
     replay.properties.insert(
         "generation".to_owned(),
         artifact.install.generation.get().to_string(),
@@ -4294,6 +4510,7 @@ fn backend_proof_family_report_identity(
 
 fn report_binding_checksums(
     request: &CompileRequest,
+    target_spec: TargetSpec,
     artifact: &CompiledArtifact,
 ) -> (
     ArtifactChecksum,
@@ -4327,16 +4544,8 @@ fn report_binding_checksums(
         );
     }
 
-    let target_spec = TargetSpec::default_for_architecture(artifact.metadata.target);
-    let target = TargetDescriptor::for_trust_cg_target_spec(target_spec);
-    let abi = AbiDescriptor::for_trust_cg_target_os(
-        artifact.metadata.target,
-        target.operating_system.clone(),
-    );
-    let layout = LayoutManifest::lp64(
-        Endianness::Little,
-        artifact.metadata.target.stack_alignment() as u16,
-    );
+    let (target, abi, layout) =
+        fallback_report_contract(target_spec, artifact.metadata.artifact_kind);
     let invalidation = InvalidationKey::new(
         artifact
             .provenance
@@ -4357,6 +4566,96 @@ fn report_binding_checksums(
         layout.checksum(),
         invalidation.checksum(),
     )
+}
+
+fn fallback_report_contract(
+    target_spec: TargetSpec,
+    artifact_kind: ArtifactKind,
+) -> (TargetDescriptor, AbiDescriptor, LayoutManifest) {
+    let target_architecture = target_spec.architecture;
+    let fallback_features = match (target_architecture, artifact_kind) {
+        (Target::Aarch64, ArtifactKind::Object) => AArch64IsaProfile::for_aot_target(target_spec)
+            .enabled_feature_names()
+            .collect(),
+        (Target::Aarch64, ArtifactKind::ExecutableMemory) => AArch64IsaProfile::for_host_jit()
+            .enabled_feature_names()
+            .collect(),
+        (Target::X86_64, ArtifactKind::Object) => {
+            crate::x86_64::X86TargetFeatures::current().enabled_feature_names()
+        }
+        (Target::X86_64, ArtifactKind::ExecutableMemory) => {
+            crate::x86_64::X86TargetFeatures::host().enabled_feature_names()
+        }
+        (Target::Riscv64, _) => Vec::new(),
+    };
+    let target =
+        TargetDescriptor::for_trust_cg_target_spec(target_spec).with_features(fallback_features);
+    let abi =
+        AbiDescriptor::for_trust_cg_target_os(target_architecture, target.operating_system.clone());
+    let layout = LayoutManifest::lp64(
+        Endianness::Little,
+        target_architecture.stack_alignment() as u16,
+    );
+    (target, abi, layout)
+}
+
+/// Return whether a terminal response remains bound to the immutable plan that
+/// crossed an asynchronous worker boundary.
+///
+/// Non-artifact failures have no target payload to authenticate, so request id
+/// and generation are sufficient. Compiled responses must carry the
+/// compile-service proof report and agree with the plan's architecture and
+/// exact OS/ABI descriptor (through the sealed payload binding, manifest, or
+/// the report's target checksum fallback).
+pub(crate) fn compile_response_matches_plan(
+    response: &CompileResponse,
+    plan: &CompilePlan,
+) -> bool {
+    let request = plan.request();
+    if response.request_id != request.request_id || response.generation != request.generation {
+        return false;
+    }
+
+    let Some(artifact) = response.artifact.as_ref() else {
+        return response.status != CompileStatus::Compiled;
+    };
+    if response.status != CompileStatus::Compiled
+        || artifact.metadata.target != plan.target_spec().architecture
+        || artifact.install.artifact.target != plan.target_spec().architecture
+        || artifact.install.generation != request.generation
+    {
+        return false;
+    }
+
+    let target_spec = plan.target_spec();
+    let expected_core = TargetDescriptor::for_trust_cg_target_spec(target_spec);
+    let expected_target_checksum =
+        if let Some(binding) = artifact.install.installed_payload_binding.as_ref() {
+            if binding.compiler_target_triple != target_spec.triple()
+                || !binding.has_canonical_binding_sha256(artifact.artifact_manifest.as_ref())
+                || !target_descriptor_core_matches(&binding.authoritative_target, &expected_core)
+            {
+                return false;
+            }
+            binding.authoritative_target.checksum()
+        } else if let Some(manifest) = artifact.artifact_manifest.as_ref() {
+            if !target_descriptor_core_matches(&manifest.target, &expected_core) {
+                return false;
+            }
+            manifest.target.checksum()
+        } else {
+            fallback_report_contract(target_spec, artifact.metadata.artifact_kind)
+                .0
+                .checksum()
+        };
+
+    let Some(report) = artifact.install.proof_evidence_report.as_ref() else {
+        return false;
+    };
+    report.target_checksum == expected_target_checksum
+        && report.artifact_identity == artifact.identity
+        && report.proof_policy_checksum == request.proof_policy.checksum()
+        && report.report_hash == report.compute_report_hash()
 }
 
 fn merge_install_disposition(
@@ -4404,11 +4703,38 @@ fn expanded_profile_for_request(request: &CompileRequest) -> ExpandedCompileProf
     expanded
 }
 
+fn authoritative_target_feature_names(
+    compiler: &Compiler,
+    artifact_kind: ArtifactKind,
+) -> Vec<&'static str> {
+    match (compiler.config().target, artifact_kind) {
+        (Target::Aarch64, ArtifactKind::Object) => {
+            AArch64IsaProfile::for_aot_target(compiler.target_spec())
+                .enabled_feature_names()
+                .collect()
+        }
+        (Target::Aarch64, ArtifactKind::ExecutableMemory) => compiler
+            .effective_aarch64_jit_isa_profile()
+            .enabled_feature_names()
+            .collect(),
+        (Target::X86_64, ArtifactKind::Object) => {
+            crate::x86_64::X86TargetFeatures::current().enabled_feature_names()
+        }
+        (Target::X86_64, ArtifactKind::ExecutableMemory) => compiler
+            .effective_x86_jit_codegen_profile()
+            .target_features
+            .enabled_feature_names(),
+        (Target::Riscv64, _) => Vec::new(),
+    }
+}
+
 fn authoritative_contract_for_compiler(
     compiler: &Compiler,
+    artifact_kind: ArtifactKind,
 ) -> (TargetDescriptor, AbiDescriptor, LayoutManifest) {
     let target_spec = compiler.target_spec();
-    let target = TargetDescriptor::for_trust_cg_target_spec(target_spec);
+    let target = TargetDescriptor::for_trust_cg_target_spec(target_spec)
+        .with_features(authoritative_target_feature_names(compiler, artifact_kind));
     let abi = AbiDescriptor::for_trust_cg_target_os(
         target_spec.architecture,
         target.operating_system.clone(),
@@ -4418,6 +4744,57 @@ fn authoritative_contract_for_compiler(
         target_spec.architecture.stack_alignment() as u16,
     );
     (target, abi, layout)
+}
+
+fn target_descriptor_core_matches(actual: &TargetDescriptor, expected: &TargetDescriptor) -> bool {
+    actual.triple == expected.triple
+        && actual.architecture == expected.architecture
+        && actual.operating_system == expected.operating_system
+        && actual.pointer_width_bits == expected.pointer_width_bits
+        && actual.endianness == expected.endianness
+}
+
+fn target_features_are_known_to_codegen(target: &TargetDescriptor) -> bool {
+    let all_known = match target.architecture {
+        crate::jit_contract::TargetArchitecture::Aarch64 => target.features.iter().all(|name| {
+            AArch64IsaFeature::ALL
+                .iter()
+                .any(|feature| feature.name() == name)
+        }),
+        crate::jit_contract::TargetArchitecture::X86_64 => {
+            let allowed = ["avx", "avx2", "popcnt", "sse4.1", "sse4.2"];
+            target
+                .features
+                .iter()
+                .all(|name| allowed.contains(&name.as_str()))
+        }
+        crate::jit_contract::TargetArchitecture::Riscv64 => target.features.is_empty(),
+        crate::jit_contract::TargetArchitecture::Other(_) => return false,
+    };
+    target.features.windows(2).all(|pair| pair[0] < pair[1]) && all_known
+}
+
+fn target_features_are_supported_by_host(target: &TargetDescriptor) -> bool {
+    let supported: Vec<&'static str> = match &target.architecture {
+        crate::jit_contract::TargetArchitecture::Aarch64 if cfg!(target_arch = "aarch64") => {
+            AArch64IsaProfile::for_host_jit()
+                .enabled_feature_names()
+                .collect()
+        }
+        crate::jit_contract::TargetArchitecture::X86_64
+            if cfg!(any(target_arch = "x86", target_arch = "x86_64")) =>
+        {
+            crate::x86_64::X86TargetFeatures::host().enabled_feature_names()
+        }
+        crate::jit_contract::TargetArchitecture::Riscv64 if cfg!(target_arch = "riscv64") => {
+            Vec::new()
+        }
+        _ => return false,
+    };
+    target
+        .features
+        .iter()
+        .all(|feature| supported.contains(&feature.as_str()))
 }
 
 fn expected_manifest_kind(kind: ArtifactKind) -> JitArtifactKind {
@@ -4518,7 +4895,7 @@ fn manifest_contract_preflight_diagnostic(
 ) -> Option<CompileDiagnostic> {
     let manifest = request.artifact_manifest.as_ref()?;
     let (expected_target, expected_abi, expected_layout) =
-        authoritative_contract_for_compiler(compiler);
+        authoritative_contract_for_compiler(compiler, request.artifact_kind);
 
     let mismatch = if request.artifact_kind == ArtifactKind::Object {
         Some(
@@ -4533,20 +4910,20 @@ fn manifest_contract_preflight_diagnostic(
             request.artifact_kind.contract_name(),
             manifest.kind
         ))
-    } else if manifest.target.triple != expected_target.triple
-        || manifest.target.architecture != expected_target.architecture
-        || manifest.target.operating_system != expected_target.operating_system
-        || manifest.target.pointer_width_bits != expected_target.pointer_width_bits
-        || manifest.target.endianness != expected_target.endianness
-    {
+    } else if !target_descriptor_core_matches(&manifest.target, &expected_target) {
         Some(format!(
             "target mismatch: compiler authority is {:?}, manifest carries {:?}",
             expected_target, manifest.target
         ))
-    } else if manifest.target.cpu.is_some() || !manifest.target.features.is_empty() {
+    } else if manifest.target.cpu != expected_target.cpu
+        || manifest.target.features != expected_target.features
+    {
         Some(format!(
-            "manifest CPU/features are caller claims with no effective-compiler validation: cpu={:?}, features={:?}",
-            manifest.target.cpu, manifest.target.features
+            "manifest CPU/features differ from the effective compiler profile: compiler cpu={:?}, features={:?}; manifest cpu={:?}, features={:?}",
+            expected_target.cpu,
+            expected_target.features,
+            manifest.target.cpu,
+            manifest.target.features
         ))
     } else if manifest.abi.name != expected_abi.name
         || !abi_structurally_matches(&manifest.abi, &expected_abi)
@@ -4717,6 +5094,7 @@ fn manifest_contract_rejection_response(
 
 fn proof_policy_preflight_diagnostic(
     request: &CompileRequest,
+    target: Target,
     phase: &'static str,
 ) -> Option<CompileDiagnostic> {
     if let Some(manifest) = &request.artifact_manifest
@@ -4735,8 +5113,7 @@ fn proof_policy_preflight_diagnostic(
         return None;
     }
 
-    let expanded = expanded_profile_for_request(request);
-    if expanded.compiler.target == Target::Riscv64 {
+    if target == Target::Riscv64 {
         return Some(
             CompileDiagnostic::error(
                 ProofTvRejectionCode::UnsupportedTarget.as_str(),
@@ -4759,15 +5136,13 @@ fn proof_policy_preflight_diagnostic(
 
     #[cfg(feature = "verify")]
     {
-        if request.artifact_kind == ArtifactKind::ExecutableMemory
-            && expanded.compiler.target != Target::host()
-        {
+        if request.artifact_kind == ArtifactKind::ExecutableMemory && target != Target::host() {
             return Some(
                 CompileDiagnostic::error(
                     ProofTvRejectionCode::UnsupportedRoute.as_str(),
                     format!(
                         "required proof policy native install target {:?} does not match host {:?}",
-                        expanded.compiler.target,
+                        target,
                         Target::host()
                     ),
                 )
@@ -4840,7 +5215,7 @@ fn installed_payload_binding_transcript(
     push_installed_payload_binding_component(
         &mut bytes,
         "transcript.domain",
-        b"trust-cg.compile_service.installed_payload_binding.sha256.v3",
+        b"trust-cg.compile_service.installed_payload_binding.sha256.v4",
     );
     push_installed_payload_binding_component(
         &mut bytes,
@@ -5511,7 +5886,7 @@ fn build_installed_payload_binding(
         )?;
     }
     let (authoritative_target, authoritative_abi, mut authoritative_layout) =
-        authoritative_contract_for_compiler(compiler);
+        authoritative_contract_for_compiler(compiler, ArtifactKind::ExecutableMemory);
     if let Some(manifest) = manifest {
         authoritative_layout.symbols = authoritative_live_layout_symbols(manifest, code, &symbols)
             .map_err(|detail| {
@@ -5600,16 +5975,22 @@ fn validate_manifest_against_installed_binding(
             manifest.kind
         )));
     }
-    if manifest.target != binding.authoritative_target {
+    if !target_descriptor_core_matches(&manifest.target, &binding.authoritative_target) {
         return Err(installed_payload_binding_mismatch(format!(
-            "manifest target {:?} does not exactly match compiler target {:?}",
+            "manifest target core {:?} does not match compiler target core {:?}",
             manifest.target, binding.authoritative_target
         )));
     }
-    if manifest.target.cpu.is_some() || !manifest.target.features.is_empty() {
-        return Err(installed_payload_binding_mismatch(
-            "manifest carries CPU/features that were not validated against the effective compiler",
-        ));
+    if manifest.target.cpu != binding.authoritative_target.cpu
+        || manifest.target.features != binding.authoritative_target.features
+    {
+        return Err(installed_payload_binding_mismatch(format!(
+            "manifest CPU/features differ from compiler-derived target authority: compiler cpu={:?}, features={:?}; manifest cpu={:?}, features={:?}",
+            binding.authoritative_target.cpu,
+            binding.authoritative_target.features,
+            manifest.target.cpu,
+            manifest.target.features
+        )));
     }
     if manifest.abi != binding.authoritative_abi {
         return Err(installed_payload_binding_mismatch(format!(
@@ -5636,7 +6017,6 @@ fn validate_manifest_against_installed_binding(
         || manifest.invalidation.abi_checksum != manifest.abi.checksum()
         || manifest.invalidation.layout_checksum != manifest.layout.checksum()
         || manifest.invalidation.proof_policy_checksum != manifest.proof_policy.checksum()
-        || manifest.invalidation.target_checksum != binding.authoritative_target.checksum()
         || manifest.invalidation.abi_checksum != binding.authoritative_abi.checksum()
         || manifest.invalidation.layout_checksum != binding.authoritative_layout.checksum()
     {
@@ -5844,7 +6224,7 @@ fn validate_installed_payload_binding(
     buffer: &ExecutableBuffer,
 ) -> Result<(), ArtifactContractError> {
     let binding = install.installed_payload_binding.as_ref().ok_or_else(|| {
-        installed_payload_binding_mismatch("missing mandatory compiler-derived v3 binding")
+        installed_payload_binding_mismatch("missing mandatory compiler-derived v4 binding")
     })?;
     if binding.schema != INSTALLED_PAYLOAD_BINDING_SCHEMA
         || binding.schema_version != INSTALLED_PAYLOAD_BINDING_SCHEMA_VERSION
@@ -5884,7 +6264,9 @@ fn validate_installed_payload_binding(
         Endianness::Little,
         install.artifact.target.stack_alignment() as u16,
     );
-    if binding.authoritative_abi != expected_abi
+    let expected_host_target = TargetDescriptor::for_trust_cg_host_jit();
+    if binding.authoritative_target != expected_host_target
+        || binding.authoritative_abi != expected_abi
         || !core_layout_matches(&binding.authoritative_layout, &expected_layout)
         || !binding.authoritative_layout.records.is_empty()
         || !binding.authoritative_layout.slices.is_empty()
@@ -5892,7 +6274,8 @@ fn validate_installed_payload_binding(
         || binding.authoritative_layout.wrapper_identity.is_some()
         || !binding.authoritative_layout.metadata.is_empty()
         || binding.authoritative_target.cpu.is_some()
-        || !binding.authoritative_target.features.is_empty()
+        || !target_features_are_known_to_codegen(&binding.authoritative_target)
+        || !target_features_are_supported_by_host(&binding.authoritative_target)
     {
         return Err(installed_payload_binding_mismatch(
             "sealed target/ABI/core-layout authority is not an exact Trust Codegen target contract",
@@ -6231,6 +6614,8 @@ fn install_proof_summary(
 fn artifact_identity_for_module(
     request: &CompileRequest,
     module: &trust_ir::Module,
+    compiler: &Compiler,
+    dependency_identity: Option<&CompileArtifactDependencyIdentity>,
 ) -> Result<ArtifactIdentity, CompileDiagnostic> {
     let module_bytes = encode_tmbc(module).map_err(|error| {
         CompileDiagnostic::error(
@@ -6240,7 +6625,17 @@ fn artifact_identity_for_module(
         .with_phase("artifact_identity")
     })?;
     let exported_symbols = module.functions.iter().map(|func| func.name.clone());
-    Ok(ArtifactIdentityInput::from_request(request, module_bytes, exported_symbols).identity())
+    let mut input = ArtifactIdentityInput::from_request(request, module_bytes, exported_symbols);
+    // CompilePlan target authority may select a different architecture from
+    // the profile's compatibility default. Bind the exact configuration owned
+    // by the already-created compiler rather than reconstructing another
+    // compiler (or hashing stale profile target fields).
+    input.target = compiler.config().target;
+    input.compiler = compiler.config().clone();
+    if let Some(dependency_identity) = dependency_identity {
+        input.dependency_identity = dependency_identity.clone();
+    }
+    Ok(input.identity_with_compiler(compiler))
 }
 
 fn raw_extern_bindings_from_map(
@@ -6303,26 +6698,77 @@ fn hash_target(hasher: &mut StableHasher, target: Target) {
     hash_str(hasher, target.name());
 }
 
-fn hash_opt_level(hasher: &mut StableHasher, opt_level: OptLevel) {
-    let tag = match opt_level {
-        OptLevel::O0 => "O0",
-        OptLevel::O1 => "O1",
-        OptLevel::O2 => "O2",
-        OptLevel::O3 => "O3",
+fn hash_profile_id(hasher: &mut StableHasher, profile: CompileProfileId) {
+    let tag = match profile {
+        CompileProfileId::FastAarch64Solver => "fast_aarch64_solver",
+        CompileProfileId::HostJitFast => "host_jit_fast",
+        CompileProfileId::Custom => "custom",
     };
     hash_str(hasher, tag);
 }
 
-fn hash_dispatch_verify_mode(hasher: &mut StableHasher, mode: DispatchVerifyMode) {
-    let tag = match mode {
-        DispatchVerifyMode::Off => "off".to_owned(),
-        DispatchVerifyMode::FallbackOnFailure => "fallback_on_failure".to_owned(),
-        DispatchVerifyMode::ErrorOnFailure => "error_on_failure".to_owned(),
-        // The modulus changes which functions are verified, so it must key
-        // the cache exactly like the mode tag itself.
-        DispatchVerifyMode::Sampled { modulus } => format!("sampled:{modulus}"),
+fn hash_artifact_kind(hasher: &mut StableHasher, artifact_kind: ArtifactKind) {
+    let tag = match artifact_kind {
+        ArtifactKind::Object => "object",
+        ArtifactKind::ExecutableMemory => "executable_memory",
     };
-    hash_str(hasher, &tag);
+    hash_str(hasher, tag);
+}
+
+fn hash_effective_backend_profile(
+    hasher: &mut StableHasher,
+    compiler: &Compiler,
+    jit: &JitConfig,
+    artifact_kind: ArtifactKind,
+) {
+    hash_str(
+        hasher,
+        "trust-cg.compile_service.effective_backend_profile.v2",
+    );
+    hash_target(hasher, compiler.config().target);
+    match (compiler.config().target, artifact_kind) {
+        (Target::X86_64, ArtifactKind::Object) => {
+            hash_str(hasher, "x86_object_current");
+            hash_x86_target_features(hasher, crate::x86_64::X86TargetFeatures::current());
+        }
+        (Target::X86_64, ArtifactKind::ExecutableMemory) => {
+            hash_str(hasher, "x86_host_jit");
+            let profile = compiler.effective_x86_jit_codegen_profile();
+            hash_x86_target_features(hasher, profile.target_features);
+            hash_bool(hasher, profile.fast_regalloc);
+        }
+        (Target::Aarch64, ArtifactKind::Object) => {
+            hash_str(hasher, "aarch64_object_v2");
+            hash_aarch64_isa_profile(
+                hasher,
+                AArch64IsaProfile::for_aot_target(compiler.target_spec()),
+            );
+        }
+        (Target::Aarch64, ArtifactKind::ExecutableMemory) => {
+            hash_str(hasher, "aarch64_host_jit_v2");
+            hash_aarch64_isa_profile(hasher, compiler.effective_aarch64_jit_isa_profile());
+        }
+        (Target::Riscv64, ArtifactKind::Object) => hash_str(hasher, "riscv64_object_v1"),
+        (Target::Riscv64, ArtifactKind::ExecutableMemory) => {
+            hash_str(hasher, "riscv64_host_jit_v1")
+        }
+    }
+
+    if artifact_kind == ArtifactKind::ExecutableMemory {
+        hash_profile_hook_mode(hasher, jit.effective_profile_hooks());
+        match compiler.captured_jit_validation_mode() {
+            Ok(JitValidationMode::Unchecked) => hash_str(hasher, "validation_unchecked"),
+            Ok(JitValidationMode::CachedVerified) => hash_str(hasher, "validation_cached_verified"),
+            Ok(JitValidationMode::AlwaysVerify) => hash_str(hasher, "validation_always_verify"),
+            Err(_) => hash_str(hasher, "validation_refused"),
+        }
+    }
+}
+
+fn hash_aarch64_isa_profile(hasher: &mut StableHasher, profile: AArch64IsaProfile) {
+    hash_str(hasher, "trust-cg.compile_service.aarch64_isa_profile.v1");
+    hash_u64(hasher, u64::from(profile.feature_bits()));
+    hash_str(hasher, &profile.canonical_name());
 }
 
 fn hash_profile_hook_mode(hasher: &mut StableHasher, mode: ProfileHookMode) {
@@ -6339,30 +6785,56 @@ fn hash_profile_hook_mode(hasher: &mut StableHasher, mode: ProfileHookMode) {
     hash_str(hasher, tag);
 }
 
-fn hash_compiler_trace_level(hasher: &mut StableHasher, trace_level: CompilerTraceLevel) {
-    let tag = match trace_level {
-        CompilerTraceLevel::None => "none",
-        CompilerTraceLevel::Summary => "summary",
-        CompilerTraceLevel::Full => "full",
-    };
-    hash_str(hasher, tag);
+fn hash_dependency_identity(
+    hasher: &mut StableHasher,
+    identity: &CompileArtifactDependencyIdentity,
+) {
+    hash_str(hasher, "trust-cg.compile_service.dependency_identity.v1");
+    hash_str(hasher, &identity.trust_cg_identity);
+    hash_str(hasher, &identity.trust_ir_identity);
+    hash_str(hasher, &identity.ay_identity);
+    hash_str(hasher, &identity.rustc_identity);
+    hash_str(hasher, &identity.cargo_identity);
+    hash_str(hasher, &identity.dependency_mode);
+    if identity.is_artifact_reuse_eligible() {
+        hash_str(hasher, "persistent_source_locked");
+    } else {
+        // Package versions and build-host placeholders do not distinguish two
+        // same-version compiler revisions. Keep repeated work shareable inside
+        // this process, but make the plan identity deliberately non-portable
+        // until the launcher supplies source-lock and pinned-tool identities.
+        hash_str(hasher, "process_local_unlocked");
+        hash_u128(hasher, process_local_build_scope());
+    }
 }
 
-fn hash_profile_id(hasher: &mut StableHasher, profile: CompileProfileId) {
-    let tag = match profile {
-        CompileProfileId::FastAarch64Solver => "fast_aarch64_solver",
-        CompileProfileId::HostJitFast => "host_jit_fast",
-        CompileProfileId::Custom => "custom",
-    };
-    hash_str(hasher, tag);
+fn process_local_build_scope() -> u128 {
+    static SCOPE: OnceLock<u128> = OnceLock::new();
+    *SCOPE.get_or_init(|| {
+        let mut hasher = StableHasher::new();
+        hash_str(
+            &mut hasher,
+            "trust-cg.compile_service.process_local_build_scope.v1",
+        );
+        hash_u64(&mut hasher, u64::from(std::process::id()));
+        let since_epoch = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        hash_u128(&mut hasher, since_epoch);
+        hash_u64(
+            &mut hasher,
+            (&SCOPE as *const OnceLock<u128>) as usize as u64,
+        );
+        hasher.finish128()
+    })
 }
 
-fn hash_artifact_kind(hasher: &mut StableHasher, artifact_kind: ArtifactKind) {
-    let tag = match artifact_kind {
-        ArtifactKind::Object => "object",
-        ArtifactKind::ExecutableMemory => "executable_memory",
-    };
-    hash_str(hasher, tag);
+fn hash_x86_target_features(hasher: &mut StableHasher, features: crate::x86_64::X86TargetFeatures) {
+    for feature in crate::x86_64::X86TargetFeature::ALL {
+        hash_str(hasher, feature.name());
+        hash_bool(hasher, features.contains(feature));
+    }
 }
 
 fn hash_install_intent(hasher: &mut StableHasher, install_intent: InstallIntent) {
@@ -6404,24 +6876,6 @@ fn normalized_solver_names(solvers: &[String]) -> Vec<&str> {
     solvers
 }
 
-fn hash_compiler_config(hasher: &mut StableHasher, config: &CompilerConfig) {
-    hash_opt_level(hasher, config.opt_level);
-    hash_target(hasher, config.target);
-    hash_bool(hasher, config.emit_proofs);
-    hash_compiler_trace_level(hasher, config.trace_level);
-    hash_bool(hasher, config.emit_debug);
-    hash_bool(hasher, config.parallel);
-    hash_option_u64(hasher, config.cegis_superopt_budget_sec);
-}
-
-fn hash_jit_config(hasher: &mut StableHasher, config: &JitConfig) {
-    hash_opt_level(hasher, config.opt_level);
-    hash_bool(hasher, config.verify);
-    hash_dispatch_verify_mode(hasher, config.verify_dispatch);
-    hash_profile_hook_mode(hasher, config.profile_hooks);
-    hash_bool(hasher, config.emit_entry_counters);
-}
-
 impl Default for CompileService {
     fn default() -> Self {
         Self::new(CompileServiceConfig::default())
@@ -6435,7 +6889,7 @@ mod tests {
         CompileArtifactCacheBoundary, CompileArtifactCacheConfig, CompileArtifactCacheStatus,
         CompileArtifactDependencyIdentity, CompileArtifactProofPolicy,
     };
-    use crate::compiler::CompilerTraceLevel;
+    use crate::compiler::{CompilerTraceLevel, JitValidationMode};
     use crate::jit::JitConfig;
     #[cfg(target_arch = "aarch64")]
     use crate::jit_install_gate::{
@@ -6477,11 +6931,11 @@ mod tests {
             root,
             CompileArtifactProofPolicy::Unchecked,
             CompileArtifactDependencyIdentity::new(
-                "trust-cg:test",
-                "trust_ir:test",
-                "ay:test",
-                "rustc:test",
-                "cargo:test",
+                "source-lock-sha256:trust-cg-test",
+                "source-lock-sha256:trust-ir-test",
+                "source-lock-sha256:ay-test",
+                "rustc:sha256:test-toolchain",
+                "cargo:sha256:test-toolchain",
                 "trust",
             ),
         )
@@ -6552,8 +7006,7 @@ mod tests {
     }
 
     fn native_install_manifest(artifact_id: &str, generation: u64) -> ArtifactManifestV1 {
-        let target_spec = TargetSpec::default_for_architecture(Target::host());
-        let target = crate::jit_contract::TargetDescriptor::for_trust_cg_target_spec(target_spec);
+        let target = crate::jit_contract::TargetDescriptor::for_trust_cg_host_jit();
         let abi = crate::jit_contract::AbiDescriptor::for_trust_cg_target_os(
             Target::host(),
             target.operating_system.clone(),
@@ -8708,6 +9161,170 @@ mod tests {
     }
 
     #[test]
+    fn artifact_identity_reuses_output_across_invocation_mechanics() {
+        let base_compiler = CompilerConfig::jit_fast(Target::Aarch64);
+        let jit = JitConfig::default();
+        let identity = |compiler: CompilerConfig| {
+            let mut request = CompileRequest::new("req", CompileGeneration::new(1));
+            request.profile = CompileProfile::Custom {
+                compiler,
+                jit: jit.clone(),
+            };
+            ArtifactIdentityInput::from_request(&request, b"canonical-module", ["entry"]).identity()
+        };
+        let baseline = identity(base_compiler.clone());
+
+        let mut serial_with_trace = base_compiler;
+        serial_with_trace.parallel = false;
+        serial_with_trace.trace_level = CompilerTraceLevel::Full;
+        assert_eq!(
+            baseline,
+            identity(serial_with_trace),
+            "deterministic scheduling and tracing must not fragment output reuse"
+        );
+    }
+
+    #[test]
+    fn x86_target_feature_profile_is_identity_bound() {
+        let digest = |features| {
+            let mut hasher = StableHasher::new();
+            hash_x86_target_features(&mut hasher, features);
+            hasher.finish128()
+        };
+        let generic = crate::x86_64::X86TargetFeatures::generic_x86_64();
+        let with_popcnt = generic.with_feature(crate::x86_64::X86TargetFeature::Popcnt);
+        let current = crate::x86_64::X86TargetFeatures::current();
+
+        assert_ne!(digest(generic), digest(with_popcnt));
+        assert_ne!(digest(generic), digest(current));
+    }
+
+    #[test]
+    fn aarch64_isa_profiles_have_disjoint_compile_service_digests() {
+        let digest = |profile| {
+            let mut hasher = StableHasher::new();
+            hash_aarch64_isa_profile(&mut hasher, profile);
+            hasher.finish128()
+        };
+        let profiles = [
+            AArch64IsaProfile::BASELINE,
+            AArch64IsaProfile::LSE,
+            AArch64IsaProfile::DOTPROD,
+            AArch64IsaProfile::FP16,
+            AArch64IsaProfile::LSE_DOTPROD,
+            AArch64IsaProfile::LSE.with_feature(AArch64IsaFeature::Fp16, true),
+            AArch64IsaProfile::DOTPROD.with_feature(AArch64IsaFeature::Fp16, true),
+            AArch64IsaProfile::APPLE_ARM64,
+        ];
+
+        let digests = profiles.map(digest);
+        for left in 0..digests.len() {
+            for right in (left + 1)..digests.len() {
+                assert_ne!(digests[left], digests[right]);
+            }
+        }
+    }
+
+    #[test]
+    fn aarch64_object_identity_binds_resolved_aot_isa_profile() {
+        let config = CompilerConfig::jit_fast(Target::Aarch64);
+        let apple = Compiler::new_for_target_spec(
+            config.clone(),
+            TargetSpec::parse("aarch64-apple-darwin").unwrap(),
+        );
+        let linux = Compiler::new_for_target_spec(
+            config.clone(),
+            TargetSpec::parse("aarch64-unknown-linux-gnu").unwrap(),
+        );
+        let mut request = CompileRequest::new("req", CompileGeneration::new(1));
+        request.artifact_kind = ArtifactKind::Object;
+        request.profile = CompileProfile::Custom {
+            compiler: config,
+            jit: JitConfig::default(),
+        };
+        let input = ArtifactIdentityInput::from_request(&request, b"canonical-module", ["entry"]);
+        let backend_digest = |compiler: &Compiler| {
+            let mut hasher = StableHasher::new();
+            hash_effective_backend_profile(&mut hasher, compiler, &input.jit, ArtifactKind::Object);
+            hasher.finish128()
+        };
+
+        assert_eq!(
+            AArch64IsaProfile::for_aot_target(apple.target_spec()),
+            AArch64IsaProfile::APPLE_ARM64
+        );
+        assert_eq!(
+            AArch64IsaProfile::for_aot_target(linux.target_spec()),
+            AArch64IsaProfile::BASELINE
+        );
+        assert_ne!(backend_digest(&apple), backend_digest(&linux));
+        assert_ne!(
+            input.identity_with_compiler(&apple),
+            input.identity_with_compiler(&linux)
+        );
+    }
+
+    #[test]
+    fn aarch64_executable_backend_identity_binds_captured_jit_isa_profile() {
+        let compiler = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64));
+        let jit = JitConfig::default();
+        let mut actual = StableHasher::new();
+        hash_effective_backend_profile(
+            &mut actual,
+            &compiler,
+            &jit,
+            ArtifactKind::ExecutableMemory,
+        );
+
+        let mut expected = StableHasher::new();
+        hash_str(
+            &mut expected,
+            "trust-cg.compile_service.effective_backend_profile.v2",
+        );
+        hash_target(&mut expected, Target::Aarch64);
+        hash_str(&mut expected, "aarch64_host_jit_v2");
+        hash_aarch64_isa_profile(&mut expected, compiler.effective_aarch64_jit_isa_profile());
+        hash_profile_hook_mode(&mut expected, jit.effective_profile_hooks());
+        match compiler.captured_jit_validation_mode() {
+            Ok(JitValidationMode::Unchecked) => hash_str(&mut expected, "validation_unchecked"),
+            Ok(JitValidationMode::CachedVerified) => {
+                hash_str(&mut expected, "validation_cached_verified")
+            }
+            Ok(JitValidationMode::AlwaysVerify) => {
+                hash_str(&mut expected, "validation_always_verify")
+            }
+            Err(_) => hash_str(&mut expected, "validation_refused"),
+        }
+
+        assert_eq!(actual.finish128(), expected.finish128());
+    }
+
+    #[test]
+    fn artifact_identity_binds_source_locked_compiler_build() {
+        let mut request = CompileRequest::new("req", CompileGeneration::new(1));
+        request.profile = CompileProfile::Custom {
+            compiler: CompilerConfig::jit_fast(Target::Aarch64),
+            jit: JitConfig::default(),
+        };
+        let mut input =
+            ArtifactIdentityInput::from_request(&request, b"canonical-module", ["entry"]);
+        input.dependency_identity = CompileArtifactDependencyIdentity::new(
+            "sha256:trust-cg-a",
+            "sha256:trust-ir-a",
+            "sha256:ay-a",
+            "rustc:sha256:toolchain-a",
+            "cargo:sha256:toolchain-a",
+            "trust",
+        );
+        assert!(input.dependency_identity.is_artifact_reuse_eligible());
+        let build_a = input.identity();
+
+        input.dependency_identity.trust_cg_identity = "sha256:trust-cg-b".to_owned();
+        let build_b = input.identity();
+        assert_ne!(build_a, build_b);
+    }
+
+    #[test]
     fn artifact_identity_hashes_proof_policy_and_profile_only_intent() {
         let mut installable = CompileRequest::new("req", CompileGeneration::new(1));
         installable.profile = CompileProfile::Custom {
@@ -8895,6 +9512,76 @@ mod tests {
             base,
             ArtifactIdentityInput::from_request(&request, b"canonical-module", ["entry"])
                 .identity()
+        );
+    }
+
+    #[test]
+    fn artifact_identity_hashes_consumed_policy_and_ignores_unwired_jit_knobs() {
+        let base_compiler = CompilerConfig::jit_fast(Target::Aarch64);
+        let base_jit = JitConfig {
+            opt_level: OptLevel::O1,
+            verify: false,
+            verify_dispatch: DispatchVerifyMode::ErrorOnFailure,
+            profile_hooks: ProfileHookMode::None,
+            emit_entry_counters: false,
+            cache_certificates: true,
+        };
+        let identity = |compiler: CompilerConfig, jit: JitConfig| {
+            let mut request = CompileRequest::new("req", CompileGeneration::new(1));
+            request.profile = CompileProfile::Custom { compiler, jit };
+            ArtifactIdentityInput::from_request(&request, b"canonical-module", ["entry"]).identity()
+        };
+        let baseline = identity(base_compiler.clone(), base_jit.clone());
+
+        let mut fsym_preflight = base_compiler.clone();
+        fsym_preflight.enable_fsym_trust_ir_preflight = true;
+        assert_ne!(
+            baseline,
+            identity(fsym_preflight, base_jit.clone()),
+            "fsym diagnostics and metrics must be identity-bound"
+        );
+
+        let mut fast_regalloc = base_compiler.clone();
+        fast_regalloc.enable_jit_fast_regalloc = false;
+        assert_ne!(
+            baseline,
+            identity(fast_regalloc, base_jit.clone()),
+            "register-allocation policy can change machine bytes"
+        );
+
+        let mut validation = base_compiler.clone();
+        validation.jit_validation_mode_override = Some(JitValidationMode::AlwaysVerify);
+        assert_ne!(
+            baseline,
+            identity(validation, base_jit.clone()),
+            "validation authority must be identity-bound"
+        );
+
+        let mut unwind = base_compiler.clone();
+        unwind.panic_unwind = true;
+        assert_ne!(
+            baseline,
+            identity(unwind, base_jit.clone()),
+            "unwind policy can change object bytes"
+        );
+
+        let mut unwired_jit = base_jit;
+        unwired_jit.opt_level = OptLevel::O3;
+        unwired_jit.verify = true;
+        unwired_jit.verify_dispatch = DispatchVerifyMode::Off;
+        unwired_jit.cache_certificates = false;
+        assert_eq!(
+            baseline,
+            identity(base_compiler.clone(), unwired_jit),
+            "CompileService must not fragment reuse on low-level JIT knobs it does not consume"
+        );
+
+        let mut profile_hooks = JitConfig::default();
+        profile_hooks.profile_hooks = ProfileHookMode::BlockCounts;
+        assert_ne!(
+            baseline,
+            identity(base_compiler, profile_hooks),
+            "the effective profiling hook is consumed by executable compilation"
         );
     }
 
@@ -9144,6 +9831,98 @@ mod tests {
     }
 
     #[test]
+    fn compile_plan_target_spec_is_authoritative_for_identity_output_and_evidence() {
+        let module = const_i64_module("compile_plan_target_authority", &[("answer", 42)]);
+        let mut request = CompileRequest::new("plan-target", CompileGeneration::new(24));
+        request.artifact_kind = ArtifactKind::Object;
+        request.profile = CompileProfile::Custom {
+            compiler: CompilerConfig {
+                opt_level: OptLevel::O0,
+                target: Target::Aarch64,
+                parallel: false,
+                ..CompilerConfig::default()
+            },
+            jit: JitConfig::default(),
+        };
+
+        let apple_target = TargetSpec::parse("aarch64-apple-darwin").unwrap();
+        let linux_target = TargetSpec::parse("aarch64-unknown-linux-gnu").unwrap();
+        let apple =
+            service().compile_plan(CompilePlan::new(request.clone(), apple_target), &module);
+        let linux = service().compile_plan(CompilePlan::new(request, linux_target), &module);
+
+        assert_eq!(apple.status, CompileStatus::Compiled);
+        assert_eq!(linux.status, CompileStatus::Compiled);
+        let apple_artifact = apple.artifact.as_ref().expect("Apple artifact");
+        let linux_artifact = linux.artifact.as_ref().expect("Linux artifact");
+        assert_ne!(
+            apple_artifact.identity, linux_artifact.identity,
+            "target OS/ABI must be part of compile-plan identity"
+        );
+        assert_eq!(apple_artifact.metadata.target, Target::Aarch64);
+        assert_eq!(linux_artifact.metadata.target, Target::Aarch64);
+
+        let apple_bytes = match apple.payload.as_ref().expect("Apple payload") {
+            ArtifactPayload::Object(payload) => payload.bytes.as_slice(),
+            other => panic!("expected Apple object payload, got {other:?}"),
+        };
+        let linux_bytes = match linux.payload.as_ref().expect("Linux payload") {
+            ArtifactPayload::Object(payload) => payload.bytes.as_slice(),
+            other => panic!("expected Linux object payload, got {other:?}"),
+        };
+        assert_eq!(&apple_bytes[..4], &[0xcf, 0xfa, 0xed, 0xfe]);
+        assert_eq!(&linux_bytes[..4], b"\x7fELF");
+
+        for (artifact, target_spec) in [
+            (apple_artifact, apple_target),
+            (linux_artifact, linux_target),
+        ] {
+            let report = artifact
+                .install
+                .proof_evidence_report
+                .as_ref()
+                .expect("compile response carries proof/TV report");
+            let expected_target = TargetDescriptor::for_trust_cg_target_spec(target_spec)
+                .with_features(
+                    AArch64IsaProfile::for_aot_target(target_spec).enabled_feature_names(),
+                );
+            assert_eq!(report.target_checksum, expected_target.checksum());
+        }
+    }
+
+    #[test]
+    fn legacy_compile_matches_profile_default_compile_plan() {
+        let module = const_i64_module("compile_plan_legacy_default", &[("answer", 42)]);
+        let mut request = CompileRequest::new("legacy-default", CompileGeneration::new(25));
+        request.artifact_kind = ArtifactKind::Object;
+        request.profile = CompileProfile::Custom {
+            compiler: CompilerConfig {
+                opt_level: OptLevel::O0,
+                target: Target::Aarch64,
+                parallel: false,
+                ..CompilerConfig::default()
+            },
+            jit: JitConfig::default(),
+        };
+
+        let legacy = service().compile(request.clone(), &module);
+        let planned = service().compile_plan(CompilePlan::for_request(request), &module);
+        assert_eq!(legacy.status, CompileStatus::Compiled);
+        assert_eq!(planned.status, CompileStatus::Compiled);
+        assert_eq!(
+            legacy.artifact.as_ref().unwrap().identity,
+            planned.artifact.as_ref().unwrap().identity
+        );
+        fn object_bytes(response: &CompileResponse) -> &[u8] {
+            match response.payload.as_ref().unwrap() {
+                ArtifactPayload::Object(payload) => payload.bytes.as_slice(),
+                other => panic!("expected object payload, got {other:?}"),
+            }
+        }
+        assert_eq!(object_bytes(&legacy), object_bytes(&planned));
+    }
+
+    #[test]
     fn compile_service_object_path_exposes_cache_hit_miss_telemetry() {
         let root = temp_cache_root("object-hit");
         let module = const_i64_module("compile_service_object_cache", &[("answer", 42)]);
@@ -9286,6 +10065,12 @@ mod tests {
                 manifest.target.architecture = crate::jit_contract::TargetArchitecture::Other(
                     "caller-architecture".to_owned(),
                 );
+            }),
+            ("target-cpu", "CPU/features", |manifest| {
+                manifest.target.cpu = Some("caller-cpu".to_owned());
+            }),
+            ("target-features", "CPU/features", |manifest| {
+                manifest.target.features.clear();
             }),
             ("abi-name", "ABI mismatch", |manifest| {
                 manifest.abi.name.push_str("-caller-spoofed");
@@ -9644,25 +10429,29 @@ mod tests {
                 .expect("installed payload binding");
             let mut legacy_transcript =
                 installed_payload_binding_transcript(binding, manifest.as_ref());
-            let current_domain = b"trust-cg.compile_service.installed_payload_binding.sha256.v3";
-            let legacy_domain = b"trust-cg.compile_service.installed_payload_binding.sha256.v2";
+            let current_domain = b"trust-cg.compile_service.installed_payload_binding.sha256.v4";
+            let legacy_domain = b"trust-cg.compile_service.installed_payload_binding.sha256.v3";
             let domain_offset = legacy_transcript
                 .windows(current_domain.len())
                 .position(|window| window == current_domain)
-                .expect("v3 transcript domain");
+                .expect("v4 transcript domain");
             legacy_transcript[domain_offset..domain_offset + current_domain.len()]
                 .copy_from_slice(legacy_domain);
             binding.binding_sha256 = format!("sha256:{}", sha256_hex(&legacy_transcript));
         });
-        assert_binding_mutation_rejected(&response, "manifest target", |response| {
-            mutate_and_reseal_installed_binding(response, |binding| {
-                binding
-                    .authoritative_target
-                    .triple
-                    .push_str("-wrong-target");
-                binding.compiler_target_triple = binding.authoritative_target.triple.clone();
-            });
-        });
+        assert_binding_mutation_rejected(
+            &response,
+            "sealed target/ABI/core-layout authority",
+            |response| {
+                mutate_and_reseal_installed_binding(response, |binding| {
+                    binding
+                        .authoritative_target
+                        .triple
+                        .push_str("-wrong-target");
+                    binding.compiler_target_triple = binding.authoritative_target.triple.clone();
+                });
+            },
+        );
         assert_binding_mutation_rejected(
             &response,
             "binding schema/version/kind or private canonical seal",
@@ -10062,6 +10851,37 @@ mod tests {
                 assert!(payload.buffer.get_fn_ptr_bound("forty_one").is_some());
                 assert!(payload.buffer.get_fn_ptr_bound("forty_two").is_some());
             }
+            other => panic!("expected executable payload, got {other:?}"),
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn compile_service_executes_entry_counter_alias_semantics() {
+        let module = const_i64_module("compile_service_counter_alias", &[("answer", 42)]);
+        let mut request = CompileRequest::new("counter-alias", CompileGeneration::new(22));
+        request.artifact_kind = ArtifactKind::ExecutableMemory;
+        request.profile = CompileProfile::Custom {
+            compiler: CompilerConfig::for_host_jit(),
+            jit: JitConfig {
+                profile_hooks: ProfileHookMode::None,
+                emit_entry_counters: true,
+                ..JitConfig::default()
+            },
+        };
+
+        let response = service().compile(request, &module);
+        assert_eq!(response.status, CompileStatus::Compiled);
+        assert_eq!(
+            response.disposition,
+            ArtifactInstallDisposition::ProfileOnly
+        );
+        match response.payload.expect("executable payload") {
+            ArtifactPayload::Executable(payload) => assert_eq!(
+                payload.buffer.entry_count("answer"),
+                Some(0),
+                "the service must execute the same effective CallCounts mode its policy hashes"
+            ),
             other => panic!("expected executable payload, got {other:?}"),
         }
     }

@@ -100,7 +100,8 @@ use std::sync::OnceLock;
 use std::time::SystemTime;
 
 use sha2::{Digest, Sha256};
-use trust_cg_codegen::jit::{ExecutableBuffer, publish_serialized_buffer};
+use trust_cg_codegen::jit::{ExecutableBuffer, publish_serialized_buffer_for_target};
+use trust_cg_codegen::jit_contract::TargetDescriptor;
 
 /// Magic preamble identifying a trust-cg JIT buffer file. `TCJ` is for
 /// "trust-cg JIT" and `1` is the file-format version (NOT the codegen
@@ -331,15 +332,18 @@ pub fn host_triple() -> String {
 
 /// Process-local override for the codegen version hash. Tests use this
 /// to simulate a stale buffer without rebuilding the codegen crate.
+#[cfg(test)]
 static CODEGEN_VERSION_OVERRIDE: OnceLock<std::sync::Mutex<Option<[u8; 32]>>> = OnceLock::new();
 
+#[cfg(test)]
 fn codegen_version_override_slot() -> &'static std::sync::Mutex<Option<[u8; 32]>> {
     CODEGEN_VERSION_OVERRIDE.get_or_init(|| std::sync::Mutex::new(None))
 }
 
 /// Test-facing override of the codegen version digest. Pass `None` to
 /// restore the package-version-derived default.
-pub fn set_codegen_version_hash_for_tests(hash: Option<[u8; 32]>) {
+#[cfg(test)]
+pub(crate) fn set_codegen_version_hash_for_tests(hash: Option<[u8; 32]>) {
     if let Ok(mut guard) = codegen_version_override_slot().lock() {
         *guard = hash;
     }
@@ -351,10 +355,13 @@ pub fn set_codegen_version_hash_for_tests(hash: Option<[u8; 32]>) {
 /// manifests/lockfile, and embedded verifier assets. A change anywhere in that
 /// closure invalidates every cached buffer without a manual version bump.
 pub fn codegen_version_hash() -> [u8; 32] {
-    if let Ok(guard) = codegen_version_override_slot().lock()
-        && let Some(h) = guard.as_ref()
+    #[cfg(test)]
     {
-        return *h;
+        if let Ok(guard) = codegen_version_override_slot().lock()
+            && let Some(h) = guard.as_ref()
+        {
+            return *h;
+        }
     }
     production_codegen_version_hash()
 }
@@ -392,36 +399,22 @@ pub(crate) fn ir_builder_version_hash() -> [u8; 32] {
 /// must remain partitioned by runtime controls and detected machine features.
 pub(crate) fn production_codegen_version_hash() -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(b"trust-cg-codegen.executable-buffer.v2\0");
+    hasher.update(b"trust-cg-codegen.executable-buffer.v3\0");
     append_pipeline_build_identity(&mut hasher);
     hasher.update(b"\0codegen-control-environment\0");
     append_codegen_control_environment(&mut hasher, crate::env_lock::vars_os());
-    hasher.update(b"\0host-machine-features\0");
-    append_machine_feature_identity(&mut hasher, &host_machine_feature_identity());
-    hasher.update(host_triple().as_bytes());
+    hasher.update(b"\0host-target-contract\0");
+    append_target_contract_identity(&mut hasher, &TargetDescriptor::for_trust_cg_host_jit());
     let digest = hasher.finalize();
     let mut out = [0u8; 32];
     out.copy_from_slice(&digest);
     out
 }
 
-fn append_machine_feature_identity(hasher: &mut Sha256, identity: &str) {
-    hasher.update((identity.len() as u64).to_le_bytes());
-    hasher.update(identity.as_bytes());
-}
-
-fn host_machine_feature_identity() -> String {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    {
-        return format!(
-            "x86-host:{}",
-            trust_cg_codegen::x86_64::pipeline::X86TargetFeatures::host().metadata_feature_list()
-        );
-    }
-    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-    {
-        format!("{}-host-baseline", std::env::consts::ARCH)
-    }
+fn append_target_contract_identity(hasher: &mut Sha256, target: &TargetDescriptor) {
+    let canonical = target.canonical_bytes();
+    hasher.update((canonical.len() as u64).to_le_bytes());
+    hasher.update(canonical);
 }
 
 fn append_codegen_control_environment<I>(hasher: &mut Sha256, variables: I)
@@ -679,10 +672,20 @@ pub fn decode_buffer_payload(bytes: &[u8]) -> io::Result<DecodedBufferPayload> {
 
 /// Re-publish a decoded payload into a live [`ExecutableBuffer`].
 ///
-/// Host-triple and codegen-version-hash checks are enforced here. Any
-/// mismatch returns `Err(io::ErrorKind::InvalidData)` so the caller
-/// treats it as a cache miss.
-pub fn publish_decoded_payload(payload: DecodedBufferPayload) -> io::Result<ExecutableBuffer> {
+/// Host-triple and codegen-version-hash checks are enforced here. Any mismatch
+/// returns `Err(io::ErrorKind::InvalidData)` so the caller treats it as a cache
+/// miss. Those integrity checks are not proof that the native bytes came from
+/// Trust Codegen; callers must establish provenance separately.
+///
+/// # Safety
+///
+/// `payload` must be authenticated as Trust Codegen output for the exact live
+/// compiler build, target, optional-feature profile, symbol layout, and
+/// function ABIs. A self-consistent checksum and publicly reproducible version
+/// hash alone do not authenticate attacker-controlled native code.
+pub unsafe fn publish_decoded_payload(
+    payload: DecodedBufferPayload,
+) -> io::Result<ExecutableBuffer> {
     if payload.host_triple != host_triple() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -699,12 +702,20 @@ pub fn publish_decoded_payload(payload: DecodedBufferPayload) -> io::Result<Exec
             "codegen version hash mismatch",
         ));
     }
-    publish_serialized_buffer(
-        &payload.code,
-        payload.canonical_symbols,
-        payload.symbol_offsets,
-        payload.function_ranges,
-    )
+    let target_contract = trust_cg_codegen::jit_contract::TargetDescriptor::for_trust_cg_host_jit();
+    // SAFETY: the caller authenticated provenance as required by this
+    // function's safety contract. The checks above additionally establish the
+    // exact live target/compiler identity, while decode established structural
+    // bounds and transport integrity.
+    unsafe {
+        publish_serialized_buffer_for_target(
+            &payload.code,
+            payload.canonical_symbols,
+            payload.symbol_offsets,
+            payload.function_ranges,
+            &target_contract,
+        )
+    }
     .map_err(|e| io::Error::other(format!("publish failed: {e}")))
 }
 
@@ -724,7 +735,7 @@ pub fn write_buffer_to_disk(hash: u64, kernel_name: &str, buffer: &ExecutableBuf
 /// kernel-side closure produces them so the live provider keeps its
 /// owned `ExecutableBuffer` untouched).
 pub fn write_buffer_bytes_to_disk(hash: u64, kernel_name: &str, payload: &[u8]) {
-    if !disk_io_enabled() {
+    if !crate::env_lock::artifact_reuse_environment_safety().is_reuse_safe() || !disk_io_enabled() {
         return;
     }
     let dir = match ensure_cache_dir() {
@@ -770,7 +781,7 @@ pub fn write_buffer_bytes_to_disk(hash: u64, kernel_name: &str, payload: &[u8]) 
 /// version / SHA mismatch, host triple / codegen mismatch, or mmap failure.
 /// Touches the file's mtime on success so the LRU sweep keeps it.
 pub fn read_buffer_from_disk(hash: u64, kernel_name: &str) -> Option<ExecutableBuffer> {
-    if !disk_io_enabled() {
+    if !crate::env_lock::artifact_reuse_environment_safety().is_reuse_safe() || !disk_io_enabled() {
         return None;
     }
     let path = cache_path(hash, kernel_name)?;
@@ -780,7 +791,11 @@ pub fn read_buffer_from_disk(hash: u64, kernel_name: &str) -> Option<ExecutableB
     drop(file);
     let serialized = unwrap_disk_payload(&bytes, hash, kernel_name).ok()?;
     let payload = decode_buffer_payload(serialized).ok()?;
-    let buffer = publish_decoded_payload(payload).ok()?;
+    // SAFETY: executable-buffer disk I/O can only be enabled by the unsafe,
+    // process-private test/benchmark hook. Its caller promises that the root
+    // is private and contains only buffers produced by this live process; the
+    // disk envelope then binds the payload to this process and cache slot.
+    let buffer = unsafe { publish_decoded_payload(payload) }.ok()?;
     let _ = touch(&path);
     Some(buffer)
 }
@@ -1019,14 +1034,32 @@ mod tests {
     }
 
     #[test]
-    fn machine_feature_identity_is_cache_key_material() {
-        let digest = |identity: &str| {
+    fn complete_target_contract_is_cache_key_material() {
+        let digest = |target: &TargetDescriptor| {
             let mut hasher = Sha256::new();
-            append_machine_feature_identity(&mut hasher, identity);
+            append_target_contract_identity(&mut hasher, target);
             <[u8; 32]>::from(hasher.finalize())
         };
-        assert_ne!(digest("x86-host:sse4.1"), digest("x86-host:sse4.1,avx2"));
-        assert!(!host_machine_feature_identity().is_empty());
+        let base = TargetDescriptor::for_trust_cg_host_jit().with_features(Vec::<String>::new());
+        let profiles = [
+            vec![],
+            vec!["lse"],
+            vec!["dotprod"],
+            vec!["fp16"],
+            vec!["dotprod", "lse"],
+            vec!["fp16", "lse"],
+            vec!["dotprod", "fp16"],
+            vec!["dotprod", "fp16", "lse"],
+        ];
+        let identities = profiles
+            .into_iter()
+            .map(|features| digest(&base.clone().with_features(features)))
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            identities.len(),
+            8,
+            "every complete optional-feature contract must have a distinct replay key"
+        );
     }
 
     #[test]
@@ -1058,7 +1091,8 @@ mod tests {
         let buffer = compile_scan_buffer();
         let bytes = serialize_buffer(&buffer);
         let payload = decode_buffer_payload(&bytes).expect("decode");
-        let replayed = publish_decoded_payload(payload).expect("re-publish");
+        // SAFETY: this test round-trips a freshly compiled in-process buffer.
+        let replayed = unsafe { publish_decoded_payload(payload) }.expect("re-publish");
         // The replayed buffer must expose the same entry symbol at the
         // same byte offset.
         let original_offset = *buffer
@@ -1081,6 +1115,25 @@ mod tests {
         assert_eq!(buffer_cache_file_count(), 1);
         let replayed = read_buffer_from_disk(0xabcd_ef01, "scan").expect("disk hit");
         assert_eq!(buffer.code_slice(), replayed.code_slice());
+    }
+
+    #[test]
+    fn unkeyed_thread_local_control_bypasses_executable_buffer_disk_tier() {
+        let _g = CacheRootGuard::new();
+        let hash = 0xb10c_ed02;
+        let kernel = "policy-blocked";
+
+        crate::env_lock::with_env_overrides(&[("TCG_NO_SELECT_FOLD", "1")], || {
+            write_buffer_bytes_to_disk(hash, kernel, b"must not be published");
+            assert!(
+                read_buffer_from_disk(hash, kernel).is_none(),
+                "unkeyed policy must bypass executable-buffer lookup"
+            );
+        });
+        assert!(
+            !cache_path(hash, kernel).expect("cache path").exists(),
+            "unkeyed policy must bypass executable-buffer publication"
+        );
     }
 
     #[test]
@@ -1119,7 +1172,9 @@ mod tests {
         let digest = hasher.finalize();
         bytes[payload_len..].copy_from_slice(&digest);
         let payload = decode_buffer_payload(&bytes).expect("decode-only OK");
-        match publish_decoded_payload(payload) {
+        // SAFETY: the mismatch is rejected before publication; the payload is
+        // otherwise a freshly serialized in-process test buffer.
+        match unsafe { publish_decoded_payload(payload) } {
             Ok(_) => panic!("host triple mismatch must fail closed"),
             Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
         }
@@ -1138,7 +1193,9 @@ mod tests {
         // `0x42` × 32, which must be rejected.
         let payload = decode_buffer_payload(&bytes).expect("decode-only OK");
         assert_eq!(payload.codegen_version_hash, bogus_hash);
-        match publish_decoded_payload(payload) {
+        // SAFETY: the mismatch is rejected before publication; the payload is
+        // otherwise a freshly serialized in-process test buffer.
+        match unsafe { publish_decoded_payload(payload) } {
             Ok(_) => panic!("version hash mismatch must fail closed"),
             Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
         }
@@ -1195,7 +1252,8 @@ mod tests {
         let original_bytes = provider.buffer().code_slice().to_vec();
         let serialized = serialize_buffer(provider.buffer());
         let payload = decode_buffer_payload(&serialized).expect("decode");
-        let replayed_buffer = publish_decoded_payload(payload).expect("re-publish");
+        // SAFETY: this test round-trips a freshly compiled in-process buffer.
+        let replayed_buffer = unsafe { publish_decoded_payload(payload) }.expect("re-publish");
         assert_eq!(replayed_buffer.code_slice(), original_bytes.as_slice());
         // Drive the original provider to confirm the fresh path still
         // works alongside an in-process replayed buffer (they must

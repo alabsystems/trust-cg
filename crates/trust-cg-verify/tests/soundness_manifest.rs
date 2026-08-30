@@ -361,7 +361,7 @@ fn manifest() -> Vec<SoundnessInvariant> {
         SoundnessInvariant {
             id: "H",
             description: "The 4 accepted-obligation pins (AArch64 156/248, RISC-V 14/17, \
-                          WASM 111/113, x86-64 167/196 accepted/emitted-value-effect) hold, and \
+                          WASM 111/113, x86-64 168/197 accepted/emitted-value-effect) hold, and \
                           every uncovered row is an explicit DeferredUnfaithfulModel rather than \
                           a wiring gap. These are evidence-inventory ratios, not formal-proof or \
                           compiler-correctness percentages. AArch64 \
@@ -1215,7 +1215,10 @@ fn inproc_headline_pins_and_honest() {
         // RMW ALU quartet XorMR/AddMR/XorMRSib/AddMRSib, covered by the
         // MemRmw reconstruction (MemStore ∘ MemAlu composition; nothing
         // emits the quartet until the Stage-2 admission-gated peephole).
-        (GateArch::X86_64, 196usize, 167usize),
+        // Rotate Stage 1: +1/+1 — RolRCl (variable-count rotate), covered by
+        // the RotlVar reconstruction (masked rotate idiom vs hardware-masked
+        // ROL; nothing emits it until the Stage-2 admission-gated peephole).
+        (GateArch::X86_64, 197usize, 168usize),
     ] {
         let report = on_large_stack(move || CoverageGate::new().audit(arch));
         for row in report.failures() {

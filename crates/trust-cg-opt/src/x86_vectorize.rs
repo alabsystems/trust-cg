@@ -1014,6 +1014,7 @@ fn recognize_header(
     defs: &DefIndex,
     header: Block,
     body: &BTreeSet<Block>,
+    preheader: Block,
 ) -> Option<(VReg, i64)> {
     let block = func.blocks.get(&header)?;
     // A header comparing `iv` against a constant: find a CmpRR/CmpRI whose
@@ -1029,17 +1030,17 @@ fn recognize_header(
                 // One side must be a MovRI constant; the other the counter.
                 if let Some(n) = const_of(func, defs, b) {
                     let iv = canon(func, defs, a);
-                    if is_counter(func, defs, iv, body) {
+                    if is_counter(func, defs, iv, body, preheader) {
                         return Some((iv, n));
                     }
-                    report_zero_init_only_decline(func, defs, iv, body, header);
+                    report_zero_init_only_decline(func, defs, iv, body, header, preheader);
                 }
                 if let Some(n) = const_of(func, defs, a) {
                     let iv = canon(func, defs, b);
-                    if is_counter(func, defs, iv, body) {
+                    if is_counter(func, defs, iv, body, preheader) {
                         return Some((iv, n));
                     }
-                    report_zero_init_only_decline(func, defs, iv, body, header);
+                    report_zero_init_only_decline(func, defs, iv, body, header, preheader);
                 }
             }
             X86Opcode::CmpRI | X86Opcode::CmpRI8 => {
@@ -1047,10 +1048,10 @@ fn recognize_header(
                     (inst.operands.first(), inst.operands.get(1))
                 {
                     let iv = canon(func, defs, *a);
-                    if is_counter(func, defs, iv, body) {
+                    if is_counter(func, defs, iv, body, preheader) {
                         return Some((iv, *n));
                     }
-                    report_zero_init_only_decline(func, defs, iv, body, header);
+                    report_zero_init_only_decline(func, defs, iv, body, header, preheader);
                 }
             }
             _ => {}
@@ -1074,14 +1075,18 @@ fn report_zero_init_only_decline(
     iv: VReg,
     body: &BTreeSet<Block>,
     header: Block,
+    preheader: Block,
 ) {
     if !trace_enabled() {
         return;
     }
-    if is_counter_any_init(func, defs, iv, body) {
+    if is_counter_any_init(func, defs, iv, body)
+        && !iv_enters_as_zero(func, defs, iv, body, preheader)
+    {
         eprintln!(
             "x86-vectorize[diag]: fn `{}` header={header:?} DECLINED ONLY BY ZERO-INIT: \
-             {iv:?} is a unit counter with a non-zero/runtime start",
+             {iv:?} is a unit counter that does not enter {preheader:?} -> {header:?} as a \
+             literal 0 (non-zero/runtime start, or a zero init that does not reach the header)",
             func.name
         );
     }
@@ -1097,19 +1102,41 @@ fn const_of(func: &X86ISelFunction, defs: &DefIndex, v: VReg) -> Option<i64> {
     }
 }
 
-/// A unit-stride loop counter: defined `= 0` outside the body (preheader) and
-/// re-defined `= iv + 1` inside the latch (both defs are the same vreg). We
-/// verify: at least one def is `MovRR from (MovRI 0)` reached from a non-body
-/// block, and at least one def is the writeback of `AddRR [iv, iv, MovRI 1]`.
-fn is_counter(func: &X86ISelFunction, defs: &DefIndex, iv: VReg, body: &BTreeSet<Block>) -> bool {
-    let mut saw_zero_init_outside = false;
+/// A unit-stride loop counter: defined `= 0` in the PREHEADER and re-defined
+/// `= iv + 1` inside the latch (both defs are the same vreg). We verify:
+///
+/// * `iv` has **exactly one** def outside the body, that def is in `preheader`,
+///   and it is `MovRR iv, <MovRI 0>` — so the value reaching the header on the
+///   loop-entry edge is literally 0 (see [`iv_enters_as_zero`]); and
+/// * at least one in-body def is the writeback of `AddRR [iv, iv, MovRI 1]`.
+///
+/// ⚑ The zero entry is the emitters' load-bearing precondition, not a
+/// stylistic preference: no `apply_*_plan` initialises the counter — the vector
+/// header they build is `iv <u vN` with `vN = (n_trip / LANES) * LANES` and the
+/// body indexes with the raw counter and steps it by `LANES`. That guard proves
+/// the packed footprint is `[0, vN)` and the scalar remainder `[vN, N)` ONLY
+/// from a zero entry; from `iv = r != 0` the last admitted iteration touches up
+/// to element `vN + LANES - 2`, i.e. out of slot when `LANES | N`, with the
+/// per-access bounds-check diamonds deliberately elided in the packed loop.
+fn is_counter(
+    func: &X86ISelFunction,
+    defs: &DefIndex,
+    iv: VReg,
+    body: &BTreeSet<Block>,
+    preheader: Block,
+) -> bool {
+    if !iv_enters_as_zero(func, defs, iv, body, preheader) {
+        return false;
+    }
     let mut saw_unit_increment_inside = false;
     for block_id in &func.block_order {
         let Some(block) = func.blocks.get(block_id) else {
             continue;
         };
-        let in_body = body.contains(block_id);
-        for (idx, inst) in block.insts.iter().enumerate() {
+        if !body.contains(block_id) {
+            continue;
+        }
+        for inst in &block.insts {
             // A def of `iv` via `MovRR [iv, src]`.
             if inst.opcode == X86Opcode::MovRR
                 && matches!(inst.operands.first(), Some(X86ISelOperand::VReg(d)) if *d == iv)
@@ -1117,22 +1144,68 @@ fn is_counter(func: &X86ISelFunction, defs: &DefIndex, iv: VReg, body: &BTreeSet
                 let Some(X86ISelOperand::VReg(src)) = inst.operands.get(1) else {
                     continue;
                 };
-                if !in_body {
-                    // Preheader-style init: src is a constant 0.
-                    if const_of(func, defs, *src) == Some(0) {
-                        saw_zero_init_outside = true;
-                    }
-                } else {
-                    // Latch-style writeback: src = iv + 1.
-                    if is_iv_plus_one(func, defs, iv, *src) {
-                        saw_unit_increment_inside = true;
-                    }
+                // Latch-style writeback: src = iv + 1.
+                if is_iv_plus_one(func, defs, iv, *src) {
+                    saw_unit_increment_inside = true;
                 }
-                let _ = idx;
             }
         }
     }
-    saw_zero_init_outside && saw_unit_increment_inside
+    saw_unit_increment_inside
+}
+
+/// The counter enters the loop as EXACTLY zero: `iv` has exactly ONE def
+/// outside the loop body, it is in `preheader`, and it is a `MovRR iv, <MovRI
+/// 0>`.
+///
+/// This is the REACHING-DEF statement the emitters need, and it is what the
+/// newest tiers (`recognize_heap_sumq_loop`, `recognize_regarg_sumq_loop`,
+/// `recognize_window_scan_loop`) already spell out inline. An EXISTENCE check —
+/// "some non-body block assigns 0 to `iv`" — is not the same statement: a
+/// function that sets the counter to 0 on one path and to a non-zero value on
+/// the path that actually reaches the header satisfies it while entering the
+/// loop non-zero.
+///
+/// Soundness of "in the preheader" as a stand-in for "reaches the header":
+/// every caller obtains `preheader` from `LoopInfo::preheader`, which
+/// `mach_view::find_preheader` only produces when it is the loop header's
+/// UNIQUE out-of-body predecessor. So every entry into the loop runs the
+/// preheader, and — since that is `iv`'s only out-of-body def — the value
+/// reaching the header on the entry edge is the zero written there. Re-entry
+/// from an enclosing loop is covered for the same reason (the preheader, and
+/// hence the init, runs again on every entry).
+fn iv_enters_as_zero(
+    func: &X86ISelFunction,
+    defs: &DefIndex,
+    iv: VReg,
+    body: &BTreeSet<Block>,
+    preheader: Block,
+) -> bool {
+    let mut outside_defs = 0usize;
+    let mut preheader_zero_init = false;
+    for block_id in &func.block_order {
+        if body.contains(block_id) {
+            continue;
+        }
+        let Some(block) = func.blocks.get(block_id) else {
+            continue;
+        };
+        for inst in &block.insts {
+            if x86_produces_value(inst.opcode)
+                && matches!(inst.operands.first(), Some(X86ISelOperand::VReg(d)) if *d == iv)
+            {
+                outside_defs += 1;
+                if *block_id == preheader
+                    && inst.opcode == X86Opcode::MovRR
+                    && let Some(X86ISelOperand::VReg(s)) = inst.operands.get(1)
+                    && const_of(func, defs, *s) == Some(0)
+                {
+                    preheader_zero_init = true;
+                }
+            }
+        }
+    }
+    outside_defs == 1 && preheader_zero_init
 }
 
 /// True if `v` is defined by `AddRR [v, iv, one]` (or `iv, MovRI 1` in either
@@ -1179,7 +1252,7 @@ fn recognize_elementwise_loop(
     let mut memo: HashMap<VReg, Prov> = HashMap::new();
 
     // 1. IV + trip count from the header.
-    let (iv, n_trip) = recognize_header(func, &defs, header, body)?;
+    let (iv, n_trip) = recognize_header(func, &defs, header, body, preheader)?;
     if n_trip < LANES {
         return None; // no full vector iteration to gain from.
     }
@@ -1493,7 +1566,7 @@ fn recognize_fill_loop(
     let mut memo: HashMap<VReg, Prov> = HashMap::new();
 
     // 1. IV + trip count from the header.
-    let (iv, n_trip) = recognize_header(func, &defs, header, body)?;
+    let (iv, n_trip) = recognize_header(func, &defs, header, body, preheader)?;
     if n_trip < LANES {
         return None; // no full vector iteration to gain from.
     }
@@ -1940,7 +2013,7 @@ fn recognize_runtime_byte_fill_loop(
     // 2. Operand roles: `cmp_a` is the unit counter, `cmp_b` the runtime bound
     //    (this exact order — `iv <s n`; a reversed compare does not match).
     let iv = canon(func, &defs, cmp_a);
-    if !is_counter(func, &defs, iv, body) {
+    if !is_counter(func, &defs, iv, body, preheader) {
         return None;
     }
     if const_of(func, &defs, cmp_b).is_some() {
@@ -2219,7 +2292,7 @@ fn recognize_saxpy_loop(
     let mut memo: HashMap<VReg, Prov> = HashMap::new();
 
     // 1. IV + trip count from the header.
-    let (iv, n_trip) = recognize_header(func, &defs, header, body)?;
+    let (iv, n_trip) = recognize_header(func, &defs, header, body, preheader)?;
     if n_trip < LANES {
         return None; // no full vector iteration to gain from.
     }
@@ -2708,7 +2781,7 @@ fn recognize_saxpyq_loop(
     let mut memo: HashMap<VReg, Prov> = HashMap::new();
 
     // 1. IV + trip count from the header.
-    let (iv, n_trip) = recognize_header(func, &defs, header, body)?;
+    let (iv, n_trip) = recognize_header(func, &defs, header, body, preheader)?;
     if n_trip < LANES_Q {
         return None; // no full vector iteration to gain from.
     }
@@ -3287,7 +3360,7 @@ fn recognize_saxpyq_rowreg_loop(
     // (b) k header: unit counter (init-0 outside / +1 inside, verified by
     // `is_counter` via `recognize_header`) against a compile-time trip count;
     // exactly one exit successor; the preheader is the only outside pred.
-    let (k_iv, k_trip) = recognize_header(func, &defs, k_header, body)?;
+    let (k_iv, k_trip) = recognize_header(func, &defs, k_header, body, k_preheader)?;
     if k_trip < 1 || k_iv == inner.iv {
         return None;
     }
@@ -3801,7 +3874,7 @@ fn recognize_reduction_loop(
     let mut memo: HashMap<VReg, Prov> = HashMap::new();
 
     // 1. IV + trip count from the header.
-    let (iv, n_trip) = recognize_header(func, &defs, header, body)?;
+    let (iv, n_trip) = recognize_header(func, &defs, header, body, preheader)?;
     if n_trip < LANES {
         return None; // no full vector iteration to gain from.
     }
@@ -4426,7 +4499,7 @@ fn recognize_heap_sumq_loop(
         return None;
     }
     let iv = canon(func, &defs, lhs);
-    if iv.class != RegClass::Gpr64 || !is_counter(func, &defs, iv, body) {
+    if iv.class != RegClass::Gpr64 || !is_counter(func, &defs, iv, body, preheader) {
         return None;
     }
     // 1b. The IV must enter the loop as EXACTLY zero: exactly ONE def outside
@@ -6711,6 +6784,18 @@ fn apply_saxpyq_rowreg_plan(func: &mut X86ISelFunction, plan: &SaxpyQRowRegPlan)
 
     // RVPB: fold the invariants into the row base pointers, hoist the c row
     // into the accumulators, seed the fresh k counter.
+    //
+    // panic-audit A: the `expect` is guarded by a validated precondition.
+    // `inv_of` holds one entry per `plan.row_obligations` entry (the RVP0
+    // loop above pushes unconditionally), and `SaxpyQRowRegPlan` has a single
+    // constructor, `recognize_saxpyq_rowreg_loop`, which returns `None`
+    // unless its `has_ob` check finds `(inner.leaf_c, inner.mult_c)` and
+    // `(leaf_a, mult_a)` in `row_obligations`, plus `(inner.leaf_x,
+    // inner.mult_x)` whenever `x_discharge == XDischarge::Runtime`. Those are
+    // exactly the three lookups below (the x lookup is under the `Runtime`
+    // arm), and the plan is borrowed immutably from recognition to here, so a
+    // miss is a recognition/apply drift bug, not a shape to skip — falling
+    // back to some other vreg would fold the wrong offset into a base pointer.
     let inv_for = |leaf: VReg, mult: i64| -> VReg {
         inv_of
             .iter()
@@ -7338,7 +7423,7 @@ fn vec_unroll_enabled() -> bool {
 /// `TCG_NO_X86_BYTE_SUM`). Flipped default-on once `Psadbw` became a PROVEN,
 /// coverage-covered opcode (the `PsadbwByteSad` reconstruction: `encode_psadbw`
 /// verified equal to the independent `encode_trust_ir_byte_sad`; coverage gate
-/// accepts 160/189 denominator rows, with the 29 named RED rows pinned as
+/// accepts 167/196 denominator rows, with the 29 named RED rows pinned as
 /// explicit debt), so the emitted `PSADBW` survives proofs-ON. Validated by a
 /// byte-sum differential fuzz (30 programs across lengths + non-multiple-of-16
 /// tails) + the 18-bench suite, all checksum-identical to LLVM O3; the
@@ -7451,7 +7536,7 @@ fn recognize_byte_sum_reduction_loop(
     let mut memo: HashMap<VReg, Prov> = HashMap::new();
 
     // 1. IV + trip count from the header. Need a full 16-byte vector iteration.
-    let (iv, n_trip) = recognize_header(func, &defs, header, body)?;
+    let (iv, n_trip) = recognize_header(func, &defs, header, body, preheader)?;
     if n_trip < LANES_B {
         return None;
     }
@@ -10247,7 +10332,7 @@ fn recognize_regarg_sumq_loop(
         bail!("header taken/fall not body/exit");
     }
     let iv = canon(func, &defs, lhs);
-    if iv.class != RegClass::Gpr64 || !is_counter(func, &defs, iv, body) {
+    if iv.class != RegClass::Gpr64 || !is_counter(func, &defs, iv, body, preheader) {
         bail!("iv {:?} not gpr64 counter", iv);
     }
     let len_reg = canon(func, &defs, rhs);
@@ -11570,7 +11655,7 @@ fn recognize_window_scan_loop(
     if n_bound - m > 255 * 16 {
         bail!("n={n_bound} exceeds the byte-counter drain cap");
     }
-    if iv.class != RegClass::Gpr64 || !is_counter(func, &defs, iv, body) {
+    if iv.class != RegClass::Gpr64 || !is_counter(func, &defs, iv, body, preheader) {
         bail!("outer iv {iv:?} not a gpr64 counter");
     }
 
@@ -11660,7 +11745,7 @@ fn recognize_window_scan_loop(
     }
     let okb = kf;
     let k = canon(func, &defs, klhs);
-    if k.class != RegClass::Gpr64 || !is_counter(func, &defs, k, &inner.body) {
+    if k.class != RegClass::Gpr64 || !is_counter(func, &defs, k, &inner.body, body_entry) {
         bail!("inner iv {k:?} not a gpr64 counter");
     }
 
@@ -12444,6 +12529,115 @@ mod tests {
     struct LoopShape {
         func: X86ISelFunction,
         iv: VReg,
+    }
+
+    /// `build_loop`'s shape, but with the counter's `= 0` def moved OFF the
+    /// preheader onto a sibling path, and a `= start` def added on the other
+    /// path — i.e. the post-ISel shape of
+    ///
+    /// ```text
+    /// let mut i = 0; if flag { i = start; }
+    /// while i < N { c[i] = a[i] + b[i]; i += 1; }
+    /// ```
+    ///
+    /// The preheader (the join block) defines nothing, so the value reaching
+    /// the header is 0 on one path and `start` on the other. Both defs are
+    /// outside the loop body, so an EXISTENCE check for "some out-of-body zero
+    /// init" is satisfied while the loop can still be entered with `i != 0`.
+    fn build_loop_split_init(n: i64, alt_start: Option<i64>) -> LoopShape {
+        let LoopShape { mut func, iv } = build_loop(n, X86Opcode::AddRR, 0, 1, 2, 1, false);
+        let entry = Block(0);
+        let pre = Block(1);
+        let alt = Block(9);
+        func.ensure_block(alt);
+
+        let mut b = B {
+            next: func.next_vreg,
+        };
+        let zero = b.g();
+        let flag = b.g();
+        let startv = b.g();
+        func.next_vreg = b.next;
+
+        // With an alternate start the preheader keeps only its `Jmp header`
+        // (the init moves out to `entry`); without one it keeps `iv = 0` and
+        // the extra path is a pure control-flow join.
+        if alt_start.is_some() {
+            let p = func.blocks.get_mut(&pre).unwrap();
+            p.insts.retain(|i| i.opcode == X86Opcode::Jmp);
+        }
+        // Entry: `iv = 0` (only in the split-init case), then a two-way branch
+        // to `alt` / `pre`.
+        {
+            let e = func.blocks.get_mut(&entry).unwrap();
+            e.insts.pop(); // drop `Jmp pre`
+            if alt_start.is_some() {
+                e.insts.push(inst(X86Opcode::MovRI, vec![vr(zero), imm(0)]));
+                e.insts.push(inst(X86Opcode::MovRR, vec![vr(iv), vr(zero)]));
+            }
+            e.insts.push(inst(X86Opcode::MovRI, vec![vr(flag), imm(1)]));
+            e.insts.push(inst(X86Opcode::CmpRI, vec![vr(flag), imm(0)]));
+            e.insts.push(inst(
+                X86Opcode::Jcc,
+                vec![
+                    X86ISelOperand::CondCode(X86CondCode::NE),
+                    X86ISelOperand::Block(alt),
+                ],
+            ));
+            e.insts
+                .push(inst(X86Opcode::Jmp, vec![X86ISelOperand::Block(pre)]));
+            e.successors = vec![alt, pre];
+        }
+        // Alt path: `iv = start` (split-init case only), then join at the
+        // preheader.
+        {
+            let a = func.blocks.get_mut(&alt).unwrap();
+            if let Some(start) = alt_start {
+                a.insts
+                    .push(inst(X86Opcode::MovRI, vec![vr(startv), imm(start)]));
+                a.insts
+                    .push(inst(X86Opcode::MovRR, vec![vr(iv), vr(startv)]));
+            }
+            a.insts
+                .push(inst(X86Opcode::Jmp, vec![X86ISelOperand::Block(pre)]));
+            a.successors = vec![pre];
+        }
+        LoopShape { func, iv }
+    }
+
+    /// The vector loops these emitters build never initialise the counter —
+    /// they reuse the scalar IV and rely on it entering the loop as EXACTLY
+    /// zero, which is what makes `iv <u (N/LANES)*LANES` a footprint of
+    /// `[0, vN)` and the scalar remainder `[vN, N)`.
+    ///
+    /// With `N = 16` (`vN = 16`) and an entry value of 3 the packed loop admits
+    /// iv = 3, 7, 11, 15 and its last `MOVDQU` store covers elements 15..19 —
+    /// bytes 60..76 of a 64-byte slot, 12 bytes of frame corruption past the
+    /// end — and the packed loop deliberately omits the bounds-check diamonds
+    /// that would catch it. So a zero init that merely EXISTS somewhere outside
+    /// the body is not enough: it must be the def that reaches the header.
+    #[test]
+    fn declines_when_the_iv_does_not_enter_the_loop_as_zero() {
+        let LoopShape { mut func, .. } = build_loop_split_init(16, Some(3));
+        assert!(
+            !X86Vectorize::default().run_on_function(&mut func),
+            "vectorized a loop whose counter can enter as 3: the packed \
+             footprint runs to element 18 of a 16-element slot"
+        );
+        assert_eq!(count_op(&func, X86Opcode::MovdquMR), 0);
+    }
+
+    /// The same CFG with the init still in the preheader (the ordinary case)
+    /// must keep vectorizing — the gate above is about the def that REACHES
+    /// the header, not about extra blocks in the function.
+    #[test]
+    fn still_vectorizes_with_an_extra_join_block_before_the_preheader() {
+        let LoopShape { mut func, .. } = build_loop_split_init(16, None);
+        assert!(
+            X86Vectorize::default().run_on_function(&mut func),
+            "should vectorize"
+        );
+        assert_eq!(count_op(&func, X86Opcode::MovdquMR), 1);
     }
 
     /// Build the canonical shape. `op` is the i32 arithmetic opcode

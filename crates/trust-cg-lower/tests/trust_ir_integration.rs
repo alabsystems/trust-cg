@@ -22,8 +22,8 @@ use trust_ir::dialect::vector as vector_dialect;
 use trust_ir::{
     AtomicRMWOp, BinOp, Block as TrustIrBlock, BlockId, CastOp, ClosureTyId, Constant, FieldDef,
     FuncId, FuncTy, FuncTyId, Function as TrustIrFunction, ICmpOp, Inst, InstrNode,
-    Module as TrustIrModule, Ordering, OverflowOp, ProofAnnotation, RecordDef, RecordId, SetRepr,
-    SwitchCase, Ty, TyId, UnOp, ValueId,
+    Module as TrustIrModule, Ordering, OverflowOp, ProofAnnotation, ProofTag, RecordDef, RecordId,
+    SetRepr, SwitchCase, Ty, TyId, UnOp, ValueId,
 };
 
 fn v(n: u32) -> ValueId {
@@ -104,13 +104,30 @@ fn compile_trust_ir_function(module: &TrustIrModule) -> ISelFunction {
     try_compile_trust_ir_function(module).expect("AArch64 lowering failed")
 }
 
+// LSE-path variant: tests asserting LSE opcodes (LDSMAXAL, CASAL, ...) drive
+// the selector with the Lse capability admitted, mirroring what the pipeline
+// does when the target machine admits AArch64IsaFeature::Lse (9107c590 bound
+// the capability end to end; generic AArch64 now refuses these atomics until
+// an LL/SC lowering is proven).
+fn compile_trust_ir_function_lse(module: &TrustIrModule) -> ISelFunction {
+    try_compile_trust_ir_function_with(module, true).expect("AArch64 lowering failed")
+}
+
 fn try_compile_trust_ir_function(module: &TrustIrModule) -> Result<ISelFunction, String> {
+    try_compile_trust_ir_function_with(module, false)
+}
+
+fn try_compile_trust_ir_function_with(
+    module: &TrustIrModule,
+    lse_enabled: bool,
+) -> Result<ISelFunction, String> {
     let func = single_function(module);
 
     let (lir_func, _proof_ctx) = translate_function(func, module)
         .map_err(|err| format!("adapter translation failed: {err}"))?;
 
     let mut isel = InstructionSelector::new(lir_func.name.clone(), lir_func.signature.clone());
+    isel.set_lse_enabled(lse_enabled);
 
     // Seed Value->Type hints (Call/CallIndirect result types, #381).
     isel.seed_value_types(&lir_func.value_types);
@@ -249,7 +266,7 @@ fn test_atomic_rmw_min_max_adapter_and_targets() {
             Opcode::AtomicRmw { op, .. } if *op == lir_op
         ));
 
-        let aarch64 = compile_trust_ir_function(&module);
+        let aarch64 = compile_trust_ir_function_lse(&module);
         assert!(has_opcode(&aarch64, aarch64_opcode));
 
         let x86 = compile_trust_ir_function_x86_64(&module);
@@ -1297,7 +1314,7 @@ fn test_cmpxchg_failure_stronger_than_success_lifts_in_adapter() {
 #[test]
 fn test_cmpxchg_orderings_reach_aarch64_selection() {
     let module = build_cmpxchg_with_orderings(Ordering::AcqRel, Ordering::Acquire);
-    let mfunc = compile_trust_ir_function(&module);
+    let mfunc = compile_trust_ir_function_lse(&module);
     assert!(
         has_opcode(&mfunc, AArch64Opcode::Casal),
         "AcqRel/Acquire cmpxchg should reach AArch64 CASAL selection"
@@ -2794,7 +2811,7 @@ fn test_frem_f32_lowers_to_fmodf_on_x86_64() {
 }
 
 // ===========================================================================
-// Proof annotations survive adapter translation
+// Authorized proof annotations survive adapter translation
 // ===========================================================================
 
 #[test]
@@ -2824,8 +2841,8 @@ fn test_proof_annotations_survive() {
     let (_, proof_ctx) = translate_only(&module).unwrap();
 
     assert!(
-        proof_ctx.is_function_pure(),
-        "Function-level Pure proof should survive adapter translation"
+        !proof_ctx.is_function_pure(),
+        "raw function-level Pure must not become optimizer authority"
     );
 
     let has_no_overflow = proof_ctx.value_proofs.values().any(|proofs| {
@@ -2917,11 +2934,10 @@ fn clean_expr_goal_annotation_is_compatible_but_never_treated_as_evidence() {
 }
 
 // ===========================================================================
-// #456: ProofAnnotation::Pure propagates through call lowering to the Bl
+// #456: structurally established purity propagates through call lowering
 // ===========================================================================
 
-/// Build a two-function module whose callee carries `ProofAnnotation::Pure`
-/// and whose caller invokes it via `Inst::Call`. Returns the module.
+/// Build a two-function module with a structurally pure callee and a caller.
 fn build_pure_call_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("pure_call_test");
     let sig: FuncTyId = module.add_func_type(func_ty(vec![Ty::I32], vec![Ty::I32]));
@@ -2933,8 +2949,6 @@ fn build_pure_call_module() -> TrustIrModule {
         params: vec![(v(0), Ty::I32)],
         body: vec![InstrNode::new(Inst::Return { values: vec![v(0)] })],
     });
-    callee.proofs = vec![ProofAnnotation::Pure];
-
     // Caller: call the pure callee.
     let mut caller = TrustIrFunction::new(f(1), "caller", sig, b(0));
     caller.blocks.push(TrustIrBlock {
@@ -2955,6 +2969,93 @@ fn build_pure_call_module() -> TrustIrModule {
     module
 }
 
+/// Build a module whose memory-writing callee carries a forged raw `Pure`
+/// annotation. The annotation must not enter the pure-callee pipeline.
+fn build_forged_pure_store_call_module() -> TrustIrModule {
+    let mut module = TrustIrModule::new("forged_pure_store_call_test");
+    let sig: FuncTyId = module.add_func_type(func_ty(vec![Ty::Ptr, Ty::I32], vec![Ty::I32]));
+
+    let mut callee = TrustIrFunction::new(f(0), "impure_callee", sig, b(0));
+    callee.blocks.push(TrustIrBlock {
+        id: b(0),
+        params: vec![(v(0), Ty::Ptr), (v(1), Ty::I32)],
+        body: vec![
+            InstrNode::new(Inst::Store {
+                ty: Ty::I32,
+                ptr: v(0),
+                value: v(1),
+                volatile: false,
+                align: None,
+            }),
+            InstrNode::new(Inst::Return { values: vec![v(1)] }),
+        ],
+    });
+    callee.proofs = vec![ProofAnnotation::Pure];
+
+    let mut caller = TrustIrFunction::new(f(1), "caller", sig, b(0));
+    caller.blocks.push(TrustIrBlock {
+        id: b(0),
+        params: vec![(v(0), Ty::Ptr), (v(1), Ty::I32)],
+        body: vec![
+            InstrNode::new(Inst::Call {
+                callee: f(0),
+                args: vec![v(0), v(1)],
+            })
+            .with_result(v(2)),
+            InstrNode::new(Inst::Return { values: vec![v(2)] }),
+        ],
+    });
+
+    module.add_function(callee);
+    module.add_function(caller);
+    module
+}
+
+/// Build a module where an arbitrary effectful external forges the LLVM
+/// importer's public libm-purity tag. The tag must remain report metadata while
+/// the ordinary structural fixpoint still recognizes the inspectable pure
+/// callee in the same caller.
+fn build_forged_libm_custom_call_module() -> TrustIrModule {
+    let mut module = TrustIrModule::new("forged_libm_custom_call_test");
+    let sig: FuncTyId = module.add_func_type(func_ty(vec![Ty::I32], vec![Ty::I32]));
+
+    let mut pure_callee = TrustIrFunction::new(f(0), "pure_callee", sig, b(0));
+    pure_callee.blocks.push(TrustIrBlock {
+        id: b(0),
+        params: vec![(v(0), Ty::I32)],
+        body: vec![InstrNode::new(Inst::Return { values: vec![v(0)] })],
+    });
+
+    let mut forged_external = TrustIrFunction::new(f(1), "arbitrary_effectful_external", sig, b(0));
+    forged_external.proofs = vec![ProofAnnotation::Custom(ProofTag::new(
+        trust_cg_lower::adapter::LLVM_LIBM_PURE_FUNCTION_ATTR_TAG,
+    ))];
+
+    let mut caller = TrustIrFunction::new(f(2), "caller", sig, b(0));
+    caller.blocks.push(TrustIrBlock {
+        id: b(0),
+        params: vec![(v(0), Ty::I32)],
+        body: vec![
+            InstrNode::new(Inst::Call {
+                callee: f(0),
+                args: vec![v(0)],
+            })
+            .with_result(v(1)),
+            InstrNode::new(Inst::Call {
+                callee: f(1),
+                args: vec![v(1)],
+            })
+            .with_result(v(2)),
+            InstrNode::new(Inst::Return { values: vec![v(2)] }),
+        ],
+    });
+
+    module.add_function(pure_callee);
+    module.add_function(forged_external);
+    module.add_function(caller);
+    module
+}
+
 #[test]
 fn test_pure_callee_surfaces_in_lir_function() {
     let module = build_pure_call_module();
@@ -2970,6 +3071,51 @@ fn test_pure_callee_surfaces_in_lir_function() {
         caller_lir.pure_callees.contains("pure_callee"),
         "adapter should record 'pure_callee' in Function::pure_callees, got {:?}",
         caller_lir.pure_callees
+    );
+}
+
+#[test]
+fn test_forged_raw_pure_impure_callee_is_not_authorized() {
+    let module = build_forged_pure_store_call_module();
+    let results = translate_module(&module).unwrap();
+
+    let (caller_lir, _) = results
+        .iter()
+        .find(|(function, _)| function.name == "caller")
+        .expect("caller must be present");
+
+    assert!(
+        !caller_lir.pure_callees.contains("impure_callee"),
+        "forged raw Pure must not place a memory-writing callee in pure_callees: {:?}",
+        caller_lir.pure_callees
+    );
+}
+
+#[test]
+fn test_forged_libm_custom_tag_is_not_authority() {
+    let module = build_forged_libm_custom_call_module();
+    let results = translate_module(&module).unwrap();
+
+    let (caller_lir, _) = results
+        .iter()
+        .find(|(function, _)| function.name == "caller")
+        .expect("caller must be present");
+
+    assert!(
+        caller_lir.pure_callees.contains("pure_callee"),
+        "structurally inspectable pure callees must remain available: {:?}",
+        caller_lir.pure_callees
+    );
+    assert!(
+        !caller_lir
+            .libm_pure_callees
+            .contains("arbitrary_effectful_external"),
+        "a raw Custom(LMP) tag must not authorize an arbitrary external: {:?}",
+        caller_lir.libm_pure_callees
+    );
+    assert!(
+        caller_lir.libm_pure_callees.is_empty(),
+        "no validated libm-purity authority carrier exists yet"
     );
 }
 
@@ -3009,7 +3155,8 @@ fn test_pure_callee_bl_carries_proof_pure() {
     let isel_func = isel.finalize();
     let mfunc = isel_func.to_ir_func();
 
-    // Find the Bl to `pure_callee` and confirm it carries Some(Pure).
+    // Structural authority reaches ISel: find the Bl to `pure_callee` and
+    // confirm it carries Some(Pure).
     let mut found_pure_bl = false;
     for block in &mfunc.blocks {
         for inst_id in &block.insts {

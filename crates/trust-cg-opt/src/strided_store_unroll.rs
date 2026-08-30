@@ -19,9 +19,16 @@
 //! reads NO memory (exactly one store, zero loads) so there is no aliasing
 //! question. The store is UNCONDITIONAL: its block dominates the latch (and is
 //! not the header), so it runs on every header->latch path and never on the
-//! exiting pass — see the "unconditional-store gate" in `recognize`. This is
-//! exactly the p7 sieve's `while q < M { comp[q] = 1; q += p }` marking loop,
-//! which LLVM 4x-unrolls; this pass matches it.
+//! exiting pass — see the "unconditional-store gate" in `recognize`. The loop
+//! has NO EARLY NORMAL EXIT: a non-header body block may leave the loop only
+//! along an edge that provably DIVERGES (a bounds-check panic block: every
+//! reachable sink ends in a trap and nothing reachable is a `Ret`, a `TailCall`,
+//! an indirect `Br`, or a jump-table dispatch). That is a WHITELIST — a `break`
+//! (any `Ret` reachable), a `break` whose `Bl f; Ret` `TailCallOptimization`
+//! already folded into a lone `TailCall f`, or any unmodeled exit shape bails —
+//! see the "no-early-normal-exit gate".
+//! This is exactly the p7 sieve's `while q < M { comp[q] = 1; q += p }`
+//! marking loop, which LLVM 4x-unrolls; this pass matches it.
 //!
 //! ## Lowering (partial-unroll-with-pre-guard; mirrors `neon_fill`)
 //!
@@ -319,6 +326,50 @@ impl Recognized {
                 store_blk,
                 latch
             );
+        }
+
+        // (2c) NO-EARLY-NORMAL-EXIT gate.
+        //
+        // Dominance of the latch is necessary but NOT sufficient. A body of the
+        // shape `while q <u N { base[q] = v; if c { break; } q += s; }` has its
+        // store block dominating the latch (every COMPLETED iteration stored),
+        // yet the ORIGINAL loop stops after the store of the breaking iteration
+        // while the unrolled main block performs all four stores of its group
+        // unconditionally — writes the source program never makes. So no
+        // non-header body block may leave the loop along an edge that RETURNS
+        // NORMALLY: control that resumes after such an exit can observe the
+        // extra stores.
+        //
+        // An out-of-body edge to a DIVERGING region is still admitted: the
+        // `base[q]` bounds check branching to a panic block is present in every
+        // real Rust sieve loop (compiled `panic=abort`), and control never
+        // resumes from it, so no unrolled store is observable through it.
+        // "Diverging" is a WHITELIST (`exit_diverges`): every block reachable
+        // from the edge target must be free of `Ret`/`TailCall`/indirect
+        // `Br`/jump-table dispatch, and every reachable sink must end in a
+        // trap. Anything else — including a `break` whose `Bl f; Ret` the
+        // earlier `TailCallOptimization` folded into a lone `TailCall f`, so
+        // that NO `Ret` remains to find — is a normal exit and bails. The
+        // header's own exit edge is the recognized `iv <u N` continue test,
+        // which the spliced `q <u N-3s` guard subsumes.
+        for &b in body {
+            if b == header {
+                continue;
+            }
+            for &s in &func.block(b).succs {
+                if body.contains(&s) {
+                    continue;
+                }
+                if let Err(why) = exit_diverges(func, s) {
+                    bail!(
+                        "body block {:?} takes an early exit to {:?} that is not proven \
+                         diverging ({}): control can resume and observe the unrolled stores",
+                        b,
+                        s,
+                        why
+                    );
+                }
+            }
         }
 
         // (1) Header preds == exactly {preheader, latch}; single latch.
@@ -706,6 +757,92 @@ fn allowed_loop_op(op: AArch64Opcode) -> bool {
 fn is_store(op: AArch64Opcode) -> bool {
     use AArch64Opcode::*;
     matches!(op, StrbRI | StrhRI | StrRI | StrRO)
+}
+
+/// Does control that leaves the loop at `start` DIVERGE — never resume anywhere
+/// the extra unrolled stores could be observed?
+///
+/// Tells a DIVERGING loop exit (a panic/abort block under `panic=abort`) from
+/// a NORMAL one (a `break`/`return` — control resumes). Decided as a WHITELIST
+/// so that an unmodeled construct is a normal exit, never a diverging one:
+/// every block reachable from `start` (inclusive) along CFG successor edges
+///
+/// * must contain no `Ret`, no `TailCall`, no indirect `Br`, and no jump-table
+///   dispatch (`JumpTableIndex` operand). Each of those leaves the local CFG
+///   along an edge `succs` does not enumerate. `TailCall` is the load-bearing
+///   one: `TailCallOptimization` runs BEFORE this pass and folds `Bl f; Ret`
+///   into a lone `TailCall f`, deleting the `Ret` — a "no `Ret` reachable"
+///   test would call that `break` diverging while control resumes in `f`;
+/// * and, if it is a sink (no successors), must end in a trap: `Brk`, or the
+///   unconditional operand-less `TrapOverflow` that ISel's `select_trap`
+///   emits after `Bl abort` for `unreachable`.
+///
+/// `Ok(())` when the region diverges; `Err(why)` naming the first offending
+/// block otherwise. The walk is bounded by the block count (visited set) and
+/// deterministic (successor order).
+fn exit_diverges(func: &MachFunction, start: BlockId) -> Result<(), String> {
+    let mut seen = HashSet::new();
+    let mut work = vec![start];
+    seen.insert(start);
+    while let Some(b) = work.pop() {
+        let blk = func.block(b);
+        for &id in &blk.insts {
+            let inst = func.inst(id);
+            if let Some(what) = local_cfg_escape(inst) {
+                return Err(format!("block {b:?} contains {what}"));
+            }
+        }
+        if blk.succs.is_empty() {
+            let ends_in_trap = blk
+                .insts
+                .last()
+                .is_some_and(|&id| is_unconditional_trap(func.inst(id)));
+            if !ends_in_trap {
+                return Err(format!("sink block {b:?} does not end in a trap"));
+            }
+        }
+        for &s in &blk.succs {
+            if seen.insert(s) {
+                work.push(s);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Name the way `inst` leaves the local CFG along an edge that `succs` does not
+/// enumerate (a return, a tail call, an indirect branch, a jump-table
+/// dispatch), or `None` when it stays local. Matched by opcode AND by flag so a
+/// return-like or call-terminator opcode this list does not name is still
+/// caught.
+fn local_cfg_escape(inst: &MachInst) -> Option<&'static str> {
+    use AArch64Opcode::*;
+    match inst.opcode {
+        Ret => Some("a `Ret`"),
+        TailCall => Some("a `TailCall`"),
+        Br => Some("an indirect `Br`"),
+        _ if inst.is_return() => Some("a returning instruction"),
+        _ if inst.is_call() && inst.is_terminator() => Some("a call terminator"),
+        _ if inst.operands.iter().any(MachOperand::is_jump_table_index) => {
+            Some("a jump-table dispatch")
+        }
+        _ => None,
+    }
+}
+
+/// Is `inst` a trap that never falls through: a real `Brk`, or the
+/// unconditional `TrapOverflow` (no `Block` target — `select_trap`'s
+/// `Bl abort; TrapOverflow` lowering of `unreachable`)? The conditional
+/// `TrapOverflow cc, Block(t)` guard is NOT one: it falls through.
+fn is_unconditional_trap(inst: &MachInst) -> bool {
+    match inst.opcode {
+        AArch64Opcode::Brk => true,
+        AArch64Opcode::TrapOverflow => !inst
+            .operands
+            .iter()
+            .any(|o| matches!(o, MachOperand::Block(_))),
+        _ => false,
+    }
 }
 
 // ---------------------------------------------------------------------------

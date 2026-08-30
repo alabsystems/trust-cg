@@ -1341,8 +1341,9 @@ fn enc2_family_shift() {
             ));
         }
     }
-    // ROL has an immediate form but no CL-count sibling. Exercise both REX.W
-    // and 32-bit encodings independently of the byte-golden encoder tests.
+    // ROL: immediate form (C1 /0 ib) and its CL-count sibling RolRCl (D3 /0).
+    // Exercise both REX.W and 32-bit encodings independently of the
+    // byte-golden encoder tests.
     for dst in G64 {
         for imm in [4i64, 9, 31, 63] {
             cases.push(Case::fixed(
@@ -1355,6 +1356,12 @@ fn enc2_family_shift() {
                 format!("RolRI {},{imm}", n64(dst)),
             ));
         }
+        cases.push(Case::fixed(
+            X86Opcode::RolRCl,
+            X86InstOperands::r(dst),
+            vec![format!("rol {}, cl", n64(dst))],
+            format!("RolRCl {},cl", n64(dst)),
+        ));
     }
     for dst in SEL32 {
         for imm in [4i64, 9, 31] {
@@ -1368,6 +1375,12 @@ fn enc2_family_shift() {
                 format!("RolRI {},{imm}", n32(dst)),
             ));
         }
+        cases.push(Case::fixed(
+            X86Opcode::RolRCl,
+            X86InstOperands::r(dst),
+            vec![format!("rol {}, cl", n32(dst))],
+            format!("RolRCl {},cl", n32(dst)),
+        ));
     }
     let (count, dis) = run_family(&d.path, "shift", cases, 0);
     assert_family_green("shift", count, dis);
@@ -2060,9 +2073,8 @@ fn lane_status(op: X86Opcode) -> LaneStatus {
         // branch
         O::Jmp | O::JmpR | O::Jcc | O::Call | O::CallR | O::CallM | O::Ret => Covered("branch"),
         // shift
-        O::ShlRR | O::ShlRI | O::ShrRR | O::ShrRI | O::SarRR | O::SarRI | O::RolRI => {
-            Covered("shift")
-        }
+        O::ShlRR | O::ShlRI | O::ShrRR | O::ShrRI | O::SarRR | O::SarRI | O::RolRI
+        | O::RolRCl => Covered("shift"),
         // mul / div
         O::ImulRR | O::ImulRRI | O::ImulRM | O::ImulRMSib | O::Mul => Covered("mul"),
         O::Idiv | O::Div | O::Cdq | O::Cqo => Covered("div"),

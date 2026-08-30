@@ -34,6 +34,8 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 mod common;
+#[path = "common/skip.rs"]
+mod skip;
 
 use common::rosetta::{codegen_run_timeout, run_executable_with_timeout};
 use trust_cg_codegen::pipeline::{OptLevel, Pipeline, PipelineConfig};
@@ -88,18 +90,6 @@ fn assert_host_object_magic_bytes(obj_bytes: &[u8], context: &str) {
 // ---------------------------------------------------------------------------
 // Test infrastructure
 // ---------------------------------------------------------------------------
-
-fn is_aarch64() -> bool {
-    cfg!(target_arch = "aarch64")
-}
-
-fn has_cc() -> bool {
-    Command::new("cc")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
 
 static TEST_DIR_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -502,7 +492,7 @@ fn build_bridge_pick() -> Function {
 
 #[test]
 fn test_bridge_add_function() {
-    if !is_aarch64() || !has_cc() {
+    if !skip::aarch64_linkrun_or_skip("test_bridge_add_function") {
         return;
     }
 
@@ -533,7 +523,7 @@ int main(void) { return (int)add(3, 4); }
 
 #[test]
 fn test_bridge_const_return() {
-    if !is_aarch64() || !has_cc() {
+    if !skip::aarch64_linkrun_or_skip("test_bridge_const_return") {
         return;
     }
 
@@ -564,7 +554,7 @@ int main(void) { return (int)const42(); }
 
 #[test]
 fn test_bridge_midpoint() {
-    if !is_aarch64() || !has_cc() {
+    if !skip::aarch64_linkrun_or_skip("test_bridge_midpoint") {
         return;
     }
 
@@ -595,7 +585,7 @@ int main(void) { return (int)midpoint(10, 20); }
 
 #[test]
 fn test_bridge_branch() {
-    if !is_aarch64() || !has_cc() {
+    if !skip::aarch64_linkrun_or_skip("test_bridge_branch") {
         return;
     }
 

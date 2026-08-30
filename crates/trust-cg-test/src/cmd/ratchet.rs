@@ -237,9 +237,11 @@ pub fn run(global: &GlobalArgs, args: &RatchetArgs) -> anyhow::Result<ResultStat
 
 // ---------------- tests (pass-count ratchet) ----------------
 //
-// Port of `scripts/check_test_ratchet.sh`. Compares the newest test-
-// matrix JSON under `evals/results/tests/` against a caller-supplied,
-// reviewed baseline. Fails (exit 1) on any of:
+// The canonical test-count ratchet (formerly `scripts/check_test_ratchet.sh`,
+// deleted once this port was complete; `trust-cg-test matrix --compare`
+// delegates here). Compares the newest test-matrix JSON under
+// `evals/results/tests/` against a caller-supplied, reviewed baseline.
+// Fails (exit 1) on any of:
 //   * A `(crate, shard)` pair in the baseline has a lower `passed`
 //     count in the current run.
 //   * A `(crate, shard)` pair in the baseline has a higher `failed`
@@ -248,7 +250,7 @@ pub fn run(global: &GlobalArgs, args: &RatchetArgs) -> anyhow::Result<ResultStat
 // New shards in the current run are accepted silently — the baseline
 // grows monotonically on refresh.
 //
-// Exit semantics match the shell script:
+// Exit semantics (the contract the shell script established):
 //   * `ResultStatus::Ok` (0)          — no regressions
 //   * `ResultStatus::Failed` (1)      — at least one violation / missing
 //   * `ResultStatus::EnvBroken` (2)   — missing / unparseable input files
@@ -760,23 +762,22 @@ fn generate_schemas() -> Vec<(String, String)> {
     ]
 }
 
-// Unused helper kept for link completeness when future ratchets are added.
-#[allow(dead_code)]
-fn unused_path_marker() -> PathBuf {
-    PathBuf::new()
-}
-
 // ---------------- warnings ----------------
 //
-// Port of `scripts/check_warnings_ratchet.sh`. Builds
-// `cargo build --workspace` and `cargo build --workspace --tests`, counts
-// distinct `warning:` diagnostics in each output, and compares the sum
-// against `ratchet/warnings_baseline.json` (default baseline: 0).
+// The canonical warnings ratchet (formerly `scripts/check_warnings_ratchet.sh`,
+// deleted once this port was complete). Builds `cargo build --workspace` and
+// `cargo build --workspace --tests`, counts distinct `warning:` diagnostics in
+// each output, and compares the sum against `ratchet/warnings_baseline.json`
+// (default baseline: 0).
 //
-// Exit semantics match the shell script:
-//   * `ResultStatus::Ok` (0)          — total <= baseline
+// Exit semantics (the contract the shell script established):
+//   * `ResultStatus::Ok` (0)          — total <= baseline AND both builds
+//                                       exited 0
 //   * `ResultStatus::Failed` (1)      — total > baseline
-//   * `ResultStatus::EnvBroken` (2)   — missing cargo / baseline file
+//   * `ResultStatus::EnvBroken` (2)   — missing cargo / baseline file, OR a
+//                                       workspace build failed without
+//                                       exceeding the baseline (a zero-warning
+//                                       compile error is never a green ratchet)
 
 /// Schema for `ratchet/warnings_baseline.json`.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -793,6 +794,10 @@ struct WarningsReport {
     prod_warnings: u64,
     tests_warnings: u64,
     total: u64,
+    /// Exit status of `cargo build --workspace` (-1 if killed by a signal, per `shell::capture`).
+    prod_build_status: i32,
+    /// Exit status of `cargo build --workspace --tests`.
+    tests_build_status: i32,
     prod_samples: Vec<String>,
     tests_samples: Vec<String>,
     exit: ResultStatus,
@@ -825,11 +830,13 @@ fn warnings(global: &GlobalArgs) -> anyhow::Result<ResultStatus> {
         )
     })?;
 
-    // Run the two builds. `deny(warnings)` can turn warnings into errors,
-    // so non-zero exit is expected and intentionally ignored — we still
-    // want to count diagnostics for the report.
-    let prod_out = cargo_build_output(&repo, &["build", "--workspace"])?;
-    let tests_out = cargo_build_output(&repo, &["build", "--workspace", "--tests"])?;
+    // Run the two builds, recording their statuses instead of discarding
+    // them. `deny(warnings)` can make a warning build fail — that case is
+    // still diagnosed by counting — but a zero-warning compile error must
+    // never be reported as a successful ratchet (fail-closed, c8a07fe3).
+    let (prod_out, prod_status) = cargo_build_output(&repo, &["build", "--workspace"])?;
+    let (tests_out, tests_status) =
+        cargo_build_output(&repo, &["build", "--workspace", "--tests"])?;
 
     let prod_diags = extract_warning_lines(&prod_out);
     let tests_diags = extract_warning_lines(&tests_out);
@@ -837,11 +844,7 @@ fn warnings(global: &GlobalArgs) -> anyhow::Result<ResultStatus> {
     let tests_count = u64::try_from(tests_diags.len()).unwrap_or(u64::MAX);
     let total = prod_count.saturating_add(tests_count);
 
-    let exit = if total > baseline.warnings {
-        ResultStatus::Failed
-    } else {
-        ResultStatus::Ok
-    };
+    let exit = warnings_exit(total, baseline.warnings, prod_status, tests_status);
 
     let report = WarningsReport {
         command: "ratchet.warnings",
@@ -849,6 +852,8 @@ fn warnings(global: &GlobalArgs) -> anyhow::Result<ResultStatus> {
         prod_warnings: prod_count,
         tests_warnings: tests_count,
         total,
+        prod_build_status: prod_status,
+        tests_build_status: tests_status,
         prod_samples: prod_diags.clone(),
         tests_samples: tests_diags.clone(),
         exit,
@@ -862,14 +867,58 @@ fn warnings(global: &GlobalArgs) -> anyhow::Result<ResultStatus> {
         OutputFormat::Human => print_warnings_human(&report),
     }
 
+    // A build that failed without exceeding the baseline is an environment
+    // failure, not a green ratchet: surface the raw build output so the
+    // compile error is visible, exactly as the shell script did.
+    if exit == ResultStatus::EnvBroken {
+        eprintln!();
+        eprintln!(
+            "warnings ratchet ERROR: a workspace build failed without exceeding the \
+             warning baseline."
+        );
+        if prod_status != 0 {
+            eprintln!();
+            eprintln!("Production build output (cargo exit {prod_status}):");
+            eprint!("{prod_out}");
+        }
+        if tests_status != 0 {
+            eprintln!();
+            eprintln!("Test build output (cargo exit {tests_status}):");
+            eprint!("{tests_out}");
+        }
+    }
+
     Ok(exit)
 }
 
+/// The exit contract of `ratchet warnings`, kept pure so it is unit-testable
+/// without running cargo:
+///   * over baseline                           -> `Failed` (1), regardless of
+///     build status (`deny(warnings)` legitimately fails a warning build);
+///   * at/under baseline but a build failed    -> `EnvBroken` (2);
+///   * at/under baseline and both builds clean -> `Ok` (0).
+const fn warnings_exit(
+    total: u64,
+    baseline: u64,
+    prod_status: i32,
+    tests_status: i32,
+) -> ResultStatus {
+    if total > baseline {
+        ResultStatus::Failed
+    } else if prod_status != 0 || tests_status != 0 {
+        ResultStatus::EnvBroken
+    } else {
+        ResultStatus::Ok
+    }
+}
+
 /// Run `cargo <args>` at `repo` with `--message-format=human --color=never`
-/// and capture combined stdout+stderr. A non-zero exit is not an error
-/// here — `deny(warnings)` can turn warnings into hard errors, and the
-/// ratchet's job is to count diagnostics regardless.
-fn cargo_build_output(repo: &RepoRoot, args: &[&str]) -> anyhow::Result<String> {
+/// and capture combined stdout+stderr plus the exit status. A non-zero exit
+/// is not an error at this layer — `deny(warnings)` can turn warnings into
+/// hard errors and the ratchet still has to count the diagnostics — but the
+/// status is returned so the caller can fail closed on a build that broke
+/// for any other reason.
+fn cargo_build_output(repo: &RepoRoot, args: &[&str]) -> anyhow::Result<(String, i32)> {
     let mut spawn = Spawn::new(Cargo::program()).cwd(repo.0.clone());
     for a in args {
         spawn = spawn.arg(*a);
@@ -879,16 +928,19 @@ fn cargo_build_output(repo: &RepoRoot, args: &[&str]) -> anyhow::Result<String> 
     let mut combined = String::with_capacity(captured.stdout.len() + captured.stderr.len());
     combined.push_str(&captured.stdout);
     combined.push_str(&captured.stderr);
-    Ok(combined)
+    Ok((combined, captured.code))
 }
 
 /// Extract the set of `warning: <...>` diagnostic lines from cargo output.
 ///
-/// Mirrors the shell script's three-stage grep pipeline:
+/// A three-stage filter:
 ///   1. Keep only lines starting with `warning: `.
 ///   2. Drop the per-crate summary line
 ///      (`warning: \`<crate>\` (...) generated N warnings?`).
-///   3. Drop cargo network/manifest warnings we never want to gate on.
+///   3. Drop cargo's own housekeeping lines (network retries, manifest
+///      keys, the `build failed, waiting for other jobs` notice) — none
+///      of them is a rustc diagnostic, so none may count against the
+///      baseline.
 ///
 /// The returned `Vec` preserves source order so the `--format human`
 /// view matches the shell-script output verbatim.
@@ -909,7 +961,7 @@ fn extract_warning_lines(output: &str) -> Vec<String> {
     out
 }
 
-/// Match the shell script's `^warning: \`[^\`]+\` \(.*\) generated [0-9]+ warnings?`.
+/// Match `^warning: \`[^\`]+\` \(.*\) generated [0-9]+ warnings?`.
 fn is_crate_summary(line: &str) -> bool {
     // Strip the leading `warning: ` prefix.
     let Some(rest) = line.strip_prefix("warning: ") else {
@@ -948,13 +1000,21 @@ fn is_crate_summary(line: &str) -> bool {
     after_digits.starts_with("warning")
 }
 
-/// Match the shell script's second negative filter:
-/// `^warning: (spurious network error|unused manifest key)`.
+/// Match cargo's own non-diagnostic `warning:` lines:
+/// `^warning: (spurious network error|unused manifest key|build failed, waiting for other jobs to finish...)`.
+///
+/// The last one is what cargo prints when one crate's compile error aborts
+/// the rest of a parallel build. It is not a warning in any crate; counting
+/// it would turn a compile error into a phantom over-baseline "warning" —
+/// and NOT counting it is exactly why the build status must be checked
+/// separately (see `warnings_exit`).
 fn is_cargo_housekeeping(line: &str) -> bool {
     let Some(rest) = line.strip_prefix("warning: ") else {
         return false;
     };
-    rest.starts_with("spurious network error") || rest.starts_with("unused manifest key")
+    rest.starts_with("spurious network error")
+        || rest.starts_with("unused manifest key")
+        || rest.starts_with("build failed, waiting for other jobs to finish...")
 }
 
 fn print_warnings_human(r: &WarningsReport) {
@@ -989,6 +1049,14 @@ fn print_warnings_human(r: &WarningsReport) {
             "Fix the warnings, or update ratchet/warnings_baseline.json and \
              justify in commit body."
         );
+    } else if r.exit == ResultStatus::EnvBroken {
+        println!();
+        println!(
+            "warnings ratchet ERROR: total {} <= baseline {} but a workspace build \
+             failed (cargo build --workspace: exit {}; --tests: exit {}). \
+             The build output follows on stderr.",
+            r.total, r.baseline, r.prod_build_status, r.tests_build_status
+        );
     } else {
         println!(
             "warnings ratchet OK: total {} <= baseline {}.",
@@ -999,15 +1067,17 @@ fn print_warnings_human(r: &WarningsReport) {
 
 // ---------------- unwrap (panic-family site ratchet) ----------------
 //
-// Port of `scripts/check_unwrap_ratchet.sh` (#385 / Part of #372). The
-// shell script shells out to `scripts/generate_unwrap_audit.py --write`
-// to compute fresh per-file counts and then diffs them against the
-// checked-in `ratchet/unwrap_baseline.json`. This Rust port keeps the
-// Python generator as the scanner (still the source of truth for
-// category labels in `ratchet/panic_audit.md`), but moves the diff + exit
-// contract into `trust-cg-test` so CI can depend on a single binary.
+// The canonical unwrap ratchet (#385 / Part of #372). This command owns the
+// whole contract: it runs `scripts/generate_unwrap_audit.py` with
+// `--baseline-out`/`--audit-out` to compute fresh per-file counts, then diffs
+// them against the checked-in `ratchet/unwrap_baseline.json`. The Python
+// generator stays the scanner (still the source of truth for category labels
+// in `ratchet/panic_audit.md`); the diff + exit contract live here so a gate
+// can depend on a single binary. `scripts/check_unwrap_ratchet.sh` is a pure
+// `exec cargo run -p trust-cg-test --quiet -- ratchet unwrap "$@"` shim kept
+// for callers that expect a script path (`scripts/check_panic_clippy.sh`).
 //
-// Exit semantics match the shell script:
+// Exit semantics:
 //   * `ResultStatus::Ok` (0)          — every file is at or below baseline
 //   * `ResultStatus::Failed` (1)      — at least one file exceeds baseline
 //   * `ResultStatus::EnvBroken` (2)   — missing python3 / baseline / generator
@@ -1288,7 +1358,7 @@ mod tests {
     use super::{
         RatchetCommand, RegressionKind, ResultStatus, ShardEntry, TestMatrixDoc, TotalsEntry,
         UnwrapBaseline, diff_matrices, diff_unwrap, extract_warning_lines, is_cargo_housekeeping,
-        is_crate_summary, newest_json, panic_clippy_status,
+        is_crate_summary, newest_json, panic_clippy_status, warnings_exit,
     };
 
     /// Guard against a silent drop of a subcommand from the ratchet tree.
@@ -1343,11 +1413,28 @@ warning: `foo` (lib test) generated 1 warning
 warning: spurious network error (2 tries remaining): timeout
 warning: unused manifest key: package.metadata.foo
 warning: dead_code — real diagnostic
+warning: build failed, waiting for other jobs to finish...
 warning: `mycrate` (bin \"x\") generated 0 warnings
 ";
         let diags = extract_warning_lines(sample);
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0], "warning: dead_code — real diagnostic");
+    }
+
+    #[test]
+    fn warnings_exit_fails_closed_on_build_failure() {
+        // Clean build, under baseline: green.
+        assert_eq!(warnings_exit(0, 0, 0, 0), ResultStatus::Ok);
+        assert_eq!(warnings_exit(2, 3, 0, 0), ResultStatus::Ok);
+        // Over baseline is a ratchet failure whatever the build status —
+        // deny(warnings) legitimately fails a warning build.
+        assert_eq!(warnings_exit(1, 0, 0, 0), ResultStatus::Failed);
+        assert_eq!(warnings_exit(1, 0, 101, 0), ResultStatus::Failed);
+        // A zero-warning compile error is an environment failure, never
+        // a green ratchet (c8a07fe3).
+        assert_eq!(warnings_exit(0, 0, 101, 0), ResultStatus::EnvBroken);
+        assert_eq!(warnings_exit(0, 0, 0, 101), ResultStatus::EnvBroken);
+        assert_eq!(warnings_exit(0, 0, 255, 255), ResultStatus::EnvBroken);
     }
 
     #[test]

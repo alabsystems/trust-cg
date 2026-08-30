@@ -215,7 +215,8 @@ fn jit_shared_buffer_cross_thread_execute() {
 /// PUBLISH CHECK binding (JIT-7 item 3): every production-path buffer carries
 /// a 64-hex-char SHA-256 of its published image, the integrity re-check
 /// passes on the live mapping, and recompiling the identical module yields
-/// the identical artifact hash (deterministic pipeline, no profile hooks).
+/// byte-identical code plus identical stable metrics, proofs, and codegen
+/// evidence (deterministic pipeline, no profile hooks).
 #[test]
 fn jit_published_buffer_is_hash_bound() {
     let compiler = Compiler::new(CompilerConfig::for_host_jit());
@@ -236,8 +237,98 @@ fn jit_published_buffer_is_hash_bound() {
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("host JIT recompile must succeed");
     assert_eq!(
+        second.buffer.code_slice(),
+        first.buffer.code_slice(),
+        "identical module + config must publish byte-identical executable code"
+    );
+    assert_eq!(
         second.buffer.published_image_sha256(),
         hash,
         "identical module + config must publish an identical artifact hash"
     );
+    assert_eq!(
+        second.buffer.symbol_offsets(),
+        first.buffer.symbol_offsets()
+    );
+    assert_eq!(
+        second.buffer.function_ranges(),
+        first.buffer.function_ranges()
+    );
+
+    assert_eq!(
+        second.metrics.code_size_bytes,
+        first.metrics.code_size_bytes
+    );
+    assert_eq!(
+        second.metrics.instruction_count,
+        first.metrics.instruction_count
+    );
+    assert_eq!(second.metrics.function_count, first.metrics.function_count);
+    assert_eq!(
+        second.metrics.optimization_passes_run,
+        first.metrics.optimization_passes_run
+    );
+    assert_eq!(
+        second.metrics.proof_optimizations,
+        first.metrics.proof_optimizations
+    );
+    assert_eq!(second.metrics.fsym_trust_ir, first.metrics.fsym_trust_ir);
+    assert_eq!(second.proofs, first.proofs);
+    assert_eq!(
+        second.proof_optimization_certificates,
+        first.proof_optimization_certificates
+    );
+    assert_eq!(
+        second.host_jit_selected_codegen_profile,
+        first.host_jit_selected_codegen_profile
+    );
+    assert_eq!(second.aarch64_machine_code, first.aarch64_machine_code);
+
+    assert_eq!(
+        second.per_function_metrics.len(),
+        first.per_function_metrics.len()
+    );
+    for (second_fn, first_fn) in second
+        .per_function_metrics
+        .iter()
+        .zip(&first.per_function_metrics)
+    {
+        assert_eq!(second_fn.name, first_fn.name);
+        assert_eq!(second_fn.code_size_bytes, first_fn.code_size_bytes);
+        assert_eq!(second_fn.instruction_count, first_fn.instruction_count);
+        assert_eq!(second_fn.spill_slot_count, first_fn.spill_slot_count);
+        assert_eq!(second_fn.branch_count, first_fn.branch_count);
+        assert_eq!(second_fn.x86_machine_code, first_fn.x86_machine_code);
+        assert_eq!(
+            second_fn.aarch64_machine_code,
+            first_fn.aarch64_machine_code
+        );
+        // Wall-clock phase timings are intentionally excluded: they are
+        // observations of each run, not deterministic compilation output.
+    }
+
+    let first_validation = first.validation.as_ref().expect("validation provenance");
+    let second_validation = second
+        .validation
+        .as_ref()
+        .expect("validation provenance on recompile");
+    assert_eq!(second_validation.mode, first_validation.mode);
+    assert_eq!(
+        second_validation.published_image_sha256,
+        first_validation.published_image_sha256
+    );
+    assert_eq!(
+        second_validation.functions.len(),
+        first_validation.functions.len()
+    );
+    for (second_fn, first_fn) in second_validation
+        .functions
+        .iter()
+        .zip(&first_validation.functions)
+    {
+        assert_eq!(second_fn.function, first_fn.function);
+        assert_eq!(second_fn.verified, first_fn.verified);
+        assert_eq!(second_fn.bytes_sha256, first_fn.bytes_sha256);
+        // CachedVerified legitimately changes `cache_hit` on the second run.
+    }
 }

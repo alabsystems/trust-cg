@@ -20,7 +20,7 @@ use thiserror::Error;
 use trust_cg_opt::cache::StableHasher;
 
 use crate::jit_diagnostics::sha256_hex;
-use crate::target::{Target, TargetSpec};
+use crate::target::{AArch64IsaProfile, Target, TargetSpec};
 use crate::x86_64::{X86TargetFeature, X86TargetFeatures};
 
 /// Stable schema name for [`DeterministicArtifactManifest`].
@@ -696,6 +696,25 @@ impl TargetDescriptor {
         descriptor
     }
 
+    /// Describe the exact current-host JIT target admitted by Trust Codegen.
+    ///
+    /// Unlike a plain target triple, this includes the compiler's normalized
+    /// optional-instruction feature set. Callers constructing an executable
+    /// manifest should use this constructor so the manifest, compile identity,
+    /// and installed payload binding name the same machine-code contract.
+    pub fn for_trust_cg_host_jit() -> Self {
+        let target = Target::host();
+        let features = match target {
+            Target::Aarch64 => AArch64IsaProfile::for_host_jit()
+                .enabled_feature_names()
+                .collect(),
+            Target::X86_64 => X86TargetFeatures::host().enabled_feature_names(),
+            Target::Riscv64 => Vec::new(),
+        };
+        Self::for_trust_cg_target_spec(TargetSpec::default_for_architecture(target))
+            .with_features(features)
+    }
+
     /// Set the optional CPU model.
     pub fn with_cpu(mut self, cpu: impl Into<String>) -> Self {
         self.cpu = Some(cpu.into());
@@ -718,7 +737,7 @@ impl TargetDescriptor {
     ///
     /// Product seals must bind these bytes rather than treating the shorter
     /// public [`ArtifactChecksum`] as collision-resistant authority.
-    pub(crate) fn canonical_bytes(&self) -> Vec<u8> {
+    pub fn canonical_bytes(&self) -> Vec<u8> {
         canonical_bytes_of(self)
     }
 }

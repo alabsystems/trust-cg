@@ -1126,6 +1126,10 @@ mod tests {
     #[test]
     fn p3_obligations_proven_formally() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "p3_obligations_proven_formally",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         for ob in all_value_domain_obligations() {
@@ -1137,6 +1141,10 @@ mod tests {
     #[test]
     fn narrow_width_proofs_proven_formally() {
         if !proof_authority_available() {
+            crate::formal_gap::skip_test(
+                "narrow_width_proofs_proven_formally",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         for ob in narrow_width_proofs() {

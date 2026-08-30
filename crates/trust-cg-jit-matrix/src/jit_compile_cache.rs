@@ -45,6 +45,10 @@
 // to "act as if the disk cache is not configured" on any error path
 // (missing dir, permission denied, corrupt content, concurrent-writer
 // races); see `jit_disk_cache` for the full error contract.
+// The same cold path is used whenever the shared compiler-environment guard
+// finds an unkeyed `TCG_*` or `TRUST_CG_*` control: L1 providers, reserved L2
+// executable buffers, and L3 TrustIR artifacts are all bypassed and no result
+// is published for reuse.
 //
 // # Scope vs ExecutableBuffer-on-disk
 //
@@ -241,10 +245,38 @@ impl<P> JitCompileCache<P> {
         self.entries.is_empty()
     }
 
+    /// Check the shared compiler-environment reuse boundary. Formula identity
+    /// alone cannot prove that a provider's machine code was produced under
+    /// the live lowering/optimization/regalloc policy. Unsafe scopes bypass
+    /// L1 without evicting still-valid default-policy providers.
+    fn prepare_artifact_reuse(&self) -> Option<crate::env_lock::ArtifactReusePermit> {
+        crate::env_lock::artifact_reuse_permit()
+    }
+
+    /// Publish a compiled provider only if the lookup permit remains valid.
+    /// The permit's mutation epoch detects even a scoped override that begins
+    /// and ends wholly inside the build closure.
+    fn publish_in_memory_if_safe(
+        &mut self,
+        reuse_permit: Option<&crate::env_lock::ArtifactReusePermit>,
+        hash: u64,
+        formula_key: FormulaKey,
+        arc: &Arc<P>,
+    ) -> bool {
+        let safe = reuse_permit.is_some_and(crate::env_lock::ArtifactReusePermit::is_valid);
+        if safe {
+            self.insert_in_memory(hash, formula_key, arc);
+        }
+        safe
+    }
+
     /// Return the cached `Arc<P>` for `hash` if present, otherwise
     /// invoke `build_fn` to compile a fresh provider, insert it, and
     /// return an `Arc<P>` referencing it. Insertion may evict the
-    /// oldest entry if the cache is at capacity.
+    /// oldest entry if the cache is at capacity. Unkeyed ambient compiler
+    /// controls bypass the cache, so the returned provider is fresh and is not
+    /// published for later reuse; default-policy entries remain available when
+    /// the override scope ends.
     pub fn get_or_compile<E, F>(
         &mut self,
         hash: u64,
@@ -254,17 +286,19 @@ impl<P> JitCompileCache<P> {
     where
         F: FnOnce() -> Result<P, E>,
     {
+        let reuse_permit = self.prepare_artifact_reuse();
         // Verify-on-hit: only trust the cached artifact when the stored
         // collision-resistant key matches. A 64-bit bucket collision (same
         // `hash`, different `formula_key`) falls through and compiles fresh.
-        if let Some((stored_key, arc)) = self.entries.get(&hash)
+        if reuse_permit.is_some()
+            && let Some((stored_key, arc)) = self.entries.get(&hash)
             && *stored_key == formula_key
         {
             return Ok(Arc::clone(arc));
         }
         let provider = build_fn()?;
         let arc = Arc::new(provider);
-        self.insert_in_memory(hash, formula_key, &arc);
+        self.publish_in_memory_if_safe(reuse_permit.as_ref(), hash, formula_key, &arc);
         Ok(arc)
     }
 
@@ -283,7 +317,8 @@ impl<P> JitCompileCache<P> {
     ///    builder rejects cached text and rebuilds, the fresh text replaces
     ///    the poisoned entry atomically.
     /// 4. The fresh `Arc<P>` is inserted into the in-memory cache
-    ///    (evicting the oldest entry if at capacity).
+    ///    (evicting the oldest entry if at capacity), unless an unkeyed
+    ///    compiler control makes native-artifact reuse unsafe.
     ///
     /// The caller controls both halves of the disk handshake because
     /// the build closure is the only code that knows how to turn IR
@@ -299,8 +334,10 @@ impl<P> JitCompileCache<P> {
     where
         F: FnOnce(Option<String>) -> Result<(P, String), E>,
     {
+        let reuse_permit = self.prepare_artifact_reuse();
         // Verify-on-hit (see `get_or_compile`).
-        if let Some((stored_key, arc)) = self.entries.get(&hash)
+        if reuse_permit.is_some()
+            && let Some((stored_key, arc)) = self.entries.get(&hash)
             && *stored_key == formula_key
         {
             return Ok(Arc::clone(arc));
@@ -309,7 +346,10 @@ impl<P> JitCompileCache<P> {
         // filename), so a 64-bit bucket collision cannot read another formula's
         // persisted artifact.
         let disk_kernel = disk_slot_name(kernel_name, &formula_key);
-        let disk_text = if self.disk_backed {
+        // L3 stores semantic TrustIR rather than executable bytes, but its
+        // builder output is still an artifact. A future prefixed control could
+        // affect module construction, so unknown policy bypasses this tier too.
+        let disk_text = if reuse_permit.is_some() && self.disk_backed {
             crate::jit_disk_cache::disk_lookup(hash, &disk_kernel)
         } else {
             None
@@ -323,10 +363,11 @@ impl<P> JitCompileCache<P> {
         let (provider, module_text) = build_fn(disk_text)?;
         let arc = Arc::new(provider);
         let cache_entry_needs_store = cached_module_text.as_deref() != Some(module_text.as_str());
-        if cache_entry_needs_store && self.disk_backed {
+        let publish_artifacts =
+            self.publish_in_memory_if_safe(reuse_permit.as_ref(), hash, formula_key, &arc);
+        if cache_entry_needs_store && self.disk_backed && publish_artifacts {
             crate::jit_disk_cache::disk_store(hash, &disk_kernel, &module_text);
         }
-        self.insert_in_memory(hash, formula_key, &arc);
         Ok(arc)
     }
 
@@ -379,8 +420,10 @@ impl<P> JitCompileCache<P> {
         BuildBuf: FnOnce(ExecutableBuffer) -> Result<P, E>,
         BuildMod: FnOnce(Option<String>) -> Result<(P, Vec<u8>, String), E>,
     {
+        let reuse_permit = self.prepare_artifact_reuse();
         // Verify-on-hit (see `get_or_compile`).
-        if let Some((stored_key, arc)) = self.entries.get(&hash)
+        if reuse_permit.is_some()
+            && let Some((stored_key, arc)) = self.entries.get(&hash)
             && *stored_key == formula_key
         {
             return Ok(Arc::clone(arc));
@@ -394,13 +437,14 @@ impl<P> JitCompileCache<P> {
         // Reserved L2: serialized ExecutableBuffer. The called module keeps
         // production I/O hard-disabled; only a process-private test/benchmark
         // override can make this return a buffer.
-        if self.disk_backed
+        if reuse_permit.is_some()
+            && self.disk_backed
             && let Some(buffer) =
                 crate::executable_buffer_cache::read_buffer_from_disk(hash, &disk_kernel)
         {
             let provider = build_from_buffer(buffer)?;
             let arc = Arc::new(provider);
-            self.insert_in_memory(hash, formula_key, &arc);
+            self.publish_in_memory_if_safe(reuse_permit.as_ref(), hash, formula_key, &arc);
             return Ok(arc);
         }
 
@@ -409,7 +453,10 @@ impl<P> JitCompileCache<P> {
         // returns serialized buffer bytes alongside the provider so the
         // quarantined same-process L2 tests can exercise replay without
         // disturbing the provider's owned executable mapping.
-        let disk_text = if self.disk_backed {
+        // L3 is semantic TrustIR rather than executable bytes, but remains an
+        // artifact of module construction and therefore shares the fail-closed
+        // ambient-policy boundary.
+        let disk_text = if reuse_permit.is_some() && self.disk_backed {
             crate::jit_disk_cache::disk_lookup(hash, &disk_kernel)
         } else {
             None
@@ -420,7 +467,10 @@ impl<P> JitCompileCache<P> {
         let cached_module_text = disk_text.clone();
         let (provider, buffer_bytes, module_text) = build_from_module(disk_text)?;
 
-        if self.disk_backed {
+        let publish_native = reuse_permit
+            .as_ref()
+            .is_some_and(crate::env_lock::ArtifactReusePermit::is_valid);
+        if self.disk_backed && publish_native {
             if cached_module_text.as_deref() != Some(module_text.as_str()) {
                 crate::jit_disk_cache::disk_store(hash, &disk_kernel, &module_text);
             }
@@ -434,7 +484,7 @@ impl<P> JitCompileCache<P> {
         }
 
         let arc = Arc::new(provider);
-        self.insert_in_memory(hash, formula_key, &arc);
+        self.publish_in_memory_if_safe(reuse_permit.as_ref(), hash, formula_key, &arc);
         Ok(arc)
     }
 
@@ -569,6 +619,72 @@ mod tests {
         let h1 = compute_formula_hash(3, &clauses);
         let h2 = compute_formula_hash(4, &clauses);
         assert_ne!(h1, h2, "num_vars must participate in the hash");
+    }
+
+    #[test]
+    fn unkeyed_thread_local_control_bypasses_l1_without_evicting_default_provider() {
+        let mut cache = JitCompileCache::<u32>::new(2);
+        let hash = 0x5afe_u64;
+        let formula_key = [0x5a; 32];
+        let seeded = Arc::new(7);
+        cache.insert_in_memory(hash, formula_key, &seeded);
+        assert_eq!(cache.len(), 1);
+
+        crate::env_lock::with_env_overrides(&[("TCG_NO_SELECT_FOLD", "1")], || {
+            let mut builds = 0;
+            let first = cache
+                .get_or_compile::<(), _>(hash, formula_key, || {
+                    builds += 1;
+                    Ok(11)
+                })
+                .expect("unsafe-policy lookup should compile fresh");
+            assert!(!Arc::ptr_eq(&seeded, &first));
+            assert_eq!(cache.len(), 1, "default-policy entry should stay resident");
+
+            let second = cache
+                .get_or_compile::<(), _>(hash, formula_key, || {
+                    builds += 1;
+                    Ok(13)
+                })
+                .expect("repeated unsafe-policy lookup should compile fresh");
+            assert_eq!(builds, 2, "L1 must stay bypassed under the override");
+            assert!(!Arc::ptr_eq(&first, &second));
+            assert_eq!(cache.len(), 1, "unsafe-policy result must not publish");
+        });
+
+        let resumed = cache
+            .get_or_compile::<(), _>(hash, formula_key, || {
+                panic!("default-policy entry should survive the override scope")
+            })
+            .expect("default-policy lookup should resume");
+        assert!(Arc::ptr_eq(&seeded, &resumed));
+    }
+
+    #[test]
+    fn transient_build_override_invalidates_l1_publication_permit() {
+        let mut cache = JitCompileCache::<u32>::new(2);
+        let hash = 0x7e11_u64;
+        let formula_key = [0x7e; 32];
+
+        let first = cache
+            .get_or_compile::<(), _>(hash, formula_key, || {
+                Ok(crate::env_lock::with_env_overrides(
+                    &[("TCG_NO_SELECT_FOLD", "1")],
+                    || 17,
+                ))
+            })
+            .expect("transient-policy build should succeed");
+        assert_eq!(*first, 17);
+        assert!(
+            cache.is_empty(),
+            "a result built under a transient override must not be published"
+        );
+
+        let second = cache
+            .get_or_compile::<(), _>(hash, formula_key, || Ok(23))
+            .expect("default-policy rebuild should succeed");
+        assert_eq!(*second, 23, "the transient result must not be reused");
+        assert_eq!(cache.len(), 1);
     }
 
     #[test]

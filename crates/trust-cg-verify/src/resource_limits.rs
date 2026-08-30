@@ -10,17 +10,22 @@
 //! function-level certificate fanout and x86 per-instruction fanout share the
 //! same fixed set of large stacks instead of multiplying them.
 
+use std::num::NonZeroUsize;
 use std::sync::{Mutex, OnceLock};
 
+use trust_cg_process_env::resource_budget::{
+    ArtifactNeutralExecutorBudget, ArtifactNeutralExecutorDefaults, HostResourceSnapshot,
+};
+
 /// Environment variable controlling Trust Codegen-owned parallelism.
-pub const TRUST_CG_MAX_PARALLELISM_ENV: &str = "TRUST_CG_MAX_PARALLELISM";
+pub use trust_cg_process_env::resource_budget::TRUST_CG_MAX_PARALLELISM_ENV;
 
 /// Stack reserved for each proof-verifier worker.
 ///
 /// Recursive SMT-expression evaluation can overflow Rust's ordinary worker
 /// stack. This retains the established 32 MiB safety margin while bounding how
 /// many such stacks exist at once.
-pub const PROOF_VERIFIER_STACK_SIZE: usize = 32 * 1024 * 1024;
+pub use trust_cg_process_env::resource_budget::PROOF_VERIFIER_STACK_BYTES as PROOF_VERIFIER_STACK_SIZE;
 
 /// Process-local default for the shared large-stack verifier pool.
 ///
@@ -31,10 +36,12 @@ pub const PROOF_VERIFIER_STACK_SIZE: usize = 32 * 1024 * 1024;
 const DEFAULT_PROOF_VERIFIER_WORKERS: usize = 2;
 
 static DEFAULT_WORKER_LIMIT: OnceLock<usize> = OnceLock::new();
+static PROOF_VERIFIER_BUDGET: OnceLock<ArtifactNeutralExecutorBudget> = OnceLock::new();
 static PROOF_VERIFIER_POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
 static SERIAL_FALLBACK_LOCK: Mutex<()> = Mutex::new(());
 
-/// Override the process-local verifier worker default before first pool use.
+/// Override the process-local verifier worker default before first budget/pool
+/// use.
 ///
 /// This changes only the default. A positive `TRUST_CG_MAX_PARALLELISM` value
 /// remains authoritative. The first caller wins, which lets an embedding set a
@@ -42,35 +49,40 @@ static SERIAL_FALLBACK_LOCK: Mutex<()> = Mutex::new(());
 /// silently widening it.
 #[must_use]
 pub fn configure_proof_verifier_default_worker_limit(worker_limit: usize) -> bool {
+    if PROOF_VERIFIER_BUDGET.get().is_some() {
+        return false;
+    }
     DEFAULT_WORKER_LIMIT.set(worker_limit.max(1)).is_ok()
 }
 
 /// Resolve the worker limit used by the shared large-stack verifier pool.
 #[must_use]
 pub fn proof_verifier_worker_limit() -> usize {
-    let available = std::thread::available_parallelism().map_or(1, usize::from);
-    let default_limit = DEFAULT_WORKER_LIMIT
+    PROOF_VERIFIER_BUDGET
+        .get_or_init(|| {
+            let host = HostResourceSnapshot::capture();
+            let default_limit = DEFAULT_WORKER_LIMIT
+                .get()
+                .copied()
+                .unwrap_or(DEFAULT_PROOF_VERIFIER_WORKERS);
+            capture_verifier_budget(host, default_limit)
+        })
+        .large_stack_slots()
         .get()
-        .copied()
-        .unwrap_or(DEFAULT_PROOF_VERIFIER_WORKERS);
-    resolve_proof_verifier_worker_limit(
-        std::env::var(TRUST_CG_MAX_PARALLELISM_ENV).ok().as_deref(),
-        available,
-        default_limit,
-    )
 }
 
-fn resolve_proof_verifier_worker_limit(
-    configured: Option<&str>,
-    available: usize,
+fn capture_verifier_budget(
+    host: HostResourceSnapshot,
     default_limit: usize,
-) -> usize {
-    let available = available.max(1);
-    let requested = configured
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(default_limit.max(1));
-    requested.min(available)
+) -> ArtifactNeutralExecutorBudget {
+    let defaults = ArtifactNeutralExecutorDefaults::new(
+        host.available_parallelism(),
+        NonZeroUsize::new(default_limit).unwrap_or(NonZeroUsize::MIN),
+        NonZeroUsize::new(PROOF_VERIFIER_STACK_SIZE)
+            .expect("proof-verifier stack reservation must be positive"),
+    );
+    ArtifactNeutralExecutorBudget::capture_for_host(defaults, host)
+        .unwrap_or_else(|error| panic!("invalid Trust Codegen execution resource budget: {error}"))
 }
 
 fn proof_verifier_pool() -> Option<&'static rayon::ThreadPool> {
@@ -152,30 +164,56 @@ where
 mod tests {
     use super::*;
 
+    fn host(available: usize) -> HostResourceSnapshot {
+        HostResourceSnapshot::new(
+            NonZeroUsize::new(available).unwrap_or(NonZeroUsize::MIN),
+            None,
+        )
+    }
+
+    fn resolve_worker_limit(
+        configured: Option<usize>,
+        available: usize,
+        default_limit: usize,
+    ) -> usize {
+        let host = host(available);
+        let defaults = ArtifactNeutralExecutorDefaults::new(
+            host.available_parallelism(),
+            NonZeroUsize::new(default_limit).unwrap_or(NonZeroUsize::MIN),
+            NonZeroUsize::new(PROOF_VERIFIER_STACK_SIZE).unwrap(),
+        );
+        ArtifactNeutralExecutorBudget::resolve(
+            defaults,
+            host,
+            configured.and_then(NonZeroUsize::new),
+        )
+        .expect("deterministic test host has no memory ceiling")
+        .large_stack_slots()
+        .get()
+    }
+
     #[test]
     fn default_worker_limit_is_small_and_host_bounded() {
         assert_eq!(
-            resolve_proof_verifier_worker_limit(None, 64, DEFAULT_PROOF_VERIFIER_WORKERS),
+            resolve_worker_limit(None, 64, DEFAULT_PROOF_VERIFIER_WORKERS),
             2
         );
         assert_eq!(
-            resolve_proof_verifier_worker_limit(None, 1, DEFAULT_PROOF_VERIFIER_WORKERS),
+            resolve_worker_limit(None, 1, DEFAULT_PROOF_VERIFIER_WORKERS),
             1
         );
-        assert_eq!(resolve_proof_verifier_worker_limit(None, 64, 1), 1);
+        assert_eq!(resolve_worker_limit(None, 64, 1), 1);
     }
 
     #[test]
     fn explicit_worker_limit_wins_over_embedding_default() {
-        assert_eq!(resolve_proof_verifier_worker_limit(Some("8"), 64, 1), 8);
-        assert_eq!(resolve_proof_verifier_worker_limit(Some("1"), 64, 8), 1);
-        assert_eq!(resolve_proof_verifier_worker_limit(Some("999"), 4, 1), 4);
+        assert_eq!(resolve_worker_limit(Some(8), 64, 1), 8);
+        assert_eq!(resolve_worker_limit(Some(1), 64, 8), 1);
+        assert_eq!(resolve_worker_limit(Some(999), 4, 1), 4);
     }
 
     #[test]
-    fn invalid_worker_limit_uses_safe_default() {
-        assert_eq!(resolve_proof_verifier_worker_limit(Some("0"), 64, 2), 2);
-        assert_eq!(resolve_proof_verifier_worker_limit(Some("bad"), 64, 2), 2);
-        assert_eq!(resolve_proof_verifier_worker_limit(None, 0, 0), 1);
+    fn zero_embedding_defaults_are_conservatively_one() {
+        assert_eq!(resolve_worker_limit(None, 0, 0), 1);
     }
 }

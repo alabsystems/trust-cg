@@ -21,7 +21,7 @@ use trust_cg_codegen::jit_install_gate::{
 };
 use trust_cg_codegen::target::{Target, TargetSpec};
 use trust_cg_codegen::{
-    CancellationToken, CompileDiagnostic, CompileGeneration, CompileGenerationFence,
+    CancellationToken, CompileDiagnostic, CompileGeneration, CompileGenerationFence, CompilePlan,
     CompileRequest, CompileRequestId, CompiledArtifact, InstallIntent,
 };
 
@@ -69,9 +69,7 @@ fn deterministic_manifest(artifact_id: &str, generation: u64) -> ArtifactManifes
     // caller-authored compatibility descriptors are intentionally not
     // authoritative after manifest preflight hardening.
     let architecture = Target::host();
-    let target = trust_cg_codegen::jit_contract::TargetDescriptor::for_trust_cg_target_spec(
-        TargetSpec::default_for_architecture(architecture),
-    );
+    let target = trust_cg_codegen::jit_contract::TargetDescriptor::for_trust_cg_host_jit();
     let abi = AbiDescriptor::for_trust_cg_target_os(architecture, target.operating_system.clone());
     let layout = LayoutManifest::lp64(Endianness::Little, architecture.stack_alignment() as u16);
     let proof_policy = ProofPolicy::disabled();
@@ -388,6 +386,94 @@ fn submit_poll_start_and_finish_installable() {
     );
     assert_eq!(async_service.telemetry_summary().compiled, 1);
     assert_metadata_only_telemetry(&async_service);
+}
+
+#[test]
+fn explicit_compile_plan_survives_async_worker_boundary() {
+    let mut async_service = AsyncCompileService::default();
+    let mut compile_request = request("async-explicit-plan", 29);
+    compile_request.install_intent = InstallIntent::CompileOnly;
+    let request_id = compile_request.request_id.clone();
+    let target_spec = TargetSpec::parse("x86_64-pc-windows-msvc").unwrap();
+    let legacy_request = request("async-after-explicit-plan", 30);
+    let legacy_request_id = legacy_request.request_id.clone();
+
+    async_service
+        .submit_plan(CompilePlan::new(compile_request, target_spec))
+        .expect("target-aware submit accepted");
+    async_service
+        .submit(legacy_request)
+        .expect("later legacy submit accepted");
+    assert!(
+        async_service.start_next().is_none(),
+        "a legacy worker must neither strip nor leapfrog the explicit front plan"
+    );
+
+    let mut observed_target = None;
+    let mut observed_compiler_target = None;
+    let poll = async_service
+        .run_next_plan_with(|service, plan| {
+            observed_target = Some(plan.target_spec());
+            let generation = plan.request().generation;
+            service.compile_plan_with(plan, |compiler| {
+                observed_compiler_target = Some(compiler.target_spec());
+                let mut artifact = artifact(generation);
+                artifact.metadata.target = compiler.config().target;
+                Ok(artifact)
+            })
+        })
+        .expect("plan-aware worker result");
+
+    assert_eq!(observed_target, Some(target_spec));
+    assert_eq!(observed_compiler_target, Some(target_spec));
+    assert_eq!(poll.request_id, request_id);
+    assert_eq!(poll.state, AsyncCompileState::ProfileOnly);
+    assert_eq!(
+        poll.response
+            .as_ref()
+            .and_then(|response| response.artifact.as_ref())
+            .map(|artifact| artifact.install.disposition),
+        Some(ArtifactInstallDisposition::ProfileOnly)
+    );
+    assert_eq!(
+        async_service
+            .start_next()
+            .expect("legacy work follows explicit front plan")
+            .request_id,
+        legacy_request_id
+    );
+}
+
+#[test]
+fn finish_plan_rejects_response_from_a_different_target() {
+    let mut async_service = AsyncCompileService::default();
+    let mut compile_request = request("async-plan-target-mismatch", 31);
+    compile_request.install_intent = InstallIntent::CompileOnly;
+    let expected_target = TargetSpec::parse("x86_64-pc-windows-msvc").unwrap();
+    let wrong_target = TargetSpec::parse("x86_64-unknown-linux-gnu").unwrap();
+
+    async_service
+        .submit_plan(CompilePlan::new(compile_request.clone(), expected_target))
+        .expect("target-aware submit accepted");
+    let ticket = async_service
+        .start_next_plan()
+        .expect("target-aware worker ticket");
+    let generation = compile_request.generation;
+    let response = async_service.service().compile_plan_with(
+        CompilePlan::new(compile_request, wrong_target),
+        |compiler| {
+            let mut artifact = artifact(generation);
+            artifact.metadata.target = compiler.config().target;
+            Ok(artifact)
+        },
+    );
+
+    let poll = async_service.finish_plan(ticket, response);
+    assert_eq!(poll.state, AsyncCompileState::Rejected);
+    let response = poll.response.expect("target mismatch response");
+    assert!(response.artifact.is_none());
+    assert_eq!(response.diagnostics.len(), 1);
+    assert_eq!(response.diagnostics[0].code, "async.compile_plan_mismatch");
 }
 
 #[test]

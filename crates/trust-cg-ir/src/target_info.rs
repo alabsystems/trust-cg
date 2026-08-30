@@ -577,6 +577,16 @@ impl TargetInfo for X86_64Target {
             | AndRR | AndRI | OrRR | OrRI | XorRR | XorRI | Not
             // Shifts
             | ShlRR | ShlRI | ShrRR | ShrRI | SarRR | SarRI
+            // Rotates: PARTIAL flag writers — CF always (OF only for 1-bit
+            // forms); ZF/SF/PF are PRESERVED. Correct for this predicate's
+            // "flags are not preserved across this instruction" meaning, but
+            // a future consumer that reads writes_flags as "fully redefines
+            // RFLAGS, prior flag-setters are dead" must special-case these
+            // (same distinction that keeps is_x86_rotate_rcl separate from
+            // is_x86_shift_rr in the codegen pipeline).
+            | RolRI | RolRCl
+            // Memory-destination RMW ALU (flags set from the memory result)
+            | XorMR | AddMR | XorMRSib | AddMRSib
             // Compare/test
             | CmpRR | CmpRI | CmpRI8 | CmpRM | TestRR | TestRI | TestRM
             | Ptest
@@ -1158,6 +1168,10 @@ mod tests {
         assert!(X86_64Target::writes_flags(X86Opcode::CmpRR));
         assert!(X86_64Target::writes_flags(X86Opcode::Ptest));
         assert!(X86_64Target::writes_flags(X86Opcode::Mul));
+        assert!(X86_64Target::writes_flags(X86Opcode::RolRI));
+        assert!(X86_64Target::writes_flags(X86Opcode::RolRCl));
+        assert!(X86_64Target::writes_flags(X86Opcode::XorMR));
+        assert!(X86_64Target::writes_flags(X86Opcode::AddMRSib));
         assert!(!X86_64Target::writes_flags(X86Opcode::Ud2));
         assert!(!X86_64Target::writes_flags(X86Opcode::MovRR));
         assert!(!X86_64Target::writes_flags(X86Opcode::Cvttsd2si));

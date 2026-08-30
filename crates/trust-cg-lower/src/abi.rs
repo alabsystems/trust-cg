@@ -1413,9 +1413,6 @@ impl UnwindInfo {
 
 /// Standard frame-pointer-based unwind mode.
 const COMPACT_MODE_FRAME: u32 = 0x0400_0000;
-/// Frameless leaf function unwind mode.
-#[allow(dead_code)] // Defined for API completeness; will be used for frameless function support.
-const COMPACT_MODE_FRAMELESS: u32 = 0x0200_0000;
 /// Fallback to full DWARF FDE.
 const COMPACT_MODE_DWARF: u32 = 0x0300_0000;
 

@@ -944,9 +944,6 @@ pub fn expr_syntactic_eq(a: &Expr, b: &Expr) -> bool {
 pub fn succ_of(e: Expr) -> Expr {
     Expr::app(Expr::cnst(nat_succ_name()), e)
 }
-pub fn pred_of(e: Expr) -> Expr {
-    Expr::app(Expr::cnst(nat_pred_name()), e)
-}
 pub fn binop(op: Name, a: Expr, b: Expr) -> Expr {
     Expr::app(Expr::app(Expr::cnst(op), a), b)
 }
@@ -1218,13 +1215,6 @@ impl Verifier {
             }
         }
         None
-    }
-
-    // Compatibility entry retained for the historical focused root. It now
-    // delegates to the same engine hook, preventing the coverage fixture from
-    // drifting into a second implementation.
-    pub fn reduce_nat_mulpow(&self, e: &Expr) -> Option<Expr> {
-        self.reduce_nat(e)
     }
 
     fn bool_lit(&self, b: bool) -> Expr {

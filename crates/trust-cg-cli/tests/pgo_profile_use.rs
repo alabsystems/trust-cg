@@ -183,7 +183,10 @@ fn pgo_key_from_hash(module_hash: u128, opt_level: u8) -> CacheKey {
         opt_level,
         default_aarch64_triple(),
         "generic-aarch64".into(),
-        vec!["+neon".into()],
+        // 9107c590 binds every admitted optional ISA family into the key, so a
+        // fresh key must derive the list exactly as the compiler does — a
+        // hardcoded ["+neon"] goes stale on any host that admits LSE etc.
+        trust_cg_codegen::pgo_target_features(Target::Aarch64),
     )
 }
 

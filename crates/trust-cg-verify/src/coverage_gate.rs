@@ -2217,6 +2217,19 @@ pub fn classify_x86(opcode: X86Opcode) -> OpcodeClass {
         O::ShlRR | O::ShlRI | O::ShrRR | O::ShrRI | O::SarRR | O::SarRI | O::RolRI => {
             EmittableNeedsProof
         }
+        // Variable-count rotate (ROL r/m64, CL — RMW-Stage-1-style admission:
+        // nothing emits it yet). Covered by Phase-2 reconstruction credit: the
+        // `X86SourceOp::RotlVar` obligation pits the bridge's masked
+        // shl/shr/or rotate idiom (the exact expansion the Stage-2 peephole
+        // will delete) against the independent hardware-masked
+        // `encode_rol_rcl_masked` — TOTAL (no count<width precondition; both
+        // sides mask mod width), with the machine half keyed off the real
+        // opcode. ROR-for-ROL, a dropped wrap half, an unmasked machine
+        // count, a wrong mask width, and SHL-for-ROL all REFUTE (rotl_var
+        // controls in reconstruction_x86.rs). The Stage-2 variable-rotate
+        // peephole is admission-gated on this very reconstruction
+        // discharging Valid.
+        O::RolRCl => EmittableNeedsProof,
         O::CmpRR | O::CmpRI | O::CmpRI8 | O::CmpRM => EmittableNeedsProof,
         O::TestRR | O::TestRI | O::TestRM => EmittableNeedsProof,
         O::Setcc | O::Cmovcc | O::Cmovcc32 => EmittableNeedsProof,
@@ -5245,6 +5258,8 @@ pub const ALL_X86_OPCODES: &[X86Opcode] = {
         AddMR,
         XorMRSib,
         AddMRSib,
+        // Variable-count rotate (appended with the enum)
+        RolRCl,
     ]
 };
 

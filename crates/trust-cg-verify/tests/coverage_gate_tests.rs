@@ -875,14 +875,24 @@ fn x86_emittable_coverage_is_honest_under_strict() {
     // in reconstruction_x86.rs). NOTHING emits these opcodes yet: proofs land
     // BEFORE the Stage-2 fusion peephole, whose admission gate is this very
     // reconstruction discharging Valid.
+    // The 167/196 -> 168/197 net (rotate Stage 1): RolRCl, the variable-count
+    // rotate. +1 emittable AND +1 covered — the RotlVar reconstruction pits
+    // the bridge's masked shl/shr/or rotate idiom (the exact expansion the
+    // Stage-2 peephole will delete) against the independent hardware-masked
+    // `encode_rol_rcl_masked`, TOTAL (no count<width precondition), machine
+    // half keyed off the real opcode. ROR-for-ROL / dropped wrap half /
+    // unmasked count / wrong mask 31 / SHL-for-ROL all REFUTE (rotl_var
+    // controls in reconstruction_x86.rs). NOTHING emits RolRCl yet: the
+    // Stage-2 variable-rotate peephole is admission-gated on this very
+    // reconstruction discharging Valid.
     assert_eq!(
         report.emittable_count(),
-        196,
+        197,
         "x86-64 emitted value/effect denominator changed; update the pin deliberately"
     );
     assert_eq!(
         report.covered_count(),
-        167,
+        168,
         "x86-64 GENUINE (non-degenerate / reconstructed-Valid) emittable coverage changed; \
          update the pinned numbers deliberately — do NOT re-admit X==X identities to inflate this, \
          do NOT credit a memory op without a faithful independent effective-address encoder, and \
@@ -890,8 +900,8 @@ fn x86_emittable_coverage_is_honest_under_strict() {
         report.audit_log()
     );
     assert!(
-        (report.coverage_percent() - (167.0 / 196.0 * 100.0)).abs() < f64::EPSILON,
-        "x86-64 accepted-obligation ratio drifted from the honest 167/196"
+        (report.coverage_percent() - (168.0 / 197.0 * 100.0)).abs() < f64::EPSILON,
+        "x86-64 accepted-obligation ratio drifted from the honest 168/197"
     );
 
     let expected_red: std::collections::HashSet<_> = [
@@ -1145,7 +1155,7 @@ fn x86_universe_has_no_duplicates_and_matches_pinned_count() {
     );
     assert_eq!(
         ALL_X86_OPCODES.len(),
-        229,
+        230,
         "x86-64 opcode count changed — a variant was added/removed. Update the array AND this \
          pinned count, and classify the new opcode in classify_x86 (the build already forced that). \
          (197 = 191 + the 2026-07-18 UNIVERSE BACKFILL of 6 opcodes that existed in the enum but \
@@ -1164,7 +1174,9 @@ fn x86_universe_has_no_duplicates_and_matches_pinned_count() {
          decoder, differential, and reconstructed-proof coverage. The +4 to 229 are the \
          memory-destination RMW ALU quartet XorMR/AddMR/XorMRSib/AddMRSib (RMW Stage 1): \
          EmittableNeedsProof, covered by the MemRmw reconstruction — encoder, decode-check, \
-         and refutation-control coverage landed BEFORE any pass may emit them.)"
+         and refutation-control coverage landed BEFORE any pass may emit them. The +1 to 230 \
+         is RolRCl, the variable-count rotate (rotate Stage 1): EmittableNeedsProof, covered \
+         by the RotlVar reconstruction — same proofs-before-emission posture.)"
     );
 }
 
@@ -1764,7 +1776,7 @@ fn gate_reports_failure_for_an_emittable_opcode_with_no_proof() {
 /// still requires the machine side to be rebuilt from the real opcode and
 /// operands. The publication inventory pins:
 ///   * AArch64: 156/248 accepted, with 92 named RED rows.
-///   * x86-64: 167/196 accepted, with 29 named RED rows.
+///   * x86-64: 168/197 accepted, with 29 named RED rows.
 ///   * RISC-V: 14/17 accepted, with 3 named RED rows.
 ///   * WebAssembly: 111/113 accepted, with 2 named RED rows.
 ///     Re-admitting an X==X identity, fake-covering a non-reconstructable opcode, or
@@ -1911,11 +1923,17 @@ fn clean_tree_reports_honest_strict_emittable_coverage() {
     );
     assert_eq!(
         (x86_cov, x86_em),
-        (167, 196),
+        (168, 197),
         "x86-64 strict emittable coverage changed; update the pinned honest numbers deliberately \
          — do NOT re-admit X==X identities NOR fake-cover a non-reconstructable opcode. x86-64 is \
-         now at honest 167/196: 13 actively emitted former exclusions and 16 volatile memory \
-         forms are explicit DeferredUnfaithfulModel RED rows. The 163 -> 167 net (RMW Stage 1): \
+         now at honest 168/197: 13 actively emitted former exclusions and 16 volatile memory \
+         forms are explicit DeferredUnfaithfulModel RED rows. The 167 -> 168 net (rotate Stage 1): \
+         RolRCl (ROL r/m64, CL) joins via the RotlVar reconstruction — the bridge's masked \
+         shl/shr/or rotate idiom vs the independent hardware-masked encode_rol_rcl_masked, TOTAL \
+         (precondition-free), machine half keyed off the real opcode; ROR-for-ROL / dropped wrap \
+         half / unmasked count / wrong mask 31 / SHL-for-ROL REFUTE (rotl_var controls). Nothing \
+         emits RolRCl yet: Stage-2's variable-rotate peephole is admission-gated on this very \
+         reconstruction. The 163 -> 167 net (RMW Stage 1): \
          the memory-destination RMW ALU quartet XorMR/AddMR/XorMRSib/AddMRSib joins via the \
          MemRmw reconstruction — the COMPOSITION of the proven MemStore shape (address half + \
          stored-value half) and the proven MemAlu shape (the REAL encode_xor_rr/encode_add_rr \
@@ -3320,7 +3338,7 @@ fn historical_comment_lines(lines: &[&str]) -> Vec<bool> {
 /// The first `N/M` token stated after `alias` on `line`.
 ///
 /// The scan stops at the next architecture name, because these ratios are
-/// routinely listed four-to-a-line ("x86-64 167/196 (29 RED), RISC-V 14/17
+/// routinely listed four-to-a-line ("x86-64 168/197 (29 RED), RISC-V 14/17
 /// ..."); without that bound a fixed window reads the *next* architecture's
 /// ratio and reports a false mismatch.
 ///

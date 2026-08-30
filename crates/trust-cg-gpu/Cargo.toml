@@ -29,7 +29,6 @@ readme.workspace = true
 default = []
 
 [dependencies]
-trust-cg-ir = { workspace = true }
 trust-cg-lower = { workspace = true }
 trust-cg-codegen = { workspace = true }
 trust-ir = { workspace = true }

@@ -46,9 +46,9 @@ struct PropagationContext {
 type AYSatWatchBcpFn = unsafe extern "C" fn(*mut PropagationContext) -> i32;
 
 fn ay_sat_target() -> TargetDescriptor {
-    TargetDescriptor::for_trust_cg_target_spec(
-        trust_cg_codegen::target::TargetSpec::default_for_architecture(Target::host()),
-    )
+    // 9107c590: executable manifests must name the admitted-feature contract;
+    // the host-JIT constructor carries the normalized optional-ISA set.
+    TargetDescriptor::for_trust_cg_host_jit()
 }
 
 fn ay_sat_abi() -> AbiDescriptor {

@@ -1786,6 +1786,13 @@ impl X86Encoder {
                 let dst = self.require_dst(ops, opcode)?;
                 self.encode_shift_rcl(7, dst);
             }
+            // ROL r/m64, CL: REX.W + D3 /0 — the same `/0` reg-field RolRI
+            // uses in `encode_shift_ri(0, ...)`, through the same D3 CL helper
+            // as ShlRR/ShrRR/SarRR.
+            X86Opcode::RolRCl => {
+                let dst = self.require_dst(ops, opcode)?;
+                self.encode_shift_rcl(0, dst);
+            }
 
             // =================================================================
             // MOV
@@ -4971,6 +4978,46 @@ mod tests {
         assert_ne!(rol, shl, "ROL must not encode identically to SHL");
         assert_eq!(rol, vec![0x48, 0xC1, 0xC0, 0x04]);
         assert_eq!(shl, vec![0x48, 0xC1, 0xE0, 0x04]);
+    }
+
+    /// ROL r/m64, CL = `REX.W + D3 /0`. Byte-for-byte against llvm-objdump:
+    /// `rolq %cl, %rax` disassembles from `48 d3 c0`, `rolq %cl, %r8` from
+    /// `49 d3 c0` (REX.WB for the extended register).
+    #[test]
+    fn test_rol_rcl_matches_assembler_bytes() {
+        assert_eq!(
+            encode(X86Opcode::RolRCl, &X86InstOperands::r(RAX)),
+            vec![0x48, 0xD3, 0xC0],
+            "rolq %cl, %rax"
+        );
+        assert_eq!(
+            encode(X86Opcode::RolRCl, &X86InstOperands::r(R8)),
+            vec![0x49, 0xD3, 0xC0],
+            "rolq %cl, %r8"
+        );
+        // 32-bit form takes no REX.W, exactly as for the CL shifts.
+        assert_eq!(
+            encode(X86Opcode::RolRCl, &X86InstOperands::r(ECX)),
+            vec![0xD3, 0xC1],
+            "roll %cl, %ecx"
+        );
+    }
+
+    /// The variable rotate shares the D3 group with the CL shifts and the /0
+    /// field with the immediate rotate; both distinctions must hold or a
+    /// rotate silently encodes as a shift (or by the wrong count source).
+    #[test]
+    fn test_rol_rcl_is_not_shl_rr_nor_rol_ri() {
+        let rol_cl = encode(X86Opcode::RolRCl, &X86InstOperands::r(RAX));
+        let shl_cl = encode(X86Opcode::ShlRR, &X86InstOperands::r(RAX));
+        assert_ne!(rol_cl, shl_cl, "RolRCl must not encode as SHL by CL");
+        assert_eq!(shl_cl, vec![0x48, 0xD3, 0xE0]);
+        // Same D3 group + register: ONLY the ModRM reg field differs (/0 vs /4).
+        assert_eq!(rol_cl[0], shl_cl[0]);
+        assert_eq!(rol_cl[1], shl_cl[1]);
+        // Immediate rotate is the C1 group (with an ib) — a different opcode byte.
+        let rol_imm = encode(X86Opcode::RolRI, &X86InstOperands::ri(RAX, 1));
+        assert_ne!(rol_cl, rol_imm, "RolRCl must not encode as ROL by imm8");
     }
 
     #[test]

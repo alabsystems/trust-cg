@@ -562,6 +562,45 @@ pub fn encode_sar_rr_masked(_size: X86OperandSize, src1: SmtExpr, count: SmtExpr
     src1.bvashr(count.bvand(x86_shift_amount_mask(width)))
 }
 
+/// Encode `ROL r/m, CL` with the FAITHFUL x86 hardware amount mask
+/// (Intel SDM Vol 2B, ROL: the count is masked `& 63` at 64-bit / `& 31` at
+/// 32-bit BEFORE the rotate, so `m = count & (width-1)` and
+/// `dst = (src >>u ((width - m) & (width-1))) | (src << m)`):
+///
+/// ```text
+///     m   = count & (width - 1)
+///     dst = (src >>u ((width - m) & (width - 1))) | (src << m)
+/// ```
+///
+/// TOTAL — unlike the CL shifts there is NO `count < width` precondition to
+/// carry: both rotate halves shift by amounts `< width` BY CONSTRUCTION
+/// (`m` and `(width - m) & (width-1)` are both masked), and `m = 0` yields
+/// `src | src = src` — the hardware identity for a zero effective count.
+///
+/// ⚑ TWO deliberate non-degeneracy choices (the [`encode_rol_ri`] pattern):
+/// the OR halves are emitted in the OPPOSITE order from the frontend idiom
+/// the Stage-2 peephole replaces (`(x << eff) | (x >>u compl)`), and the
+/// complement is computed as `(width - m) & (width-1)` where the bridge's
+/// `bitmanip_rotate` source computes `(0 - eff) & (width-1)`. The two are
+/// equal (`-m ≡ width - m  (mod width)`) but STRUCTURALLY DISTINCT, so the
+/// reconstruction obligation that ties them is not the vacuous `X == X` that
+/// `ProofObligation::is_degenerate` exists to catch.
+///
+/// The width is taken from the OPERAND sort (`count.bv_width()`), not the
+/// `X86OperandSize`, so the encoder composes at any power-of-two bitvector
+/// width — the width-8 exhaustive reconstruction test relies on this.
+pub fn encode_rol_rcl_masked(_size: X86OperandSize, src: SmtExpr, count: SmtExpr) -> SmtExpr {
+    let width = count.bv_width();
+    let mask = x86_shift_amount_mask(width);
+    let m = count.bvand(mask.clone());
+    let compl = SmtExpr::bv_const(u64::from(width), width)
+        .bvsub(m.clone())
+        .bvand(mask);
+    let hi = src.clone().bvlshr(compl);
+    let lo = src.bvshl(m);
+    hi.bvor(lo)
+}
+
 // ---------------------------------------------------------------------------
 // SIMD integer instruction semantics
 // ---------------------------------------------------------------------------

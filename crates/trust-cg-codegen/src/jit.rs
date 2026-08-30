@@ -440,15 +440,17 @@ use thiserror::Error;
 
 use crate::jit_contract::{
     ArtifactContractError, ArtifactManifestV1, HostJitSelectedCodegenProfile, SymbolLookupContract,
-    TypedSymbol,
+    TargetDescriptor, TypedSymbol,
 };
 use crate::macho::fixup::{Fixup, FixupTarget};
 #[cfg(target_arch = "aarch64")]
 use crate::pipeline::encode_function_with_fixups_and_blocks;
 use crate::pipeline::{
     DispatchVerifyMode, OptLevel, Pipeline, PipelineConfig, PipelineError,
+    aarch64_inst_requires_fp16, aarch64_opcode_requires_dotprod, aarch64_opcode_requires_lse,
     encode_function_with_fixups,
 };
+use crate::target::AArch64IsaProfile;
 use trust_cg_ir::function::MachFunction as IrMachFunction;
 #[cfg(target_arch = "aarch64")]
 use trust_cg_ir::types::BlockId;
@@ -2290,12 +2292,29 @@ pub(crate) fn publish_raw_executable_buffer_with_profile_data(
 /// `windows_unwind_functions` list to the inner publisher. Replay on
 /// Windows therefore requires the buffer to have been produced without
 /// unwind-info patching (which is the case for the BCP kernels).
-pub fn publish_serialized_buffer(
+///
+/// # Safety
+///
+/// `code` must be an authenticated Trust Codegen payload produced for the
+/// exact `target_contract`; every instruction, relocation, symbol range, and
+/// function ABI must satisfy that contract. A byte checksum is sufficient
+/// only when its domain also binds the compiler build, target triple, and full
+/// optional-feature profile. This function checks that `target_contract`
+/// equals the live host contract, but cannot infer arbitrary bytes' ISA needs.
+pub unsafe fn publish_serialized_buffer_for_target(
     code: &[u8],
     canonical_symbols: Vec<String>,
     symbol_offsets: HashMap<String, u64>,
     function_ranges: Vec<(String, std::ops::Range<u64>)>,
+    target_contract: &TargetDescriptor,
 ) -> Result<ExecutableBuffer, JitError> {
+    let host_contract = TargetDescriptor::for_trust_cg_host_jit();
+    if target_contract != &host_contract {
+        return Err(JitError::SerializedBufferTargetMismatch {
+            serialized_target: format!("{target_contract:?}"),
+            host_target: format!("{host_contract:?}"),
+        });
+    }
     // No profile counters: the empty `counters` map paired with the empty
     // `counter_patch_sites` list short-circuits the patch loop inside
     // `publish_raw_executable_buffer_with_profile_data` so no
@@ -2314,6 +2333,24 @@ pub fn publish_serialized_buffer(
     )
 }
 
+/// Legacy serialized-code publication entry point.
+///
+/// This source-compatible shim now fails closed because the historical API
+/// carried no target-feature or provenance authority. Authenticated caches
+/// must use [`publish_serialized_buffer_for_target`] after checking a digest
+/// whose domain binds the exact compiler and target profile.
+#[deprecated(
+    note = "unauthenticated native replay is refused; verify payload provenance and use unsafe publish_serialized_buffer_for_target"
+)]
+pub fn publish_serialized_buffer(
+    _code: &[u8],
+    _canonical_symbols: Vec<String>,
+    _symbol_offsets: HashMap<String, u64>,
+    _function_ranges: Vec<(String, std::ops::Range<u64>)>,
+) -> Result<ExecutableBuffer, JitError> {
+    Err(JitError::SerializedBufferTargetAuthorityRequired)
+}
+
 // ---------------------------------------------------------------------------
 // Process symbol resolution — dlsym(RTLD_DEFAULT, name)
 // ---------------------------------------------------------------------------
@@ -2323,7 +2360,7 @@ pub fn publish_serialized_buffer(
 // callsite ABI before invoking it.
 #[cfg(unix)]
 mod dl {
-    use std::os::raw::{c_char, c_int, c_void};
+    use std::os::raw::{c_char, c_void};
 
     // RTLD_DEFAULT is an opaque pseudo-handle. Values differ per platform.
     #[cfg(target_os = "macos")]
@@ -2335,12 +2372,6 @@ mod dl {
     unsafe extern "C" {
         pub(super) fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
         pub(super) fn dlerror() -> *const c_char;
-    }
-
-    // Suppress unused warning where target_os is neither macos nor linux.
-    #[allow(dead_code)]
-    fn _unused() {
-        let _: c_int = 0;
     }
 }
 
@@ -2383,6 +2414,29 @@ pub enum JitError {
         function: String,
         host_arch: &'static str,
     },
+
+    #[error(
+        "raw AArch64 JIT function `{function}` contains opcode {opcode:?} requiring {required_feature}, but host ISA profile `{host_profile}` does not admit that feature"
+    )]
+    RawJitIsaExtensionNotAdmitted {
+        function: String,
+        opcode: trust_cg_ir::inst::AArch64Opcode,
+        required_feature: &'static str,
+        host_profile: String,
+    },
+
+    #[error(
+        "serialized executable target contract does not match the current Trust Codegen host-JIT contract: serialized={serialized_target}, host={host_target}"
+    )]
+    SerializedBufferTargetMismatch {
+        serialized_target: String,
+        host_target: String,
+    },
+
+    #[error(
+        "serialized executable publication requires authenticated target/feature authority; use unsafe publish_serialized_buffer_for_target after verifying the payload provenance"
+    )]
+    SerializedBufferTargetAuthorityRequired,
 
     #[error("Windows x64 JIT unwind metadata for `{function}` is unsupported: {reason}")]
     WindowsUnwindUnsupported { function: String, reason: String },
@@ -2832,6 +2886,22 @@ pub struct JitConfig {
     pub cache_certificates: bool,
 }
 
+impl JitConfig {
+    /// Resolve the entry-counter convenience flag into the one profiling mode
+    /// the compiler actually executes.
+    ///
+    /// An explicit profiling mode wins. Otherwise `emit_entry_counters` is the
+    /// ergonomic spelling of [`ProfileHookMode::CallCounts`]. Keeping this
+    /// resolution here makes execution, compile-policy identity, and service
+    /// metadata consume the same semantics.
+    pub const fn effective_profile_hooks(&self) -> ProfileHookMode {
+        match (self.profile_hooks, self.emit_entry_counters) {
+            (ProfileHookMode::None, true) => ProfileHookMode::CallCounts,
+            (mode, _) => mode,
+        }
+    }
+}
+
 impl Default for JitConfig {
     fn default() -> Self {
         Self {
@@ -2983,11 +3053,14 @@ fn jit_lowering_target() -> &'static str {
 fn jit_lowering_compiler_config_bytes(
     config: &PipelineConfig,
     profile_hooks: ProfileHookMode,
+    aarch64_isa_profile: AArch64IsaProfile,
 ) -> Vec<u8> {
     format!(
         concat!(
-            "trust-cg.jit.compiler_config.v1\n",
+            "trust-cg.jit.compiler_config.v2\n",
             "target={}\n",
+            "aarch64_isa_profile={}\n",
+            "aarch64_isa_feature_bits={}\n",
             "opt_level={:?}\n",
             "verify={}\n",
             "verify_dispatch={:?}\n",
@@ -2997,6 +3070,8 @@ fn jit_lowering_compiler_config_bytes(
             "target_triple={}\n"
         ),
         jit_lowering_target(),
+        aarch64_isa_profile.canonical_name(),
+        aarch64_isa_profile.feature_bits(),
         config.opt_level,
         config.verify,
         config.verify_dispatch,
@@ -3027,14 +3102,56 @@ pub struct JitCompiler {
     cache_certificates: bool,
 }
 
+fn ensure_raw_jit_aarch64_isa(
+    functions: &[IrMachFunction],
+    host_profile: AArch64IsaProfile,
+) -> Result<(), JitError> {
+    for func in functions {
+        for &block_id in &func.block_order {
+            for &inst_id in &func.block(block_id).insts {
+                let inst = func.inst(inst_id);
+                let opcode = inst.opcode;
+                let required_feature = if aarch64_opcode_requires_lse(opcode)
+                    && !host_profile.permits_lse()
+                {
+                    Some("lse")
+                } else if aarch64_opcode_requires_dotprod(opcode) && !host_profile.permits_dotprod()
+                {
+                    Some("dotprod")
+                } else if aarch64_inst_requires_fp16(inst) && !host_profile.permits_fp16() {
+                    Some("fp16")
+                } else {
+                    None
+                };
+                if let Some(required_feature) = required_feature {
+                    return Err(JitError::RawJitIsaExtensionNotAdmitted {
+                        function: func.name.clone(),
+                        opcode,
+                        required_feature,
+                        host_profile: host_profile.canonical_name(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 impl JitCompiler {
     pub fn new(config: JitConfig) -> Self {
-        let profile_hooks =
-            if config.profile_hooks == ProfileHookMode::None && config.emit_entry_counters {
-                ProfileHookMode::CallCounts
-            } else {
-                config.profile_hooks
-            };
+        Self::new_with_aarch64_isa_profile(config, AArch64IsaProfile::for_host_jit())
+    }
+
+    /// Construct a raw JIT encoder with an already-resolved AArch64 profile.
+    ///
+    /// The typed [`crate::Compiler`] path uses this constructor so lowering,
+    /// reusable-artifact identity, and executable publication all consume the
+    /// same once-captured host capability snapshot.
+    pub(crate) fn new_with_aarch64_isa_profile(
+        config: JitConfig,
+        aarch64_isa_profile: AArch64IsaProfile,
+    ) -> Self {
+        let profile_hooks = config.effective_profile_hooks();
         Self {
             pipeline: Pipeline::new(PipelineConfig {
                 opt_level: config.opt_level,
@@ -3061,7 +3178,8 @@ impl JitCompiler {
                 // configured Pipeline first.
                 disabled_passes_override: None,
                 contains4_scanner_batch_rewrite_override: None,
-            }),
+            })
+            .with_aarch64_isa_profile(aarch64_isa_profile),
             profile_hooks,
             cache_certificates: config.cache_certificates,
         }
@@ -3160,6 +3278,8 @@ impl JitCompiler {
                 host_arch: std::env::consts::ARCH,
             });
         }
+
+        ensure_raw_jit_aarch64_isa(functions, self.pipeline.aarch64_isa_profile())?;
 
         if !sys::host_supported() {
             return Err(JitError::UnsupportedHost {
@@ -3716,8 +3836,11 @@ impl JitCompiler {
         #[cfg(feature = "verify")]
         let certificates: HashMap<String, crate::jit_cert::JitCertificate> =
             if self.pipeline.config.verify {
-                let compiler_config_bytes =
-                    jit_lowering_compiler_config_bytes(&self.pipeline.config, self.profile_hooks);
+                let compiler_config_bytes = jit_lowering_compiler_config_bytes(
+                    &self.pipeline.config,
+                    self.profile_hooks,
+                    self.pipeline.aarch64_isa_profile(),
+                );
                 // JIT-5: consult the process-global content-addressed
                 // certificate cache. The AArch64 JitCertificate path has the
                 // emitted machine bytes available at verify time, so the cache
@@ -4710,7 +4833,7 @@ impl ExecutableBuffer {
     /// and must not outlive it.
     ///
     /// This accessor exists for callers that need to persist the JIT'd code
-    /// to disk and replay it via [`publish_serialized_buffer`]; it is the
+    /// to disk and replay it via [`publish_serialized_buffer_for_target`]; it is the
     /// public counterpart of the internal `code_bytes` helper.
     pub fn code_slice(&self) -> &[u8] {
         self.code_bytes()
@@ -6599,7 +6722,7 @@ mod tests {
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     use trust_cg_ir::operand::MachOperand;
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-    use trust_cg_ir::regs::X0;
+    use trust_cg_ir::regs::{H0, H1, H2, X0};
 
     // Also compiled on x86_64: test_x86_compile_raw_rejects_untagged_aarch64_machir
     // feeds this AArch64-tagged function to the x86 JIT to check rejection.
@@ -6621,6 +6744,92 @@ mod tests {
         func.append_inst(entry, ret_id);
 
         func
+    }
+
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[test]
+    fn raw_jit_enforces_resolved_optional_isa_profile() {
+        let mut lse_func =
+            MachFunction::new("lse_required".to_string(), Signature::new(vec![], vec![]));
+        let entry = lse_func.entry;
+        let lse = lse_func.push_inst(MachInst::new(AArch64Opcode::Ldadd, vec![]));
+        lse_func.append_inst(entry, lse);
+
+        let err = ensure_raw_jit_aarch64_isa(
+            std::slice::from_ref(&lse_func),
+            AArch64IsaProfile::BASELINE,
+        )
+        .expect_err("a baseline host profile must reject raw LSE machine IR");
+        assert!(matches!(
+            err,
+            JitError::RawJitIsaExtensionNotAdmitted {
+                function,
+                opcode: AArch64Opcode::Ldadd,
+                required_feature: "lse",
+                host_profile,
+            } if function == "lse_required" && host_profile == "aarch64-isa-v1"
+        ));
+
+        ensure_raw_jit_aarch64_isa(std::slice::from_ref(&lse_func), AArch64IsaProfile::LSE)
+            .expect("an admitted LSE host profile accepts LSE machine IR");
+
+        let mut dotprod_func = MachFunction::new(
+            "dotprod_required".to_string(),
+            Signature::new(vec![], vec![]),
+        );
+        let entry = dotprod_func.entry;
+        let dotprod = dotprod_func.push_inst(MachInst::new(AArch64Opcode::NeonUdotV, vec![]));
+        dotprod_func.append_inst(entry, dotprod);
+
+        let err =
+            ensure_raw_jit_aarch64_isa(std::slice::from_ref(&dotprod_func), AArch64IsaProfile::LSE)
+                .expect_err("LSE admission must not accidentally admit DotProd");
+        assert!(matches!(
+            err,
+            JitError::RawJitIsaExtensionNotAdmitted {
+                opcode: AArch64Opcode::NeonUdotV,
+                required_feature: "dotprod",
+                ..
+            }
+        ));
+        ensure_raw_jit_aarch64_isa(
+            std::slice::from_ref(&dotprod_func),
+            AArch64IsaProfile::DOTPROD,
+        )
+        .expect("an admitted DotProd host profile accepts UDOT machine IR");
+
+        let mut fp16_func =
+            MachFunction::new("fp16_required".to_string(), Signature::new(vec![], vec![]));
+        let entry = fp16_func.entry;
+        let fp16 = fp16_func.push_inst(MachInst::new(
+            AArch64Opcode::FaddRR,
+            vec![
+                MachOperand::PReg(H0),
+                MachOperand::PReg(H1),
+                MachOperand::PReg(H2),
+            ],
+        ));
+        fp16_func.append_inst(entry, fp16);
+
+        let err = ensure_raw_jit_aarch64_isa(
+            std::slice::from_ref(&fp16_func),
+            AArch64IsaProfile::LSE_DOTPROD,
+        )
+        .expect_err("LSE and DotProd admission must not accidentally admit FP16");
+        assert!(matches!(
+            err,
+            JitError::RawJitIsaExtensionNotAdmitted {
+                opcode: AArch64Opcode::FaddRR,
+                required_feature: "fp16",
+                ..
+            }
+        ));
+        ensure_raw_jit_aarch64_isa(std::slice::from_ref(&fp16_func), AArch64IsaProfile::FP16)
+            .expect("an admitted FP16 host profile accepts scalar half arithmetic");
+
+        let ordinary = build_return_const_named("ordinary");
+        ensure_raw_jit_aarch64_isa(std::slice::from_ref(&ordinary), AArch64IsaProfile::BASELINE)
+            .expect("baseline hosts must continue accepting ordinary AArch64 machine IR");
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -9298,12 +9507,54 @@ mod tests {
         let code = jit7_sample_code();
         let mut symbol_offsets = HashMap::new();
         symbol_offsets.insert(symbol.to_string(), 0u64);
-        publish_serialized_buffer(
-            &code,
-            vec![symbol.to_string()],
-            symbol_offsets,
-            vec![(symbol.to_string(), 0..code.len() as u64)],
-        )
+        let target_contract = TargetDescriptor::for_trust_cg_host_jit();
+        // SAFETY: `jit7_sample_code` is a fixed reviewed host-native image;
+        // every symbol offset and range below is derived from its bounds.
+        unsafe {
+            publish_serialized_buffer_for_target(
+                &code,
+                vec![symbol.to_string()],
+                symbol_offsets,
+                vec![(symbol.to_string(), 0..code.len() as u64)],
+                &target_contract,
+            )
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serialized_publish_rejects_non_host_target_contract() {
+        if !sys::host_supported() {
+            return;
+        }
+        let host_contract = TargetDescriptor::for_trust_cg_host_jit();
+        let baseline_contract = TargetDescriptor::for_trust_cg_target_spec(
+            crate::target::TargetSpec::default_for_architecture(crate::target::Target::host()),
+        );
+        if baseline_contract == host_contract {
+            return;
+        }
+        let code = jit7_sample_code();
+        let symbol = "feature_contract_mismatch".to_owned();
+        let mut symbol_offsets = HashMap::new();
+        symbol_offsets.insert(symbol.clone(), 0);
+        // SAFETY: the fixed sample uses only baseline instructions, so it is
+        // valid for `baseline_contract`; publication must still reject because
+        // that is not the cache's exact live host contract.
+        let err = unsafe {
+            publish_serialized_buffer_for_target(
+                &code,
+                vec![symbol.clone()],
+                symbol_offsets,
+                vec![(symbol, 0..code.len() as u64)],
+                &baseline_contract,
+            )
+        }
+        .expect_err("serialized replay must bind the exact host target contract");
+        assert!(matches!(
+            err,
+            JitError::SerializedBufferTargetMismatch { .. }
+        ));
     }
 
     /// Happy path: the published buffer's hash accessor is bound to the

@@ -9,14 +9,27 @@
 # has NO translation-validation net — a wrong hoist miscompiles silently. Run
 # x2-consistent + at -O0/-O2/-O3 before flipping TCG_PURE_CALL_HOIST default-on.
 #
-# Usage: [OPT=3] .fuzz-purecall/run_purecall_differential.sh
+# Usage (from any cwd): [OPT=3] fuzz/repros/purecall/run_purecall_differential.sh
+#   TCG_BRIDGE_DYLIB  librustc_codegen_trust_cg.{so,dylib} to test (default: the
+#                     release build under crates/rustc-codegen-trust-cg/target/)
+#   TC                rustup toolchain for the bridge (default nightly-2026-04-20)
+#   TARGET            optional --target triple (default: host). The hoist is an
+#                     x86 lane (TCG_PURE_CALL_HOIST), so run on an x86_64 host.
 set -u
-WT=/tmp/fbatch-wt
-DYLIB="$WT/crates/rustc-codegen-trust-cg/target/release/librustc_codegen_trust_cg.dylib"
-TC=nightly-2026-04-20
-TARGET=x86_64-apple-darwin
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(git -C "$HERE" rev-parse --show-toplevel)" || { echo "FATAL: $HERE is not inside a git checkout" >&2; exit 2; }
+export PATH="$HOME/.cargo/bin:$PATH"
+TC="${TC:-nightly-2026-04-20}"
 OPT="${OPT:-3}"
-[[ -f "$DYLIB" ]] || { echo "FATAL: dylib not found: $DYLIB"; exit 2; }
+if [[ -n "${TCG_BRIDGE_DYLIB:-}" ]]; then
+  DYLIB="$TCG_BRIDGE_DYLIB"
+elif [[ -f "$ROOT/crates/rustc-codegen-trust-cg/target/release/librustc_codegen_trust_cg.so" ]]; then
+  DYLIB="$ROOT/crates/rustc-codegen-trust-cg/target/release/librustc_codegen_trust_cg.so"
+else
+  DYLIB="$ROOT/crates/rustc-codegen-trust-cg/target/release/librustc_codegen_trust_cg.dylib"
+fi
+[[ -f "$DYLIB" ]] || { echo "FATAL: dylib not found: $DYLIB (build the bridge --release, or set TCG_BRIDGE_DYLIB)" >&2; exit 2; }
+TARGET_FLAGS=(); [[ -n "${TARGET:-}" ]] && TARGET_FLAGS=(--target "$TARGET")
 
 link() { # <objdir> <bin>
   local od="$1" bin="$2"; local objs=("$od"/*.o)
@@ -33,27 +46,29 @@ link() { # <objdir> <bin>
 
 compile() { # <src> <hoist:0|1> <bin>
   local src="$1" hoist="$2" bin="$3"
-  local pre=(TCG_NO_PROOF_CERTS=1 TCG_PURE_FN_ANALYSIS=1)
+  local pre=(TCG_NO_PROOF_CERTS=1)
   [[ "$hoist" == 1 ]] && pre+=(TCG_PURE_CALL_HOIST=1)
   local od; od=$(mktemp -d)
   env "${pre[@]}" rustup run "$TC" rustc -Zcodegen-backend="$DYLIB" --edition=2021 \
-    --crate-type bin --target "$TARGET" -Cpanic=abort -Coverflow-checks=off \
+    --crate-type bin ${TARGET_FLAGS[@]+"${TARGET_FLAGS[@]}"} -Cpanic=abort -Coverflow-checks=off \
     -Ccodegen-units=1 -Copt-level="$OPT" --emit=obj -o "$od/o.o" "$src" \
     >/dev/null 2>/dev/null || { rm -rf "$od"; return 1; }
   link "$od" "$bin"; local rc=$?; rm -rf "$od"; return $rc
 }
 
-fail=0
-for src in "$WT"/.fuzz-purecall/pc*.rs; do
+fail=0; compared=0
+for src in "$HERE"/pc*.rs; do
   stem=$(basename "$src" .rs)
   b0=$(mktemp); b1=$(mktemp)
   if ! compile "$src" 0 "$b0"; then echo "$stem  OFF FAILCLOSED"; rm -f "$b0" "$b1"; continue; fi
   if ! compile "$src" 1 "$b1"; then echo "$stem  ON  FAILCLOSED"; rm -f "$b0" "$b1"; continue; fi
   "$b0" >/dev/null 2>&1; r0=$?
   "$b1" >/dev/null 2>&1; r1=$?
+  compared=$((compared+1))
   if [[ "$r0" == "$r1" ]]; then echo "$stem  OK   (exit=$r0, hoist on==off)";
   else echo "$stem  *** MISMATCH off=$r0 on=$r1 ***"; fail=1; fi
   rm -f "$b0" "$b1"
 done
-echo "=== $( [[ $fail == 0 ]] && echo 'ALL CONSISTENT' || echo 'MISMATCH — DO NOT LAND' ) (OPT=$OPT) ==="
+if [[ $compared == 0 ]]; then echo "=== NO PROGRAMS COMPARED (every compile failed closed) (OPT=$OPT) ==="; exit 2; fi
+echo "=== $( [[ $fail == 0 ]] && echo 'ALL CONSISTENT' || echo 'MISMATCH — DO NOT LAND' ) (OPT=$OPT, $compared compared) ==="
 exit $fail

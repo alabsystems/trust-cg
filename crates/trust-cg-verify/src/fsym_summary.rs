@@ -1751,6 +1751,10 @@ mod tests {
     #[test]
     fn ay_solver_proves_guarded_null_unknown_safe() {
         if !crate::ay_bridge::z3_available() {
+            crate::formal_gap::skip_test(
+                "ay_solver_proves_guarded_null_unknown_safe",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         let x = SmtExpr::var("x", 64);
@@ -1791,6 +1795,10 @@ mod tests {
     #[test]
     fn ay_solver_proves_symbolic_oob_safe() {
         if !crate::ay_bridge::z3_available() {
+            crate::formal_gap::skip_test(
+                "ay_solver_proves_symbolic_oob_safe",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         let offset = SmtExpr::var("i", 4);

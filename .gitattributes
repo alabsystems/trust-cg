@@ -4,3 +4,8 @@
 # embedded tier-0 verdict DB fails to parse on Windows (schema-line mismatch +
 # corrupted length framing), silently disabling the proof cache.
 *.vdb binary
+# The include_str!-embedded LRAT canary certificates and their manifest are
+# length-framed (`cnf <len>` / `drat <len>` / `smt2 <len>`) and SHA-256-pinned
+# by canary_certs/manifest.v1 for exactly the same reason.
+*.lratcert binary
+crates/trust-cg-verify/verdict_db/canary_certs/manifest.v1 binary

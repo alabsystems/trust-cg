@@ -35,7 +35,7 @@ fn build_add_module() -> trust_ir::Module {
     mb.build()
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", feature = "verify"))]
 fn build_covered_call_module() -> trust_ir::Module {
     let mut mb = ModuleBuilder::new("jit_covered_call_proof");
     let identity_ty = mb.add_func_type(vec![Ty::I64], vec![Ty::I64]);

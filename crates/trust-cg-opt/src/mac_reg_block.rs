@@ -161,6 +161,20 @@ fn dumping() -> bool {
     std::env::var("TRUST_CG_DUMP_MRB").is_ok()
 }
 
+/// Whether any live block contains the opcode every recognized MAC nest needs.
+///
+/// This is an exact no-fire prefilter: every accepted shape traces its address
+/// calculations and accumulated value through `Madd`, so without one the pass
+/// cannot change the function.  Looking only at `block_order` matches the
+/// recognizer's live-CFG scope; a dead-but-listed `Madd` may conservatively miss
+/// the shortcut, but can never cause a false decline.
+fn has_live_madd(func: &MachFunction) -> bool {
+    func.block_order
+        .iter()
+        .flat_map(|&block| func.block(block).insts.iter())
+        .any(|&inst| func.inst(inst).opcode == AArch64Opcode::Madd)
+}
+
 // ---------------------------------------------------------------------------
 // Pass
 // ---------------------------------------------------------------------------
@@ -190,6 +204,10 @@ impl MachinePass for MacRegBlock {
         if !mrb_enabled() {
             return false;
         }
+        if !has_live_madd(func) {
+            self.fired = 0;
+            return false;
+        }
         let dom = DomTree::compute(func);
         let loops = LoopAnalysis::compute(func, &dom);
         self.run_core(func, &dom, &loops)
@@ -197,6 +215,10 @@ impl MachinePass for MacRegBlock {
 
     fn run_with_analyses(&mut self, func: &mut MachFunction, analyses: &mut AnalysisCache) -> bool {
         if !mrb_enabled() {
+            return false;
+        }
+        if !has_live_madd(func) {
+            self.fired = 0;
             return false;
         }
         let loops = analyses.loop_analysis(func).clone();

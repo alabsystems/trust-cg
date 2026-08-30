@@ -8,8 +8,8 @@
 //! Trust can compile to WebAssembly through the experimental path
 //! `tRust → trust-ir → trust-cg → .wasm`. This backend consumes **trust-ir**
 //! directly (no new IR, no intermediate SSA) and emits a binary `.wasm` module.
-//! The current lowering and evidence limits are part of the v0.1.0 research
-//! boundary.
+//! The current lowering and evidence limits are part of the 0.x research
+//! boundary; this lane shipped in 0.5.0 (see CHANGELOG.md, [0.5.0]).
 //!
 //! Unlike the native targets, wasm is a stack machine with structured control
 //! flow and its own module format — so it deliberately bypasses register

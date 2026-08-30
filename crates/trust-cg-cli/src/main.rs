@@ -1455,47 +1455,12 @@ fn opt_level_name(level: OptLevel) -> &'static str {
     }
 }
 
-fn opt_level_num(level: OptLevel) -> u8 {
-    match level {
-        OptLevel::O0 => 0,
-        OptLevel::O1 => 1,
-        OptLevel::O2 => 2,
-        OptLevel::O3 => 3,
-    }
-}
-
-fn target_triple_for(target_spec: TargetSpec) -> String {
-    target_spec.with_default_os_abi().triple()
-}
-
-fn target_cpu_for(target: Target) -> &'static str {
-    match target {
-        Target::Aarch64 => "generic-aarch64",
-        Target::X86_64 => "generic-x86_64",
-        Target::Riscv64 => "generic-riscv64",
-    }
-}
-
-fn target_features_for(target: Target) -> Vec<String> {
-    match target {
-        Target::Aarch64 => vec!["+neon".to_string()],
-        Target::X86_64 => vec!["+sse2".to_string()],
-        Target::Riscv64 => Vec::new(),
-    }
-}
-
 fn pgo_cache_key(
     trust_ir_bytes: &[u8],
     config: &CompilerConfig,
     target_spec: TargetSpec,
 ) -> trust_cg_opt::CacheKey {
-    trust_cg_opt::CacheKey::new(
-        trust_cg_opt::stable_hash(trust_ir_bytes),
-        opt_level_num(config.opt_level),
-        target_triple_for(target_spec),
-        target_cpu_for(config.target).to_string(),
-        target_features_for(config.target),
-    )
+    trust_cg_codegen::pgo_cache_key(trust_ir_bytes, config, target_spec)
 }
 
 fn canonical_compiler_config_bytes(config: &CompilerConfig, target_spec: TargetSpec) -> Vec<u8> {

@@ -675,6 +675,10 @@ fn op_requires_impurity_nonce(inst: &X86ISelInst, acc: &InstAccess) -> bool {
         | MovdquMR | MovdqaMR | Lea | LeaSib | LeaRip => false,
         // Conservative default: any other memory-shaped operand is read as a
         // value; pure register/immediate forms stay identity-free.
+        // (RolRCl deliberately rides this default exactly like ShlRR/ShrRR/
+        // SarRR: a pure register op whose value event is a function of its
+        // tied register and the implicit-CL lane read the classifier reports
+        // — no memory value, no nonce.)
         _ => has_memory_operand(inst),
     }
 }

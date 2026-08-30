@@ -27,6 +27,7 @@ fn make_config(cache: Option<Arc<dyn CacheBackend>>, budget_sec: u64) -> CegisSu
         cpu: "apple-m1".to_string(),
         features: vec!["neon".to_string(), "fp-armv8".to_string()],
         opt_level: 2,
+        search_schedule: Default::default(),
         cache,
         trace: None,
     }

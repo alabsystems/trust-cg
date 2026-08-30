@@ -2148,8 +2148,13 @@ fn verify_with_cli_smt2(obligation: &ProofObligation, config: &AYConfig, smt2: &
     // ONLY after an INDEPENDENT Carcara re-check confirms it refutes THIS exact
     // SMT2 under THIS solver identity, in this process — strictly stronger than
     // the live ay verdict it replaces, and never a weaker one (any
-    // miss/binding-mismatch/tamper/absent-checker falls through). Inert unless
-    // `TCG_PROOF_CERT_STORE` is set; suppressed while recording.
+    // miss/binding-mismatch/tamper/absent-checker falls through). ON by
+    // default: the store lives at `TCG_PROOF_CERT_STORE` if set, else the
+    // per-box `$XDG_CACHE_HOME`/`$HOME/.cache` `trust-cg/alethe-certs` dir;
+    // `TCG_NO_CERT_STORE` or `TCG_NO_PROOF_CACHE` turns it off (precedence in
+    // `obligation_cert_store::store_dir_from`). Suppressed while recording:
+    // `alethe_cert_skip_verified` and `mint_alethe_cert` bail on
+    // `verdict_db::recording_active()`.
     if let Some(key) = &cache_key
         && crate::obligation_cert_store::alethe_cert_skip_verified(key, &solver_path, smt2)
     {
@@ -2200,10 +2205,13 @@ fn verify_with_cli_smt2(obligation: &ProofObligation, config: &AYConfig, smt2: &
                 };
                 if let (Some(key), AYResult::Verified) = (&cache_key, &result) {
                     session_proof_cache_store_verified(key);
-                    // MINT-ON-MISS (opt-in, off the hot path): persist an
-                    // independently-Carcara-verified Alethe cert so the next
-                    // identical compile can skip this live solve. No-op unless
-                    // `TCG_PROOF_CERT_STORE` is set; verifies before writing.
+                    // MINT-ON-MISS (on by default, off the hot path): persist
+                    // an independently-Carcara-verified Alethe cert so the
+                    // next identical compile can skip this live solve. No-op
+                    // when the store is off (`TCG_NO_CERT_STORE` /
+                    // `TCG_NO_PROOF_CACHE`), while recording, when the cert
+                    // already exists, or when no capable Carcara checker
+                    // resolves; verifies before writing.
                     crate::obligation_cert_store::mint_alethe_cert(
                         key,
                         &solver_path,
@@ -5860,6 +5868,10 @@ mod tests {
         // Skip if no solver binary available
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_cli_verify_correct_rule",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return; // No solver available, skip test
         }
 
@@ -5887,6 +5899,10 @@ mod tests {
         // Skip if no solver binary available
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_cli_verify_wrong_rule",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         // a + b != a - b (should find counterexample)
@@ -5912,6 +5928,10 @@ mod tests {
     fn test_cli_verify_iadd_i32() {
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_cli_verify_iadd_i32",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -5925,6 +5945,10 @@ mod tests {
     fn test_cli_verify_peephole_add_zero() {
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_cli_verify_peephole_add_zero",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -6173,6 +6197,10 @@ mod tests {
         // Integration test: verify store-load roundtrip with the AY CLI.
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_cli_verify_memory_roundtrip_i8",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return; // No solver available, skip test
         }
 
@@ -6659,6 +6687,10 @@ mod tests {
     fn test_verify_with_ay_cli_trivial_correct() {
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_verify_with_ay_cli_trivial_correct",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -6683,6 +6715,10 @@ mod tests {
     fn test_verify_with_ay_cli_trivial_wrong() {
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_verify_with_ay_cli_trivial_wrong",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -6717,6 +6753,10 @@ mod tests {
     fn test_selected_ay_protocol_unsat_sat_unknown_and_timeout_are_clean() {
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_selected_ay_protocol_unsat_sat_unknown_and_timeout_are_clean",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         let Some(checker) = crate::obligation_cert_store::clean_checker_path() else {
@@ -7587,6 +7627,10 @@ mod tests {
         // through AY if available.
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_serialize_to_smt2_roundtrip_with_solver",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -7647,6 +7691,10 @@ mod tests {
     fn test_verify_with_ay_cli_with_preconditions() {
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_verify_with_ay_cli_with_preconditions",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -7675,6 +7723,10 @@ mod tests {
     fn test_verify_with_ay_cli_negation_rule() {
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_verify_with_ay_cli_negation_rule",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -7700,6 +7752,10 @@ mod tests {
     fn test_verify_with_ay_cli_bitwise_identity() {
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_verify_with_ay_cli_bitwise_identity",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -7733,6 +7789,10 @@ mod tests {
     fn test_verify_with_ay_cli_extract_zeroext_identity() {
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_verify_with_ay_cli_extract_zeroext_identity",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -7814,6 +7874,10 @@ mod tests {
     fn test_ay_batch_verify_arithmetic_proofs() {
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_ay_batch_verify_arithmetic_proofs",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -7857,6 +7921,10 @@ mod tests {
     fn test_ay_batch_verify_comparison_proofs() {
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_ay_batch_verify_comparison_proofs",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -7892,6 +7960,10 @@ mod tests {
     fn test_ay_batch_verify_branch_proofs() {
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_ay_batch_verify_branch_proofs",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -7924,6 +7996,10 @@ mod tests {
     fn test_ay_batch_verify_peephole_proofs() {
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_ay_batch_verify_peephole_proofs",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -7996,6 +8072,10 @@ mod tests {
     fn test_ay_verify_all_batch_and_summary() {
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_ay_verify_all_batch_and_summary",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -8108,6 +8188,10 @@ mod tests {
     fn test_ay_batch_verify_load_store_proofs() {
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_ay_batch_verify_load_store_proofs",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -8144,6 +8228,10 @@ mod tests {
     fn test_ay_batch_verify_bitwise_shift_proofs() {
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_ay_batch_verify_bitwise_shift_proofs",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -8199,6 +8287,10 @@ mod tests {
         timeout_ms: u64,
     ) {
         if !z3_available() {
+            crate::formal_gap::skip_test(
+                &format!("verify_category_batch({category:?})"),
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -8263,6 +8355,10 @@ mod tests {
     fn test_ay_verify_div_guard_collapse_proofs() {
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_ay_verify_div_guard_collapse_proofs",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -8339,6 +8435,10 @@ mod tests {
     #[test]
     fn test_ay_batch_verify_cse_licm_proofs() {
         if !z3_available() {
+            crate::formal_gap::skip_test(
+                "test_ay_batch_verify_cse_licm_proofs",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -8415,6 +8515,10 @@ mod tests {
     fn test_ay_batch_verify_neon_lanewise_compute_proofs() {
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_ay_batch_verify_neon_lanewise_compute_proofs",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -8479,6 +8583,10 @@ mod tests {
     fn test_ay_batch_verify_neon_fp_lanewise_proofs() {
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_ay_batch_verify_neon_fp_lanewise_proofs",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -8543,6 +8651,10 @@ mod tests {
     fn test_ay_batch_verify_neon_fpred_lane_proofs() {
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_ay_batch_verify_neon_fpred_lane_proofs",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -8608,6 +8720,10 @@ mod tests {
     fn test_ay_batch_verify_neon_fmla_lane_proofs() {
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_ay_batch_verify_neon_fmla_lane_proofs",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -8671,6 +8787,10 @@ mod tests {
     fn test_ay_batch_verify_neon_fcvtl_lane_proofs() {
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_ay_batch_verify_neon_fcvtl_lane_proofs",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -8745,6 +8865,10 @@ mod tests {
     fn test_ay_batch_verify_x86_rol_proofs() {
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_ay_batch_verify_x86_rol_proofs",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         let _batch_lock = ay_batch_test_lock();
@@ -8791,6 +8915,10 @@ mod tests {
     fn test_ay_batch_verify_eor_ror_shift_proofs() {
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_ay_batch_verify_eor_ror_shift_proofs",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -8848,6 +8976,10 @@ mod tests {
     fn test_ay_verify_umull_widening() {
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_ay_verify_umull_widening",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -8899,6 +9031,10 @@ mod tests {
 
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_ay_verify_eor_lsl_lsr_reconstruction",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         let _batch_lock = ay_batch_test_lock();
@@ -8971,6 +9107,10 @@ mod tests {
 
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_ay_verify_symbolic_ubfx_encoding_and_refute_off_by_one",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
         let _batch_lock = ay_batch_test_lock();
@@ -9025,6 +9165,10 @@ mod tests {
     fn test_ay_batch_verify_fcsel_proofs() {
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_ay_batch_verify_fcsel_proofs",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -9089,6 +9233,10 @@ mod tests {
     fn test_ay_batch_verify_neon_umov_lane_proofs() {
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_ay_batch_verify_neon_umov_lane_proofs",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -9150,6 +9298,10 @@ mod tests {
     fn test_ay_batch_verify_neon_lanewise_compute_proofs_2d() {
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_ay_batch_verify_neon_lanewise_compute_proofs_2d",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -9210,6 +9362,10 @@ mod tests {
     fn test_ay_batch_verify_neon_saddlp_proofs() {
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_ay_batch_verify_neon_saddlp_proofs",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -9268,6 +9424,10 @@ mod tests {
     fn test_ay_batch_verify_neon_bit_proofs() {
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_ay_batch_verify_neon_bit_proofs",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -9320,6 +9480,10 @@ mod tests {
     fn test_ay_batch_verify_neon_popcount_proofs() {
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_ay_batch_verify_neon_popcount_proofs",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -9379,6 +9543,10 @@ mod tests {
     fn test_ay_batch_verify_neon_abs_proofs() {
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_ay_batch_verify_neon_abs_proofs",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -9438,6 +9606,10 @@ mod tests {
     fn test_ay_batch_verify_neon_udot_proofs() {
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_ay_batch_verify_neon_udot_proofs",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -9497,6 +9669,10 @@ mod tests {
     fn test_ay_batch_verify_neon_rev64_proofs() {
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_ay_batch_verify_neon_rev64_proofs",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -9555,6 +9731,10 @@ mod tests {
     fn test_ay_batch_verify_neon_ext_proofs() {
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_ay_batch_verify_neon_ext_proofs",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -9632,6 +9812,10 @@ mod tests {
     #[test]
     fn test_ay_batch_verify_constant_materialization_proofs() {
         if !z3_available() {
+            crate::formal_gap::skip_test(
+                "test_ay_batch_verify_constant_materialization_proofs",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -9763,6 +9947,10 @@ mod tests {
     fn test_ay_verify_tst_packed_nzcv_proofs() {
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_ay_verify_tst_packed_nzcv_proofs",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -9797,6 +9985,10 @@ mod tests {
     #[test]
     fn test_ay_batch_verify_gvn_proofs() {
         if !z3_available() {
+            crate::formal_gap::skip_test(
+                "test_ay_batch_verify_gvn_proofs",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -9867,6 +10059,10 @@ mod tests {
     #[test]
     fn test_ay_batch_verify_fp_conversion_proofs() {
         if !z3_available() {
+            crate::formal_gap::skip_test(
+                "test_ay_batch_verify_fp_conversion_proofs",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -9943,6 +10139,10 @@ mod tests {
     #[test]
     fn test_ay_batch_verify_atomic_proofs() {
         if !z3_available() {
+            crate::formal_gap::skip_test(
+                "test_ay_batch_verify_atomic_proofs",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -10056,6 +10256,10 @@ mod tests {
     fn test_ay_batch_verify_all_categories_comprehensive() {
         run_with_ay_batch_stack(|| {
             if !z3_available() {
+                crate::formal_gap::skip_test(
+                    "test_ay_batch_verify_all_categories_comprehensive",
+                    crate::formal_gap::NO_PROOF_AUTHORITY,
+                );
                 return;
             }
 
@@ -10355,6 +10559,10 @@ mod tests {
     #[test]
     fn test_verify_proof_database_with_ay_arithmetic_subset() {
         if !z3_available() {
+            crate::formal_gap::skip_test(
+                "test_verify_proof_database_with_ay_arithmetic_subset",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -10448,6 +10656,10 @@ mod tests {
         // This is the fundamental array axiom: read-after-write returns the written value.
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_cli_verify_array_store_load_roundtrip",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -10485,6 +10697,10 @@ mod tests {
         // This is the second array axiom: write at address a doesn't affect reads at b.
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_cli_verify_array_store_load_different_addr",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -10533,6 +10749,10 @@ mod tests {
         // Overwriting the same address with a new value: last write wins.
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_cli_verify_array_double_store",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -10575,6 +10795,10 @@ mod tests {
         // Verify: select(const_array(0), any_addr) == 0
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_cli_verify_array_const_array_select",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -10647,6 +10871,10 @@ mod tests {
         // the simpler identity: fp.add(RNE, a, a) == fp.add(RNE, a, a)
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_cli_verify_fp_add_identity",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -10680,6 +10908,10 @@ mod tests {
         // Verify: fp.neg(fp.neg(x)) == x for symbolic FP64
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_cli_verify_fp_neg_double",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -10714,6 +10946,10 @@ mod tests {
         // Verify: fp.sub(RNE, a, b) == fp.add(RNE, a, fp.neg(b)) for concrete values
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_cli_verify_fp_sub_as_add_neg",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -10749,6 +10985,10 @@ mod tests {
         // Verify: fp.mul(RNE, a, b) == fp.mul(RNE, b, a) for concrete values
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_cli_verify_fp_mul_commutative",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -10832,6 +11072,10 @@ mod tests {
         // bitvector encoding tractable.
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_cli_verify_fp_symbolic_add_commutative_fp16",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -10858,6 +11102,10 @@ mod tests {
         // a concrete non-zero value to make this clean.
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_cli_verify_fp_neg_self_not_identity",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -10890,6 +11138,10 @@ mod tests {
         // AY is the sole solver: gate on AY availability and discharge the FP
         // roundtrip through AY (z3 has been removed from selection entirely).
         if find_solver_binary().is_empty() {
+            crate::formal_gap::skip_test(
+                "test_cli_verify_fp_roundtrip_prefers_fp_safe_solver",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -10915,6 +11167,10 @@ mod tests {
         // AY is the sole solver: gate on AY availability and discharge the FP
         // roundtrip through AY (z3 has been removed from selection entirely).
         if find_solver_binary().is_empty() {
+            crate::formal_gap::skip_test(
+                "test_cli_verify_fp16_roundtrip_prefers_fp_safe_solver",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -10936,6 +11192,10 @@ mod tests {
         // AY is the sole solver: gate on AY availability and discharge the FP
         // roundtrip through AY (z3 has been removed from selection entirely).
         if find_solver_binary().is_empty() {
+            crate::formal_gap::skip_test(
+                "test_cli_verify_fp64_roundtrip_prefers_fp_safe_solver",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -10957,6 +11217,10 @@ mod tests {
         // AY is the sole solver: gate on AY availability and discharge the FP
         // roundtrip through AY (z3 has been removed from selection entirely).
         if find_solver_binary().is_empty() {
+            crate::formal_gap::skip_test(
+                "test_cli_verify_unsigned_fp16_roundtrip_prefers_fp_safe_solver",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -10978,6 +11242,10 @@ mod tests {
         // AY is the sole solver: gate on AY availability and discharge the FP
         // roundtrip through AY (z3 has been removed from selection entirely).
         if find_solver_binary().is_empty() {
+            crate::formal_gap::skip_test(
+                "test_cli_verify_unsigned_fp64_roundtrip_prefers_fp_safe_solver",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -10999,6 +11267,10 @@ mod tests {
         // AY is the sole solver: gate on AY availability and discharge the FP
         // roundtrip through AY (z3 has been removed from selection entirely).
         if find_solver_binary().is_empty() {
+            crate::formal_gap::skip_test(
+                "test_cli_verify_unsigned_fp_roundtrip_prefers_fp_safe_solver",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -11099,6 +11371,10 @@ mod tests {
         // This should be trivially true by reflexivity.
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_cli_verify_uf_equality",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -11475,6 +11751,10 @@ mod tests {
         // Integration test: verify the expanded-quantifier memset proof through AY.
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_cli_verify_expanded_memset",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -11493,6 +11773,10 @@ mod tests {
     fn test_cli_verify_expanded_buffer_init() {
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_cli_verify_expanded_buffer_init",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -11511,6 +11795,10 @@ mod tests {
     fn test_cli_verify_expanded_memcpy() {
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_cli_verify_expanded_memcpy",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -11530,6 +11818,10 @@ mod tests {
         // Verify array operations with 32-bit indices (common for memory models)
         let solver = find_solver_binary();
         if solver.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_cli_verify_array_32bit_index",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 
@@ -11836,6 +12128,10 @@ mod tests {
                 solver.is_empty(),
                 "AY without an independent proof checker is not proof authority"
             );
+            crate::formal_gap::skip_test(
+                "test_find_solver_binary_requires_checker_and_prefers_trust_toolchain_ay",
+                crate::formal_gap::NO_CLEAN_CHECKER,
+            );
             return;
         }
         if let Some(toolchain_ay) = trust_toolchain_solver() {
@@ -11973,6 +12269,10 @@ mod tests {
         // solver, so use the AY binary as the fixture.
         let solver_path = find_solver_binary();
         if solver_path.is_empty() {
+            crate::formal_gap::skip_test(
+                "test_solver_route_summary_for_forced_solver_path_includes_config_override",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
             return;
         }
 

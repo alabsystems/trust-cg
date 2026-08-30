@@ -67,13 +67,13 @@ pub const LLVM_STACK_PROTECTOR_REQUIRED_FUNCTION_ATTR_TAG: u32 = 0x0053_5351;
 
 /// Reserved trust_ir custom proof tag ("LMP") the LLVM IR importer attaches to
 /// a BODYLESS EXTERNAL libm declaration (e.g. `asin`) it synthesized while
-/// rewriting `llvm.<fn>.f64/.f32` math intrinsics to libm calls, WHEN the
-/// importer proved the license: every direct call to that symbol in the module
-/// originated from such an intrinsic, the intrinsic's declared attribute set
-/// carries `speculatable willreturn nounwind memory(none)`, the symbol is not
-/// defined in the module, and its address is never taken. The adapter turns
-/// this into per-call-name `libm_pure_callees`, which AArch64 ISel stamps onto
-/// the emitted `Bl` as `InstFlags::LIBM_PURE_CALL` (metadata only).
+/// rewriting `llvm.<fn>.f64/.f32` math intrinsics to libm calls.
+///
+/// The tag is public, producer-constructible report metadata. It cannot by
+/// itself authorize call motion or elimination. The adapter keeps the tag
+/// stable for importer/report compatibility, but withholds it from
+/// `libm_pure_callees` until an importer-issued, module-bound capability can be
+/// validated here.
 pub const LLVM_LIBM_PURE_FUNCTION_ATTR_TAG: u32 = 0x004C_4D50;
 
 const IMPORTED_STACK_PROTECTOR_BUFFER_BYTES: u32 = 8;
@@ -2648,7 +2648,7 @@ struct TrustIrAdapter<'a> {
     /// sequence rather than an opaque pointer.
     materialized_sequence_values: HashSet<ValueId>,
 
-    /// Set of trust_ir `FuncId`s whose source function is `ProofAnnotation::Pure`.
+    /// Set of trust_ir `FuncId`s whose bodies pass structural purity analysis.
     ///
     /// Precomputed from the trust_ir module once so each `Inst::Call` translation
     /// can record the callee name in `pure_callees` without re-scanning.
@@ -2663,16 +2663,16 @@ struct TrustIrAdapter<'a> {
     /// by `translate()` so the ISel pipeline can propagate
     /// `ProofAnnotation::Pure` onto the emitted `Bl` MachInst (#456).
     pure_callees: HashSet<String>,
-    /// Set of trust_ir `FuncId`s that are BODYLESS EXTERNAL libm declarations
-    /// carrying the importer's `LLVM_LIBM_PURE_FUNCTION_ATTR_TAG` custom proof
-    /// (intrinsic-origin purity license). Precomputed once per module by
-    /// `collect_libm_pure_func_ids`; shared (`Rc`) like `pure_func_ids`.
+    /// Set of bodyless external function IDs carrying validated libm-purity
+    /// authority. Empty until an importer-bound authority carrier exists;
+    /// `LLVM_LIBM_PURE_FUNCTION_ATTR_TAG` alone is report metadata. Precomputed
+    /// once per module by `collect_libm_pure_func_ids`; shared (`Rc`) like
+    /// `pure_func_ids`.
     libm_pure_func_ids: Rc<HashSet<FuncId>>,
-    /// Names of direct-call callees licensed libm-pure (see
-    /// `LLVM_LIBM_PURE_FUNCTION_ATTR_TAG`). Populated during `Inst::Call`
-    /// translation; merged into `Function::libm_pure_callees` by `translate()`
-    /// so AArch64 ISel can stamp the emitted `Bl` with
-    /// `InstFlags::LIBM_PURE_CALL` (metadata only).
+    /// Names of direct-call callees carrying validated libm-purity authority.
+    /// Populated during `Inst::Call` translation; merged into
+    /// `Function::libm_pure_callees` by `translate()` so AArch64 ISel can stamp
+    /// the emitted `Bl` with `InstFlags::LIBM_PURE_CALL`.
     libm_pure_callees: HashSet<String>,
     /// Exception-handling structure accumulated from `Inst::Invoke` /
     /// `Inst::LandingPad`. Merged into `Function::eh_info` by `translate()` so
@@ -2782,8 +2782,8 @@ impl<'a> TrustIrAdapter<'a> {
         self.pure_func_ids = ids;
     }
 
-    /// Seed the set of trust_ir `FuncId`s that are importer-licensed libm-pure
-    /// external declarations (see `LLVM_LIBM_PURE_FUNCTION_ATTR_TAG`).
+    /// Seed the set of trust_ir `FuncId`s carrying validated libm-purity
+    /// authority. Raw custom tags never enter this set.
     fn seed_libm_pure_function_ids(&mut self, ids: Rc<HashSet<FuncId>>) {
         self.libm_pure_func_ids = ids;
     }
@@ -5053,8 +5053,8 @@ impl<'a> TrustIrAdapter<'a> {
         // targeting these callees with `ProofAnnotation::Pure`.
         lir_func.pure_callees = self.pure_callees.clone();
 
-        // Propagate importer-licensed libm-pure callee names so AArch64 ISel
-        // can stamp the emitted `Bl` with `InstFlags::LIBM_PURE_CALL`.
+        // Propagate validated libm-pure callee names so AArch64 ISel can stamp
+        // the emitted `Bl` with `InstFlags::LIBM_PURE_CALL`.
         lir_func.libm_pure_callees = self.libm_pure_callees.clone();
 
         // Propagate exception-handling structure (Invoke/LandingPad) so ISel
@@ -7450,9 +7450,10 @@ impl<'a> TrustIrAdapter<'a> {
                 if self.pure_func_ids.contains(callee) {
                     self.pure_callees.insert(callee_name.clone());
                 }
-                // Importer-licensed libm-pure external callees (intrinsic-origin
-                // math calls; see `LLVM_LIBM_PURE_FUNCTION_ATTR_TAG`). Disjoint
-                // from `pure_func_ids` (which excludes bodyless externals).
+                // Extern callees carrying validated libm-purity authority.
+                // Disjoint from `pure_func_ids` (which excludes bodyless
+                // externals); currently empty because raw Custom tags are not
+                // authority.
                 if self.libm_pure_func_ids.contains(callee) {
                     self.libm_pure_callees.insert(callee_name.clone());
                 }
@@ -16400,60 +16401,37 @@ fn is_stack_pointer_readonly_intrinsic(name: &str) -> bool {
         || name.starts_with("llvm.lifetime.end")
 }
 
-/// Collect trust_ir `FuncId`s whose source functions are proven `Pure`.
+/// Collect trust_ir `FuncId`s whose bodies are structurally pure.
 ///
-/// Uses the trust_ir-level `Function::is_pure()` helper (rev 1357fbd) which
-/// checks for `ProofAnnotation::Pure` in each function's proof list.
-/// Called once per module so each `Inst::Call` translation can cheaply
-/// tag direct calls to pure callees. #456.
+/// A raw function-level `ProofAnnotation::Pure` is a producer claim, not
+/// replayed, module-bound authority. It is deliberately ignored here so a
+/// forged or stale annotation cannot make calls hoistable. Called once per
+/// module so each `Inst::Call` translation can cheaply tag direct calls to
+/// structurally pure callees. #456.
 fn collect_pure_func_ids(module: &TrustIrModule) -> HashSet<FuncId> {
-    let mut ids: HashSet<FuncId> = module
-        .functions
-        .iter()
-        .filter(|f| !is_bodyless_external_declaration(f))
-        .filter(|f| function_is_pure(f))
-        .map(|f| f.id)
-        .collect();
-
     // Structural purity inference (#pure-call-hoist Piece 1). The rustc frontend
     // does NOT annotate user functions `ProofAnnotation::Pure` — that annotation
     // only arrives on Clean/GPU-sourced trust-ir. So a genuinely pure user
     // function (e.g. a recursive `ack(m,n)` whose result depends only on its
     // args) is invisible to the pure-callee pipeline. This fixpoint recovers it
     // structurally, feeding the x86 pure-call LICM hoist (and, on the
-    // generic/aarch64 path, proof_opts `apply_pure` flag-refinement). Default ON
-    // (opt-out `TCG_NO_PURE_FN_ANALYSIS`) after the differential-fuzz campaign
-    // (354 program-pairs baseline-vs-on, 0 mismatch, x2, all opt levels).
-    if std::env::var_os("TCG_NO_PURE_FN_ANALYSIS").is_none() {
-        ids.extend(compute_structural_pure_func_ids(module));
-    }
-    ids
+    // generic/aarch64 path, proof_opts `apply_pure` flag-refinement). This
+    // module-derived result is unconditional so identical module/compiler inputs
+    // cannot receive different purity authority from process environment state.
+    compute_structural_pure_func_ids(module)
 }
 
-/// Collect trust_ir `FuncId`s of BODYLESS EXTERNAL declarations the LLVM
-/// importer licensed libm-pure (carry
-/// `ProofAnnotation::Custom(LLVM_LIBM_PURE_FUNCTION_ATTR_TAG)`).
+/// Collect bodyless libm declarations carrying independently validated purity
+/// authority.
 ///
-/// Fail-closed on both axes: a function with a body NEVER qualifies (the tag
-/// is only meaningful on the importer-synthesized external libm stub), and a
-/// bodyless external without the tag never qualifies. Disjoint from
-/// `collect_pure_func_ids`, which EXCLUDES bodyless externals.
-fn collect_libm_pure_func_ids(module: &TrustIrModule) -> HashSet<FuncId> {
-    module
-        .functions
-        .iter()
-        .filter(|f| is_bodyless_external_declaration(f))
-        .filter(|f| {
-            f.proofs.iter().any(|annotation| {
-                matches!(
-                    annotation,
-                    ProofAnnotation::Custom(tag)
-                        if tag.index() == LLVM_LIBM_PURE_FUNCTION_ATTR_TAG
-                )
-            })
-        })
-        .map(|f| f.id)
-        .collect()
+/// No such authority carrier exists yet. A raw
+/// `ProofAnnotation::Custom(LLVM_LIBM_PURE_FUNCTION_ATTR_TAG)` is forgeable by
+/// every frontend, so accepting it would let an arbitrary effectful external
+/// acquire `LIBM_PURE_CALL` and enter `loop-dead-pure-sink`. Fail closed until
+/// this function receives and validates an importer-issued, module-bound
+/// capability rather than reading annotation membership.
+fn collect_libm_pure_func_ids(_module: &TrustIrModule) -> HashSet<FuncId> {
+    HashSet::new()
 }
 
 /// Fail-closed whitelist: is this instruction free of observable side effects
@@ -16499,19 +16477,17 @@ fn inst_is_locally_pure_nonaccess(inst: &Inst) -> bool {
 ///
 /// A function is pure iff every instruction is either locally pure (see
 /// [`inst_is_locally_pure_nonaccess`]) or a direct `Call` to another pure
-/// function. `CallIndirect`, any call to a bodyless external / unknown callee,
+/// function. `CallIndirect`, any call to a bodyless declaration / unknown callee,
 /// and any impure instruction demote it. Recursion is handled by the optimistic
 /// start (all bodied functions begin pure; only genuine impurity demotes), so a
 /// self- or mutually-recursive pure function converges pure.
 fn compute_structural_pure_func_ids(module: &TrustIrModule) -> HashSet<FuncId> {
     let debug = std::env::var_os("TCG_PURE_FN_DEBUG").is_some();
-    // Candidate set = bodied, non-external functions. A call to anything outside
-    // this set (external declaration, unknown FuncId) is treated as impure.
-    let candidates: Vec<&TrustIrFunction> = module
-        .functions
-        .iter()
-        .filter(|f| !is_bodyless_external_declaration(f))
-        .collect();
+    // Candidate set = every function with a body. Every declaration is excluded
+    // regardless of linkage or summary; a call to anything outside this set is
+    // treated as impure.
+    let candidates: Vec<&TrustIrFunction> =
+        module.functions.iter().filter(|f| f.has_body()).collect();
     let candidate_ids: HashSet<FuncId> = candidates.iter().map(|f| f.id).collect();
     // Optimistic: every candidate starts pure.
     let mut pure: HashSet<FuncId> = candidate_ids.clone();
@@ -17640,9 +17616,10 @@ pub fn extract_proof_metadata(node: &InstrNode) -> ExtractedProofMetadata {
 
 /// Extract function-level proof annotations from a trust_ir function.
 ///
-/// Function-level proofs describe properties of the entire function
-/// (e.g., "this function is pure" or "this function's operation is
-/// commutative"). These are stored in `ProofContext::function_proofs`.
+/// Translatable function-level proofs describe properties of the entire
+/// function (for example, that its operation is commutative) and are stored in
+/// `ProofContext::function_proofs`. Raw `Pure` is deliberately not translated
+/// because it is a producer claim rather than replayed authority.
 pub fn extract_function_proofs(func: &TrustIrFunction) -> Vec<Proof> {
     extract_function_proof_metadata(func).proofs
 }
@@ -17673,11 +17650,12 @@ pub fn module_proof_summary(module: &TrustIrModule) -> trust_ir::ProofSummary {
     module.proof_summary()
 }
 
-/// Check if a trust_ir function is annotated as pure (no side effects).
+/// Check if a trust_ir function carries a raw `Pure` claim.
 ///
 /// Delegates to trust_ir's `Function::is_pure()` method (added in trust_ir rev 1357fbd),
 /// which checks for `ProofAnnotation::Pure` in the function's proof annotations.
-/// Pure functions can be safely dispatched to GPU/ANE for cross-target synthesis.
+/// This report-only query does not authorize optimization or cross-target
+/// dispatch; the adapter derives call purity from the function body instead.
 pub fn function_is_pure(func: &TrustIrFunction) -> bool {
     func.is_pure()
 }
@@ -17763,7 +17741,9 @@ fn source_spanned_value_debug_local(
 /// NoOverflow, Commutative, Associative, Deterministic, ValidBorrow.
 ///
 /// Returns translated `Proof` values (adapter-internal representation) for
-/// only the GPU-relevant subset of the instruction's proof annotations.
+/// only the GPU-relevant subset of the instruction's proof annotations. Raw
+/// `Pure` claims are intentionally withheld by the translator until an exact
+/// authorization carrier exists.
 pub fn gpu_relevant_proofs(node: &InstrNode) -> Vec<Proof> {
     node.proofs
         .iter()
@@ -18033,7 +18013,12 @@ fn translate_trust_ir_proof(p: &ProofAnnotation) -> Option<Proof> {
         // op never wraps") and licenses overflow-check elision and range
         // reasoning that are unsound for intentionally-wrapping ops.
         ProofAnnotation::Wrapping => None,
-        ProofAnnotation::Pure => Some(Proof::Pure),
+        // Raw `Pure` is a producer claim with no replayed, module-bound
+        // authority. Keep it in trust_ir for reporting, but never translate it
+        // into behavior-authorizing Trust Codegen proof metadata. Function-call
+        // purity is independently recovered by the fail-closed structural
+        // fixpoint in `compute_structural_pure_func_ids`.
+        ProofAnnotation::Pure => None,
         ProofAnnotation::Terminates => None,
         ProofAnnotation::Deterministic => None,
         ProofAnnotation::Associative => Some(Proof::Associative),
@@ -29199,7 +29184,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_extract_function_proofs_pure() {
+    fn test_raw_function_pure_is_not_translated() {
         let func = TrustIrFunc {
             summary: None,
             producer: None,
@@ -29232,9 +29217,10 @@ mod tests {
 
         let module = make_module_for_func(&func);
         let (_, proof_ctx) = translate_func_test(&func, &module).unwrap();
-        assert!(proof_ctx.is_function_pure());
+        assert!(!proof_ctx.is_function_pure());
         assert!(!proof_ctx.is_function_associative());
         assert!(!proof_ctx.is_function_commutative());
+        assert!(proof_ctx.function_proofs().is_empty());
     }
 
     #[test]
@@ -29290,11 +29276,11 @@ mod tests {
 
         let module = make_module_for_func(&func);
         let (_, proof_ctx) = translate_func_test(&func, &module).unwrap();
-        assert!(proof_ctx.is_function_pure());
+        assert!(!proof_ctx.is_function_pure());
         assert!(proof_ctx.is_function_associative());
         assert!(proof_ctx.is_function_commutative());
         assert!(!proof_ctx.is_function_idempotent());
-        assert_eq!(proof_ctx.function_proofs().len(), 3);
+        assert_eq!(proof_ctx.function_proofs().len(), 2);
     }
 
     #[test]
@@ -29399,9 +29385,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_instruction_level_pure_propagation() {
-        // An add instruction with Pure proof annotation: the result value
-        // should have the Pure proof in ProofContext.
+    fn test_raw_instruction_pure_is_not_translated() {
+        // A raw Pure annotation is report metadata, not optimizer authority.
         let func = TrustIrFunc {
             summary: None,
             producer: None,
@@ -29449,15 +29434,14 @@ mod tests {
 
         let module = make_module_for_func(&func);
         let (_, proof_ctx) = translate_func_test(&func, &module).unwrap();
-        // Find the internal value for ValueId::new(2)
-        let val2 = proof_ctx.value_proofs.keys().find(|v| {
+        assert!(
             proof_ctx
-                .proofs_for(v)
-                .iter()
-                .any(|p| matches!(p, Proof::Pure))
-        });
-        assert!(val2.is_some(), "Result value should have Pure proof");
-        assert!(proof_ctx.has_pure(val2.unwrap()));
+                .value_proofs
+                .values()
+                .flatten()
+                .all(|proof| !matches!(proof, Proof::Pure)),
+            "raw instruction Pure must not reach optimizer proof metadata"
+        );
     }
 
     #[test]
@@ -29522,7 +29506,8 @@ mod tests {
 
     #[test]
     fn test_combined_function_and_instruction_proofs() {
-        // Function has Pure proof, instruction has Associative + Commutative.
+        // Function has a raw Pure claim; the instruction has translatable
+        // Associative + Commutative proofs.
         let func = TrustIrFunc {
             summary: None,
             producer: None,
@@ -29575,8 +29560,8 @@ mod tests {
         let module = make_module_for_func(&func);
         let (_, proof_ctx) = translate_func_test(&func, &module).unwrap();
 
-        // Function-level: Pure
-        assert!(proof_ctx.is_function_pure());
+        // Function-level raw Pure is withheld from optimizer metadata.
+        assert!(!proof_ctx.is_function_pure());
         assert!(!proof_ctx.is_function_associative());
 
         // Instruction-level: Associative, Commutative, NoOverflow on result value
@@ -29588,7 +29573,7 @@ mod tests {
         assert!(proof_ctx.has_associative(val));
         assert!(proof_ctx.has_commutative(val));
         assert!(proof_ctx.has_no_overflow(val));
-        assert!(!proof_ctx.has_pure(val)); // Pure is function-level, not instruction-level here
+        assert!(!proof_ctx.has_pure(val)); // Raw Pure is not optimizer authority.
     }
 
     // -----------------------------------------------------------------------
@@ -29664,7 +29649,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_extract_proofs_pure() {
+    fn test_extract_proofs_withholds_raw_pure() {
         let node = InstrNode {
             inst: Inst::Load {
                 ty: Ty::I32,
@@ -29679,8 +29664,7 @@ mod tests {
             scope: None,
         };
         let proofs = extract_proofs(&node);
-        assert_eq!(proofs.len(), 1);
-        assert!(matches!(proofs[0], Proof::Pure));
+        assert!(proofs.is_empty());
     }
 
     #[test]
@@ -30440,7 +30424,7 @@ mod tests {
             },
             results: vec![ValueId::new(2)],
             proofs: vec![
-                ProofAnnotation::Pure,         // GPU-relevant -> Proof::Pure
+                ProofAnnotation::Pure,         // GPU-relevant but unauthorized -> withheld
                 ProofAnnotation::DataRaceFree, // NOT GPU-relevant
                 ProofAnnotation::InBounds,     // GPU-relevant -> Proof::InBounds
                 ProofAnnotation::Terminates,   // NOT GPU-relevant
@@ -30452,9 +30436,9 @@ mod tests {
             scope: None,
         };
         let proofs = gpu_relevant_proofs(&node);
-        // Pure, InBounds, NoOverflow, Commutative = 4 GPU-relevant annotations
-        assert_eq!(proofs.len(), 4);
-        assert!(proofs.iter().any(|p| matches!(p, Proof::Pure)));
+        // Raw Pure is withheld; InBounds, NoOverflow, and Commutative survive.
+        assert_eq!(proofs.len(), 3);
+        assert!(!proofs.iter().any(|p| matches!(p, Proof::Pure)));
         assert!(proofs.iter().any(|p| matches!(p, Proof::InBounds { .. })));
         assert!(proofs.iter().any(|p| matches!(p, Proof::NoOverflow { .. })));
         assert!(proofs.iter().any(|p| matches!(p, Proof::Commutative)));
@@ -30503,9 +30487,11 @@ mod tests {
             scope: None,
         };
         let proofs = gpu_relevant_proofs(&node);
-        // All 6 are GPU-relevant and this pointer-producing fixture has the
-        // operands needed to translate InBounds and ValidBorrow losslessly.
-        assert_eq!(proofs.len(), 6);
+        // Raw Pure is withheld. The other 5 annotations are GPU-relevant and
+        // this pointer-producing fixture has the operands needed to translate
+        // InBounds and ValidBorrow losslessly.
+        assert_eq!(proofs.len(), 5);
+        assert!(!proofs.iter().any(|p| matches!(p, Proof::Pure)));
     }
 
     // -----------------------------------------------------------------------
@@ -31903,7 +31889,7 @@ mod tests {
     }
 
     #[test]
-    fn structural_purity_fixpoint_marks_recursion_pure_and_demotes_impurity() {
+    fn structural_purity_fixpoint_ignores_forged_raw_pure_claims() {
         // Piece 1 of the pure-call hoist: recover purity of user functions the
         // rustc frontend never annotates. Validates the optimistic-start
         // call-graph fixpoint on the four canonical shapes.
@@ -31951,6 +31937,7 @@ mod tests {
             }),
             ret(),
         ])];
+        f2.proofs = vec![ProofAnnotation::Pure];
         // F3: transitively impure — calls the impure F2.
         let mut f3 = TrustIrFunc::new(FuncId::new(3), "caller_of_impure", ft, BlockId::new(0));
         f3.blocks = vec![block(vec![
@@ -31960,16 +31947,22 @@ mod tests {
             }),
             ret(),
         ])];
-        // F4: calls an unknown/external callee (FuncId not in the module) — impure.
+        f3.proofs = vec![ProofAnnotation::Pure];
+        // F4: calls a bodyless external declaration — impure.
         let mut f4 = TrustIrFunc::new(FuncId::new(4), "caller_of_extern", ft, BlockId::new(0));
         f4.blocks = vec![block(vec![
             node(Inst::Call {
-                callee: FuncId::new(99),
+                callee: FuncId::new(5),
                 args: vec![],
             }),
             ret(),
         ])];
-        for f in [f0, f1, f2, f3, f4] {
+        f4.proofs = vec![ProofAnnotation::Pure];
+        // F5: the bodyless external itself is also forged Pure. Bodyless
+        // declarations never enter structural purity analysis.
+        let mut f5 = TrustIrFunc::new(FuncId::new(5), "external", ft, BlockId::new(0));
+        f5.proofs = vec![ProofAnnotation::Pure];
+        for f in [f0, f1, f2, f3, f4, f5] {
             module.add_function(f);
         }
 
@@ -31989,7 +31982,123 @@ mod tests {
         );
         assert!(
             !pure.contains(&FuncId::new(4)),
-            "caller of unknown/external callee must be demoted"
+            "caller of bodyless external callee must be demoted"
+        );
+        assert!(
+            !pure.contains(&FuncId::new(5)),
+            "bodyless external declaration must not be structurally pure"
+        );
+
+        // The production collector must not union producer-asserted Pure back
+        // into the structural result. These three forged/stale claims cover a
+        // direct store, a transitive call, and an unknown/external call.
+        let authorized = collect_pure_func_ids(&module);
+        assert!(
+            !authorized.contains(&FuncId::new(2)),
+            "raw Pure must not authorize a function that stores"
+        );
+        assert!(
+            !authorized.contains(&FuncId::new(3)),
+            "raw Pure must not authorize a transitively impure function"
+        );
+        assert!(
+            !authorized.contains(&FuncId::new(4)),
+            "raw Pure must not authorize a function calling an external"
+        );
+        assert!(
+            !authorized.contains(&FuncId::new(5)),
+            "raw Pure must not authorize a bodyless external declaration"
+        );
+    }
+
+    #[test]
+    fn structural_purity_requires_a_body_for_every_declaration_linkage() {
+        let node = |inst: Inst| InstrNode::new(inst);
+        let ret = || node(Inst::Return { values: vec![] });
+        let block = |body: Vec<InstrNode>| TrustIrBlockDef {
+            id: BlockId::new(0),
+            params: vec![],
+            body,
+        };
+        let mut module = Module::new("bodyless_purity_candidates");
+        let ft = module.add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![],
+            is_vararg: false,
+        });
+
+        // A structurally inspectable leaf and its caller remain positive.
+        let mut pure_leaf = TrustIrFunc::new(FuncId::new(0), "pure_leaf", ft, BlockId::new(0));
+        pure_leaf.blocks = vec![block(vec![ret()])];
+        let mut pure_caller = TrustIrFunc::new(FuncId::new(1), "pure_caller", ft, BlockId::new(0));
+        pure_caller.blocks = vec![block(vec![
+            node(Inst::Call {
+                callee: pure_leaf.id,
+                args: vec![],
+            }),
+            ret(),
+        ])];
+        module.add_function(pure_leaf);
+        module.add_function(pure_caller);
+
+        // Exercise every current linkage and both declaration shapes: an opaque
+        // external (no summary) plus contract declarations (summary present).
+        // Raw Pure is deliberately forged on each declaration too.
+        let declaration_cases = [
+            (FuncId::new(2), "opaque_external", Linkage::External, false),
+            (FuncId::new(3), "contract_external", Linkage::External, true),
+            (FuncId::new(4), "contract_internal", Linkage::Internal, true),
+            (FuncId::new(5), "contract_private", Linkage::Private, true),
+            (FuncId::new(6), "contract_weak", Linkage::Weak, true),
+            (FuncId::new(7), "contract_linkonce", Linkage::LinkOnce, true),
+        ];
+        let mut declaration_ids = Vec::new();
+        for (id, name, linkage, with_summary) in declaration_cases {
+            let mut declaration = TrustIrFunc::new(id, name, ft, BlockId::new(0));
+            declaration.linkage = linkage;
+            declaration.proofs = vec![ProofAnnotation::Pure];
+            if with_summary {
+                declaration.summary = Some(trust_ir::FunctionSummary::new());
+            }
+            assert!(!declaration.has_body(), "{name} must be a declaration");
+            declaration_ids.push(id);
+            module.add_function(declaration);
+        }
+
+        // Any call to any bodyless declaration must also demote the caller.
+        let declaration_calls = declaration_ids.iter().copied().map(|callee| {
+            node(Inst::Call {
+                callee,
+                args: vec![],
+            })
+        });
+        let mut caller_body: Vec<InstrNode> = declaration_calls.collect();
+        caller_body.push(ret());
+        let declaration_caller_id = FuncId::new(8);
+        let mut declaration_caller = TrustIrFunc::new(
+            declaration_caller_id,
+            "declaration_caller",
+            ft,
+            BlockId::new(0),
+        );
+        declaration_caller.blocks = vec![block(caller_body)];
+        module.add_function(declaration_caller);
+
+        let pure = collect_pure_func_ids(&module);
+        assert!(pure.contains(&FuncId::new(0)), "pure leaf must remain pure");
+        assert!(
+            pure.contains(&FuncId::new(1)),
+            "caller of a structurally pure bodied function must remain pure"
+        );
+        for declaration_id in declaration_ids {
+            assert!(
+                !pure.contains(&declaration_id),
+                "bodyless declaration {declaration_id:?} must never be a purity candidate"
+            );
+        }
+        assert!(
+            !pure.contains(&declaration_caller_id),
+            "a caller of bodyless declarations must be transitively impure"
         );
     }
 
